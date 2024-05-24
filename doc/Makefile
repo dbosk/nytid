@@ -25,6 +25,7 @@ nytid.pdf: ../src/nytid/signup/utils.tex
 nytid.pdf: ../src/nytid
 
 FIGS+=		figs/nytid-storage.pdf
+FIGS+=		figs/timesheet-dbosk.pdf
 
 nytid.pdf: preamble.tex abstract.tex ../LICENSE ${FIGS}
 
