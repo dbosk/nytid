@@ -10,6 +10,7 @@ nytid.pdf: ../src/nytid/cli/courses.tex
 nytid.pdf: ../src/nytid/cli/schedule.tex
 nytid.pdf: ../src/nytid/cli/signupsheets.tex
 nytid.pdf: ../src/nytid/cli/hr.tex
+nytid.pdf: ../src/nytid/cli/recruit.tex
 
 nytid.pdf: ../src/nytid/storage/init.tex
 nytid.pdf: ../src/nytid/storage/afs.tex
