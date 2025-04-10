@@ -10,6 +10,7 @@ nytid.pdf: ../src/nytid/cli/courses.tex
 nytid.pdf: ../src/nytid/cli/schedule.tex
 nytid.pdf: ../src/nytid/cli/signupsheets.tex
 nytid.pdf: ../src/nytid/cli/hr.tex
+nytid.pdf: ../src/nytid/cli/utils/freerooms.tex
 
 nytid.pdf: ../src/nytid/storage/init.tex
 nytid.pdf: ../src/nytid/storage/afs.tex
@@ -26,6 +27,7 @@ nytid.pdf: ../src/nytid
 
 FIGS+=		figs/nytid-storage.pdf
 FIGS+=		figs/timesheet-dbosk.pdf
+FIGS+=		figs/timeedit-csv-export.png
 
 DEPENDS+=	didactic.sty
 
