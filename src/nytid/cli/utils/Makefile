@@ -1,9 +1,14 @@
 SUBDIR_GOALS=	all clean distclean
 
+MODULES+=	__init__.py
 MODULES+=	freerooms.py
 
 .PHONY: all
 all: ${MODULES}
+
+.intermediate: init.py
+__init__.py: init.py
+	${MV} $< $@
 
 .PHONY: clean
 clean:
