@@ -1,4 +1,5 @@
 SUBDIR_GOALS=	all clean distclean
+SUBDIR+=		utils
 
 MODULES+=	__init__.py
 MODULES+=	courses.py
