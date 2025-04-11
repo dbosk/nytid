@@ -1,7 +1,7 @@
 SUBDIR_GOALS=	all clean distclean
 
 MODULES+=	__init__.py
-MODULES+=	freerooms.py
+MODULES+=	rooms.py
 
 .PHONY: all
 all: ${MODULES}
