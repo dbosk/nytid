@@ -90,7 +90,7 @@ def fit_image(img, height=None, width=None):
 def make_xlsx(personnummer, name, email, events,
               course_leader, HoD,
               org = "JH", project = "1102",
-              hourly_salary = 150,
+              hourly_salary = 165,
               output = None,
               course_leader_signature = None,
               HoD_signature = None,
