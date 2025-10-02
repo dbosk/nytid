@@ -811,17 +811,25 @@ def test_offset_functionality(temp_tracking_dir):
     assert "Start time offset by -10 minutes" in result.stdout
 @
 
+\subsection{Stop Command}
+
+The stop command ends tracking for specified labels or all labels. Unlike the old
+hierarchical model, you can stop any arbitrary label(s) in any order.
+
 <<stop command>>=
 @cli.command()
 def stop(
-    all_labels: bool = typer.Option(False, "--all", "-a", 
-                                  help="Stop tracking for all active labels"),
+    labels: Optional[List[str]] = typer.Argument(None, help="Specific labels to stop (if not provided, stops all)"),
     offset_minutes: Optional[int] = typer.Option(None, "--offset", "-o",
                                                help="Offset stop time by this many minutes (negative for past)")
 ):
     """
-    Stop tracking. By default stops the most recently started labels.
-    Use --all to stop all active tracking.
+    Stop tracking for specified labels or all labels.
+    
+    Examples:
+      nytid track stop              # Stop all active labels
+      nytid track stop DD1310       # Stop only DD1310 label
+      nytid track stop DD1310 lecture  # Stop DD1310 and lecture labels
     """
     session = load_active_session()
     
@@ -833,39 +841,42 @@ def stop(
     end_time = datetime.datetime.now()
     if offset_minutes is not None:
         end_time += datetime.timedelta(minutes=offset_minutes)
-        # Update the session's label times if we're offsetting
-        for i, (label, start_time) in enumerate(session.label_stack):
-            session.label_stack[i] = (label, start_time)
     
     # Stop tracking and get completed entries
-    if all_labels:
-        completed_entries = session.clear_all()
-        save_active_session(ActiveSession())  # Clear the session
-        typer.echo("Stopped all tracking")
-    else:
-        completed_entries = session.pop_labels(1)
-        save_active_session(session)
-        if session.is_active():
-            typer.echo(f"Stopped latest label. Still tracking: {get_labels_display(session.get_current_labels())}")
-        else:
-            typer.echo("Stopped tracking")
+    completed_entries = session.stop_labels(labels, end_time)
     
-    # Update end times if offset was provided
-    if offset_minutes is not None and completed_entries:
-        for entry in completed_entries:
-            entry.end_time = end_time
+    if not completed_entries:
+        if labels:
+            typer.echo(f"None of the specified labels are currently tracking: {', '.join(labels)}", err=True)
+        else:
+            typer.echo("No active tracking to stop", err=True)
+        raise typer.Exit(1)
+    
+    # Save session
+    save_active_session(session)
     
     # Save completed entries
     add_completed_entries(completed_entries)
     
     # Display what was completed
     for entry in completed_entries:
-        typer.echo(f"Completed: {get_labels_display(entry.labels)} ({format_duration(entry.duration())})")
+        typer.echo(f"Stopped: {get_labels_display(entry.labels)} ({format_duration(entry.duration())})")
+    
+    # Show remaining active labels
+    if session.is_active():
+        remaining = session.get_active_labels()
+        typer.echo(f"Still tracking: {', '.join(remaining)}")
+    else:
+        typer.echo("All tracking stopped")
+    
+    if offset_minutes is not None:
+        typer.echo(f"Stop time offset by {offset_minutes} minutes: {end_time.strftime('%H:%M:%S')}")
 @
 
 \subsection{Status Command}
 
-The status command shows what is currently being tracked.
+The status command shows what is currently being tracked, with each label's 
+individual start time and duration.
 
 <<status command>>=
 @cli.command()
@@ -882,13 +893,47 @@ def status():
     typer.echo("Currently tracking:")
     current_time = datetime.datetime.now()
     
-    for i, (label, start_time) in enumerate(session.label_stack):
-        duration = current_time - start_time
-        indent = "  " * i
-        typer.echo(f"{indent}- {label} (for {format_duration(duration)})")
+    # Show each active label with its duration and notes
+    for label in session.get_active_labels():
+        info = session.get_label_info(label)
+        if info:
+            start_time, notes = info
+            duration = current_time - start_time
+            notes_display = f" - {notes}" if notes else ""
+            typer.echo(f"  {label}: {format_duration(duration)}{notes_display}")
+@
+
+\subsection{Notes Command}
+
+The notes command allows adding or updating notes/descriptions for any active label.
+
+<<notes command>>=
+@cli.command()
+def notes(
+    label: str = typer.Argument(..., help="Label to add notes to"),
+    note_text: str = typer.Argument(..., help="Notes/description to add")
+):
+    """
+    Add or update notes for an active tracking label.
     
-    total_labels = session.get_current_labels()
-    typer.echo(f"\nFull label hierarchy: {get_labels_display(total_labels)}")
+    Example:
+      nytid track notes DD1310 "Discussing course structure with TA"
+    """
+    session = load_active_session()
+    
+    if not session.is_active():
+        typer.echo("No active tracking session", err=True)
+        raise typer.Exit(1)
+    
+    if session.add_notes(label, note_text):
+        save_active_session(session)
+        typer.echo(f"Added notes to '{label}': {note_text}")
+    else:
+        typer.echo(f"Label '{label}' is not currently being tracked", err=True)
+        active = session.get_active_labels()
+        if active:
+            typer.echo(f"Active labels: {', '.join(active)}")
+        raise typer.Exit(1)
 @
 
 \subsection{Run Command}
@@ -915,12 +960,12 @@ def run(
     
     start_time = datetime.datetime.now()
     
-    # Load current session and add labels
+    # Load current session and start tracking labels
     session = load_active_session()
-    session.push_labels(labels, start_time)
+    started = session.start_labels(labels, start_time)
     save_active_session(session)
     
-    typer.echo(f"Running '{' '.join(command_args)}' and tracking as: {get_labels_display(labels)}")
+    typer.echo(f"Running '{' '.join(command_args)}' and tracking with labels: {', '.join(sorted(labels))}")
     
     try:
         # Run the command
@@ -933,13 +978,9 @@ def run(
         typer.echo(f"Command not found: {command_args[0]}", err=True)
         exit_code = 127
     
-    # Stop tracking and save the completed entry
+    # Stop tracking the labels we started and save completed entries
     end_time = datetime.datetime.now()
-    completed_entries = session.pop_labels(len(labels))
-    
-    # Update end times
-    for entry in completed_entries:
-        entry.end_time = end_time
+    completed_entries = session.stop_labels(started, end_time)
     
     # Save state
     save_active_session(session)
@@ -1481,6 +1522,7 @@ Now we collect all the subcommands:
 <<status command>>
 <<start command>>
 <<stop command>>
+<<notes command>>
 <<add command>>
 <<run command>>
 <<stats command>>
