@@ -348,12 +348,17 @@ class ActiveSession:
     This class maintains a dictionary of currently active tracking labels,
     where each label tracks independently with its own start time and notes.
     Labels can be started, stopped, and annotated independently.
+    
+    The session tracks the order in which labels were started to support
+    LIFO (Last In, First Out) stopping behavior.
     """
     
     def __init__(self):
         """Initialize an empty active session."""
         # Dictionary mapping label -> (start_time, notes)
         self.active_labels: Dict[str, tuple] = {}
+        # Ordered list of labels by start time (most recent last)
+        self.label_order: List[str] = []
         
     def start_labels(self, labels: List[str], start_time: datetime.datetime) -> List[str]:
         """
@@ -373,30 +378,42 @@ class ActiveSession:
         for label in labels:
             if label not in self.active_labels:
                 self.active_labels[label] = (start_time, "")
+                self.label_order.append(label)
                 started.append(label)
         return started
     
-    def stop_labels(self, labels: List[str] = None, end_time: datetime.datetime = None) -> List[TrackingEntry]:
+    def stop_labels(self, labels: List[str] = None, end_time: datetime.datetime = None, 
+                    count: int = None) -> List[TrackingEntry]:
         """
         Stop tracking for specified labels and return completed entries.
         
         Args:
-            labels: List of labels to stop. If None, stops all active labels.
+            labels: List of labels to stop. If None and count is None, behavior depends on count.
             end_time: When tracking ended. If None, uses current time.
+            count: Number of most recently started labels to stop. If None, stops specified labels.
             
         Returns:
             List of TrackingEntry objects for the stopped labels
         """
         if end_time is None:
             end_time = datetime.datetime.now()
-            
-        if labels is None:
-            labels = list(self.active_labels.keys())
+        
+        # Determine which labels to stop
+        if labels is None and count is None:
+            # Stop most recently started label
+            if not self.label_order:
+                return []
+            labels = [self.label_order[-1]]
+        elif count is not None:
+            # Stop the N most recently started labels
+            labels = self.label_order[-count:] if self.label_order else []
+        # else: use the provided labels list
             
         entries = []
         for label in labels:
             if label in self.active_labels:
                 start_time, notes = self.active_labels.pop(label)
+                self.label_order.remove(label)
                 # Create entry with just this label
                 entry = TrackingEntry(start_time, end_time, [label], notes)
                 entries.append(entry)
@@ -461,7 +478,8 @@ class ActiveSession:
             'active_labels': {
                 label: (start_time.isoformat(), notes)
                 for label, (start_time, notes) in self.active_labels.items()
-            }
+            },
+            'label_order': self.label_order
         }
     
     @classmethod
@@ -484,11 +502,22 @@ class ActiveSession:
             for label, start_time_str in data['label_stack']:
                 start_time = datetime.datetime.fromisoformat(start_time_str)
                 session.active_labels[label] = (start_time, "")
+                session.label_order.append(label)
         else:
             # Use new flat format
             for label, (start_time_str, notes) in active_labels_data.items():
                 start_time = datetime.datetime.fromisoformat(start_time_str)
                 session.active_labels[label] = (start_time, notes)
+            
+            # Restore label order if available, otherwise sort by start time
+            if 'label_order' in data:
+                session.label_order = data['label_order']
+            else:
+                # Build order from start times for backward compatibility
+                session.label_order = sorted(
+                    session.active_labels.keys(),
+                    key=lambda l: session.active_labels[l][0]
+                )
         
         return session
 @
@@ -758,21 +787,30 @@ def test_offset_functionality(temp_tracking_dir):
 
 \subsection{Stop Command}
 
-The stop command ends tracking for specified labels or all labels. Unlike the old
-hierarchical model, you can stop any arbitrary label(s) in any order.
+The stop command ends tracking for labels. By default, it stops the most recently
+started label (LIFO - Last In, First Out). This allows progressive unwinding of
+tracking sessions. You can also stop specific labels or use [[--all]] to stop
+everything at once.
+
+This LIFO behavior is useful when tracking nested contexts, like starting with a
+course label, then adding an activity label. Repeated [[stop]] commands naturally
+unwind in reverse order.
 
 <<stop command>>=
 @cli.command()
 def stop(
-    labels: Optional[List[str]] = typer.Argument(None, help="Specific labels to stop (if not provided, stops all)"),
+    labels: Optional[List[str]] = typer.Argument(None, help="Specific labels to stop"),
+    all_labels: bool = typer.Option(False, "--all", "-a", help="Stop all active labels"),
     offset_minutes: Optional[int] = typer.Option(None, "--offset", "-o",
                                                help="Offset stop time by this many minutes (negative for past)")
 ):
     """
-    Stop tracking for specified labels or all labels.
+    Stop tracking. By default, stops the most recently started label.
+    Use --all to stop all active tracking.
     
     Examples:
-      nytid track stop              # Stop all active labels
+      nytid track stop              # Stop most recently started label
+      nytid track stop --all        # Stop all active labels
       nytid track stop DD1310       # Stop only DD1310 label
       nytid track stop DD1310 lecture  # Stop DD1310 and lecture labels
     """
@@ -787,8 +825,16 @@ def stop(
     if offset_minutes is not None:
         end_time += datetime.timedelta(minutes=offset_minutes)
     
-    # Stop tracking and get completed entries
-    completed_entries = session.stop_labels(labels, end_time)
+    # Determine what to stop
+    if all_labels:
+        # Stop all active labels
+        completed_entries = session.stop_labels(count=len(session.label_order), end_time=end_time)
+    elif labels:
+        # Stop specified labels
+        completed_entries = session.stop_labels(labels, end_time)
+    else:
+        # Default: stop most recently started label
+        completed_entries = session.stop_labels(end_time=end_time)
     
     if not completed_entries:
         if labels:
@@ -821,12 +867,34 @@ def stop(
 \subsubsection{Testing Stop Command}
 
 <<test stop command>>=
+def test_stop_most_recent_label(temp_tracking_dir):
+    """Test stopping most recently started label"""
+    # Start tracking multiple labels
+    runner.invoke(cli, ["start", "DD1310"])
+    runner.invoke(cli, ["start", "lecture"])
+    runner.invoke(cli, ["start", "grading"])
+    
+    # Stop without arguments should stop most recent (grading)
+    result = runner.invoke(cli, ["stop"])
+    assert result.exit_code == 0
+    assert "Stopped: grading" in result.stdout
+    assert "Still tracking:" in result.stdout
+    assert "DD1310" in result.stdout
+    assert "lecture" in result.stdout
+    
+    # Stop again should stop next most recent (lecture)
+    result = runner.invoke(cli, ["stop"])
+    assert result.exit_code == 0
+    assert "Stopped: lecture" in result.stdout
+    assert "Still tracking:" in result.stdout
+    assert "DD1310" in result.stdout
+
 def test_stop_specific_labels(temp_tracking_dir):
     """Test stopping specific labels"""
     # Start tracking multiple labels
     runner.invoke(cli, ["start", "DD1310", "lecture", "grading"])
     
-    # Stop one label
+    # Stop one specific label
     result = runner.invoke(cli, ["stop", "lecture"])
     assert result.exit_code == 0
     assert "Stopped: lecture" in result.stdout
@@ -835,12 +903,12 @@ def test_stop_specific_labels(temp_tracking_dir):
     assert "grading" in result.stdout
 
 def test_stop_all_labels(temp_tracking_dir):
-    """Test stopping all labels"""
+    """Test stopping all labels with --all flag"""
     # Start tracking
     runner.invoke(cli, ["start", "DD1310", "lecture"])
     
-    # Stop all (no arguments)
-    result = runner.invoke(cli, ["stop"])
+    # Stop all
+    result = runner.invoke(cli, ["stop", "--all"])
     assert result.exit_code == 0
     assert "Stopped:" in result.stdout
     assert "All tracking stopped" in result.stdout
