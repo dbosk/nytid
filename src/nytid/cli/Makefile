@@ -6,6 +6,7 @@ MODULES+=	courses.py
 MODULES+=	schedule.py
 MODULES+=	signupsheets.py
 MODULES+=	hr.py
+MODULES+=	track.py
 
 EXTRAS+=	nytid.hourly.sh
 EXTRAS+=	nytid.daily.sh
