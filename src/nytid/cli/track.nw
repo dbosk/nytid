@@ -21,6 +21,7 @@ independent tags that can be started and stopped individually:
 \item Labels can be stopped in any order
 \item Same label cannot track twice in parallel (attempting to start it again just continues existing tracking)
 \item Labels can be combined for multi-dimensional categorization
+\item Labels started together form a "batch" that can be stopped together
 \end{itemize}
 
 This allows for flexible reporting and analysis, such as:
@@ -28,6 +29,28 @@ This allows for flexible reporting and analysis, such as:
 \item All time spent on [[DD1310]] (regardless of activity)
 \item All [[lecture]] time (regardless of course)
 \item Time spent on [[DD1310]] AND [[lecture]] (intersection)
+\end{itemize}
+
+\subsection{Batch Stopping Behavior}
+When multiple labels are started together in a single command, they form a "batch" that
+can be stopped together. This is useful for tracking related activities:
+\begin{itemize}
+\item [[nytid track start DD1310]] starts DD1310 alone (batch 1)
+\item [[nytid track start lecture prep]] starts lecture and prep together (batch 2)
+\item [[nytid track stop]] stops the most recent batch (lecture and prep)
+\item [[nytid track stop]] again stops the next batch (DD1310)
+\end{itemize}
+
+You can still stop individual labels by specifying them: [[nytid track stop lecture]]
+or stop all labels at once with [[nytid track stop --all]].
+
+\subsection{Resume Functionality}
+The system remembers the most recently stopped labels, allowing you to resume tracking
+without retyping label names:
+\begin{itemize}
+\item After stopping labels, [[nytid track start]] (without arguments) resumes them
+\item Useful when interrupted and want to continue the same activity
+\item Example: [[nytid track run -l mail -- mutt]] is interrupted, [[nytid track stop]] stops mail tracking, later [[nytid track start]] resumes mail tracking
 \end{itemize}
 
 \subsection{Independent Label Tracking}
@@ -177,7 +200,7 @@ def get_default_daily_limit() -> float:
 
 \section{Helper Functions}
 
-We need some utility functions for formatting and display.
+We need some utility functions for formatting, display, and autocompletion.
 
 <<helper functions>>=
 def format_duration(duration: datetime.timedelta) -> str:
@@ -196,6 +219,40 @@ def format_duration(duration: datetime.timedelta) -> str:
 def get_labels_display(labels: List[str]) -> str:
     """Get a display string for labels (as comma-separated tags)"""
     return ", ".join(sorted(labels)) if labels else "No labels"
+
+def complete_active_labels(ctx, args, incomplete):
+    """
+    Shell completion function for active labels (used by stop command).
+    
+    Returns currently tracking labels that match the incomplete string.
+    """
+    try:
+        session = load_active_session()
+        active = session.get_active_labels()
+        return [label for label in active if label.startswith(incomplete)]
+    except:
+        return []
+
+def complete_historical_labels(ctx, args, incomplete):
+    """
+    Shell completion function for historical labels (used by start command).
+    
+    Returns previously used labels from tracking history that match the incomplete string.
+    """
+    try:
+        entries = load_completed_entries()
+        # Collect all unique labels from historical entries
+        all_labels = set()
+        for entry in entries:
+            all_labels.update(entry.labels)
+        
+        # Also include currently active labels
+        session = load_active_session()
+        all_labels.update(session.get_active_labels())
+        
+        return sorted([label for label in all_labels if label.startswith(incomplete)])
+    except:
+        return []
 
 def parse_offset(offset_str: str) -> datetime.timedelta:
     """
@@ -468,15 +525,22 @@ class ActiveSession:
     Labels can be started, stopped, and annotated independently.
     
     The session tracks the order in which labels were started to support
-    LIFO (Last In, First Out) stopping behavior.
+    LIFO (Last In, First Out) stopping behavior. Labels started together
+    in one command form a "batch" that can be stopped together.
     """
     
     def __init__(self):
         """Initialize an empty active session."""
-        # Dictionary mapping label -> (start_time, notes)
+        # Dictionary mapping label -> (start_time, notes, batch_id)
         self.active_labels: Dict[str, tuple] = {}
         # Ordered list of labels by start time (most recent last)
         self.label_order: List[str] = []
+        # Track which labels were started together (batch_id -> list of labels)
+        self.batches: Dict[int, List[str]] = {}
+        # Next batch ID to use
+        self.next_batch_id: int = 1
+        # Remember last stopped labels for resume functionality
+        self.last_stopped: List[str] = []
         
     def start_labels(self, labels: List[str], start_time: datetime.datetime) -> List[str]:
         """
@@ -484,6 +548,8 @@ class ActiveSession:
         
         If a label is already being tracked, it's ignored (continues existing tracking).
         This prevents duplicate tracking of the same label.
+        
+        Labels started together in one call form a "batch" and can be stopped together.
         
         Args:
             labels: List of labels to start tracking
@@ -493,22 +559,31 @@ class ActiveSession:
             List of labels that were actually started (excludes already-active labels)
         """
         started = []
+        batch_id = self.next_batch_id
+        self.next_batch_id += 1
+        
         for label in labels:
             if label not in self.active_labels:
-                self.active_labels[label] = (start_time, "")
+                self.active_labels[label] = (start_time, "", batch_id)
                 self.label_order.append(label)
                 started.append(label)
+                
+        # Track this batch
+        if started:
+            self.batches[batch_id] = started
+            
         return started
     
     def stop_labels(self, labels: List[str] = None, end_time: datetime.datetime = None, 
-                    count: int = None) -> List[TrackingEntry]:
+                    count: int = None, stop_batch: bool = True) -> List[TrackingEntry]:
         """
         Stop tracking for specified labels and return completed entries.
         
         Args:
-            labels: List of labels to stop. If None and count is None, behavior depends on count.
+            labels: List of labels to stop. If None and count is None, stops most recent batch.
             end_time: When tracking ended. If None, uses current time.
-            count: Number of most recently started labels to stop. If None, stops specified labels.
+            count: Number of most recently started labels to stop. If None, uses batch logic.
+            stop_batch: If True (default), stopping without arguments stops the most recent batch.
             
         Returns:
             List of TrackingEntry objects for the stopped labels
@@ -518,19 +593,35 @@ class ActiveSession:
         
         # Determine which labels to stop
         if labels is None and count is None:
-            # Stop most recently started label
-            if not self.label_order:
-                return []
-            labels = [self.label_order[-1]]
+            if stop_batch and self.label_order:
+                # Stop the most recent batch (labels started together)
+                # Find the most recently started label and get its batch
+                most_recent = self.label_order[-1]
+                start_time, notes, batch_id = self.active_labels[most_recent]
+                
+                # Get all labels from this batch that are still active
+                if batch_id in self.batches:
+                    labels = [l for l in self.batches[batch_id] if l in self.active_labels]
+                else:
+                    # Fallback if batch info is missing
+                    labels = [most_recent]
+            else:
+                # Stop most recently started label only
+                if not self.label_order:
+                    return []
+                labels = [self.label_order[-1]]
         elif count is not None:
             # Stop the N most recently started labels
             labels = self.label_order[-count:] if self.label_order else []
         # else: use the provided labels list
+        
+        # Remember stopped labels for resume functionality
+        self.last_stopped = labels.copy() if labels else []
             
         entries = []
         for label in labels:
             if label in self.active_labels:
-                start_time, notes = self.active_labels.pop(label)
+                start_time, notes, batch_id = self.active_labels.pop(label)
                 self.label_order.remove(label)
                 # Create entry with just this label
                 entry = TrackingEntry(start_time, end_time, [label], notes)
@@ -550,8 +641,8 @@ class ActiveSession:
             True if notes were added, False if label is not active
         """
         if label in self.active_labels:
-            start_time, _ = self.active_labels[label]
-            self.active_labels[label] = (start_time, notes)
+            start_time, _, batch_id = self.active_labels[label]
+            self.active_labels[label] = (start_time, notes, batch_id)
             return True
         return False
     
@@ -572,7 +663,7 @@ class ActiveSession:
             label: The label to query
             
         Returns:
-            Tuple of (start_time, notes) if label is active, None otherwise
+            Tuple of (start_time, notes, batch_id) if label is active, None otherwise
         """
         return self.active_labels.get(label)
     
@@ -594,10 +685,13 @@ class ActiveSession:
         """
         return {
             'active_labels': {
-                label: (start_time.isoformat(), notes)
-                for label, (start_time, notes) in self.active_labels.items()
+                label: (start_time.isoformat(), notes, batch_id)
+                for label, (start_time, notes, batch_id) in self.active_labels.items()
             },
-            'label_order': self.label_order
+            'label_order': self.label_order,
+            'batches': self.batches,
+            'next_batch_id': self.next_batch_id,
+            'last_stopped': self.last_stopped
         }
     
     @classmethod
@@ -617,15 +711,21 @@ class ActiveSession:
         # Handle both old format (label_stack) and new format (active_labels)
         if 'label_stack' in data and not active_labels_data:
             # Convert old hierarchical format to flat labels
+            batch_id = session.next_batch_id
             for label, start_time_str in data['label_stack']:
                 start_time = datetime.datetime.fromisoformat(start_time_str)
-                session.active_labels[label] = (start_time, "")
+                session.active_labels[label] = (start_time, "", batch_id)
                 session.label_order.append(label)
+            session.next_batch_id += 1
         else:
             # Use new flat format
-            for label, (start_time_str, notes) in active_labels_data.items():
+            for label, label_data in active_labels_data.items():
+                start_time_str = label_data[0]
+                notes = label_data[1] if len(label_data) > 1 else ""
+                batch_id = label_data[2] if len(label_data) > 2 else 0
+                
                 start_time = datetime.datetime.fromisoformat(start_time_str)
-                session.active_labels[label] = (start_time, notes)
+                session.active_labels[label] = (start_time, notes, batch_id)
             
             # Restore label order if available, otherwise sort by start time
             if 'label_order' in data:
@@ -636,6 +736,14 @@ class ActiveSession:
                     session.active_labels.keys(),
                     key=lambda l: session.active_labels[l][0]
                 )
+            
+            # Restore batch information
+            if 'batches' in data:
+                session.batches = {int(k): v for k, v in data['batches'].items()}
+            if 'next_batch_id' in data:
+                session.next_batch_id = data['next_batch_id']
+            if 'last_stopped' in data:
+                session.last_stopped = data['last_stopped']
         
         return session
 @
@@ -831,7 +939,9 @@ starting it again just continues the existing tracking (prevents duplicates).
 <<start command>>=
 @cli.command()
 def start(
-    labels: List[str] = typer.Argument(..., help="Labels to track (independent tags)"),
+    labels: List[str] = typer.Argument(None, 
+                                       help="Labels to track (independent tags). If empty, resumes last stopped labels.",
+                                       autocompletion=complete_historical_labels),
     offset: Optional[str] = typer.Option(None, "--offset", "-o", 
                                           help="Offset start time (e.g., '-30m', '-1.5h', '30' for minutes)"),
     at: Optional[str] = typer.Option(None, "--at", 
@@ -841,16 +951,28 @@ def start(
     Start tracking time with the given labels.
     Labels are independent tags. If a label is already being tracked, it continues.
     
+    If no labels are provided, resumes tracking the most recently stopped labels.
+    
     Examples:
       nytid track start DD1310 lecture preparation
       nytid track start DD1310 --offset -30m        # Started 30 minutes ago
       nytid track start lecture --offset -1.5h      # Started 1.5 hours ago
       nytid track start meeting --at 14:30          # Started at 2:30 PM today
       nytid track start DD1321 --at "2024-12-13 14:30"  # Started at specific date/time
+      nytid track start                             # Resume last stopped labels
     """
+    # Load current session for resume functionality
+    session = load_active_session()
+    
+    # If no labels provided, try to resume last stopped labels
     if not labels:
-        typer.echo("Error: At least one label is required", err=True)
-        raise typer.Exit(1)
+        if session.last_stopped:
+            labels = session.last_stopped
+            typer.echo(f"Resuming: {', '.join(sorted(labels))}")
+        else:
+            typer.echo("Error: No labels specified and no previous labels to resume", err=True)
+            typer.echo("Usage: nytid track start <label1> [label2] ...", err=True)
+            raise typer.Exit(1)
     
     # Check for conflicting options
     if offset is not None and at is not None:
@@ -873,9 +995,6 @@ def start(
         except ValueError as e:
             typer.echo(f"Error parsing offset '{offset}': {e}", err=True)
             raise typer.Exit(1)
-    
-    # Load current session
-    session = load_active_session()
     
     # Start tracking labels (ignores already-active labels)
     started = session.start_labels(labels, start_time)
@@ -982,7 +1101,9 @@ unwind in reverse order.
 <<stop command>>=
 @cli.command()
 def stop(
-    labels: Optional[List[str]] = typer.Argument(None, help="Specific labels to stop"),
+    labels: Optional[List[str]] = typer.Argument(None, 
+                                                  help="Specific labels to stop",
+                                                  autocompletion=complete_active_labels),
     all_labels: bool = typer.Option(False, "--all", "-a", help="Stop all active labels"),
     offset: Optional[str] = typer.Option(None, "--offset", "-o",
                                           help="Offset stop time (e.g., '-30m', '-1.5h', '30' for minutes)"),
@@ -990,11 +1111,19 @@ def stop(
                                      help="Stop at specific time (e.g., '14:30' or '2024-12-13 14:30')")
 ):
     """
-    Stop tracking. By default, stops the most recently started label.
-    Use --all to stop all active tracking.
+    Stop tracking. By default, stops the most recently started batch of labels.
+    
+    When labels are started together in one command, they form a "batch" and
+    are stopped together. For example:
+      nytid track start DD1310          # Start DD1310 (batch 1)
+      nytid track start lecture prep    # Start lecture and prep (batch 2)  
+      nytid track stop                  # Stops batch 2 (lecture and prep)
+      nytid track stop                  # Stops batch 1 (DD1310)
+    
+    Use --all to stop all active tracking, or specify labels to stop specific ones.
     
     Examples:
-      nytid track stop                   # Stop most recently started label
+      nytid track stop                   # Stop most recent batch
       nytid track stop --all             # Stop all active labels
       nytid track stop DD1310            # Stop only DD1310 label
       nytid track stop DD1310 lecture    # Stop DD1310 and lecture labels
@@ -1037,8 +1166,8 @@ def stop(
         # Stop specified labels
         completed_entries = session.stop_labels(labels, end_time)
     else:
-        # Default: stop most recently started label
-        completed_entries = session.stop_labels(end_time=end_time)
+        # Default: stop most recently started batch
+        completed_entries = session.stop_labels(end_time=end_time, stop_batch=True)
     
     if not completed_entries:
         if labels:
@@ -1072,27 +1201,32 @@ def stop(
 \subsubsection{Testing Stop Command}
 
 <<test stop command>>=
-def test_stop_most_recent_label(temp_tracking_dir):
-    """Test stopping most recently started label"""
-    # Start tracking multiple labels
+def test_stop_batch_behavior(temp_tracking_dir):
+    """Test stopping batches of labels started together"""
+    # Start DD1310 alone (batch 1)
     runner.invoke(cli, ["start", "DD1310"])
-    runner.invoke(cli, ["start", "lecture"])
-    runner.invoke(cli, ["start", "grading"])
     
-    # Stop without arguments should stop most recent (grading)
+    # Start lecture and prep together (batch 2)
+    runner.invoke(cli, ["start", "lecture", "prep"])
+    
+    # Stop without arguments should stop batch 2 (lecture and prep)
     result = runner.invoke(cli, ["stop"])
     assert result.exit_code == 0
-    assert "Stopped: grading" in result.stdout
+    assert "Stopped: lecture" in result.stdout or "Stopped: prep" in result.stdout
     assert "Still tracking:" in result.stdout
     assert "DD1310" in result.stdout
-    assert "lecture" in result.stdout
     
-    # Stop again should stop next most recent (lecture)
+    # Verify batch 2 labels are both stopped
+    session = load_active_session()
+    assert "DD1310" in session.get_active_labels()
+    assert "lecture" not in session.get_active_labels()
+    assert "prep" not in session.get_active_labels()
+    
+    # Stop again should stop batch 1 (DD1310)
     result = runner.invoke(cli, ["stop"])
     assert result.exit_code == 0
-    assert "Stopped: lecture" in result.stdout
-    assert "Still tracking:" in result.stdout
-    assert "DD1310" in result.stdout
+    assert "Stopped: DD1310" in result.stdout
+    assert "All tracking stopped" in result.stdout
 
 def test_stop_specific_labels(temp_tracking_dir):
     """Test stopping specific labels"""
@@ -1130,6 +1264,18 @@ def test_stop_error_cases(temp_tracking_dir):
     result = runner.invoke(cli, ["stop", "nonexistent"])
     assert result.exit_code == 1
     assert "None of the specified labels are currently tracking" in result.stdout
+
+def test_resume_functionality(temp_tracking_dir):
+    """Test resuming previously stopped labels"""
+    # Start and stop some labels
+    runner.invoke(cli, ["start", "DD1310", "lecture"])
+    runner.invoke(cli, ["stop"])
+    
+    # Resume should start the same labels again
+    result = runner.invoke(cli, ["start"])
+    assert result.exit_code == 0
+    assert "Resuming:" in result.stdout
+    assert "DD1310" in result.stdout or "lecture" in result.stdout
 @
 
 \subsection{Status Command}
