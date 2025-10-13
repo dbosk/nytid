@@ -118,6 +118,10 @@ def make_xlsx(personnummer, name, email, events,
     - `logo` is an image (or path to one) containing the logotype of the 
       university.
     """
+    # Don't create empty timesheets when there are no events to report
+    if not events and not removed_events:
+        return
+    
     login = email.replace("@kth.se", "")
     if not output:
         output = login + "_tid_" + datetime.date.today().strftime("%Y-%m-%d.xlsx")
