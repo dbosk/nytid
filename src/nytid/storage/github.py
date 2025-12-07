@@ -86,15 +86,16 @@ class StorageRoot(git.StorageRoot):
         owner, repo_name = extract_github_repo_info(url)
         self.__owner = owner
         self.__repo = repo_name
-        if "github.com" in url:
+        hostname = extract_github_hostname(url)
+        if hostname == "github.com":
             self.__api_base = "https://api.github.com"
         else:
-            # Extract hostname for GitHub Enterprise
-            hostname = extract_github_hostname(url)
+            # GitHub Enterprise
             self.__api_base = f"https://{hostname}/api/v3"
         self.__headers = {
             "Authorization": f"token {self.__token}",
-            "Accept": "application/vnd.github.v3+json",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
         }
         super().__init__(url)
 
