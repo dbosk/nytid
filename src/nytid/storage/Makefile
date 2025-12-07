@@ -1,6 +1,7 @@
 MODULES+=	__init__.py
 MODULES+=	afs.py
 MODULES+=	git.py
+MODULES+=	github.py
 
 .PHONY: all
 all: ${MODULES}
