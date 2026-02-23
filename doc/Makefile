@@ -11,6 +11,7 @@ nytid.pdf: ../src/nytid/cli/schedule.tex
 nytid.pdf: ../src/nytid/cli/signupsheets.tex
 nytid.pdf: ../src/nytid/cli/hr.tex
 nytid.pdf: ../src/nytid/cli/track.tex
+nytid.pdf: ../src/nytid/cli/todo.tex
 nytid.pdf: ../src/nytid/cli/utils/init.tex
 nytid.pdf: ../src/nytid/cli/utils/rooms.tex
 
