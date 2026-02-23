@@ -56,7 +56,10 @@ import logging
 import math
 import os
 import pathlib
+import re
+import subprocess
 import sys
+import tempfile
 import typer
 import typerconf as config
 from typing_extensions import Annotated
@@ -77,6 +80,7 @@ cli = typer.Typer(
 <<effective priority>>
 <<storage functions>>
 <<sub-item helpers>>
+<<editor infrastructure>>
 <<binary search priority>>
 <<autocompletion functions>>
 <<subcommands>>
@@ -175,6 +179,15 @@ status, timestamps, an optional deadline, an estimated duration in
 hours, a longer description, an optional parent ID for sub-items, and
 an optional worker assignment.
 
+To support work-session management (inspired by the UNIX [[at]]
+command), each item can also capture the working directory and
+environment at creation time, extended notes for the editor, and a
+default command to run when starting the task. The [[cwd]] and [[env]]
+fields together let [[todo start]] restore the exact context in which
+the task was conceived---solving the common problem of \enquote{where
+was I working on this?} The [[command]] field defaults to [[$SHELL]]
+but can be set to tools like [[claude]] or [[opencode]].
+
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
 track, which manages mutable state with batch semantics.
@@ -199,6 +212,10 @@ class TodoItem:
     description: str = ""
     parent_id: Optional[int] = None
     who: Optional[str] = None
+    notes: str = ""
+    cwd: Optional[str] = None
+    env: Optional[Dict[str, str]] = None
+    command: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -235,6 +252,10 @@ def test_todo_item_roundtrip():
         description="Grade lab 3",
         parent_id=None,
         who="me",
+        notes="Check Canvas for submissions",
+        cwd="/home/user/courses/DD1310",
+        env={"COURSE": "DD1310"},
+        command="claude",
     )
     data = item.to_dict()
     restored = TodoItem.from_dict(data)
@@ -244,6 +265,10 @@ def test_todo_item_roundtrip():
     assert restored.priority == 5.0
     assert restored.deadline == "2026-02-28T23:59:00"
     assert restored.who == "me"
+    assert restored.notes == "Check Canvas for submissions"
+    assert restored.cwd == "/home/user/courses/DD1310"
+    assert restored.env == {"COURSE": "DD1310"}
+    assert restored.command == "claude"
 
 
 def test_todo_item_from_dict_ignores_unknown():
@@ -549,6 +574,591 @@ def test_check_parent_completion():
     assert check_parent_completion(todos, 1)
 @
 
+\section{Editor Infrastructure}
+\label{editor-infrastructure}
+
+The editor system lets users create and edit todos using a markdown
+document with YAML front matter---a format familiar from static site
+generators and note-taking tools. This serves two purposes: creating
+hierarchical todos with sub-items in a single editor session, and
+providing a natural format for viewing and editing existing todos.
+
+The document format uses the first non-empty line as the title,
+an optional \texttt{---}-delimited YAML block for metadata, free text
+for notes, and markdown headings for sub-items. Each heading can have
+its own YAML block and notes.
+
+\subsection{Parsed Document Structure}
+
+We represent the parsed editor output as a tree of items. Each item
+has a title, notes, metadata from YAML front matter, and children
+from nested headings. This mirrors [[TodoItem]] but is independent
+of it---parsing produces a [[ParsedTodo]], which the caller converts
+to [[TodoItem]] instances.
+
+Why separate from [[TodoItem]]? Because the parsed structure is
+transient (exists only during editor interaction) and doesn't carry
+IDs, timestamps, or status. Keeping them separate avoids polluting
+the domain model with editor concerns.
+
+<<editor infrastructure>>=
+@dataclass
+class ParsedItem:
+    """A single item parsed from editor content.
+
+    Represents either a heading-delimited sub-item or
+    the top-level item in an editor document.
+    """
+
+    title: str
+    notes: str = ""
+    metadata: dict = field(default_factory=dict)
+    children: list = field(default_factory=list)
+
+
+@dataclass
+class ParsedTodo:
+    """Complete parsed result from editor content.
+
+    The top-level item plus its tree of children from
+    markdown headings.
+    """
+
+    title: str
+    notes: str = ""
+    metadata: dict = field(default_factory=dict)
+    children: list = field(default_factory=list)
+@
+
+\subsection{Minimal YAML Parser}
+
+We need to parse YAML front matter blocks, but only a small subset:
+flat key-value pairs with strings, numbers, and bracketed lists.
+Rather than adding a PyYAML dependency for this narrow use case, we
+implement a minimal parser. This keeps the dependency footprint small
+and avoids YAML's many surprising edge cases (the \enquote{Norway
+problem}, implicit type coercion, etc.).
+
+<<editor infrastructure>>=
+def parse_yaml_block(text):
+    """Parse a minimal YAML block into a dictionary.
+
+    Handles only flat key-value pairs with string,
+    number, and bracket-list values. This is sufficient
+    for our front matter format.
+    """
+    result = {}
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        result[key] = parse_yaml_value(value)
+    return result
+
+
+def parse_yaml_value(value):
+    """Parse a single YAML value.
+
+    Recognizes: bracketed lists, floats, integers,
+    and plain strings. Quoted strings have quotes
+    stripped.
+    """
+    if not value:
+        return ""
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1]
+        if not inner.strip():
+            return []
+        return [
+            v.strip().strip("'\"")
+            for v in inner.split(",")
+        ]
+    if value.startswith(("'", '"')):
+        return value.strip("'\"")
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value
+@
+
+\subsection{Rendering YAML}
+
+The inverse of parsing: convert a dictionary back to YAML front
+matter. We only emit keys with non-default values to keep the
+output clean.
+
+<<editor infrastructure>>=
+def render_yaml_block(metadata):
+    """Render a dictionary as minimal YAML front matter.
+
+    Produces the ``---``-delimited block. Returns empty
+    string if metadata is empty.
+    """
+    if not metadata:
+        return ""
+    lines = ["---"]
+    for key, value in metadata.items():
+        if value is None or value == "" or value == []:
+            continue
+        if isinstance(value, list):
+            items = ", ".join(str(v) for v in value)
+            lines.append(f"{key}: [{items}]")
+        else:
+            lines.append(f"{key}: {value}")
+    lines.append("---")
+    if len(lines) == 2:
+        return ""
+    return "\n".join(lines)
+@
+
+\subsection{Parsing Editor Content}
+
+The parser walks the document line by line, building a tree from
+headings. The algorithm uses a stack to track the current nesting
+level: a [[# Heading]] starts a level-1 child, [[## Heading]]
+starts a level-2 child (nested under the preceding level-1), and
+so on.
+
+The key insight is that each heading level maps directly to tree
+depth, so we maintain a stack of the current path from root to the
+active item. When we encounter a heading at level~$n$, we pop the
+stack back to depth~$n-1$ and push a new child there.
+
+<<editor infrastructure>>=
+def parse_editor_content(text):
+    """Parse editor content into a ParsedTodo tree.
+
+    Format:
+    - First non-empty line = title
+    - Optional ``---``...``---`` = YAML front matter
+    - Text until first heading = parent notes
+    - ``# Heading`` = level-1 child
+    - ``## Heading`` = level-2 child (of preceding #)
+    - Each heading may have its own YAML block + notes
+    """
+    lines = text.splitlines()
+    <<parse title from first line>>
+    <<parse optional yaml block>>
+    <<parse notes and headings>>
+    return ParsedTodo(
+        title=title,
+        notes=parent_notes.strip(),
+        metadata=parent_metadata,
+        children=top_children,
+    )
+@
+
+The title is simply the first non-empty line, analogous to how
+[[git commit]] treats the first line of the commit message:
+
+<<parse title from first line>>=
+title = ""
+idx = 0
+while idx < len(lines):
+    stripped = lines[idx].strip()
+    if stripped:
+        title = stripped
+        idx += 1
+        break
+    idx += 1
+@
+
+After the title, an optional YAML front matter block provides
+metadata. We detect it by looking for a line that is exactly
+[[---]]:
+
+<<parse optional yaml block>>=
+parent_metadata = {}
+while idx < len(lines) and not lines[idx].strip():
+    idx += 1
+if idx < len(lines) and lines[idx].strip() == "---":
+    yaml_start = idx + 1
+    idx = yaml_start
+    while idx < len(lines):
+        if lines[idx].strip() == "---":
+            yaml_text = "\n".join(
+                lines[yaml_start:idx]
+            )
+            parent_metadata = parse_yaml_block(
+                yaml_text
+            )
+            idx += 1
+            break
+        idx += 1
+@
+
+The remaining content splits into parent notes (text before any
+heading) and children (created by headings). We use the heading
+level to maintain the tree structure via a stack.
+
+<<parse notes and headings>>=
+parent_notes_lines = []
+top_children = []
+heading_re = re.compile(r"^(#+)\s+(.*)")
+
+<<initialize heading parser state>>
+
+while idx < len(lines):
+    line = lines[idx]
+    heading_match = heading_re.match(line)
+    if heading_match:
+        <<handle heading line>>
+    else:
+        <<handle content line>>
+    idx += 1
+
+<<finalize last item notes>>
+@
+
+The parser state tracks: whether we've seen any heading yet
+(to distinguish parent notes from child notes), the current
+item being built, and a stack mapping heading levels to their
+parent's children list.
+
+<<initialize heading parser state>>=
+current_item = None
+current_notes_lines = []
+current_yaml_lines = None
+in_yaml = False
+# Stack: list of (level, children_list) pairs
+# Level 0 = top-level children
+stack = [(0, top_children)]
+@
+
+When we encounter a heading, we finalize the previous item's
+notes, determine where in the tree the new item belongs, and
+push it onto the appropriate children list:
+
+<<handle heading line>>=
+<<finalize current item>>
+level = len(heading_match.group(1))
+item_title = heading_match.group(2).strip()
+current_item = ParsedItem(title=item_title)
+current_notes_lines = []
+current_yaml_lines = None
+in_yaml = False
+# Pop stack to find parent at level-1
+while len(stack) > 1 and stack[-1][0] >= level:
+    stack.pop()
+# Add to parent's children
+stack[-1][1].append(current_item)
+# Push this item's children list
+stack.append((level, current_item.children))
+@
+
+Content lines go to either the parent notes (if no heading seen
+yet) or the current item's notes. We also detect YAML blocks
+within heading sections:
+
+<<handle content line>>=
+if current_item is None:
+    parent_notes_lines.append(line)
+else:
+    stripped = line.strip()
+    if stripped == "---":
+        if in_yaml:
+            in_yaml = False
+        elif current_yaml_lines is None:
+            current_yaml_lines = []
+            in_yaml = True
+        else:
+            current_notes_lines.append(line)
+    elif in_yaml:
+        current_yaml_lines.append(line)
+    else:
+        current_notes_lines.append(line)
+@
+
+<<finalize current item>>=
+if current_item is not None:
+    if current_yaml_lines is not None:
+        current_item.metadata = parse_yaml_block(
+            "\n".join(current_yaml_lines)
+        )
+    current_item.notes = "\n".join(
+        current_notes_lines
+    ).strip()
+@
+
+<<finalize last item notes>>=
+if current_item is not None:
+    <<finalize current item>>
+else:
+    parent_notes = "\n".join(parent_notes_lines)
+if current_item is not None:
+    parent_notes = "\n".join(parent_notes_lines)
+@
+
+\subsection{Testing the Editor Parser}
+
+Let's verify the parser handles the key cases: title extraction,
+YAML front matter, notes, and heading hierarchy.
+
+<<test functions>>=
+def test_parse_editor_title_from_first_line():
+    """First non-empty line becomes the title."""
+    text = "\n  My Task Title\n\nSome notes here."
+    result = parse_editor_content(text)
+    assert result.title == "My Task Title"
+    assert "Some notes" in result.notes
+
+
+def test_parse_editor_headings():
+    """Headings create children with notes."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+---
+
+Parent notes here.
+
+# Sub-item one
+
+Notes for sub-item one.
+
+# Sub-item two
+
+Notes for sub-item two.
+"""
+    result = parse_editor_content(text)
+    assert result.title == "Parent Task"
+    assert result.metadata.get("deadline") == "2026-03-01"
+    assert "Parent notes" in result.notes
+    assert len(result.children) == 2
+    assert result.children[0].title == "Sub-item one"
+    assert "sub-item one" in result.children[0].notes
+    assert result.children[1].title == "Sub-item two"
+
+
+def test_parse_editor_nested():
+    """## headings create children of preceding #."""
+    text = """Parent
+
+# Level 1
+
+## Level 2a
+
+## Level 2b
+
+# Another level 1
+"""
+    result = parse_editor_content(text)
+    assert len(result.children) == 2
+    assert result.children[0].title == "Level 1"
+    assert len(result.children[0].children) == 2
+    assert (
+        result.children[0].children[0].title
+        == "Level 2a"
+    )
+    assert result.children[1].title == "Another level 1"
+
+
+def test_parse_editor_child_yaml():
+    """Children can have their own YAML front matter."""
+    text = """Parent
+
+# Child
+---
+command: claude
+cwd: /tmp
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    child = result.children[0]
+    assert child.metadata.get("command") == "claude"
+    assert child.metadata.get("cwd") == "/tmp"
+    assert "Child notes" in child.notes
+@
+
+\subsection{Rendering Todo as Markdown}
+
+The renderer is the inverse of the parser: given a [[TodoItem]]
+and its children (looked up from the full todo list), it produces
+the same markdown format that the editor expects. This enables
+round-tripping: render an existing todo, edit it, parse it back.
+
+We only include metadata fields that differ from defaults to keep
+the output clean. The [[cwd]], [[command]], [[deadline]],
+[[estimated]], [[who]], and [[labels]] fields are emitted when set.
+
+<<editor infrastructure>>=
+def render_todo_markdown(
+    item, todos,
+):
+    """Render a todo item as editor markdown.
+
+    Produces the same format that parse_editor_content
+    expects, enabling round-trip editing.
+    """
+    lines = [item.title]
+    meta = build_item_metadata(item)
+    yaml_block = render_yaml_block(meta)
+    if yaml_block:
+        lines.append(yaml_block)
+    lines.append("")
+    if item.notes:
+        lines.append(item.notes)
+        lines.append("")
+    children = sorted(
+        get_children(todos, item.id),
+        key=lambda c: c.priority,
+    )
+    for child in children:
+        lines.extend(
+            render_child_markdown(child, todos, 1)
+        )
+    return "\n".join(lines)
+
+
+def build_item_metadata(item):
+    """Extract non-default metadata from a TodoItem.
+
+    Returns a dict suitable for YAML front matter.
+    """
+    meta = {}
+    if item.cwd:
+        meta["cwd"] = item.cwd
+    if item.command:
+        meta["command"] = item.command
+    if item.labels:
+        meta["labels"] = item.labels
+    if item.deadline:
+        meta["deadline"] = item.deadline
+    if item.estimated:
+        meta["estimate"] = item.estimated
+    if item.who:
+        meta["who"] = item.who
+    return meta
+
+
+def render_child_markdown(item, todos, level):
+    """Render a child item as markdown heading section.
+
+    Returns a list of lines. Level determines the
+    heading depth (1 = #, 2 = ##, etc.).
+    """
+    prefix = "#" * level
+    lines = [f"{prefix} {item.title}"]
+    meta = build_item_metadata(item)
+    yaml_block = render_yaml_block(meta)
+    if yaml_block:
+        lines.append(yaml_block)
+    lines.append("")
+    if item.notes:
+        lines.append(item.notes)
+        lines.append("")
+    grandchildren = sorted(
+        get_children(todos, item.id),
+        key=lambda c: c.priority,
+    )
+    for child in grandchildren:
+        lines.extend(
+            render_child_markdown(
+                child, todos, level + 1
+            )
+        )
+    return lines
+@
+
+\subsection{Testing the Renderer}
+
+We verify round-tripping: rendering a todo then parsing the output
+should produce equivalent structure.
+
+<<test functions>>=
+def test_render_todo_markdown():
+    """Rendering then parsing produces equivalent data."""
+    parent = TodoItem(
+        id=1, title="Grade labs",
+        labels=["DD1310"], deadline="2026-03-01",
+        notes="Check submissions",
+        cwd="/home/user/project",
+        command="claude",
+    )
+    child1 = TodoItem(
+        id=2, title="Download",
+        parent_id=1, priority=1.0,
+        notes="From Canvas",
+    )
+    child2 = TodoItem(
+        id=3, title="Run tests",
+        parent_id=1, priority=2.0,
+    )
+    todos = [parent, child1, child2]
+
+    md = render_todo_markdown(parent, todos)
+    parsed = parse_editor_content(md)
+
+    assert parsed.title == "Grade labs"
+    assert "Check submissions" in parsed.notes
+    assert parsed.metadata.get("cwd") == (
+        "/home/user/project"
+    )
+    assert len(parsed.children) == 2
+    assert parsed.children[0].title == "Download"
+    assert parsed.children[1].title == "Run tests"
+@
+
+\subsection{Editor Invocation}
+
+Opening the user's preferred editor follows the standard UNIX
+pattern: write content to a temporary file, launch [[$EDITOR]]
+(falling back to [[vi]]), and read back the result. We use
+the [[.md]] suffix so editors enable markdown syntax highlighting.
+
+<<editor infrastructure>>=
+def open_editor(initial_content=""):
+    """Open the user's editor with initial content.
+
+    Returns the edited content as a string. Raises
+    SystemExit if the editor exits with an error.
+    """
+    with tempfile.NamedTemporaryFile(
+        suffix=".md",
+        mode="w",
+        delete=False,
+    ) as f:
+        f.write(initial_content)
+        temp_path = f.name
+
+    editor = os.environ.get("EDITOR", "vi")
+    try:
+        result = subprocess.run(
+            [editor, temp_path],
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                "Editor exited with error.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        with open(temp_path, "r") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+@
+
 \section{Binary Search Priority}
 
 When a user adds a new todo, we need to determine where it falls in
@@ -821,6 +1431,7 @@ exporting to calendars.
 <<item management commands>>=
 <<add command>>
 <<list command>>
+<<view command>>
 <<edit command>>
 <<reprioritize command>>
 @
@@ -855,7 +1466,7 @@ a task reveals sub-tasks.
 @cli.command()
 def add(
     title: str = typer.Argument(
-        ..., help="Title of the todo item"
+        "", help="Title (optional with --edit)"
     ),
     <<add command options>>
 ):
@@ -899,6 +1510,43 @@ description: Optional[str] = typer.Option(
 ),
 @
 
+Like the UNIX [[at]] command, we can capture the current working
+directory and environment at creation time. The [[--here]] flag is a
+convenient shorthand that captures both [[os.getcwd()]] and
+[[os.environ]], while [[--cwd]] allows specifying an explicit
+directory. When either is used, the environment is also captured so
+that [[todo start]] can restore the full context later. The [[--run]]
+option sets a default command (such as [[claude]] or [[opencode]]) to
+launch when starting the todo.
+
+<<add command options>>=
+cwd_path: Optional[str] = typer.Option(
+    None, "--cwd", "-C",
+    help="Working directory to capture",
+),
+here: bool = typer.Option(
+    False, "--here",
+    help="Capture current directory and environment",
+),
+run_command: Optional[str] = typer.Option(
+    None, "--run", "-r",
+    help="Default command to run on start",
+),
+@
+
+The [[--edit]] flag opens an interactive editor where the user can
+write a full markdown document with YAML front matter and headings.
+This is the most powerful way to create todos: one editor session can
+define a parent with metadata, notes, and an arbitrary hierarchy of
+sub-items.
+
+<<add command options>>=
+edit_mode: bool = typer.Option(
+    False, "--edit", "-E",
+    help="Open editor for rich input",
+),
+@
+
 Parent-related options control hierarchy placement:
 
 <<add command options>>=
@@ -924,6 +1572,23 @@ binary search among siblings, and finally save.
 <<add command implementation>>=
 next_id, todos = load_todos()
 
+if edit_mode:
+    <<add via editor>>
+else:
+    <<add via cli flags>>
+@
+
+The CLI-flag path is the original flow: resolve parent, run binary
+search, create a single item.
+
+<<add via cli flags>>=
+if not title:
+    typer.echo(
+        "Error: title is required "
+        "(or use --edit)",
+        err=True,
+    )
+    raise typer.Exit(1)
 <<resolve parent id>>
 <<inherit from parent>>
 <<run binary search for priority>>
@@ -977,8 +1642,26 @@ siblings = get_active_siblings(todos, temp)
 priority = binary_search_priority(siblings, title)
 @
 
+When [[--here]] is used, we capture the current working directory and
+the full environment---just like UNIX [[at]]. When [[--cwd]] is given
+explicitly, we also capture the environment since the user intends to
+restore context later. The two flags are mutually exclusive in
+practice, but [[--here]] takes precedence.
+
+<<resolve cwd and env for new todo>>=
+resolved_cwd = None
+resolved_env = None
+if here:
+    resolved_cwd = os.getcwd()
+    resolved_env = dict(os.environ)
+elif cwd_path:
+    resolved_cwd = os.path.abspath(cwd_path)
+    resolved_env = dict(os.environ)
+@
+
 <<create and save new todo>>=
 now = datetime.datetime.now().isoformat()
+<<resolve cwd and env for new todo>>
 item = TodoItem(
     id=next_id,
     title=title,
@@ -991,6 +1674,9 @@ item = TodoItem(
     description=description or "",
     parent_id=resolved_parent,
     who=who,
+    cwd=resolved_cwd,
+    env=resolved_env,
+    command=run_command,
 )
 todos.append(item)
 save_todos(next_id + 1, todos)
@@ -1004,6 +1690,155 @@ if estimate:
     typer.echo(f"  Estimate: {estimate}h")
 if who:
     typer.echo(f"  Assigned: {who}")
+if resolved_cwd:
+    typer.echo(f"  CWD: {resolved_cwd}")
+if run_command:
+    typer.echo(f"  Command: {run_command}")
+@
+
+\subsubsection{Adding via Editor}
+
+When [[--edit]] is used, the editor opens with the title pre-filled
+(if given on the command line). The user writes a markdown document;
+we parse it and create the parent item plus any children from
+headings. Children get sequential priorities reflecting document
+order, and inherit the parent's labels and deadline unless they
+override them in their own YAML block.
+
+<<add via editor>>=
+initial = title if title else ""
+content = open_editor(initial + "\n")
+parsed = parse_editor_content(content)
+if not parsed.title:
+    typer.echo("No title provided.", err=True)
+    raise typer.Exit(1)
+
+<<resolve parent id>>
+<<run binary search for priority>>
+<<create parent from parsed>>
+<<create children from parsed>>
+save_todos(next_id, todos)
+@
+
+We apply metadata from the YAML front matter to the parent item,
+with CLI flags taking precedence where provided:
+
+<<create parent from parsed>>=
+now = datetime.datetime.now().isoformat()
+meta = parsed.metadata
+resolved_cwd = meta.get("cwd") or (
+    os.getcwd() if here else None
+)
+resolved_env = (
+    dict(os.environ)
+    if resolved_cwd or here
+    else None
+)
+if cwd_path:
+    resolved_cwd = os.path.abspath(cwd_path)
+    resolved_env = dict(os.environ)
+parent_item = TodoItem(
+    id=next_id,
+    title=parsed.title,
+    labels=(
+        list(label) if label
+        else meta.get("labels", [])
+    ),
+    priority=priority,
+    status="pending",
+    created=now,
+    deadline=deadline or meta.get("deadline"),
+    estimated=(
+        estimate
+        or meta.get("estimate")
+    ),
+    description=description or "",
+    parent_id=resolved_parent,
+    who=who or meta.get("who"),
+    notes=parsed.notes,
+    cwd=resolved_cwd,
+    env=resolved_env,
+    command=(
+        run_command or meta.get("command")
+    ),
+)
+todos.append(parent_item)
+parent_id_for_children = next_id
+next_id += 1
+typer.echo(
+    f"Added todo #{parent_item.id}: "
+    f"{parent_item.title}"
+)
+@
+
+Children are created recursively. Each child inherits the parent's
+labels and deadline unless its own YAML block overrides them:
+
+<<create children from parsed>>=
+def create_children_from_parsed(
+    parsed_children, parent_id,
+    parent_labels, parent_deadline,
+    child_priority_start,
+):
+    """Recursively create TodoItems from parsed children.
+
+    Returns the next available priority value.
+    """
+    nonlocal next_id, todos
+    prio = child_priority_start
+    for parsed_child in parsed_children:
+        child_meta = parsed_child.metadata
+        child_labels = child_meta.get(
+            "labels", list(parent_labels)
+        )
+        child_deadline = child_meta.get(
+            "deadline", parent_deadline
+        )
+        child_cwd = child_meta.get("cwd")
+        child_env = (
+            dict(os.environ) if child_cwd else None
+        )
+        child = TodoItem(
+            id=next_id,
+            title=parsed_child.title,
+            labels=child_labels,
+            priority=prio,
+            status="pending",
+            created=now,
+            deadline=child_deadline,
+            estimated=child_meta.get("estimate"),
+            parent_id=parent_id,
+            who=child_meta.get("who"),
+            notes=parsed_child.notes,
+            cwd=child_cwd,
+            env=child_env,
+            command=child_meta.get("command"),
+        )
+        todos.append(child)
+        child_id = next_id
+        next_id += 1
+        prio += 1.0
+        typer.echo(
+            f"  Added sub-item #{child.id}: "
+            f"{child.title}"
+        )
+        if parsed_child.children:
+            create_children_from_parsed(
+                parsed_child.children,
+                child_id,
+                child_labels,
+                child_deadline,
+                1.0,
+            )
+    return prio
+
+create_children_from_parsed(
+    parsed.children,
+    parent_id_for_children,
+    parent_item.labels,
+    parent_item.deadline,
+    1.0,
+)
 @
 
 \subsection{The \texttt{ls} Command}
@@ -1247,10 +2082,148 @@ if all_children:
     )
 @
 
+\subsection{The \texttt{view} Command}
+
+The [[view]] command displays a single todo with all its details and
+children in a readable format. This is the read-only counterpart to
+the editor---you can see exactly what [[--edit]] would show, without
+opening an editor.
+
+<<view command>>=
+@cli.command()
+def view(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to view",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """View a todo item with full details."""
+    _, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    <<display todo details>>
+    <<display todo children>>
+@
+
+<<display todo details>>=
+typer.echo(
+    f"#{item.id} {item.title} [{item.status}]"
+)
+parts = []
+if item.priority:
+    parts.append(f"Priority: {item.priority:.1f}")
+if item.deadline:
+    parts.append(f"Deadline: {item.deadline}")
+if item.estimated:
+    parts.append(f"Est: {item.estimated:.1f}h")
+if parts:
+    typer.echo("  " + "  ".join(parts))
+meta_parts = []
+if item.labels:
+    meta_parts.append(
+        f"Labels: {', '.join(item.labels)}"
+    )
+if item.who:
+    meta_parts.append(f"Worker: {item.who}")
+if meta_parts:
+    typer.echo("  " + "  ".join(meta_parts))
+if item.cwd:
+    typer.echo(f"  CWD: {item.cwd}")
+if item.command:
+    typer.echo(f"  Command: {item.command}")
+if item.description:
+    typer.echo(f"  Description: {item.description}")
+if item.notes:
+    typer.echo("")
+    typer.echo("Notes:")
+    for line in item.notes.splitlines():
+        typer.echo(f"  {line}")
+@
+
+<<display todo children>>=
+children = sorted(
+    get_children(todos, item.id),
+    key=lambda c: c.priority,
+)
+if children:
+    typer.echo("")
+    typer.echo("Sub-items:")
+    for child in children:
+        status_mark = {
+            "done": "done",
+            "in-progress": "active",
+            "pending": "pending",
+        }.get(child.status, child.status)
+        typer.echo(
+            f"  #{child.id} [{status_mark}] "
+            f"{child.title}"
+        )
+        if child.notes:
+            first_line = child.notes.splitlines()[0]
+            typer.echo(f"    {first_line}")
+        grandchildren = get_children(
+            todos, child.id
+        )
+        for gc in grandchildren:
+            gc_mark = {
+                "done": "done",
+                "in-progress": "active",
+                "pending": "pending",
+            }.get(gc.status, gc.status)
+            typer.echo(
+                f"    #{gc.id} [{gc_mark}] "
+                f"{gc.title}"
+            )
+@
+
+\subsection{Testing the \texttt{view} Command}
+
+<<integration tests>>=
+def test_view_command(temp_todo_dir):
+    """Test viewing a todo with details."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            notes="Some notes here",
+            cwd="/tmp/project",
+            command="claude",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            parent_id=1, priority=1.0,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["view", "1"])
+    assert result.exit_code == 0
+    assert "Parent task" in result.stdout
+    assert "/tmp/project" in result.stdout
+    assert "claude" in result.stdout
+    assert "Some notes" in result.stdout
+    assert "Child task" in result.stdout
+@
+
 \subsection{The \texttt{edit} Command}
 
-Editing updates specific fields of an existing todo. Only provided
-options are changed; others remain untouched.
+Editing updates specific fields of an existing todo. The [[--edit]]
+/ [[-E]] flag opens the interactive editor with the todo rendered as
+markdown (using [[render_todo_markdown]]). After editing, the parser
+reconciles changes: existing children are matched by title to preserve
+their IDs and status, new headings become new children, and removed
+headings are deleted.
+
+Without [[-E]], the command works as before: CLI flags update
+individual fields.
 
 <<edit command>>=
 @cli.command()
@@ -1258,6 +2231,10 @@ def edit(
     todo_id: int = typer.Argument(
         ..., help="Todo ID to edit",
         autocompletion=complete_todo_ids,
+    ),
+    edit_interactive: bool = typer.Option(
+        False, "--edit", "-E",
+        help="Open in editor",
     ),
     title: Optional[str] = typer.Option(
         None, "--title", "-t",
@@ -1298,21 +2275,170 @@ def edit(
         )
         raise typer.Exit(1)
 
-    if title is not None:
-        item.title = title
-    if deadline is not None:
-        item.deadline = deadline
-    if estimate is not None:
-        item.estimated = estimate
-    if label is not None:
-        item.labels = list(label)
-    if description is not None:
-        item.description = description
-    if reassign is not None:
-        item.who = reassign
+    if edit_interactive:
+        <<edit via editor>>
+    else:
+        <<edit via cli flags>>
+@
 
-    save_todos(next_id, todos)
-    typer.echo(f"Updated todo #{todo_id}: {item.title}")
+The CLI-flag path updates individual fields, unchanged from before:
+
+<<edit via cli flags>>=
+if title is not None:
+    item.title = title
+if deadline is not None:
+    item.deadline = deadline
+if estimate is not None:
+    item.estimated = estimate
+if label is not None:
+    item.labels = list(label)
+if description is not None:
+    item.description = description
+if reassign is not None:
+    item.who = reassign
+
+save_todos(next_id, todos)
+typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+\subsubsection{Editing via the Editor}
+
+We render the todo as markdown, open the editor, parse the result,
+and reconcile. Reconciliation matches existing children by title
+(case-insensitive, whitespace-stripped) to preserve their IDs,
+status, and tracked time. New headings create new children; removed
+headings delete children.
+
+<<edit via editor>>=
+md = render_todo_markdown(item, todos)
+content = open_editor(md)
+parsed = parse_editor_content(content)
+if not parsed.title:
+    typer.echo("No title provided.", err=True)
+    raise typer.Exit(1)
+
+<<update parent from parsed>>
+<<reconcile children>>
+save_todos(next_id, todos)
+typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+<<update parent from parsed>>=
+item.title = parsed.title
+item.notes = parsed.notes
+meta = parsed.metadata
+if "cwd" in meta:
+    item.cwd = meta["cwd"]
+if "command" in meta:
+    item.command = meta["command"]
+if "labels" in meta:
+    item.labels = meta["labels"]
+if "deadline" in meta:
+    item.deadline = meta["deadline"]
+if "estimate" in meta:
+    item.estimated = meta["estimate"]
+if "who" in meta:
+    item.who = meta["who"]
+@
+
+Reconciliation matches children by normalized title. Existing
+children keep their ID, status, and tracked time. New headings get
+fresh IDs. Priority is reassigned sequentially to reflect document
+order.
+
+<<reconcile children>>=
+existing_children = get_children(todos, todo_id)
+existing_by_title = {
+    c.title.strip().lower(): c
+    for c in existing_children
+}
+
+new_child_ids = set()
+prio = 1.0
+for parsed_child in parsed.children:
+    norm_title = parsed_child.title.strip().lower()
+    if norm_title in existing_by_title:
+        child = existing_by_title.pop(norm_title)
+        child.title = parsed_child.title
+        child.notes = parsed_child.notes
+        child.priority = prio
+        child_meta = parsed_child.metadata
+        if "cwd" in child_meta:
+            child.cwd = child_meta["cwd"]
+        if "command" in child_meta:
+            child.command = child_meta["command"]
+        if "labels" in child_meta:
+            child.labels = child_meta["labels"]
+        if "deadline" in child_meta:
+            child.deadline = child_meta["deadline"]
+        if "estimate" in child_meta:
+            child.estimated = child_meta["estimate"]
+        if "who" in child_meta:
+            child.who = child_meta["who"]
+        new_child_ids.add(child.id)
+    else:
+        now = datetime.datetime.now().isoformat()
+        child_meta = parsed_child.metadata
+        new_child = TodoItem(
+            id=next_id,
+            title=parsed_child.title,
+            labels=child_meta.get(
+                "labels", list(item.labels)
+            ),
+            priority=prio,
+            status="pending",
+            created=now,
+            deadline=child_meta.get(
+                "deadline", item.deadline
+            ),
+            parent_id=todo_id,
+            who=child_meta.get("who"),
+            notes=parsed_child.notes,
+            cwd=child_meta.get("cwd"),
+            command=child_meta.get("command"),
+        )
+        todos.append(new_child)
+        new_child_ids.add(next_id)
+        next_id += 1
+        typer.echo(
+            f"  Added sub-item #{new_child.id}: "
+            f"{new_child.title}"
+        )
+    prio += 1.0
+
+# Remove children that were deleted from the document
+for removed in existing_by_title.values():
+    todos = [t for t in todos if t.id != removed.id]
+    typer.echo(
+        f"  Removed sub-item #{removed.id}: "
+        f"{removed.title}"
+    )
+@
+
+\subsection{Testing Editor Reconciliation}
+
+<<test functions>>=
+def test_edit_interactive_reconcile():
+    """Editing preserves existing child IDs/status."""
+    parent = TodoItem(
+        id=1, title="Parent",
+        created="2026-02-20T10:00:00",
+    )
+    child = TodoItem(
+        id=2, title="Existing child",
+        parent_id=1, priority=1.0,
+        status="done",
+        created="2026-02-20T10:00:00",
+    )
+    todos = [parent, child]
+    md = render_todo_markdown(parent, todos)
+    parsed = parse_editor_content(md)
+
+    # Verify the existing child is found in parsed
+    assert len(parsed.children) == 1
+    assert (
+        parsed.children[0].title == "Existing child"
+    )
 @
 
 \subsection{The \texttt{reprioritize} Command}
@@ -1503,6 +2629,16 @@ the todo's labels plus a special [[todo:<id>]] label, and set the
 todo's status to \enquote{in-progress}. The track worker is the todo's
 assigned worker, defaulting to \enquote{me}.
 
+The key enhancement: if the todo has a [[cwd]], [[start]] automatically
+spawns a subprocess---the stored [[command]], a [[--run]] override, or
+[[$SHELL]]. This combines the patterns from [[track run]] (tracking
+bookends around a subprocess) and [[courses data]] shell (PS1
+modification and [[cwd]] control). When the subprocess exits,
+tracking stops and the user is prompted to mark the todo as done.
+
+Without a [[cwd]], the command behaves as before: it starts tracking
+without spawning anything.
+
 <<start command>>=
 @cli.command()
 def start(
@@ -1510,11 +2646,12 @@ def start(
         ..., help="Todo ID to start tracking",
         autocompletion=complete_todo_ids,
     ),
+    <<start command options>>
 ):
     """Start tracking time for a todo item.
 
-    Delegates to 'nytid track start' with the todo's
-    labels plus a 'todo:<id>' label.
+    If the todo has a working directory, spawns a
+    shell or command in that directory with tracking.
     """
     next_id, todos = load_todos()
     item = next(
@@ -1534,6 +2671,18 @@ def start(
     typer.echo(
         f"Started: #{todo_id} {item.title}"
     )
+
+    <<spawn subprocess if cwd>>
+@
+
+The [[--run]] option lets the user override the todo's stored command
+at start time:
+
+<<start command options>>=
+run: Optional[str] = typer.Option(
+    None, "--run", "-r",
+    help="Override command to run",
+),
 @
 
 We import and use the track module's session management directly
@@ -1570,6 +2719,147 @@ except ImportError:
         "time tracking disabled",
         err=True,
     )
+@
+
+\subsubsection{Spawning a Subprocess}
+
+When the todo has a [[cwd]] (or [[--run]] is given), we spawn a
+subprocess with the stored environment restored. The environment
+restoration starts from the stored [[env]] (if available) and
+overlays terminal-related variables ([[TERM]], [[DISPLAY]],
+[[SSH_*]]) from the current environment to ensure the terminal
+works correctly.
+
+The PS1 prefix shows the todo ID so the user always knows which
+task they're working on---following the same pattern as the
+[[courses data]] shell command.
+
+<<spawn subprocess if cwd>>=
+if item.cwd or run:
+    <<prepare subprocess environment>>
+    <<determine command to run>>
+    <<run subprocess>>
+    <<handle subprocess exit>>
+@
+
+<<prepare subprocess environment>>=
+proc_env = os.environ.copy()
+if item.env:
+    proc_env = dict(item.env)
+    # Overlay terminal variables from current env
+    for key in os.environ:
+        if key in (
+            "TERM", "DISPLAY", "COLORTERM",
+            "TERM_PROGRAM",
+        ) or key.startswith("SSH_"):
+            proc_env[key] = os.environ[key]
+if "PS1" in proc_env:
+    proc_env["PS1"] = (
+        f"todo:{todo_id} {proc_env['PS1']}"
+    )
+else:
+    proc_env["PS1"] = (
+        f"todo:{todo_id} \\w\\n$ "
+    )
+proc_cwd = item.cwd or os.getcwd()
+@
+
+The command resolution follows a priority chain: [[--run]] overrides
+the stored [[command]], which overrides [[$SHELL]]. Special commands
+like [[claude]] and [[opencode]] receive the todo's notes or
+description as a prompt argument, so the AI tool starts with context.
+
+<<determine command to run>>=
+cmd_str = run or item.command
+if cmd_str:
+    prompt_text = item.notes or item.description
+    if cmd_str in ("claude", "opencode"):
+        if prompt_text:
+            cmd = [cmd_str, prompt_text]
+        else:
+            cmd = [cmd_str]
+    else:
+        cmd = cmd_str.split()
+else:
+    cmd = [os.environ.get("SHELL", "/bin/sh")]
+@
+
+<<run subprocess>>=
+try:
+    typer.echo(
+        f"  Spawning in {proc_cwd}: "
+        f"{' '.join(cmd)}"
+    )
+    result = subprocess.run(
+        cmd,
+        cwd=proc_cwd,
+        env=proc_env,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+except KeyboardInterrupt:
+    typer.echo("\nSession interrupted.", err=True)
+except FileNotFoundError:
+    typer.echo(
+        f"Command not found: {cmd[0]}",
+        err=True,
+    )
+@
+
+After the subprocess exits, we reload todos (the file may have
+changed during the session), stop tracking, and prompt the user
+about completion status.
+
+<<handle subprocess exit>>=
+# Reload in case file changed during session
+next_id, todos = load_todos()
+item = next(
+    (t for t in todos if t.id == todo_id), None
+)
+if item is None:
+    return
+
+<<stop tracking after subprocess>>
+
+if typer.confirm(
+    f"Mark todo #{todo_id} as done?"
+):
+    item.status = "done"
+    <<check parent auto-completion>>
+else:
+    item.status = "pending"
+
+save_todos(next_id, todos)
+@
+
+<<stop tracking after subprocess>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        add_completed_entries,
+    )
+
+    worker = item.who or "me"
+    session = load_active_session(worker)
+    todo_label = f"todo:{todo_id}"
+    if todo_label in session.get_active_labels():
+        labels_to_stop = [todo_label] + [
+            l for l in item.labels
+            if l in session.get_active_labels()
+        ]
+        entries = session.stop_labels(
+            labels_to_stop
+        )
+        if entries:
+            add_completed_entries(entries)
+        save_active_session(session, worker)
+        typer.echo(
+            f"  Stopped tracking todo:{todo_id}"
+        )
+except ImportError:
+    pass
 @
 
 \subsection{The \texttt{stop} Command}
@@ -2134,11 +3424,12 @@ throughout the document via chunk concatenation.
 <<test clitodo.py>>=
 import datetime
 import json
+import os
 import pathlib
 import tempfile
 import pytest
 from typer.testing import CliRunner
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import sys
 
@@ -2147,6 +3438,8 @@ sys.path.insert(0, "../src")
 from nytid.cli.todo import (
     cli,
     TodoItem,
+    ParsedItem,
+    ParsedTodo,
     effective_priority,
     load_todos,
     save_todos,
@@ -2158,6 +3451,11 @@ from nytid.cli.todo import (
     check_parent_completion,
     assign_priority_at_position,
     compute_free_slots,
+    parse_editor_content,
+    render_todo_markdown,
+    parse_yaml_block,
+    render_yaml_block,
+    build_item_metadata,
     DEFAULT_MAX_BOOST,
 )
 
@@ -2328,4 +3626,92 @@ def test_parent_auto_done(temp_todo_dir):
     _, todos = load_todos()
     parent = next(t for t in todos if t.id == 1)
     assert parent.status == "done"
+
+
+def test_todo_item_with_cwd_env(temp_todo_dir):
+    """Round-trip with cwd, env, and command fields."""
+    item = TodoItem(
+        id=1, title="With context",
+        created="2026-02-20T10:00:00",
+        cwd="/tmp/project",
+        env={"PATH": "/usr/bin", "HOME": "/tmp"},
+        command="opencode",
+    )
+    save_todos(2, [item])
+    _, todos = load_todos()
+    restored = todos[0]
+    assert restored.cwd == "/tmp/project"
+    assert restored.env["PATH"] == "/usr/bin"
+    assert restored.command == "opencode"
+
+
+def test_start_no_spawn_without_cwd(temp_todo_dir):
+    """No subprocess when cwd is None."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Simple task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["start", "1"]
+        )
+        assert result.exit_code == 0
+        mock_sub.run.assert_not_called()
+
+
+def test_start_spawns_shell(temp_todo_dir):
+    """Subprocess spawned when cwd is set."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            created="2026-02-20T10:00:00",
+            cwd="/tmp",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1"],
+            input="n\n",
+        )
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        call_kwargs = mock_run.call_args
+        assert call_kwargs.kwargs["cwd"] == "/tmp"
+
+
+def test_start_special_command(temp_todo_dir):
+    """Claude/opencode get notes as prompt arg."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="AI task",
+            created="2026-02-20T10:00:00",
+            cwd="/tmp",
+            command="claude",
+            notes="Fix the login bug",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1"],
+            input="n\n",
+        )
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "claude"
+        assert "Fix the login bug" in cmd[1]
 @
