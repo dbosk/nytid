@@ -1,0 +1,2331 @@
+\chapter{The \texttt{cli.todo} module and
+         the \texttt{todo} subcommands}%
+\label{cli.todo}
+
+In this chapter we introduce the subcommands found under [[nytid todo]].
+The module provides task management with priority-based ordering,
+optional deadlines, estimated durations, and ICS calendar export.
+
+\section{Design Overview and Rationale}
+
+Teachers juggle many tasks: grading, preparing lectures, meeting
+students, answering email. A todo system embedded in nytid can leverage
+the existing time-tracking infrastructure (see \cref{cli.track}) to
+connect \emph{what needs doing} with \emph{how long it actually takes}.
+
+\subsection{Why Binary-Search Priority?}
+
+Numeric priority scales (1--5, 1--10) suffer from two problems: users
+cluster items at the top, and absolute numbers are hard to assign
+consistently. Instead, we use \emph{relative comparison}: when adding a
+new todo, the system asks \enquote{Is this more important than X?} using
+a binary search over existing items. This produces a float priority
+that reflects the user's true ranking without requiring them to think in
+numbers.
+
+\subsection{Effective Priority with Deadline Boost}
+
+Items with approaching deadlines should float upward even if their base
+priority is modest. We define an \emph{effective priority} that adds a
+deadline-based boost using a quadratic urgency curve: gentle when the
+deadline is far away, sharply increasing as it approaches. This means a
+low-priority grading task due tomorrow will correctly outrank a
+high-priority lecture-prep task due next month.
+
+\subsection{Sub-items and Hierarchy}
+
+Any todo can have children (sub-items). A sub-item inherits the
+parent's deadline and labels by default, tracks priority among its
+siblings, and can be started/stopped independently via the track
+system. When all children of a parent are done, the parent is
+automatically marked done.
+
+\subsection{Track Integration}
+
+Rather than building a separate time-tracking mechanism, [[todo start]]
+delegates to [[nytid track start]] with a special [[todo:<id>]] label.
+This means all existing track infrastructure---persistence, export,
+statistics---works with todo items out of the box.
+
+\section{Code Outline}
+
+<<todo.py>>=
+import datetime
+import json
+import logging
+import math
+import os
+import pathlib
+import sys
+import typer
+import typerconf as config
+from typing_extensions import Annotated
+from typing import List, Optional, Dict
+from dataclasses import dataclass, field, asdict
+
+from nytid import storage
+
+<<constants>>
+<<configuration>>
+
+cli = typer.Typer(
+    name="todo",
+    help="Manage tasks with priorities and deadlines"
+)
+
+<<data model>>
+<<effective priority>>
+<<storage functions>>
+<<sub-item helpers>>
+<<binary search priority>>
+<<autocompletion functions>>
+<<subcommands>>
+@
+
+\section{Configuration}
+
+The todo system stores its data in a configurable directory, defaulting
+to [[~/.nytid/todos]]. We also allow configuring the maximum deadline
+boost, work hours for scheduling, and a calendar URL for reading
+existing events.
+
+Why a separate directory from track data? Because todos have a different
+lifecycle---they are created, prioritized, and completed, whereas track
+entries are append-only historical records. Keeping them separate avoids
+coupling the two storage formats.
+
+<<constants>>=
+DEFAULT_MAX_BOOST = 10.0
+DEFAULT_WORK_START = "08:00"
+DEFAULT_WORK_END = "17:00"
+DEFAULT_WORK_DAYS = "mon,tue,wed,thu,fri"
+DEFAULT_PLANNING_DAYS = 14
+@
+
+<<configuration>>=
+TODO_DIR_CONFIG = "todo.data_dir"
+TODO_MAX_BOOST_CONFIG = "todo.max_boost"
+TODO_WORK_START_CONFIG = "todo.work_start"
+TODO_WORK_END_CONFIG = "todo.work_end"
+TODO_WORK_DAYS_CONFIG = "todo.work_days"
+TODO_CALENDAR_CONFIG = "todo.calendar_url"
+
+
+def get_todo_dir() -> pathlib.Path:
+    """Get the todo data directory path."""
+    try:
+        return pathlib.Path(
+            config.get(TODO_DIR_CONFIG)
+        )
+    except KeyError:
+        todo_dir = (
+            pathlib.Path.home() / ".nytid" / "todos"
+        )
+        config.set(TODO_DIR_CONFIG, str(todo_dir))
+        return todo_dir
+
+
+def get_todo_file() -> pathlib.Path:
+    """Get the path to the todos JSON file."""
+    return get_todo_dir() / "todos.json"
+
+
+def get_max_boost() -> float:
+    """Get the maximum deadline boost value."""
+    try:
+        return float(
+            config.get(TODO_MAX_BOOST_CONFIG)
+        )
+    except (KeyError, ValueError):
+        return DEFAULT_MAX_BOOST
+
+
+def get_work_start() -> str:
+    """Get configured work day start time."""
+    try:
+        return config.get(TODO_WORK_START_CONFIG)
+    except KeyError:
+        return DEFAULT_WORK_START
+
+
+def get_work_end() -> str:
+    """Get configured work day end time."""
+    try:
+        return config.get(TODO_WORK_END_CONFIG)
+    except KeyError:
+        return DEFAULT_WORK_END
+
+
+def get_work_days() -> List[str]:
+    """Get configured work days as list."""
+    try:
+        days_str = config.get(TODO_WORK_DAYS_CONFIG)
+    except KeyError:
+        days_str = DEFAULT_WORK_DAYS
+    return [d.strip().lower() for d in days_str.split(",")]
+@
+
+\section{Data Model}
+
+\subsection{The TodoItem Dataclass}
+
+Each todo item carries an integer ID, a title, labels that connect to
+the track system, a float priority determined by binary search, a
+status, timestamps, an optional deadline, an estimated duration in
+hours, a longer description, an optional parent ID for sub-items, and
+an optional worker assignment.
+
+We use a dataclass rather than a plain class because the fields are
+pure data with no complex invariants---unlike [[ActiveSession]] in
+track, which manages mutable state with batch semantics.
+
+<<data model>>=
+@dataclass
+class TodoItem:
+    """A single todo item with priority and metadata.
+
+    Items are stored in a JSON file and sorted by
+    effective priority for display and scheduling.
+    """
+
+    id: int
+    title: str
+    labels: List[str] = field(default_factory=list)
+    priority: float = 0.0
+    status: str = "pending"
+    created: str = ""
+    deadline: Optional[str] = None
+    estimated: Optional[float] = None
+    description: str = ""
+    parent_id: Optional[int] = None
+    who: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TodoItem":
+        """Create from dictionary (JSON deserialization).
+
+        Unknown keys are silently ignored for forward
+        compatibility.
+        """
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+@
+
+\subsection{Testing the Data Model}
+
+Let's verify round-trip serialization preserves all fields:
+
+<<test functions>>=
+def test_todo_item_roundtrip():
+    """Test TodoItem serialization round-trip."""
+    item = TodoItem(
+        id=1,
+        title="Grade labs",
+        labels=["DD1310", "grading"],
+        priority=5.0,
+        status="pending",
+        created="2026-02-20T10:00:00",
+        deadline="2026-02-28T23:59:00",
+        estimated=3.0,
+        description="Grade lab 3",
+        parent_id=None,
+        who="me",
+    )
+    data = item.to_dict()
+    restored = TodoItem.from_dict(data)
+    assert restored.id == 1
+    assert restored.title == "Grade labs"
+    assert restored.labels == ["DD1310", "grading"]
+    assert restored.priority == 5.0
+    assert restored.deadline == "2026-02-28T23:59:00"
+    assert restored.who == "me"
+
+
+def test_todo_item_from_dict_ignores_unknown():
+    """Unknown keys should not cause errors."""
+    data = {
+        "id": 1,
+        "title": "Test",
+        "future_field": "ignored",
+    }
+    item = TodoItem.from_dict(data)
+    assert item.id == 1
+    assert item.title == "Test"
+@
+
+\section{Effective Priority}
+
+The effective priority determines display and scheduling order.
+Without a deadline, it equals the base priority. With a deadline, we
+add a boost that increases quadratically as the deadline approaches.
+
+Why quadratic rather than linear? A linear curve would start boosting
+immediately, which is unhelpful for items due in three months. The
+quadratic curve stays near zero until roughly the last third of the
+time span, then ramps up sharply---matching the human experience of
+\enquote{it's not urgent yet} followed by \enquote{this is due soon!}
+
+<<effective priority>>=
+def effective_priority(
+    item: TodoItem,
+    now: Optional[datetime.datetime] = None,
+) -> float:
+    """Compute effective priority including deadline boost.
+
+    Returns base priority plus a deadline-based urgency
+    boost that increases quadratically as the deadline
+    approaches.
+    """
+    if now is None:
+        now = datetime.datetime.now()
+
+    base = item.priority
+
+    if not item.deadline:
+        return base
+
+    deadline_dt = datetime.datetime.fromisoformat(
+        item.deadline
+    )
+    created_dt = datetime.datetime.fromisoformat(
+        item.created
+    )
+
+    max_boost = get_max_boost()
+
+    days_remaining = (deadline_dt - now).total_seconds() / 86400
+    total_span = max(
+        (deadline_dt - created_dt).total_seconds() / 86400,
+        1.0,
+    )
+
+    if days_remaining <= 0:
+        return base + max_boost
+
+    urgency = max(0.0, 1.0 - days_remaining / total_span)
+    deadline_boost = max_boost * (urgency ** 2)
+
+    return base + deadline_boost
+@
+
+\subsection{Testing Effective Priority}
+
+We verify the key properties: no boost without deadline, zero boost
+when deadline is far away, maximum boost when deadline is past, and
+quadratic growth in between.
+
+<<test functions>>=
+def test_effective_priority_no_deadline():
+    """Without a deadline, effective equals base priority."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00"
+    )
+    assert effective_priority(item) == 5.0
+
+
+def test_effective_priority_past_deadline():
+    """Past-deadline items get maximum boost."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00",
+        deadline="2026-01-15T00:00:00",
+    )
+    now = datetime.datetime(2026, 1, 20)
+    result = effective_priority(item, now)
+    assert result == 5.0 + DEFAULT_MAX_BOOST
+
+
+def test_effective_priority_quadratic_growth():
+    """Boost should be small early and large near deadline."""
+    item = TodoItem(
+        id=1, title="Test", priority=0.0,
+        created="2026-01-01T00:00:00",
+        deadline="2026-01-31T00:00:00",
+    )
+    early = datetime.datetime(2026, 1, 5)
+    mid = datetime.datetime(2026, 1, 20)
+    late = datetime.datetime(2026, 1, 29)
+
+    p_early = effective_priority(item, early)
+    p_mid = effective_priority(item, mid)
+    p_late = effective_priority(item, late)
+
+    assert p_early < p_mid < p_late
+    # Early boost should be small (quadratic)
+    assert p_early < 1.0
+@
+
+\section{Storage}
+
+The storage format uses a single JSON file with a [[next_id]] counter
+and an array of todo items. This is simpler than the track system's
+dual-file approach because todos don't have the active/historical
+split---all state lives in one place.
+
+<<storage functions>>=
+def ensure_todo_dir():
+    """Create the todo data directory if needed."""
+    get_todo_dir().mkdir(parents=True, exist_ok=True)
+
+
+def load_todos() -> tuple:
+    """Load todos from persistent storage.
+
+    Returns (next_id, todos_list). Returns (1, []) if
+    the file doesn't exist or contains invalid data.
+    """
+    todo_file = get_todo_file()
+    if not todo_file.exists():
+        return 1, []
+
+    try:
+        with open(todo_file, "r") as f:
+            data = json.load(f)
+            todos = [
+                TodoItem.from_dict(t)
+                for t in data.get("todos", [])
+            ]
+            return data.get("next_id", 1), todos
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        ValueError,
+    ) as e:
+        logging.warning(
+            f"Error loading todos from {todo_file}: {e}"
+        )
+        return 1, []
+
+
+def save_todos(next_id: int, todos: List[TodoItem]):
+    """Save todos to persistent storage."""
+    ensure_todo_dir()
+    todo_file = get_todo_file()
+    data = {
+        "next_id": next_id,
+        "todos": [t.to_dict() for t in todos],
+    }
+    with open(todo_file, "w") as f:
+        json.dump(data, f, indent=2)
+@
+
+\subsection{Testing Storage}
+
+<<test functions>>=
+def test_load_empty(temp_todo_dir):
+    """Loading from nonexistent file returns empty state."""
+    next_id, todos = load_todos()
+    assert next_id == 1
+    assert todos == []
+
+
+def test_save_and_load(temp_todo_dir):
+    """Round-trip save/load preserves data."""
+    item = TodoItem(
+        id=1, title="Test",
+        created="2026-02-20T10:00:00"
+    )
+    save_todos(2, [item])
+    next_id, todos = load_todos()
+    assert next_id == 2
+    assert len(todos) == 1
+    assert todos[0].title == "Test"
+@
+
+\section{Sub-item Helpers}
+
+Sub-items create a tree structure within the flat todo list. We need
+helpers to navigate this tree: finding children, finding siblings (for
+priority comparison), and checking whether a parent's children are all
+done.
+
+Why store sub-items flat with [[parent_id]] rather than nesting them?
+Because flat storage simplifies JSON serialization, avoids recursive
+data structures, and lets commands like [[todo ls --flat]] work
+without flattening logic.
+
+<<sub-item helpers>>=
+def get_children(
+    todos: List[TodoItem], parent_id: int
+) -> List[TodoItem]:
+    """Get all direct children of a todo item."""
+    return [t for t in todos if t.parent_id == parent_id]
+
+
+def get_siblings(
+    todos: List[TodoItem], item: TodoItem
+) -> List[TodoItem]:
+    """Get siblings of an item (same parent level).
+
+    For top-level items, siblings are all other top-level
+    items. For sub-items, siblings share the same parent.
+    """
+    return [
+        t
+        for t in todos
+        if t.parent_id == item.parent_id and t.id != item.id
+    ]
+
+
+def get_active_siblings(
+    todos: List[TodoItem], item: TodoItem
+) -> List[TodoItem]:
+    """Get pending/in-progress siblings, sorted by
+    effective priority (highest first)."""
+    siblings = get_siblings(todos, item)
+    active = [
+        s for s in siblings if s.status != "done"
+    ]
+    active.sort(key=effective_priority, reverse=True)
+    return active
+
+
+def check_parent_completion(
+    todos: List[TodoItem], parent_id: int
+) -> bool:
+    """Check if all children of a parent are done.
+
+    Returns True if the parent has children and all are
+    done. Returns False if there are no children or any
+    child is not done.
+    """
+    children = get_children(todos, parent_id)
+    if not children:
+        return False
+    return all(c.status == "done" for c in children)
+
+
+def get_currently_tracked_todo(
+    todos: List[TodoItem],
+) -> Optional[TodoItem]:
+    """Find the todo currently being tracked (in-progress).
+
+    Used for auto-parenting: new todos added while tracking
+    become children of the active todo.
+    """
+    for t in todos:
+        if t.status == "in-progress":
+            return t
+    return None
+@
+
+\subsection{Testing Sub-item Helpers}
+
+<<test functions>>=
+def test_get_children():
+    """Children are items with matching parent_id."""
+    todos = [
+        TodoItem(id=1, title="Parent"),
+        TodoItem(id=2, title="Child 1", parent_id=1),
+        TodoItem(id=3, title="Child 2", parent_id=1),
+        TodoItem(id=4, title="Other"),
+    ]
+    children = get_children(todos, 1)
+    assert len(children) == 2
+    assert {c.id for c in children} == {2, 3}
+
+
+def test_check_parent_completion():
+    """Parent is complete when all children are done."""
+    todos = [
+        TodoItem(id=1, title="Parent"),
+        TodoItem(
+            id=2, title="C1",
+            parent_id=1, status="done"
+        ),
+        TodoItem(
+            id=3, title="C2",
+            parent_id=1, status="pending"
+        ),
+    ]
+    assert not check_parent_completion(todos, 1)
+    todos[2].status = "done"
+    assert check_parent_completion(todos, 1)
+@
+
+\section{Binary Search Priority}
+
+When a user adds a new todo, we need to determine where it falls in
+the priority order relative to existing items. Rather than asking the
+user to pick a number, we show them existing items and ask
+\enquote{Is your new task more important than this?}
+
+The algorithm works like a standard binary search over the sorted
+siblings: we show the middle item and ask if the new item is higher or
+lower priority. After $O(\log n)$ questions, we've narrowed down to
+a position and assign a priority value that's the midpoint between
+the two neighbors.
+
+Why midpoint? Because it leaves room for future insertions without
+needing to renumber. If we have items at priorities 3.0 and 5.0 and
+insert between them at 4.0, there's still room for items at 3.5 and
+4.5 later.
+
+<<binary search priority>>=
+def format_todo_for_comparison(item: TodoItem) -> str:
+    """Format a todo item for display during comparison.
+
+    Shows title, deadline, estimate, and labels to give
+    the user full context for prioritization decisions.
+    """
+    parts = [item.title]
+    if item.deadline:
+        try:
+            dl = datetime.datetime.fromisoformat(
+                item.deadline
+            )
+            parts.append(f"(due {dl.strftime('%b %d')})")
+        except ValueError:
+            pass
+    if item.estimated:
+        parts.append(f"~{item.estimated}h")
+    if item.labels:
+        parts.append(
+            f"[{', '.join(item.labels)}]"
+        )
+    return " ".join(parts)
+
+
+def binary_search_priority(
+    siblings: List[TodoItem],
+    new_title: str,
+) -> float:
+    """Determine priority via interactive binary search.
+
+    Presents existing items and asks the user to compare.
+    Returns the computed priority value.
+
+    If there are no siblings, returns 1.0 as a starting
+    point.
+    """
+    if not siblings:
+        return 1.0
+
+    sorted_items = sorted(
+        siblings, key=effective_priority, reverse=True
+    )
+
+    low = 0
+    high = len(sorted_items)
+
+    while low < high:
+        mid = (low + high) // 2
+        mid_item = sorted_items[mid]
+
+        display = format_todo_for_comparison(mid_item)
+        prompt = (
+            f"Is \"{new_title}\" higher priority than:"
+            f"\n  {display}\n[y/n] "
+        )
+
+        answer = typer.prompt(prompt, type=str).strip().lower()
+        if answer in ("y", "yes"):
+            high = mid
+        else:
+            low = mid + 1
+
+    <<compute midpoint priority>>
+    return new_priority
+
+
+def assign_priority_at_position(
+    sorted_items: List[TodoItem],
+    position: int,
+) -> float:
+    """Compute a priority value at the given insertion
+    position in a sorted (descending) list.
+
+    The priority is the midpoint between neighbors,
+    or offset by 1.0 at the edges.
+    """
+    if not sorted_items:
+        return 1.0
+
+    if position == 0:
+        top = effective_priority(sorted_items[0])
+        return top + 1.0
+
+    if position >= len(sorted_items):
+        bottom = effective_priority(sorted_items[-1])
+        return max(0.0, bottom - 1.0)
+
+    above = effective_priority(sorted_items[position - 1])
+    below = effective_priority(sorted_items[position])
+    return (above + below) / 2.0
+@
+
+After the binary search narrows down the position, we compute the
+midpoint between the neighboring items' priorities. Edge cases
+(inserting at the top or bottom) use a fixed offset of 1.0 instead.
+
+<<compute midpoint priority>>=
+new_priority = assign_priority_at_position(
+    sorted_items, low
+)
+@
+
+\subsection{Testing Priority Assignment}
+
+We test the position-based priority computation (the non-interactive
+part) since the binary search itself requires user input.
+
+<<test functions>>=
+def test_assign_priority_empty():
+    """Empty list gives default priority."""
+    assert assign_priority_at_position([], 0) == 1.0
+
+
+def test_assign_priority_at_top():
+    """Inserting at top gives priority above highest."""
+    items = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    p = assign_priority_at_position(items, 0)
+    assert p == 6.0
+
+
+def test_assign_priority_at_bottom():
+    """Inserting at bottom gives priority below lowest."""
+    items = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    p = assign_priority_at_position(items, 2)
+    assert p == 2.0
+
+
+def test_assign_priority_between():
+    """Inserting between items gives the midpoint."""
+    items = [
+        TodoItem(id=1, title="A", priority=6.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=2.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    p = assign_priority_at_position(items, 1)
+    assert p == 4.0
+@
+
+\section{Shell Autocompletion}
+
+Following the patterns established in [[track.nw]], we provide
+completion functions for labels, worker names, and todo IDs. We
+import [[complete_workers]] and [[complete_historical_labels]] from
+the track module where possible, and extend them with todo-specific
+data.
+
+<<autocompletion functions>>=
+def complete_labels(ctx, args, incomplete):
+    """Complete labels from todos and track history.
+
+    Combines labels from existing todos with historical
+    track labels for comprehensive completion.
+    """
+    try:
+        labels = set()
+        _, todos = load_todos()
+        for t in todos:
+            labels.update(t.labels)
+
+        try:
+            from nytid.cli.track import (
+                complete_historical_labels,
+            )
+            labels.update(
+                complete_historical_labels(
+                    ctx, args, ""
+                )
+            )
+        except ImportError:
+            pass
+
+        return sorted(
+            l for l in labels
+            if l.startswith(incomplete)
+        )
+    except Exception:
+        return []
+
+
+def complete_todo_ids(ctx, args, incomplete):
+    """Complete todo IDs with titles for context.
+
+    Shows pending and in-progress items as completion
+    candidates.
+    """
+    try:
+        _, todos = load_todos()
+        results = []
+        for t in todos:
+            if t.status == "done":
+                continue
+            id_str = str(t.id)
+            if id_str.startswith(incomplete):
+                results.append(id_str)
+        return results
+    except Exception:
+        return []
+
+
+def complete_todo_workers(ctx, args, incomplete):
+    """Complete worker names from todos and track data."""
+    try:
+        workers = set()
+        _, todos = load_todos()
+        for t in todos:
+            if t.who:
+                workers.add(t.who)
+
+        try:
+            from nytid.cli.track import (
+                complete_workers as track_workers,
+            )
+            workers.update(
+                track_workers(ctx, args, "")
+            )
+        except ImportError:
+            workers.add("me")
+
+        return sorted(
+            w for w in workers
+            if w.startswith(incomplete)
+        )
+    except Exception:
+        return []
+@
+
+\section{Subcommands}
+
+We organize commands by workflow: adding and listing items, completing
+and removing them, editing and reprioritizing, tracking time, and
+exporting to calendars.
+
+<<subcommands>>=
+<<item management commands>>
+<<status change commands>>
+<<tracking commands>>
+<<export commands>>
+@
+
+<<item management commands>>=
+<<add command>>
+<<list command>>
+<<edit command>>
+<<reprioritize command>>
+@
+
+<<status change commands>>=
+<<done command>>
+<<remove command>>
+@
+
+<<tracking commands>>=
+<<start command>>
+<<stop command>>
+@
+
+<<export commands>>=
+<<export command>>
+<<schedule command>>
+@
+
+\subsection{The \texttt{add} Command}
+
+Adding a todo involves three steps: determining parentage (auto, explicit,
+or top-level), running the binary-search priority insertion among siblings,
+and persisting the result.
+
+Auto-parenting is a convenience feature: if you're currently tracking a
+todo via [[todo start]], new todos are automatically added as children
+of that active todo. This supports a natural workflow where working on
+a task reveals sub-tasks.
+
+<<add command>>=
+@cli.command()
+def add(
+    title: str = typer.Argument(
+        ..., help="Title of the todo item"
+    ),
+    <<add command options>>
+):
+    """Add a new todo item.
+
+    Priority is determined by interactive binary search
+    comparison with existing items at the same level.
+
+    Examples:
+      nytid todo add "Grade DD1310 labs" -l DD1310 -e 3
+      nytid todo add "Review section 2" -p 1
+    """
+    <<add command implementation>>
+@
+
+The labels option accepts multiple values, matching the track system's
+label pattern:
+
+<<add command options>>=
+label: Optional[List[str]] = typer.Option(
+    None, "--label", "-l",
+    help="Labels (repeatable)",
+    autocompletion=complete_labels,
+),
+@
+
+Deadlines and estimates help with scheduling and priority boosting:
+
+<<add command options>>=
+deadline: Optional[str] = typer.Option(
+    None, "--deadline", "-d",
+    help="Deadline (ISO datetime or YYYY-MM-DD)",
+),
+estimate: Optional[float] = typer.Option(
+    None, "--estimate", "-e",
+    help="Estimated hours",
+),
+description: Optional[str] = typer.Option(
+    "", "--description",
+    help="Longer description",
+),
+@
+
+Parent-related options control hierarchy placement:
+
+<<add command options>>=
+parent: Optional[int] = typer.Option(
+    None, "--parent", "-p",
+    help="Parent todo ID",
+    autocompletion=complete_todo_ids,
+),
+top_level: bool = typer.Option(
+    False, "--top-level",
+    help="Add at root level (override auto-parenting)",
+),
+who: Optional[str] = typer.Option(
+    None, "--who", "-w",
+    help="Assign to worker",
+    autocompletion=complete_todo_workers,
+),
+@
+
+Now the implementation. We first resolve the parent ID, then run the
+binary search among siblings, and finally save.
+
+<<add command implementation>>=
+next_id, todos = load_todos()
+
+<<resolve parent id>>
+<<inherit from parent>>
+<<run binary search for priority>>
+<<create and save new todo>>
+@
+
+Auto-parenting: if no explicit parent is given and we're not forcing
+top-level, check for a currently tracked (in-progress) todo:
+
+<<resolve parent id>>=
+resolved_parent = parent
+if parent is None and not top_level:
+    active = get_currently_tracked_todo(todos)
+    if active is not None:
+        resolved_parent = active.id
+        typer.echo(
+            f"Auto-parenting under: "
+            f"#{active.id} {active.title}"
+        )
+@
+
+When a parent is set, inherit its deadline and labels unless the user
+explicitly provided overrides:
+
+<<inherit from parent>>=
+inherited_labels = list(label) if label else []
+inherited_deadline = deadline
+if resolved_parent is not None:
+    parent_item = next(
+        (t for t in todos if t.id == resolved_parent),
+        None,
+    )
+    if parent_item is None:
+        typer.echo(
+            f"Error: parent #{resolved_parent} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if not label and parent_item.labels:
+        inherited_labels = list(parent_item.labels)
+    if deadline is None and parent_item.deadline:
+        inherited_deadline = parent_item.deadline
+@
+
+<<run binary search for priority>>=
+# Build a temporary item to find siblings
+temp = TodoItem(
+    id=0, title=title, parent_id=resolved_parent
+)
+siblings = get_active_siblings(todos, temp)
+priority = binary_search_priority(siblings, title)
+@
+
+<<create and save new todo>>=
+now = datetime.datetime.now().isoformat()
+item = TodoItem(
+    id=next_id,
+    title=title,
+    labels=inherited_labels,
+    priority=priority,
+    status="pending",
+    created=now,
+    deadline=inherited_deadline,
+    estimated=estimate,
+    description=description or "",
+    parent_id=resolved_parent,
+    who=who,
+)
+todos.append(item)
+save_todos(next_id + 1, todos)
+
+typer.echo(f"Added todo #{item.id}: {item.title}")
+if inherited_labels:
+    typer.echo(f"  Labels: {', '.join(inherited_labels)}")
+if inherited_deadline:
+    typer.echo(f"  Deadline: {inherited_deadline}")
+if estimate:
+    typer.echo(f"  Estimate: {estimate}h")
+if who:
+    typer.echo(f"  Assigned: {who}")
+@
+
+\subsection{The \texttt{ls} Command}
+
+The list command shows todos sorted by effective priority. By default
+it displays a tree structure: top-level items with their children
+indented below. The [[--flat]] option disables tree display.
+
+We query tracked time by looking for entries with [[todo:<id>]] labels
+in the track data, connecting the todo system to actual time spent.
+
+<<list command>>=
+@cli.command(name="ls")
+def ls(
+    all_items: bool = typer.Option(
+        False, "--all", "-a",
+        help="Include done items",
+    ),
+    label_filter: Optional[List[str]] = typer.Option(
+        None, "--label", "-l",
+        help="Filter by label",
+        autocompletion=complete_labels,
+    ),
+    who_filter: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Filter by assignee",
+        autocompletion=complete_todo_workers,
+    ),
+    flat: bool = typer.Option(
+        False, "--flat",
+        help="Flat list (no tree)",
+    ),
+    output_format: str = typer.Option(
+        "table", "--format", "-f",
+        help="Output format (table, json)",
+    ),
+):
+    """List todo items sorted by effective priority."""
+    _, todos = load_todos()
+
+    <<filter todos>>
+    <<query tracked time>>
+
+    if output_format == "json":
+        <<output json>>
+    else:
+        <<output table>>
+@
+
+<<filter todos>>=
+filtered = todos
+if not all_items:
+    filtered = [
+        t for t in filtered if t.status != "done"
+    ]
+if label_filter:
+    filtered = [
+        t for t in filtered
+        if any(l in t.labels for l in label_filter)
+    ]
+if who_filter:
+    filtered = [
+        t for t in filtered if t.who == who_filter
+    ]
+@
+
+To show tracked time, we load track data and sum durations for
+entries matching [[todo:<id>]] labels. This avoids duplicating the
+track system's storage logic.
+
+<<query tracked time>>=
+tracked_times: Dict[int, float] = {}
+try:
+    from nytid.cli.track import load_tracking_data
+
+    entries = load_tracking_data()
+    for entry in entries:
+        for lbl in entry.labels:
+            if lbl.startswith("todo:"):
+                try:
+                    tid = int(lbl.split(":")[1])
+                    hours = (
+                        entry.duration().total_seconds()
+                        / 3600
+                    )
+                    tracked_times[tid] = (
+                        tracked_times.get(tid, 0) + hours
+                    )
+                except (ValueError, IndexError):
+                    pass
+except ImportError:
+    pass
+@
+
+<<output json>>=
+import json as json_mod
+
+output = []
+for t in filtered:
+    d = t.to_dict()
+    d["effective_priority"] = effective_priority(t)
+    d["tracked_hours"] = tracked_times.get(t.id, 0)
+    output.append(d)
+print(json_mod.dumps(output, indent=2))
+@
+
+For table output we display a header and format each item with
+columns for ID, priority, title, assignee, deadline, estimate,
+tracked time, and status. Tree display indents children under
+their parents.
+
+<<output table>>=
+if not filtered:
+    typer.echo("No todos found.")
+    return
+
+now = datetime.datetime.now()
+
+if flat:
+    <<display flat list>>
+else:
+    <<display tree>>
+@
+
+<<display flat list>>=
+sorted_items = sorted(
+    filtered,
+    key=lambda t: effective_priority(t, now),
+    reverse=True,
+)
+<<print table header>>
+for item in sorted_items:
+    <<print table row>>
+@
+
+<<display tree>>=
+top_level = [
+    t for t in filtered if t.parent_id is None
+]
+top_level.sort(
+    key=lambda t: effective_priority(t, now),
+    reverse=True,
+)
+<<print table header>>
+for item in top_level:
+    <<print table row>>
+    children = sorted(
+        [
+            t for t in filtered
+            if t.parent_id == item.id
+        ],
+        key=lambda t: effective_priority(t, now),
+        reverse=True,
+    )
+    <<print progress for parent>>
+    for child in children:
+        <<print child row>>
+@
+
+<<print table header>>=
+typer.echo(
+    f"{'ID':>4}  {'Pri':>5}  "
+    f"{'Title':<35}  "
+    f"{'Who':<10}  "
+    f"{'Deadline':<12}  "
+    f"{'Est':>5}  "
+    f"{'Tracked':>8}  "
+    f"{'Status':<11}"
+)
+typer.echo("-" * 105)
+@
+
+<<print table row>>=
+ep = effective_priority(item, now)
+dl_str = ""
+if item.deadline:
+    try:
+        dl = datetime.datetime.fromisoformat(
+            item.deadline
+        )
+        dl_str = dl.strftime("%b %d")
+    except ValueError:
+        dl_str = item.deadline[:10]
+est_str = (
+    f"{item.estimated:.1f}h" if item.estimated else ""
+)
+tracked = tracked_times.get(item.id, 0)
+tracked_str = f"{tracked:.1f}h" if tracked > 0 else ""
+who_str = item.who or ""
+typer.echo(
+    f"{item.id:>4}  {ep:>5.1f}  "
+    f"{item.title:<35}  "
+    f"{who_str:<10}  "
+    f"{dl_str:<12}  "
+    f"{est_str:>5}  "
+    f"{tracked_str:>8}  "
+    f"{item.status:<11}"
+)
+@
+
+<<print child row>>=
+ep = effective_priority(child, now)
+dl_str = ""
+if child.deadline:
+    try:
+        dl = datetime.datetime.fromisoformat(
+            child.deadline
+        )
+        dl_str = dl.strftime("%b %d")
+    except ValueError:
+        dl_str = child.deadline[:10]
+est_str = (
+    f"{child.estimated:.1f}h"
+    if child.estimated
+    else ""
+)
+tracked = tracked_times.get(child.id, 0)
+tracked_str = f"{tracked:.1f}h" if tracked > 0 else ""
+who_str = child.who or ""
+typer.echo(
+    f"{child.id:>4}  {ep:>5.1f}    "
+    f"  └─ {child.title:<30}  "
+    f"{who_str:<10}  "
+    f"{dl_str:<12}  "
+    f"{est_str:>5}  "
+    f"{tracked_str:>8}  "
+    f"{child.status:<11}"
+)
+@
+
+<<print progress for parent>>=
+all_children = get_children(todos, item.id)
+if all_children:
+    done_count = sum(
+        1 for c in all_children if c.status == "done"
+    )
+    total = len(all_children)
+    typer.echo(
+        f"      "
+        f"       [{done_count}/{total} done]"
+    )
+@
+
+\subsection{The \texttt{edit} Command}
+
+Editing updates specific fields of an existing todo. Only provided
+options are changed; others remain untouched.
+
+<<edit command>>=
+@cli.command()
+def edit(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to edit",
+        autocompletion=complete_todo_ids,
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title", "-t",
+        help="New title",
+    ),
+    deadline: Optional[str] = typer.Option(
+        None, "--deadline", "-d",
+        help="New deadline (ISO datetime)",
+    ),
+    estimate: Optional[float] = typer.Option(
+        None, "--estimate", "-e",
+        help="New estimated hours",
+    ),
+    label: Optional[List[str]] = typer.Option(
+        None, "--label", "-l",
+        help="Replace all labels",
+        autocompletion=complete_labels,
+    ),
+    description: Optional[str] = typer.Option(
+        None, "--description",
+        help="New description",
+    ),
+    reassign: Optional[str] = typer.Option(
+        None, "--reassign",
+        help="Reassign to worker",
+        autocompletion=complete_todo_workers,
+    ),
+):
+    """Edit an existing todo item."""
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if title is not None:
+        item.title = title
+    if deadline is not None:
+        item.deadline = deadline
+    if estimate is not None:
+        item.estimated = estimate
+    if label is not None:
+        item.labels = list(label)
+    if description is not None:
+        item.description = description
+    if reassign is not None:
+        item.who = reassign
+
+    save_todos(next_id, todos)
+    typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+\subsection{The \texttt{reprioritize} Command}
+
+When priorities shift, a todo may need repositioning among its
+siblings. This reruns the same binary search algorithm used during
+[[add]], but for an existing item.
+
+<<reprioritize command>>=
+@cli.command()
+def reprioritize(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to reprioritize",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """Rerun binary search priority for a todo item.
+
+    Alias: reprio
+    """
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    siblings = get_active_siblings(todos, item)
+    new_priority = binary_search_priority(
+        siblings, item.title
+    )
+    old_priority = item.priority
+    item.priority = new_priority
+
+    save_todos(next_id, todos)
+    typer.echo(
+        f"Reprioritized #{todo_id}: "
+        f"{old_priority:.1f} -> {new_priority:.1f}"
+    )
+@
+
+We also register the [[reprio]] alias:
+
+<<subcommands>>=
+@cli.command(name="reprio", hidden=True)
+def reprio(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to reprioritize",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """Alias for reprioritize."""
+    reprioritize(todo_id=todo_id)
+@
+
+\subsection{The \texttt{done} Command}
+
+Marking a todo as done also stops any active tracking for that item.
+If the item has a parent, we check whether all siblings are now done
+and auto-complete the parent.
+
+<<done command>>=
+@cli.command()
+def done(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to mark done",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """Mark a todo item as done."""
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    item.status = "done"
+    typer.echo(f"Done: #{todo_id} {item.title}")
+
+    <<stop tracking if active>>
+    <<check parent auto-completion>>
+
+    save_todos(next_id, todos)
+@
+
+<<stop tracking if active>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        add_completed_entries,
+    )
+
+    worker = item.who or "me"
+    session = load_active_session(worker)
+    todo_label = f"todo:{todo_id}"
+    if todo_label in session.get_active_labels():
+        entries = session.stop_labels([todo_label])
+        if entries:
+            add_completed_entries(entries)
+            save_active_session(session, worker)
+            typer.echo(
+                f"  Stopped tracking todo:{todo_id}"
+            )
+except ImportError:
+    pass
+@
+
+<<check parent auto-completion>>=
+if item.parent_id is not None:
+    if check_parent_completion(todos, item.parent_id):
+        parent_item = next(
+            (t for t in todos if t.id == item.parent_id),
+            None,
+        )
+        if parent_item and parent_item.status != "done":
+            parent_item.status = "done"
+            typer.echo(
+                f"  Parent #{parent_item.id} "
+                f"auto-completed: {parent_item.title}"
+            )
+@
+
+\subsection{The \texttt{rm} Command}
+
+Removing a todo requires confirmation. If the item has children,
+those are removed as well.
+
+<<remove command>>=
+@cli.command()
+def rm(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to remove",
+        autocompletion=complete_todo_ids,
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Skip confirmation",
+    ),
+):
+    """Remove a todo item."""
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    children = get_children(todos, todo_id)
+    if not force:
+        msg = f"Remove #{todo_id}: {item.title}?"
+        if children:
+            msg += f" ({len(children)} sub-items)"
+        if not typer.confirm(msg):
+            typer.echo("Cancelled.")
+            raise typer.Exit(0)
+
+    # Remove item and its children
+    ids_to_remove = {todo_id}
+    ids_to_remove.update(c.id for c in children)
+    todos = [t for t in todos if t.id not in ids_to_remove]
+
+    save_todos(next_id, todos)
+    typer.echo(f"Removed #{todo_id}: {item.title}")
+    if children:
+        typer.echo(
+            f"  Also removed {len(children)} sub-items"
+        )
+@
+
+\subsection{The \texttt{start} Command}
+
+Starting a todo delegates to the track system. We start tracking with
+the todo's labels plus a special [[todo:<id>]] label, and set the
+todo's status to \enquote{in-progress}. The track worker is the todo's
+assigned worker, defaulting to \enquote{me}.
+
+<<start command>>=
+@cli.command()
+def start(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to start tracking",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """Start tracking time for a todo item.
+
+    Delegates to 'nytid track start' with the todo's
+    labels plus a 'todo:<id>' label.
+    """
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    <<start tracking via track module>>
+
+    item.status = "in-progress"
+    save_todos(next_id, todos)
+    typer.echo(
+        f"Started: #{todo_id} {item.title}"
+    )
+@
+
+We import and use the track module's session management directly
+rather than shelling out to the CLI. This is more reliable and avoids
+subprocess overhead.
+
+<<start tracking via track module>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+    )
+
+    worker = item.who or "me"
+    session = load_active_session(worker)
+
+    track_labels = list(item.labels) + [
+        f"todo:{todo_id}"
+    ]
+    started = session.start_labels(
+        track_labels, datetime.datetime.now()
+    )
+    save_active_session(session, worker)
+
+    if started:
+        typer.echo(
+            f"  Tracking: {', '.join(sorted(started))}"
+        )
+        if worker != "me":
+            typer.echo(f"  Worker: {worker}")
+except ImportError:
+    typer.echo(
+        "Warning: track module not available, "
+        "time tracking disabled",
+        err=True,
+    )
+@
+
+\subsection{The \texttt{stop} Command}
+
+Stopping can target a specific todo by ID, or if no ID is given, find
+whichever todo is currently being tracked and stop it.
+
+<<stop command>>=
+@cli.command()
+def stop(
+    todo_id: Optional[int] = typer.Argument(
+        None,
+        help="Todo ID to stop (or auto-detect)",
+        autocompletion=complete_todo_ids,
+    ),
+):
+    """Stop tracking time for a todo item.
+
+    If no ID given, stops the currently tracked todo.
+    """
+    next_id, todos = load_todos()
+
+    <<resolve which todo to stop>>
+    <<stop tracking via track module>>
+    <<update todo status after stop>>
+
+    save_todos(next_id, todos)
+@
+
+<<resolve which todo to stop>>=
+if todo_id is None:
+    in_progress = [
+        t for t in todos if t.status == "in-progress"
+    ]
+    if not in_progress:
+        typer.echo("No todo is currently in-progress.")
+        raise typer.Exit(0)
+    item = in_progress[0]
+    todo_id = item.id
+else:
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+<<stop tracking via track module>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        add_completed_entries,
+    )
+
+    worker = item.who or "me"
+    session = load_active_session(worker)
+    todo_label = f"todo:{todo_id}"
+
+    if todo_label in session.get_active_labels():
+        labels_to_stop = [todo_label] + [
+            l for l in item.labels
+            if l in session.get_active_labels()
+        ]
+        entries = session.stop_labels(labels_to_stop)
+        if entries:
+            add_completed_entries(entries)
+        save_active_session(session, worker)
+except ImportError:
+    pass
+@
+
+<<update todo status after stop>>=
+item.status = "pending"
+typer.echo(f"Stopped: #{todo_id} {item.title}")
+@
+
+\section{ICS Export}
+
+The export command supports two modes: VTODO (task list) and scheduled
+VEVENT (calendar blocks). VTODO is the default---it exports todos as
+iCalendar task components that calendar apps can import. The schedule
+mode is more ambitious: it reads an existing calendar, finds free
+slots, and schedules todos into them.
+
+\subsection{The \texttt{export} Command}
+
+<<export command>>=
+@cli.command()
+def export(
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Output file (stdout if not specified)",
+    ),
+    all_items: bool = typer.Option(
+        False, "--all", "-a",
+        help="Include done items",
+    ),
+    format: str = typer.Option(
+        "vtodo", "--format", "-f",
+        help="Export format (vtodo, schedule)",
+    ),
+):
+    """Export todos as ICS (VTODO or scheduled VEVENT)."""
+    _, todos = load_todos()
+
+    if not all_items:
+        todos = [t for t in todos if t.status != "done"]
+
+    if not todos:
+        typer.echo("No todos to export.", err=True)
+        return
+
+    if format == "vtodo":
+        ics_data = export_vtodo(todos)
+    elif format == "schedule":
+        typer.echo(
+            "Use 'nytid todo schedule' for "
+            "scheduled export.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    else:
+        typer.echo(
+            f"Unknown format: {format}", err=True
+        )
+        raise typer.Exit(1)
+
+    if output:
+        with open(output, "w") as f:
+            f.write(ics_data)
+        typer.echo(
+            f"Exported {len(todos)} todos to {output}"
+        )
+    else:
+        print(ics_data)
+@
+
+\subsection{VTODO Export}
+
+The VTODO format maps naturally to our data model. ICS priority uses
+a 1--9 scale (1 = highest, 9 = lowest), so we need to invert and
+clamp our float priority.
+
+<<export command>>=
+def export_vtodo(todos: List[TodoItem]) -> str:
+    """Export todos as VTODO components in ICS format.
+
+    Maps our float priority to the ICS 1-9 scale and
+    includes deadline, duration, status, and labels.
+    """
+    try:
+        from ics import Calendar
+        from ics.todo import Todo
+    except ImportError:
+        typer.echo(
+            "ICS export requires the 'ics' package. "
+            "Install with: pip install ics",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    cal = Calendar()
+
+    max_prio = max(
+        (effective_priority(t) for t in todos),
+        default=1.0,
+    )
+
+    for item in todos:
+        todo = Todo()
+        todo.name = item.title
+        if item.description:
+            todo.description = item.description
+
+        <<map priority to ics scale>>
+        <<set vtodo deadline and duration>>
+        <<set vtodo status>>
+
+        cal.todos.add(todo)
+
+    return str(cal)
+@
+
+ICS priority 1 is highest, 9 is lowest. We normalize our effective
+priority into this range.
+
+<<map priority to ics scale>>=
+ep = effective_priority(item)
+if max_prio > 0:
+    normalized = ep / max_prio
+    ics_prio = max(1, min(9, round(
+        9 - normalized * 8
+    )))
+else:
+    ics_prio = 5
+todo.priority = ics_prio
+@
+
+<<set vtodo deadline and duration>>=
+if item.deadline:
+    try:
+        todo.due = datetime.datetime.fromisoformat(
+            item.deadline
+        )
+    except ValueError:
+        pass
+if item.estimated:
+    todo.duration = datetime.timedelta(
+        hours=item.estimated
+    )
+@
+
+<<set vtodo status>>=
+status_map = {
+    "pending": "NEEDS-ACTION",
+    "in-progress": "IN-PROCESS",
+    "done": "COMPLETED",
+}
+todo.status = status_map.get(
+    item.status, "NEEDS-ACTION"
+)
+@
+
+\subsection{The \texttt{schedule} Command}
+
+The schedule command is the most complex subcommand. It reads an
+existing calendar to find occupied slots, generates free time windows
+within configured work hours, and assigns todos to those windows in
+priority order.
+
+Why read an existing calendar? Because teachers already have meetings,
+lectures, and other commitments. Scheduling todos into already-occupied
+slots would produce a useless calendar.
+
+<<schedule command>>=
+@cli.command()
+def schedule(
+    calendar_source: Optional[str] = typer.Option(
+        None, "--calendar", "-c",
+        help="ICS file or URL for existing events",
+    ),
+    days: int = typer.Option(
+        DEFAULT_PLANNING_DAYS, "--days",
+        help="Planning horizon in days",
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Output file (stdout if not specified)",
+    ),
+    all_items: bool = typer.Option(
+        False, "--all", "-a",
+        help="Include done items",
+    ),
+):
+    """Schedule todos into free calendar slots.
+
+    Reads existing events from an ICS file or URL,
+    finds free time within work hours, and assigns
+    todos to slots in priority order.
+    """
+    _, todos = load_todos()
+    if not all_items:
+        todos = [t for t in todos if t.status != "done"]
+    todos = [t for t in todos if t.estimated]
+
+    if not todos:
+        typer.echo(
+            "No schedulable todos "
+            "(need estimated hours).",
+            err=True,
+        )
+        return
+
+    <<load existing calendar>>
+    <<compute free slots>>
+    <<assign todos to slots>>
+    <<output scheduled events>>
+@
+
+We support both local ICS files and URLs. If no source is given, we
+try the configured calendar URL.
+
+<<load existing calendar>>=
+existing_events = []
+source = calendar_source
+if source is None:
+    try:
+        source = config.get(TODO_CALENDAR_CONFIG)
+    except KeyError:
+        source = None
+
+if source:
+    existing_events = load_calendar_events(source)
+@
+
+<<schedule command>>=
+def load_calendar_events(source: str) -> list:
+    """Load events from an ICS file or URL.
+
+    Returns a list of (start, end) datetime tuples.
+    """
+    try:
+        from ics import Calendar
+    except ImportError:
+        typer.echo(
+            "Scheduling requires the 'ics' package.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    ics_text = ""
+    if source.startswith(("http://", "https://")):
+        try:
+            import requests
+
+            resp = requests.get(source, timeout=30)
+            resp.raise_for_status()
+            ics_text = resp.text
+        except Exception as e:
+            typer.echo(
+                f"Error fetching calendar: {e}",
+                err=True,
+            )
+            return []
+    else:
+        try:
+            with open(source, "r") as f:
+                ics_text = f.read()
+        except FileNotFoundError:
+            typer.echo(
+                f"Calendar file not found: {source}",
+                err=True,
+            )
+            return []
+
+    cal = Calendar(ics_text)
+    events = []
+    for event in cal.events:
+        if event.begin and event.end:
+            events.append((
+                event.begin.datetime,
+                event.end.datetime,
+            ))
+    return events
+@
+
+\subsubsection{Free Slot Computation}
+
+We generate candidate time slots within work hours for each work day
+in the planning horizon, then subtract occupied times from existing
+calendar events.
+
+<<schedule command>>=
+def compute_free_slots(
+    existing_events: list,
+    days: int,
+) -> list:
+    """Compute free time slots within work hours.
+
+    Returns list of (start, end) datetime tuples
+    representing available time slots.
+    """
+    work_start_str = get_work_start()
+    work_end_str = get_work_end()
+    work_days = get_work_days()
+
+    day_names = [
+        "mon", "tue", "wed", "thu", "fri",
+        "sat", "sun",
+    ]
+
+    work_start_h, work_start_m = map(
+        int, work_start_str.split(":")
+    )
+    work_end_h, work_end_m = map(
+        int, work_end_str.split(":")
+    )
+
+    now = datetime.datetime.now()
+    free_slots = []
+
+    for day_offset in range(days):
+        date = now.date() + datetime.timedelta(
+            days=day_offset
+        )
+        day_name = day_names[date.weekday()]
+
+        if day_name not in work_days:
+            continue
+
+        day_start = datetime.datetime.combine(
+            date,
+            datetime.time(work_start_h, work_start_m),
+        )
+        day_end = datetime.datetime.combine(
+            date,
+            datetime.time(work_end_h, work_end_m),
+        )
+
+        if day_offset == 0 and now > day_start:
+            day_start = now.replace(
+                second=0, microsecond=0
+            )
+            if day_start >= day_end:
+                continue
+
+        <<subtract occupied times from day>>
+        free_slots.extend(day_free)
+
+    return free_slots
+@
+
+To subtract occupied events from a work-day window, we sort events by
+start time and walk through them, collecting the gaps.
+
+<<subtract occupied times from day>>=
+day_events = sorted(
+    [
+        (max(s, day_start), min(e, day_end))
+        for s, e in existing_events
+        if s < day_end and e > day_start
+    ],
+    key=lambda x: x[0],
+)
+
+day_free = []
+cursor = day_start
+for evt_start, evt_end in day_events:
+    if cursor < evt_start:
+        day_free.append((cursor, evt_start))
+    cursor = max(cursor, evt_end)
+if cursor < day_end:
+    day_free.append((cursor, day_end))
+@
+
+<<compute free slots>>=
+free_slots = compute_free_slots(
+    existing_events, days
+)
+if not free_slots:
+    typer.echo(
+        "No free slots found in the planning horizon.",
+        err=True,
+    )
+    return
+@
+
+\subsubsection{Assigning Todos to Slots}
+
+We walk todos in effective-priority order (highest first) and greedily
+assign each to the earliest available slot(s). If a todo's estimated
+time exceeds a single slot, it gets split across multiple slots.
+
+<<assign todos to slots>>=
+scheduled_events = []
+now = datetime.datetime.now()
+sorted_todos = sorted(
+    todos,
+    key=lambda t: effective_priority(t, now),
+    reverse=True,
+)
+
+remaining_slots = list(free_slots)
+
+for item in sorted_todos:
+    if not item.estimated:
+        continue
+    hours_needed = item.estimated
+    <<schedule item into available slots>>
+@
+
+<<schedule item into available slots>>=
+while hours_needed > 0 and remaining_slots:
+    slot_start, slot_end = remaining_slots[0]
+    slot_hours = (
+        (slot_end - slot_start).total_seconds() / 3600
+    )
+
+    if slot_hours <= 0:
+        remaining_slots.pop(0)
+        continue
+
+    if hours_needed >= slot_hours:
+        scheduled_events.append((
+            item, slot_start, slot_end
+        ))
+        hours_needed -= slot_hours
+        remaining_slots.pop(0)
+    else:
+        event_end = slot_start + datetime.timedelta(
+            hours=hours_needed
+        )
+        scheduled_events.append((
+            item, slot_start, event_end
+        ))
+        remaining_slots[0] = (event_end, slot_end)
+        hours_needed = 0
+@
+
+\subsubsection{Outputting Scheduled Events}
+
+We generate VEVENT components for each scheduled block, using the
+todo's title and labels.
+
+<<output scheduled events>>=
+ics_data = generate_schedule_ics(scheduled_events)
+if output:
+    with open(output, "w") as f:
+        f.write(ics_data)
+    typer.echo(
+        f"Scheduled {len(scheduled_events)} events "
+        f"to {output}"
+    )
+else:
+    print(ics_data)
+@
+
+<<schedule command>>=
+def generate_schedule_ics(
+    scheduled_events: list,
+) -> str:
+    """Generate ICS with VEVENT for scheduled todos.
+
+    Each entry is a (TodoItem, start, end) tuple.
+    """
+    try:
+        from ics import Calendar, Event
+    except ImportError:
+        typer.echo(
+            "Scheduling requires the 'ics' package.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    cal = Calendar()
+
+    for item, start, end in scheduled_events:
+        event = Event()
+        event.name = f"[TODO] {item.title}"
+        event.begin = start
+        event.end = end
+        if item.description:
+            event.description = item.description
+        if item.labels:
+            event.categories = set(item.labels)
+        cal.events.add(event)
+
+    return str(cal)
+@
+
+\section{Tests}
+
+The test file follows the same pattern as [[track.nw]]: a fixture
+provides a temporary directory, and test functions are collected from
+throughout the document via chunk concatenation.
+
+<<test clitodo.py>>=
+import datetime
+import json
+import pathlib
+import tempfile
+import pytest
+from typer.testing import CliRunner
+from unittest.mock import patch
+
+import sys
+
+sys.path.insert(0, "../src")
+
+from nytid.cli.todo import (
+    cli,
+    TodoItem,
+    effective_priority,
+    load_todos,
+    save_todos,
+    get_todo_dir,
+    get_todo_file,
+    get_children,
+    get_siblings,
+    get_active_siblings,
+    check_parent_completion,
+    assign_priority_at_position,
+    compute_free_slots,
+    DEFAULT_MAX_BOOST,
+)
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def temp_todo_dir():
+    """Create a temporary directory for todo data
+    during tests.
+
+    Patches storage functions so all file operations
+    resolve inside the temporary directory.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = pathlib.Path(tmpdir) / "todos"
+        temp_file = temp_dir / "todos.json"
+
+        with patch(
+            "nytid.cli.todo.get_todo_dir",
+            return_value=temp_dir,
+        ), patch(
+            "nytid.cli.todo.get_todo_file",
+            return_value=temp_file,
+        ), patch(
+            "nytid.cli.todo.get_max_boost",
+            return_value=DEFAULT_MAX_BOOST,
+        ):
+            yield temp_dir
+
+
+# All test functions distributed throughout the document
+<<test functions>>
+
+# Integration tests
+<<integration tests>>
+@
+
+\subsection{Integration Tests}
+
+These tests exercise the CLI commands end-to-end through the Typer
+test runner.
+
+<<integration tests>>=
+def test_add_and_ls(temp_todo_dir):
+    """Test adding a todo and listing it."""
+    result = runner.invoke(
+        cli,
+        ["add", "Test task", "-e", "2",
+         "--top-level"],
+        input="",
+    )
+    assert result.exit_code == 0
+    assert "Added todo #1" in result.stdout
+
+    result = runner.invoke(cli, ["ls"])
+    assert result.exit_code == 0
+    assert "Test task" in result.stdout
+
+
+def test_done_command(temp_todo_dir):
+    """Test marking a todo as done."""
+    # First add a todo
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task 1", status="pending",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["done", "1"])
+    assert result.exit_code == 0
+    assert "Done:" in result.stdout
+
+    _, todos = load_todos()
+    assert todos[0].status == "done"
+
+
+def test_rm_command(temp_todo_dir):
+    """Test removing a todo with confirmation."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Remove me",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["rm", "1", "--force"]
+    )
+    assert result.exit_code == 0
+    assert "Removed" in result.stdout
+
+    _, todos = load_todos()
+    assert len(todos) == 0
+
+
+def test_edit_command(temp_todo_dir):
+    """Test editing a todo."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["edit", "1", "--title", "Updated"],
+    )
+    assert result.exit_code == 0
+    assert "Updated" in result.stdout
+
+    _, todos = load_todos()
+    assert todos[0].title == "Updated"
+
+
+def test_export_vtodo(temp_todo_dir):
+    """Test VTODO export."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Export me",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            estimated=2.0,
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["export", "--format", "vtodo"]
+    )
+    assert result.exit_code == 0
+    assert "VTODO" in result.stdout
+    assert "Export me" in result.stdout
+
+
+def test_free_slot_computation():
+    """Test free slot computation with no events."""
+    slots = compute_free_slots([], 1)
+    # Should have at least one slot (today if work day)
+    # or zero if weekend; just verify no crash
+    assert isinstance(slots, list)
+
+
+def test_parent_auto_done(temp_todo_dir):
+    """When all children are done, parent is auto-done."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child 1", parent_id=1,
+            status="done",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Child 2", parent_id=1,
+            status="pending",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["done", "3"])
+    assert result.exit_code == 0
+    assert "auto-completed" in result.stdout
+
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    assert parent.status == "done"
+@
