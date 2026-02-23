@@ -73,6 +73,36 @@ consistency with other nytid components. The system maintains two separate data 
 \item[Active session] Current tracking state that survives application restarts.
 \end{description}
 
+\subsection{Multi-Worker Support}
+
+The tracking system supports parallel tracking by different workers.
+Each worker is identified by a name string (defaulting to
+\enquote{me}) and maintains an independent active session file.
+This enables scenarios like a teacher and an AI assistant tracking
+time simultaneously on the same project without interference.
+
+The design separates \emph{active state} from \emph{historical data}:
+\begin{description}
+\item[Per-worker session files] Each worker gets its own active
+  session file ([[current_session_me.json]],
+  [[current_session_dan-claude.json]], etc.), preventing
+  concurrent trackers from overwriting each other's state.
+\item[Shared history] Completed entries from all workers are
+  stored in a single [[tracking_data.json]] file, with a [[who]]
+  field identifying the worker. This simplifies analysis and
+  export across workers.
+\end{description}
+
+All commands accept a [[--who]]/[[-w]] option (defaulting to
+\enquote{me}). The [[status]] command without [[--who]] shows all
+active workers, while [[stats]] and [[export]] can optionally
+filter by worker.
+
+Backward compatibility is maintained: old session files without a
+worker suffix are treated as belonging to \enquote{me}, and
+historical entries without a [[who]] field default to \enquote{me}
+when loaded.
+
 \subsection{Multi-format Export Capability}
 The system supports multiple export formats (ICS, JSON, CSV) to integrate with different
 tools and workflows that teachers use for time management and reporting.
@@ -182,9 +212,30 @@ def get_tracking_data_file() -> pathlib.Path:
     """Get the path to the tracking data file"""
     return get_tracking_dir() / "tracking_data.json"
 
-def get_current_session_file() -> pathlib.Path:
-    """Get the path to the current session file"""
-    return get_tracking_dir() / "current_session.json"
+def sanitize_who(who: str) -> str:
+    """Sanitize a worker name for use in filenames.
+
+    Lowercases the name, keeps alphanumerics and hyphens,
+    replaces everything else with underscores.
+    """
+    return "".join(
+        c if c.isalnum() or c == "-" else "_"
+        for c in who.lower()
+    )
+
+def get_current_session_file(who: str = "me") -> pathlib.Path:
+    """Get the path to the current session file for a worker."""
+    tracking_dir = get_tracking_dir()
+    suffix = sanitize_who(who)
+    session_file = tracking_dir / f"current_session_{suffix}.json"
+
+    # Backward compatibility: migrate old unsuffixed file
+    if who == "me" and not session_file.exists():
+        old_file = tracking_dir / "current_session.json"
+        if old_file.exists():
+            return old_file
+
+    return session_file
 
 def get_default_weekly_limit() -> float:
     """Get the default weekly hour limit from config"""
@@ -242,34 +293,78 @@ def get_labels_display(labels: List[str]) -> str:
 def complete_active_labels(ctx, args, incomplete):
     """
     Shell completion function for active labels (used by stop command).
-    
-    Returns currently tracking labels that match the incomplete string.
+
+    Returns currently tracking labels that match the incomplete
+    string.
     """
     try:
         session = load_active_session()
         active = session.get_active_labels()
-        return [label for label in active if label.startswith(incomplete)]
+        return [
+            label for label in active
+            if label.startswith(incomplete)
+        ]
     except:
         return []
 
 def complete_historical_labels(ctx, args, incomplete):
     """
-    Shell completion function for historical labels (used by start command).
-    
-    Returns previously used labels from tracking history that match the incomplete string.
+    Shell completion function for historical labels
+    (used by start command).
+
+    Returns previously used labels from tracking history
+    that match the incomplete string.
     """
     try:
-        entries = load_completed_entries()
+        entries = load_tracking_data()
         # Collect all unique labels from historical entries
         all_labels = set()
         for entry in entries:
             all_labels.update(entry.labels)
-        
+
         # Also include currently active labels
         session = load_active_session()
         all_labels.update(session.get_active_labels())
-        
-        return sorted([label for label in all_labels if label.startswith(incomplete)])
+
+        return sorted([
+            label for label in all_labels
+            if label.startswith(incomplete)
+        ])
+    except:
+        return []
+
+def complete_workers(ctx, args, incomplete):
+    """
+    Shell completion function for worker names.
+
+    Discovers workers from active session files and
+    historical tracking data.
+    """
+    try:
+        workers = {"me"}
+        tracking_dir = get_tracking_dir()
+
+        # Find active workers from session files
+        if tracking_dir.exists():
+            import glob as glob_mod
+            for f in tracking_dir.glob(
+                "current_session_*.json"
+            ):
+                name = f.stem.replace(
+                    "current_session_", ""
+                )
+                if name:
+                    workers.add(name)
+
+        # Find historical workers from tracking data
+        entries = load_tracking_data()
+        for entry in entries:
+            workers.add(entry.who)
+
+        return sorted([
+            w for w in workers
+            if w.startswith(incomplete)
+        ])
     except:
         return []
 
@@ -405,10 +500,16 @@ what labels (tags) it had, and any descriptive notes.
 
 This class serves as the fundamental data unit for historical tracking data. It provides:
 \begin{description}
-\item[Immutable record] Once created, entries represent completed work sessions.
+\item[Immutable record] Once created, entries represent completed
+  work sessions.
 \item[Duration calculation] Automatic computation of time spent.
-\item[Serialization support] JSON conversion for persistent storage.
-\item[Flat labels] Maintains independent labels (tags) for flexible categorization.
+\item[Serialization support] JSON conversion for persistent
+  storage.
+\item[Flat labels] Maintains independent labels (tags) for
+  flexible categorization.
+\item[Worker identity] Each entry records which worker
+  (\enquote{me}, \enquote{Dan-Claude}, etc.)\ performed the work,
+  enabling multi-worker analysis and filtering.
 \end{description}
 
 <<tracking entry class>>=
@@ -426,21 +527,24 @@ class TrackingEntry:
         start_time: datetime.datetime,
         end_time: datetime.datetime,
         labels: List[str],
-        description: str = ""
+        description: str = "",
+        who: str = "me"
     ):
         """
         Initialize a tracking entry.
-        
+
         Args:
             start_time: When the tracked work began
-            end_time: When the tracked work ended  
+            end_time: When the tracked work ended
             labels: List of independent labels/tags (e.g., ['DD1310', 'lecture', 'prep'])
             description: Optional description of the work performed
+            who: Identity of the worker (default "me")
         """
         self.start_time = start_time
         self.end_time = end_time
         self.labels = sorted(list(set(labels)))  # Ensure unique and sorted
         self.description = description
+        self.who = who
         
     def duration(self) -> datetime.timedelta:
         """
@@ -462,7 +566,8 @@ class TrackingEntry:
             'start_time': self.start_time.isoformat(),
             'end_time': self.end_time.isoformat(),
             'labels': self.labels,
-            'description': self.description
+            'description': self.description,
+            'who': self.who
         }
     
     @classmethod
@@ -480,7 +585,8 @@ class TrackingEntry:
             start_time=datetime.datetime.fromisoformat(data['start_time']),
             end_time=datetime.datetime.fromisoformat(data['end_time']),
             labels=data['labels'],
-            description=data.get('description', '')
+            description=data.get('description', ''),
+            who=data.get('who', 'me')
         )
 @
 
@@ -607,7 +713,8 @@ class ActiveSession:
         labels: List[str] = None,
         end_time: datetime.datetime = None,
         count: int = None,
-        stop_batch: bool = True
+        stop_batch: bool = True,
+        who: str = "me"
     ) -> List[TrackingEntry]:
         """
         Stop tracking for specified labels and return completed entries.
@@ -657,7 +764,10 @@ class ActiveSession:
                 start_time, notes, batch_id = self.active_labels.pop(label)
                 self.label_order.remove(label)
                 # Create entry with just this label
-                entry = TrackingEntry(start_time, end_time, [label], notes)
+                entry = TrackingEntry(
+                    start_time, end_time, [label], notes,
+                    who=who
+                )
                 entries.append(entry)
                 
         return entries
@@ -913,38 +1023,59 @@ def add_completed_entries(new_entries: List[TrackingEntry]):
 
 \subsection{Active Session Management}
 
-The active session maintains the current tracking state and survives application restarts.
+The active session maintains the current tracking state and survives
+application restarts. To support multi-worker parallel tracking, each
+worker gets an independent session file. The filename includes a
+sanitized version of the worker name: [[current_session_me.json]] for
+the default worker, [[current_session_dan-claude.json]] for
+\enquote{Dan-Claude}, and so on. This avoids conflicts when two
+workers track time simultaneously.
+
+For backward compatibility, if the old [[current_session.json]] file
+exists and no per-worker file is found for \enquote{me}, the system
+loads from the old file. This means existing users continue working
+without any migration step.
 
 <<session management>>=
-def load_active_session() -> ActiveSession:
+def load_active_session(who: str = "me") -> ActiveSession:
     """
     Load the current active session from persistent storage.
-    
+
+    Args:
+        who: Worker identity (default "me")
+
     Returns:
-        ActiveSession object with restored state, or empty session if
-        file doesn't exist or contains invalid data
+        ActiveSession object with restored state, or empty
+        session if file doesn't exist or contains invalid data
     """
-    session_file = get_current_session_file()
+    session_file = get_current_session_file(who)
     if not session_file.exists():
         return ActiveSession()
-    
+
     try:
         with open(session_file, 'r') as f:
             data = json.load(f)
             return ActiveSession.from_dict(data)
     except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logging.warning(f"Error loading active session from {session_file}: {e}")
+        logging.warning(
+            f"Error loading active session from "
+            f"{session_file}: {e}"
+        )
         return ActiveSession()
 
-def save_active_session(session: ActiveSession):
+def save_active_session(
+    session: ActiveSession,
+    who: str = "me"
+):
     """
     Save the current active session to persistent storage.
-    
+
     Args:
         session: ActiveSession object to save
+        who: Worker identity (default "me")
     """
     ensure_tracking_dir()
-    session_file = get_current_session_file()
+    session_file = get_current_session_file(who)
     with open(session_file, 'w') as f:
         json.dump(session.to_dict(), f, indent=2)
 @
@@ -1009,16 +1140,24 @@ We load the active session first, since we need it both for resume
 functionality and for starting new labels.
 
 <<load session and resolve labels>>=
-session = load_active_session()
+session = load_active_session(who)
 
 # If no labels provided, try to resume last stopped labels
 if not labels:
     if session.last_stopped:
         labels = session.last_stopped
-        typer.echo(f"Resuming: {', '.join(sorted(labels))}")
+        typer.echo(
+            f"Resuming: {', '.join(sorted(labels))}"
+        )
     else:
-        typer.echo("Error: No labels specified and no previous labels to resume", err=True)
-        typer.echo("Usage: nytid track start <label1> [label2] ...", err=True)
+        typer.echo(
+            "Error: No labels specified and no "
+            "previous labels to resume", err=True
+        )
+        typer.echo(
+            "Usage: nytid track start "
+            "<label1> [label2] ...", err=True
+        )
         raise typer.Exit(1)
 @
 
@@ -1026,17 +1165,27 @@ After resolving labels, we start tracking and report what happened:
 
 <<start tracking and report results>>=
 started = session.start_labels(labels, start_time)
-already_tracking = [l for l in labels if l not in started]
+already_tracking = [
+    l for l in labels if l not in started
+]
 
-save_active_session(session)
+save_active_session(session, who)
 
 if started:
-    typer.echo(f"Started tracking: {', '.join(sorted(started))}")
+    typer.echo(
+        f"Started tracking: "
+        f"{', '.join(sorted(started))}"
+    )
 if already_tracking:
-    typer.echo(f"Already tracking: {', '.join(sorted(already_tracking))}")
+    typer.echo(
+        f"Already tracking: "
+        f"{', '.join(sorted(already_tracking))}"
+    )
 
 all_active = session.get_active_labels()
 typer.echo(f"Active labels: {', '.join(all_active)}")
+if who != "me":
+    typer.echo(f"Worker: {who}")
 <<report custom start time if used>>
 @
 
@@ -1067,12 +1216,27 @@ specifies an exact time.
 at: Optional[str] = typer.Option(
     None, "--at",
     help="Start at specific time (e.g., '14:30' or '2024-12-13 14:30')"
-)
+),
 @
 
 <<start command docstring examples>>=
 nytid track start meeting --at 14:30          # Started at 2:30 PM today
 nytid track start                             # Resume last stopped labels
+nytid track start DD1310 --who Dan-Claude     # Track as Dan-Claude
+@
+
+\subsubsection{Worker Identity}
+
+The [[--who]] option identifies which worker is tracking. This enables
+parallel tracking by different people (or agents) without interference,
+since each worker maintains an independent active session file.
+
+<<start command options>>=
+who: str = typer.Option(
+    "me", "--who", "-w",
+    help="Worker identity (default 'me')",
+    autocompletion=complete_workers
+)
 @
 
 \subsubsection{Calculating Start Time}
@@ -1194,14 +1358,25 @@ unwind in reverse order.
 <<stop command>>=
 @cli.command()
 def stop(
-    labels: Optional[List[str]] = typer.Argument(None, 
-                                                  help="Specific labels to stop",
-                                                  autocompletion=complete_active_labels),
-    all_labels: bool = typer.Option(False, "--all", "-a", help="Stop all active labels"),
-    offset: Optional[str] = typer.Option(None, "--offset", "-o",
-                                          help="Offset stop time (e.g., '-30m', '-1.5h', '30' for minutes)"),
-    at: Optional[str] = typer.Option(None, "--at",
-                                     help="Stop at specific time (e.g., '14:30' or '2024-12-13 14:30')")
+    labels: Optional[List[str]] = typer.Argument(
+        None,
+        help="Specific labels to stop",
+        autocompletion=complete_active_labels),
+    all_labels: bool = typer.Option(
+        False, "--all", "-a",
+        help="Stop all active labels"),
+    offset: Optional[str] = typer.Option(
+        None, "--offset", "-o",
+        help="Offset stop time "
+             "(e.g., '-30m', '-1.5h', '30' for minutes)"),
+    at: Optional[str] = typer.Option(
+        None, "--at",
+        help="Stop at specific time "
+             "(e.g., '14:30' or '2024-12-13 14:30')"),
+    who: str = typer.Option(
+        "me", "--who", "-w",
+        help="Worker identity (default 'me')",
+        autocompletion=complete_workers)
 ):
     """
     Stop tracking. By default, stops the most recently started batch of labels.
@@ -1223,20 +1398,23 @@ def stop(
       nytid track stop --offset -30m     # Stopped 30 minutes ago
       nytid track stop --at 16:00        # Stopped at 4:00 PM
     """
-    session = load_active_session()
-    
+    session = load_active_session(who)
+
     if not session.is_active():
         typer.echo("No active tracking session", err=True)
         raise typer.Exit(1)
-    
+
     # Check for conflicting options
     if offset is not None and at is not None:
-        typer.echo("Error: Cannot use both --offset and --at options", err=True)
+        typer.echo(
+            "Error: Cannot use both --offset and "
+            "--at options", err=True
+        )
         raise typer.Exit(1)
-    
+
     # Calculate end time
     end_time = datetime.datetime.now()
-    
+
     if at is not None:
         try:
             end_time = parse_at_time(at)
@@ -1248,47 +1426,70 @@ def stop(
             offset_delta = parse_offset(offset)
             end_time += offset_delta
         except ValueError as e:
-            typer.echo(f"Error parsing offset '{offset}': {e}", err=True)
+            typer.echo(
+                f"Error parsing offset '{offset}': {e}",
+                err=True
+            )
             raise typer.Exit(1)
-    
+
     # Determine what to stop
     if all_labels:
-        # Stop all active labels
-        completed_entries = session.stop_labels(count=len(session.label_order), end_time=end_time)
+        completed_entries = session.stop_labels(
+            count=len(session.label_order),
+            end_time=end_time, who=who
+        )
     elif labels:
-        # Stop specified labels
-        completed_entries = session.stop_labels(labels, end_time)
+        completed_entries = session.stop_labels(
+            labels, end_time, who=who
+        )
     else:
-        # Default: stop most recently started batch
-        completed_entries = session.stop_labels(end_time=end_time, stop_batch=True)
-    
+        completed_entries = session.stop_labels(
+            end_time=end_time, stop_batch=True,
+            who=who
+        )
+
     if not completed_entries:
         if labels:
-            typer.echo(f"None of the specified labels are currently tracking: {', '.join(labels)}", err=True)
+            typer.echo(
+                "None of the specified labels are "
+                "currently tracking: "
+                f"{', '.join(labels)}", err=True
+            )
         else:
-            typer.echo("No active tracking to stop", err=True)
+            typer.echo(
+                "No active tracking to stop", err=True
+            )
         raise typer.Exit(1)
-    
+
     # Save session
-    save_active_session(session)
-    
+    save_active_session(session, who)
+
     # Save completed entries
     add_completed_entries(completed_entries)
-    
+
     # Display what was completed
     for entry in completed_entries:
-        typer.echo(f"Stopped: {get_labels_display(entry.labels)} ({format_duration(entry.duration())})")
-    
+        typer.echo(
+            f"Stopped: "
+            f"{get_labels_display(entry.labels)} "
+            f"({format_duration(entry.duration())})"
+        )
+
     # Show remaining active labels
     if session.is_active():
         remaining = session.get_active_labels()
-        typer.echo(f"Still tracking: {', '.join(remaining)}")
+        typer.echo(
+            f"Still tracking: {', '.join(remaining)}"
+        )
     else:
         typer.echo("All tracking stopped")
-    
+
     # Show time information if not current time
     if at is not None or offset is not None:
-        typer.echo(f"Stop time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        typer.echo(
+            f"Stop time: "
+            f"{end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 @
 
 \subsubsection{Testing Stop Command}
@@ -1378,27 +1579,106 @@ individual start time and duration.
 
 <<status command>>=
 @cli.command()
-def status():
+def status(
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Show status for specific worker "
+             "(shows all workers if omitted)",
+        autocompletion=complete_workers)
+):
     """
     Show current tracking status.
+
+    Without --who, shows all active workers.
+    With --who, shows only that worker's session.
     """
-    session = load_active_session()
-    
-    if not session.is_active():
-        typer.echo("No active tracking")
-        return
-    
-    typer.echo("Currently tracking:")
-    current_time = datetime.datetime.now()
-    
-    # Show each active label with its duration and notes
-    for label in session.get_active_labels():
-        info = session.get_label_info(label)
-        if info:
-            start_time, notes, batch_id = info
-            duration = current_time - start_time
-            notes_display = f" - {notes}" if notes else ""
-            typer.echo(f"  {label}: {format_duration(duration)}{notes_display}")
+    if who is not None:
+        <<show single worker status>>
+    else:
+        <<show all workers status>>
+@
+
+<<show single worker status>>=
+session = load_active_session(who)
+
+if not session.is_active():
+    typer.echo(f"No active tracking for {who}")
+    return
+
+typer.echo(f"Currently tracking ({who}):")
+current_time = datetime.datetime.now()
+
+for label in session.get_active_labels():
+    info = session.get_label_info(label)
+    if info:
+        start_time, notes, batch_id = info
+        duration = current_time - start_time
+        notes_display = f" - {notes}" if notes else ""
+        typer.echo(
+            f"  {label}: "
+            f"{format_duration(duration)}"
+            f"{notes_display}"
+        )
+@
+
+When no [[--who]] is specified, we discover all active workers by
+globbing for session files in the tracking directory. This gives a
+quick overview of who is currently tracking time.
+
+<<show all workers status>>=
+tracking_dir = get_tracking_dir()
+found_any = False
+
+if tracking_dir.exists():
+    for session_file in sorted(
+        tracking_dir.glob("current_session_*.json")
+    ):
+        worker = session_file.stem.replace(
+            "current_session_", ""
+        )
+        session = load_active_session(worker)
+        if session.is_active():
+            found_any = True
+            typer.echo(f"Currently tracking ({worker}):")
+            current_time = datetime.datetime.now()
+            for label in session.get_active_labels():
+                info = session.get_label_info(label)
+                if info:
+                    start_time, notes, batch_id = info
+                    duration = current_time - start_time
+                    notes_display = (
+                        f" - {notes}" if notes else ""
+                    )
+                    typer.echo(
+                        f"  {label}: "
+                        f"{format_duration(duration)}"
+                        f"{notes_display}"
+                    )
+
+# Also check old unsuffixed file for backward compat
+old_session_file = tracking_dir / "current_session.json"
+if old_session_file.exists():
+    session = load_active_session("me")
+    if session.is_active() and not found_any:
+        found_any = True
+        typer.echo("Currently tracking (me):")
+        current_time = datetime.datetime.now()
+        for label in session.get_active_labels():
+            info = session.get_label_info(label)
+            if info:
+                start_time, notes, batch_id = info
+                duration = current_time - start_time
+                notes_display = (
+                    f" - {notes}" if notes else ""
+                )
+                typer.echo(
+                    f"  {label}: "
+                    f"{format_duration(duration)}"
+                    f"{notes_display}"
+                )
+
+if not found_any:
+    typer.echo("No active tracking")
 @
 
 \subsubsection{Testing Status Command}
@@ -1422,7 +1702,7 @@ def test_status_with_single_label(temp_tracking_dir):
     # Check status shows the label
     result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0
-    assert "Currently tracking:" in result.stdout
+    assert "Currently tracking" in result.stdout
     assert "DD1310" in result.stdout
     # Check duration is displayed (format: Xm Ys or Xh Ym Zs)
     assert ":" in result.stdout  # label: duration format
@@ -1431,11 +1711,11 @@ def test_status_with_multiple_labels(temp_tracking_dir):
     """Test status command with multiple active labels"""
     # Start tracking multiple labels
     runner.invoke(cli, ["start", "DD1310", "lecture"])
-    
+
     # Check status shows all labels
     result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0
-    assert "Currently tracking:" in result.stdout
+    assert "Currently tracking" in result.stdout
     assert "DD1310" in result.stdout
     assert "lecture" in result.stdout
 
@@ -1507,29 +1787,44 @@ The notes command allows adding or updating notes/descriptions for any active la
 <<notes command>>=
 @cli.command()
 def notes(
-    label: str = typer.Argument(..., help="Label to add notes to"),
-    note_text: str = typer.Argument(..., help="Notes/description to add")
+    label: str = typer.Argument(
+        ..., help="Label to add notes to"),
+    note_text: str = typer.Argument(
+        ..., help="Notes/description to add"),
+    who: str = typer.Option(
+        "me", "--who", "-w",
+        help="Worker identity (default 'me')",
+        autocompletion=complete_workers)
 ):
     """
     Add or update notes for an active tracking label.
-    
+
     Example:
       nytid track notes DD1310 "Discussing course structure with TA"
     """
-    session = load_active_session()
-    
+    session = load_active_session(who)
+
     if not session.is_active():
-        typer.echo("No active tracking session", err=True)
+        typer.echo(
+            "No active tracking session", err=True
+        )
         raise typer.Exit(1)
-    
+
     if session.add_notes(label, note_text):
-        save_active_session(session)
-        typer.echo(f"Added notes to '{label}': {note_text}")
+        save_active_session(session, who)
+        typer.echo(
+            f"Added notes to '{label}': {note_text}"
+        )
     else:
-        typer.echo(f"Label '{label}' is not currently being tracked", err=True)
+        typer.echo(
+            f"Label '{label}' is not currently "
+            f"being tracked", err=True
+        )
         active = session.get_active_labels()
         if active:
-            typer.echo(f"Active labels: {', '.join(active)}")
+            typer.echo(
+                f"Active labels: {', '.join(active)}"
+            )
         raise typer.Exit(1)
 @
 
@@ -1540,62 +1835,87 @@ The run command tracks time while executing another command.
 <<run command>>=
 @cli.command()
 def run(
-    command_args: List[str] = typer.Argument(..., help="Command and arguments to run"),
-    labels: List[str] = typer.Option([], "--label", "-l", help="Additional labels for this tracking session")
+    command_args: List[str] = typer.Argument(
+        ..., help="Command and arguments to run"),
+    labels: List[str] = typer.Option(
+        [], "--label", "-l",
+        help="Additional labels for this tracking "
+             "session"),
+    who: str = typer.Option(
+        "me", "--who", "-w",
+        help="Worker identity (default 'me')",
+        autocompletion=complete_workers)
 ):
     """
     Run a command and track the time spent.
-    The command name is automatically used as a label, and the full command with arguments is stored as a description.
-    Additional labels can be provided with --label/-l options.
+
+    The command name is automatically used as a label,
+    and the full command with arguments is stored as a
+    description. Additional labels can be provided with
+    --label/-l options.
     """
     if not command_args:
-        typer.echo("Error: Command is required", err=True)
+        typer.echo(
+            "Error: Command is required", err=True
+        )
         raise typer.Exit(1)
-    
-    # Use the command name as the primary label
+
     command_name = command_args[0]
     full_command = ' '.join(command_args)
-    
-    # Combine command name with any additional labels
     all_labels = [command_name] + labels
-    
+
     start_time = datetime.datetime.now()
-    
-    # Load current session and start tracking labels
-    session = load_active_session()
-    started = session.start_labels(all_labels, start_time)
 
-    # Add the full command as a note/description for the command label
+    session = load_active_session(who)
+    started = session.start_labels(
+        all_labels, start_time
+    )
+
+    # Add the full command as a note/description
     if command_name in session.active_labels:
-        start_time, _, batch_id = session.active_labels[command_name]
-        session.active_labels[command_name] = (start_time, full_command, batch_id)
+        start_time, _, batch_id = (
+            session.active_labels[command_name]
+        )
+        session.active_labels[command_name] = (
+            start_time, full_command, batch_id
+        )
 
-    save_active_session(session)
-    
-    typer.echo(f"Running '{full_command}' and tracking with labels: {', '.join(sorted(all_labels))}")
-    
+    save_active_session(session, who)
+
+    typer.echo(
+        f"Running '{full_command}' and tracking with "
+        f"labels: {', '.join(sorted(all_labels))}"
+    )
+
     try:
-        # Run the command
-        result = subprocess.run(command_args, capture_output=False)
+        result = subprocess.run(
+            command_args, capture_output=False
+        )
         exit_code = result.returncode
     except KeyboardInterrupt:
         typer.echo("\nCommand interrupted", err=True)
         exit_code = 130
     except FileNotFoundError:
-        typer.echo(f"Command not found: {command_name}", err=True)
+        typer.echo(
+            f"Command not found: {command_name}",
+            err=True
+        )
         exit_code = 127
-    
-    # Stop tracking the labels we started and save completed entries
+
     end_time = datetime.datetime.now()
-    completed_entries = session.stop_labels(started, end_time)
-    
-    # Save state
-    save_active_session(session)
+    completed_entries = session.stop_labels(
+        started, end_time, who=who
+    )
+
+    save_active_session(session, who)
     add_completed_entries(completed_entries)
-    
+
     duration = end_time - start_time
-    typer.echo(f"Command completed in {format_duration(duration)}")
-    
+    typer.echo(
+        f"Command completed in "
+        f"{format_duration(duration)}"
+    )
+
     raise typer.Exit(exit_code)
 @
 
@@ -1606,36 +1926,67 @@ The add command allows adding arbitrary time intervals.
 <<add command>>=
 @cli.command()
 def add(
-    labels: List[str] = typer.Argument(..., help="Labels for the time entry"),
-    duration_minutes: int = typer.Option(..., "--duration", "-d", help="Duration in minutes"),
-    start_offset_minutes: int = typer.Option(0, "--start-offset", help="Start time offset in minutes from now (negative for past)"),
-    description: str = typer.Option("", "--description", help="Description for this time entry")
+    labels: List[str] = typer.Argument(
+        ..., help="Labels for the time entry"),
+    duration_minutes: int = typer.Option(
+        ..., "--duration", "-d",
+        help="Duration in minutes"),
+    start_offset_minutes: int = typer.Option(
+        0, "--start-offset",
+        help="Start time offset in minutes from now "
+             "(negative for past)"),
+    description: str = typer.Option(
+        "", "--description",
+        help="Description for this time entry"),
+    who: str = typer.Option(
+        "me", "--who", "-w",
+        help="Worker identity (default 'me')",
+        autocompletion=complete_workers)
 ):
     """
-    Add a time entry for work done when not at the computer.
-    Useful for recording time spent in meetings, at whiteboards, etc.
+    Add a time entry for work done when not at the
+    computer. Useful for recording time spent in
+    meetings, at whiteboards, etc.
     """
     if not labels:
-        typer.echo("Error: At least one label is required", err=True)
+        typer.echo(
+            "Error: At least one label is required",
+            err=True
+        )
         raise typer.Exit(1)
-    
+
     if duration_minutes <= 0:
-        typer.echo("Error: Duration must be positive", err=True)
+        typer.echo(
+            "Error: Duration must be positive",
+            err=True
+        )
         raise typer.Exit(1)
-    
-    # Calculate times
+
     now = datetime.datetime.now()
-    start_time = now + datetime.timedelta(minutes=start_offset_minutes)
-    end_time = start_time + datetime.timedelta(minutes=duration_minutes)
-    
-    # Create and save entry
-    entry = TrackingEntry(start_time, end_time, labels, description)
+    start_time = now + datetime.timedelta(
+        minutes=start_offset_minutes
+    )
+    end_time = start_time + datetime.timedelta(
+        minutes=duration_minutes
+    )
+
+    entry = TrackingEntry(
+        start_time, end_time, labels, description,
+        who=who
+    )
     add_completed_entries([entry])
-    
-    typer.echo(f"Added entry: {get_labels_display(labels)} ({format_duration(entry.duration())})")
+
+    typer.echo(
+        f"Added entry: "
+        f"{get_labels_display(labels)} "
+        f"({format_duration(entry.duration())})"
+    )
     if description:
         typer.echo(f"Description: {description}")
-    typer.echo(f"Time: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}")
+    typer.echo(
+        f"Time: {start_time.strftime('%H:%M')} - "
+        f"{end_time.strftime('%H:%M')}"
+    )
 @
 
 \subsection{Stats Command}
@@ -1645,10 +1996,25 @@ The stats command provides statistics about time tracking.
 <<stats command>>=
 @cli.command()
 def stats(
-    labels: List[str] = typer.Argument(None, help="Filter statistics by specific labels (shows all if not specified)"),
-    days: int = typer.Option(7, "--days", help="Number of days to include in stats"),
-    weekly_limit: Optional[float] = typer.Option(None, "--weekly-limit", help="Weekly hour limit for warnings (uses config default if not specified)"),
-    daily_limit: Optional[float] = typer.Option(None, "--daily-limit", help="Daily hour limit for warnings (uses config default if not specified)")
+    labels: List[str] = typer.Argument(
+        None,
+        help="Filter statistics by specific labels "
+             "(shows all if not specified)"),
+    days: int = typer.Option(
+        7, "--days",
+        help="Number of days to include in stats"),
+    weekly_limit: Optional[float] = typer.Option(
+        None, "--weekly-limit",
+        help="Weekly hour limit for warnings "
+             "(uses config default if not specified)"),
+    daily_limit: Optional[float] = typer.Option(
+        None, "--daily-limit",
+        help="Daily hour limit for warnings "
+             "(uses config default if not specified)"),
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Filter by worker (shows all if omitted)",
+        autocompletion=complete_workers)
 ):
     """
     Show statistics about tracked time.
@@ -1677,8 +2043,18 @@ def stats(
     cutoff_date = now - datetime.timedelta(days=days)
     
     # Filter entries within the time range
-    recent_entries = [e for e in entries if e.start_time >= cutoff_date]
-    
+    recent_entries = [
+        e for e in entries
+        if e.start_time >= cutoff_date
+    ]
+
+    # Filter by worker if specified
+    if who is not None:
+        recent_entries = [
+            e for e in recent_entries
+            if e.who == who
+        ]
+
     # Filter by labels if specified
     if labels:
         recent_entries = [e for e in recent_entries if any(label in e.labels for label in labels)]
@@ -1765,9 +2141,19 @@ The export command allows exporting tracking data to various formats.
 <<export command>>=
 @cli.command()
 def export(
-    format: str = typer.Option("ics", "--format", "-f", help="Export format (ics, json, csv)"),
-    days: int = typer.Option(30, "--days", help="Number of days to export"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output file (stdout if not specified)")
+    format: str = typer.Option(
+        "ics", "--format", "-f",
+        help="Export format (ics, json, csv)"),
+    days: int = typer.Option(
+        30, "--days",
+        help="Number of days to export"),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Output file (stdout if not specified)"),
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Filter by worker (exports all if omitted)",
+        autocompletion=complete_workers)
 ):
     """
     Export tracking data in various formats.
@@ -1782,8 +2168,18 @@ def export(
     # Filter by date range
     now = datetime.datetime.now()
     cutoff_date = now - datetime.timedelta(days=days)
-    filtered_entries = [e for e in entries if e.start_time >= cutoff_date]
-    
+    filtered_entries = [
+        e for e in entries
+        if e.start_time >= cutoff_date
+    ]
+
+    # Filter by worker if specified
+    if who is not None:
+        filtered_entries = [
+            e for e in filtered_entries
+            if e.who == who
+        ]
+
     if not filtered_entries:
         typer.echo(f"No tracking data in the last {days} days", err=True)
         return
@@ -1848,18 +2244,25 @@ def export_to_csv(entries: List[TrackingEntry]) -> str:
     writer = csv.writer(output)
     
     # Write header
-    writer.writerow(['Start Time', 'End Time', 'Duration (minutes)', 'Labels', 'Description'])
-    
+    writer.writerow([
+        'Start Time', 'End Time',
+        'Duration (minutes)', 'Labels',
+        'Description', 'Who'
+    ])
+
     # Write entries
     for entry in entries:
-        duration_minutes = entry.duration().total_seconds() / 60
+        duration_minutes = (
+            entry.duration().total_seconds() / 60
+        )
         labels_str = LABEL_SEPARATOR.join(entry.labels)
         writer.writerow([
             entry.start_time.isoformat(),
             entry.end_time.isoformat(),
             f"{duration_minutes:.1f}",
             labels_str,
-            entry.description
+            entry.description,
+            entry.who
         ])
     
     return output.getvalue()
@@ -1947,24 +2350,45 @@ sys.path.insert(0, '../src')
 
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
-    get_tracking_dir, get_tracking_data_file, get_current_session_file,
+    get_tracking_dir, get_tracking_data_file,
+    get_current_session_file,
     load_tracking_data, load_active_session,
-    parse_offset, parse_at_time
+    parse_offset, parse_at_time,
+    sanitize_who, complete_workers
 )
 
 runner = CliRunner()
 
 @pytest.fixture
 def temp_tracking_dir():
-    """Create a temporary directory for tracking data during tests"""
+    """Create a temporary directory for tracking data
+    during tests.
+
+    Patches storage functions so that per-worker session
+    files resolve inside the temporary directory.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_dir = pathlib.Path(tmpdir) / "tracking"
-        temp_data_file = temp_dir / "tracking_data.json"
-        temp_session_file = temp_dir / "current_session.json"
+        temp_data_file = (
+            temp_dir / "tracking_data.json"
+        )
 
-        with patch('nytid.cli.track.get_tracking_dir', return_value=temp_dir), \
-             patch('nytid.cli.track.get_tracking_data_file', return_value=temp_data_file), \
-             patch('nytid.cli.track.get_current_session_file', return_value=temp_session_file):
+        def _session_file(who="me"):
+            suffix = sanitize_who(who)
+            return temp_dir / (
+                f"current_session_{suffix}.json"
+            )
+
+        with patch(
+            'nytid.cli.track.get_tracking_dir',
+            return_value=temp_dir
+        ), patch(
+            'nytid.cli.track.get_tracking_data_file',
+            return_value=temp_data_file
+        ), patch(
+            'nytid.cli.track.get_current_session_file',
+            side_effect=_session_file
+        ):
             yield temp_dir
 
 # All test functions defined throughout the document
@@ -2209,4 +2633,136 @@ def test_run_command_with_additional_labels(temp_tracking_dir):
     assert "DD1310" in result.stdout
     assert "admin" in result.stdout
     assert "echo" in result.stdout
+
+def test_tracking_entry_with_who():
+    """Test TrackingEntry serialization with who field"""
+    start = datetime.datetime(2023, 1, 1, 10, 0, 0)
+    end = datetime.datetime(2023, 1, 1, 11, 0, 0)
+    entry = TrackingEntry(
+        start, end, ["DD1310"], "test",
+        who="Dan-Claude"
+    )
+
+    assert entry.who == "Dan-Claude"
+    data = entry.to_dict()
+    assert data["who"] == "Dan-Claude"
+
+    # Round-trip
+    entry2 = TrackingEntry.from_dict(data)
+    assert entry2.who == "Dan-Claude"
+
+def test_tracking_entry_backward_compat():
+    """Test that old entries without who default to 'me'"""
+    data = {
+        "start_time": "2023-01-01T10:00:00",
+        "end_time": "2023-01-01T11:00:00",
+        "labels": ["DD1310"],
+        "description": "old entry"
+    }
+    entry = TrackingEntry.from_dict(data)
+    assert entry.who == "me"
+
+def test_per_worker_session_files(temp_tracking_dir):
+    """Test that two workers get independent session files"""
+    # Start tracking for default worker
+    runner.invoke(cli, ["start", "DD1310"])
+    # Start tracking for Dan-Claude
+    runner.invoke(cli, [
+        "start", "coding", "--who", "Dan-Claude"
+    ])
+
+    # Verify both session files exist
+    me_file = temp_tracking_dir / "current_session_me.json"
+    dc_file = temp_tracking_dir / "current_session_dan-claude.json"
+    assert me_file.exists()
+    assert dc_file.exists()
+
+def test_start_stop_with_who(temp_tracking_dir):
+    """Test --who creates separate session"""
+    result = runner.invoke(cli, [
+        "start", "coding", "--who", "Dan-Claude"
+    ])
+    assert result.exit_code == 0
+    assert "Started tracking: coding" in result.stdout
+    assert "Worker: Dan-Claude" in result.stdout
+
+    result = runner.invoke(cli, [
+        "stop", "--who", "Dan-Claude"
+    ])
+    assert result.exit_code == 0
+    assert "Stopped: coding" in result.stdout
+
+def test_parallel_tracking(temp_tracking_dir):
+    """Test two workers tracking simultaneously"""
+    # Start both workers
+    runner.invoke(cli, ["start", "DD1310"])
+    runner.invoke(cli, [
+        "start", "coding", "--who", "Dan-Claude"
+    ])
+
+    # Stop one worker doesn't affect the other
+    result = runner.invoke(cli, [
+        "stop", "--who", "Dan-Claude"
+    ])
+    assert result.exit_code == 0
+    assert "All tracking stopped" in result.stdout
+
+    # Default worker still active
+    result = runner.invoke(cli, ["status", "--who", "me"])
+    assert result.exit_code == 0
+    assert "DD1310" in result.stdout
+
+    runner.invoke(cli, ["stop"])
+
+def test_status_shows_all_workers(temp_tracking_dir):
+    """Test status without --who lists all active workers"""
+    runner.invoke(cli, ["start", "DD1310"])
+    runner.invoke(cli, [
+        "start", "coding", "--who", "Dan-Claude"
+    ])
+
+    result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "me" in result.stdout
+    assert "dan-claude" in result.stdout
+    assert "DD1310" in result.stdout
+    assert "coding" in result.stdout
+
+def test_stats_with_who_filter(temp_tracking_dir):
+    """Test filtering stats by worker"""
+    # Add entries for different workers
+    runner.invoke(cli, [
+        "add", "DD1310", "--duration", "60"
+    ])
+    runner.invoke(cli, [
+        "add", "coding", "--duration", "90",
+        "--who", "Dan-Claude"
+    ])
+
+    # Stats for Dan-Claude only
+    result = runner.invoke(cli, [
+        "stats", "--who", "Dan-Claude"
+    ])
+    assert result.exit_code == 0
+    assert "coding" in result.stdout
+
+    # Stats for me only
+    result = runner.invoke(cli, ["stats", "--who", "me"])
+    assert result.exit_code == 0
+    assert "DD1310" in result.stdout
+
+def test_complete_workers(temp_tracking_dir):
+    """Test autocompletion returns known workers"""
+    # Add some data for different workers
+    runner.invoke(cli, [
+        "add", "DD1310", "--duration", "60"
+    ])
+    runner.invoke(cli, [
+        "add", "coding", "--duration", "90",
+        "--who", "Dan-Claude"
+    ])
+
+    workers = complete_workers(None, None, "")
+    assert "me" in workers
+    assert "dan-claude" in workers or "Dan-Claude" in workers
 @
