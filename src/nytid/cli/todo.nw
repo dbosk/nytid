@@ -79,6 +79,7 @@ cli = typer.Typer(
 <<effective priority>>
 <<storage functions>>
 <<sub-item helpers>>
+<<child priority helpers>>
 <<editor infrastructure>>
 <<binary search priority>>
 <<autocompletion functions>>
@@ -571,6 +572,160 @@ def test_check_parent_completion():
     assert not check_parent_completion(todos, 1)
     todos[2].status = "done"
     assert check_parent_completion(todos, 1)
+@
+
+\subsection{Context-Aware Child Priorities}
+
+When children are created via the editor or reconciled during edits,
+they need priorities that place them \emph{between} their parent and
+the parent's next-lower-priority sibling. Without this, children
+receive absolute sequential priorities (1.0, 2.0, \ldots) and can
+sort below unrelated lower-priority items in flat view.
+
+Consider: parent~A at priority~5.0, parent~B at priority~3.0. If
+children of~A get priorities 1.0 and~2.0, a flat sort places them
+\emph{below}~B---the opposite of what the user intended. Instead,
+children of~A should receive priorities in the range $(3.0, 5.0)$,
+so they always appear between~A and~B.
+
+The first helper finds the available priority range for children of
+a given parent. We look at the parent's siblings (same
+[[parent_id]] level) to find the next-lower-priority item. The range
+runs from the parent's priority down to that sibling's priority. If
+no sibling exists below, we use a generous default floor.
+
+<<child priority helpers>>=
+def compute_child_priority_range(
+    todos: List[TodoItem],
+    parent: TodoItem,
+) -> tuple:
+    """Find the priority range for children.
+
+    Returns ``(high, low)`` where high is the parent's
+    priority and low is the next-lower sibling's priority
+    (or a default floor if no lower sibling exists).
+    """
+    high = parent.priority
+    siblings = [
+        t for t in todos
+        if t.parent_id == parent.parent_id
+        and t.id != parent.id
+        and t.status != "done"
+    ]
+    lower = [
+        s for s in siblings
+        if effective_priority(s) < high
+    ]
+    if lower:
+        closest = max(
+            lower, key=effective_priority
+        )
+        low = effective_priority(closest)
+    else:
+        low = max(0.0, high - 10.0)
+    return (high, low)
+@
+
+The second helper distributes [[count]] priorities evenly within a
+range, highest first. We divide the range into [[count + 1]] equal
+segments and place one priority at each interior division point.
+This leaves room at both ends for future insertions---the same
+\enquote{leave room for midpoints} philosophy used by
+[[assign_priority_at_position]].
+
+<<child priority helpers>>=
+def distribute_priorities_in_range(
+    count: int, high: float, low: float,
+) -> List[float]:
+    """Distribute priorities evenly in (low, high).
+
+    Returns a list of ``count`` values, highest first.
+    For example, 3 items in (3.0, 5.0) gives
+    [4.5, 4.0, 3.5].
+    """
+    if count == 0:
+        return []
+    step = (high - low) / (count + 1)
+    return [high - step * (i + 1) for i in range(count)]
+@
+
+\subsection{Testing Child Priority Helpers}
+
+<<test functions>>=
+def test_compute_child_priority_range_with_sibling():
+    """Range is bounded by next-lower sibling."""
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=3.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 3.0
+
+
+def test_compute_child_priority_range_no_sibling():
+    """No lower sibling uses default floor."""
+    todos = [
+        TodoItem(
+            id=1, title="Only parent", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 0.0
+
+
+def test_distribute_priorities_in_range():
+    """Priorities are evenly spaced, highest first."""
+    result = distribute_priorities_in_range(
+        3, 5.0, 3.0
+    )
+    assert len(result) == 3
+    assert result == [4.5, 4.0, 3.5]
+
+
+def test_distribute_priorities_single():
+    """Single item gets the midpoint."""
+    result = distribute_priorities_in_range(
+        1, 5.0, 3.0
+    )
+    assert result == [4.0]
+
+
+def test_children_priorities_between_parent_siblings():
+    """Integration: children sort between parents."""
+    parent_a = TodoItem(
+        id=1, title="High priority",
+        priority=5.0,
+        created="2026-01-01T00:00:00",
+    )
+    parent_b = TodoItem(
+        id=2, title="Lower priority",
+        priority=3.0,
+        created="2026-01-01T00:00:00",
+    )
+    todos = [parent_a, parent_b]
+    high, low = compute_child_priority_range(
+        todos, parent_a
+    )
+    child_prios = distribute_priorities_in_range(
+        2, high, low
+    )
+    # All children must sort between parents
+    for p in child_prios:
+        assert p > 3.0
+        assert p < 5.0
 @
 
 \section{Editor Infrastructure}
@@ -1181,6 +1336,12 @@ lower priority. After $O(\log n)$ questions, we've narrowed down to
 a position and assign a priority value that's the midpoint between
 the two neighbors.
 
+When a child item has no siblings yet, the default priority of 1.0
+would cause it to sort incorrectly in flat view (below unrelated
+lower-priority items). The optional [[parent]] parameter provides
+context: when present, the first child gets a priority within the
+parent's range from [[compute_child_priority_range]] instead.
+
 Why midpoint? Because it leaves room for future insertions without
 needing to renumber. If we have items at priorities 3.0 and 5.0 and
 insert between them at 4.0, there's still room for items at 3.5 and
@@ -1214,16 +1375,24 @@ def format_todo_for_comparison(item: TodoItem) -> str:
 def binary_search_priority(
     siblings: List[TodoItem],
     new_title: str,
+    parent: Optional[TodoItem] = None,
+    todos: Optional[List[TodoItem]] = None,
 ) -> float:
     """Determine priority via interactive binary search.
 
     Presents existing items and asks the user to compare.
     Returns the computed priority value.
 
-    If there are no siblings, returns 1.0 as a starting
-    point.
+    When ``parent`` and ``todos`` are provided and there
+    are no siblings, the priority is placed within the
+    parent's context range instead of defaulting to 1.0.
     """
     if not siblings:
+        if parent is not None and todos is not None:
+            high, low = compute_child_priority_range(
+                todos, parent
+            )
+            return (high + low) / 2.0
         return 1.0
 
     sorted_items = sorted(
@@ -1648,7 +1817,14 @@ temp = TodoItem(
     id=0, title=title, parent_id=resolved_parent
 )
 siblings = get_active_siblings(todos, temp)
-priority = binary_search_priority(siblings, title)
+parent_ctx = (
+    parent_item if resolved_parent is not None
+    else None
+)
+priority = binary_search_priority(
+    siblings, title,
+    parent=parent_ctx, todos=todos,
+)
 @
 
 When [[--here]] is used, we capture the current working directory and
@@ -1781,21 +1957,32 @@ typer.echo(
 @
 
 Children are created recursively. Each child inherits the parent's
-labels and deadline unless its own YAML block overrides them:
+labels and deadline unless its own YAML block overrides them.
+Priorities are distributed within the range computed by
+[[compute_child_priority_range]] so that children sort between their
+parent and the parent's next-lower sibling in flat view:
 
 <<create children from parsed>>=
 def create_children_from_parsed(
     parsed_children, parent_id,
     parent_labels, parent_deadline,
-    child_priority_start,
+    priority_high, priority_low,
 ):
-    """Recursively create TodoItems from parsed children.
+    """Recursively create TodoItems from parsed
+    children.
 
-    Returns the next available priority value.
+    Priorities are distributed evenly in the range
+    (priority_low, priority_high).
     """
     nonlocal next_id, todos
-    prio = child_priority_start
-    for parsed_child in parsed_children:
+    priorities = distribute_priorities_in_range(
+        len(parsed_children),
+        priority_high, priority_low,
+    )
+    for i, parsed_child in enumerate(
+        parsed_children
+    ):
+        prio = priorities[i]
         child_meta = parsed_child.metadata
         child_labels = child_meta.get(
             "labels", list(parent_labels)
@@ -1826,27 +2013,46 @@ def create_children_from_parsed(
         todos.append(child)
         child_id = next_id
         next_id += 1
-        prio += 1.0
         typer.echo(
             f"  Added sub-item #{child.id}: "
             f"{child.title}"
         )
         if parsed_child.children:
+            <<nested child priority range>>
             create_children_from_parsed(
                 parsed_child.children,
                 child_id,
                 child_labels,
                 child_deadline,
-                1.0,
+                nested_high, nested_low,
             )
-    return prio
+@
 
+For nested children (grandchildren), the sub-range falls between the
+current child's priority and the next child's priority. If this is the
+last child, we use the range's lower bound instead:
+
+<<nested child priority range>>=
+nested_high = prio
+if i + 1 < len(priorities):
+    nested_low = priorities[i + 1]
+else:
+    nested_low = priority_low
+@
+
+The call site computes the parent's priority range from its sibling
+context:
+
+<<create children from parsed>>=
+prio_high, prio_low = compute_child_priority_range(
+    todos, parent_item
+)
 create_children_from_parsed(
     parsed.children,
     parent_id_for_children,
     parent_item.labels,
     parent_item.deadline,
-    1.0,
+    prio_high, prio_low,
 )
 @
 
@@ -2352,8 +2558,10 @@ if "who" in meta:
 
 Reconciliation matches children by normalized title. Existing
 children keep their ID, status, and tracked time. New headings get
-fresh IDs. Priority is reassigned sequentially to reflect document
-order.
+fresh IDs. Priorities are distributed within the parent's context
+range (using [[compute_child_priority_range]]) so that children
+sort correctly in flat view, rather than using absolute sequential
+values.
 
 <<reconcile children>>=
 existing_children = get_children(todos, todo_id)
@@ -2362,9 +2570,16 @@ existing_by_title = {
     for c in existing_children
 }
 
+prio_high, prio_low = compute_child_priority_range(
+    todos, item
+)
+priorities = distribute_priorities_in_range(
+    len(parsed.children), prio_high, prio_low,
+)
+
 new_child_ids = set()
-prio = 1.0
-for parsed_child in parsed.children:
+for i, parsed_child in enumerate(parsed.children):
+    prio = priorities[i] if i < len(priorities) else 0.0
     norm_title = parsed_child.title.strip().lower()
     if norm_title in existing_by_title:
         child = existing_by_title.pop(norm_title)
@@ -2413,7 +2628,6 @@ for parsed_child in parsed.children:
             f"  Added sub-item #{new_child.id}: "
             f"{new_child.title}"
         )
-    prio += 1.0
 
 # Remove children that were deleted from the document
 for removed in existing_by_title.values():
@@ -3459,6 +3673,8 @@ from nytid.cli.todo import (
     get_active_siblings,
     check_parent_completion,
     assign_priority_at_position,
+    compute_child_priority_range,
+    distribute_priorities_in_range,
     compute_free_slots,
     parse_editor_content,
     render_todo_markdown,
