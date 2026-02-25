@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-nytid is a Python CLI application for managing TA bookings, lab sessions, tutorials, and course schedules. It uses literate programming (noweb) to generate Python source code from `.nw` files, Poetry for dependency management, and integrates with Canvas LMS and LADOK systems.
+nytid is a Python CLI application for managing TA bookings, lab sessions, tutorials, course schedules, time tracking, and task management. It uses literate programming (noweb) to generate Python source code from `.nw` files, Poetry for dependency management, and integrates with Canvas LMS and LADOK systems.
 
 ## Build & Test Commands
 
@@ -39,6 +39,8 @@ poetry run nytid --help
 - `poetry run nytid courses ls` - List courses
 - `poetry run nytid schedule show` - Show schedules
 - `poetry run nytid hr --help` - HR/timesheet commands
+- `poetry run nytid todo --help` - Task management
+- `poetry run nytid track --help` - Time tracking
 
 ## Repository Structure
 
@@ -46,9 +48,17 @@ poetry run nytid --help
 nytid/
 ├── src/nytid/           # Source code (literate programming .nw files)
 │   ├── cli/             # Command-line interface modules
+│   │   ├── courses.nw   #   Course management commands
+│   │   ├── hr.nw        #   HR/timesheet commands
+│   │   ├── schedule.nw  #   Schedule display commands
+│   │   ├── signupsheets.nw # Sign-up sheet commands
+│   │   ├── todo.nw      #   Task management commands
+│   │   ├── track.nw     #   Time tracking commands
+│   │   └── utils/       #   Utility subcommands (rooms, etc.)
 │   ├── courses/         # Course management
 │   ├── signup/          # Sign-up sheet management
 │   ├── storage/         # Storage backends (AFS)
+│   ├── http_utils.nw    # HTTP utilities
 │   └── schedules.nw     # Schedule handling
 ├── tests/               # Test suite (generates from .nw files)
 ├── doc/                 # Documentation (LaTeX/PDF generation)
