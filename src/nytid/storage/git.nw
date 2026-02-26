@@ -1,0 +1,459 @@
+\chapter{Git storage backend, the \texttt{storage.git} module}
+
+In this chapter we describe how to use Git repositories as storage backends, 
+the [[storage.git]] module.
+
+Git provides version control and distributed storage, making it suitable for 
+collaborative data management.
+Unlike AFS, Git doesn't have built-in access control—this module focuses on 
+repository operations.
+Access control will be handled by a separate GitHub module 
+(\cref{GitHubStorage}).
+
+
+\section{Design overview}
+
+We want to use Git repositories as storage backends with the same interface 
+as other storage modules.
+The key differences from the local file system storage are:
+\begin{description}
+\item[Repository cloning] When opening a Git storage root, we clone the 
+  repository if it doesn't exist locally.
+\item[Synchronization] Before reading files, we pull changes. 
+  After writing files, we commit and push changes.
+\item[Working directory] Files are accessed in the Git working directory, not 
+  directly in the repository.
+\end{description}
+
+We contrast this with the AFS approach:
+AFS provides access control through ACLs on directories.
+Git provides access control through repository permissions (handled separately 
+by hosting platforms like GitHub).
+
+
+\section{Code outline}
+
+The Git storage module inherits from the base [[storage.StorageRoot]] class.
+We override methods to add Git synchronization around file operations.
+<<git.py>>=
+from nytid import storage
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+<<helper exceptions>>
+<<helper functions>>
+
+class StorageRoot(storage.StorageRoot):
+  """
+  Manages a storage root in a Git repository.
+  """
+
+  def __init__(self, url: str):
+    """
+    Uses Git repository at `url` as storage root. 
+    Clones the repository if needed, or uses existing clone.
+    For local paths, uses the repository directly if it exists.
+    """
+    <<initialize Git repository path>>
+    <<determine if local path or remote URL>>
+    <<clone repository if needed>>
+    super().__init__(self.__repo_path)
+
+  <<Git storage methods>>
+@
+
+We also add tests to verify Git storage functionality.
+<<test storagegit.py>>=
+import pathlib
+import tempfile
+import shutil
+import os
+import subprocess
+import pytest
+from nytid.storage.git import *
+
+<<test fixture>>
+<<test functions>>
+@
+
+
+\section{Repository initialization}
+
+When creating a Git [[StorageRoot]], we need to determine where to store the 
+local clone.
+We use a consistent location based on the repository URL.
+
+First, we extract a usable directory name from the Git URL.
+<<initialize Git repository path>>=
+self.__url = url
+self.__repo_name = self.__extract_repo_name(url)
+self.__repo_path = self.__get_local_repo_path(self.__repo_name)
+@
+
+We parse the repository name from various Git URL formats:
+\begin{itemize}
+\item SSH format: [[git@github.com:user/repo.git]]
+\item HTTPS format: [[https://github.com/user/repo.git]]
+\item Local path: [[/path/to/repo.git]]
+\end{itemize}
+
+<<helper functions>>=
+def extract_repo_name(url: str) -> str:
+  """
+  Extracts repository name from Git URL.
+  Examples:
+    'git@github.com:user/repo.git' -> 'user_repo'
+    'https://github.com/user/repo.git' -> 'user_repo'
+  """
+  # Remove .git suffix if present
+  if url.endswith(".git"):
+    url = url[:-4]
+  
+  # Extract last two path components (user/repo)
+  if ":" in url and "@" in url:
+    # SSH format: git@github.com:user/repo
+    parts = url.split(":")[-1].split("/")
+  elif url.startswith("http"):
+    # HTTPS format: https://github.com/user/repo
+    parts = url.split("/")
+  else:
+    # Local path format
+    parts = url.split("/")
+  
+  # Take last two non-empty parts and join with underscore
+  non_empty = [p for p in parts if p]
+  if len(non_empty) >= 2:
+    return f"{non_empty[-2]}_{non_empty[-1]}"
+  elif len(non_empty) == 1:
+    return non_empty[-1]
+  else:
+    return "repo"
+@
+
+We define a method in the class to use this helper.
+<<Git storage methods>>=
+def __extract_repo_name(self, url: str) -> str:
+  """Extracts repository name from URL"""
+  return extract_repo_name(url)
+@
+
+We store Git repositories in a cache directory under the user's home.
+<<helper functions>>=
+def get_local_repo_path(repo_name: str) -> pathlib.Path:
+  """
+  Returns path where Git repository should be cloned locally.
+  Uses XDG cache directory structure.
+  """
+  cache_dir = pathlib.Path.home() / ".cache" / "nytid" / "git-repos"
+  return cache_dir / repo_name
+@
+
+<<Git storage methods>>=
+def __get_local_repo_path(self, repo_name: str) -> pathlib.Path:
+  """Returns local path for repository"""
+  return get_local_repo_path(repo_name)
+@
+
+
+\section{Cloning and updating repositories}
+
+For remote URLs, we clone the repository to a local cache directory.
+For local paths that already exist and are Git repositories, we use them 
+directly without cloning.
+
+First, we check if the URL is a local path and if it exists.
+<<determine if local path or remote URL>>=
+local_path = pathlib.Path(self.__url)
+self.__is_local = local_path.exists() and local_path.is_dir()
+if self.__is_local:
+  # Use the local path directly, don't use cache
+  self.__repo_path = local_path
+else:
+  # Remote URL - will clone to cache
+  pass
+@
+
+When the repository doesn't exist locally, we clone it.
+If it already exists, we verify it's a valid Git repository.
+<<clone repository if needed>>=
+if not self.__is_local:
+  if not self.__repo_path.exists():
+    <<clone the repository>>
+  else:
+    <<verify existing repository>>
+  <<pull latest changes>>
+@
+
+To clone a repository, we run [[git clone]].
+<<clone the repository>>=
+try:
+  run_git_command(["clone", self.__url, str(self.__repo_path)])
+except GitError as err:
+  raise GitError(f"Failed to clone repository {self.__url}: {err}")
+@
+
+For existing repositories, we verify they are valid Git repositories.
+<<verify existing repository>>=
+try:
+  run_git_command(["status"], cwd=self.__repo_path)
+except GitError as err:
+  raise GitError(
+    f"Directory {self.__repo_path} exists but is not a valid Git repository"
+  )
+@
+
+Before reading files, we pull the latest changes from the remote.
+<<pull latest changes>>=
+try:
+  run_git_command(["pull"], cwd=self.__repo_path)
+except GitError as err:
+  # Pull failure is not fatal - we can work with local changes
+  pass
+@
+
+
+\section{Running Git commands}
+
+We create a helper function to run Git commands, similar to how the AFS module 
+runs [[fs]] and [[pts]] commands.
+<<helper functions>>=
+def run_git_command(args, cwd=None):
+  """
+  Runs a Git command with the given arguments.
+  
+  Args:
+    args: List of command arguments (e.g., ['clone', 'url', 'path'])
+    cwd: Working directory for the command
+  
+  Raises:
+    GitError: If the command fails
+  """
+  cmd = ["git"] + args
+  try:
+    result = subprocess.run(
+      cmd, 
+      cwd=cwd, 
+      check=True, 
+      capture_output=True,
+      text=True
+    )
+    return result.stdout
+  except subprocess.CalledProcessError as err:
+    raise GitError(
+      f"Git command failed: {' '.join(cmd)}\n"
+      f"Error: {err.stderr}"
+    )
+  except FileNotFoundError:
+    raise GitError("Git is not installed or not in PATH")
+@
+
+We define an exception for Git errors.
+<<helper exceptions>>=
+class GitError(Exception):
+  pass
+@
+
+
+\section{Committing and pushing changes}
+
+When files are modified through the storage interface, we need to commit and 
+push changes back to the remote repository.
+
+We override the file closing behavior to commit changes after writing.
+However, the base class [[open]] method uses Python's built-in [[open]], 
+which doesn't provide hooks for post-close operations.
+
+Instead, we provide explicit methods for committing changes.
+Users should call [[commit_changes]] after modifying files.
+<<Git storage methods>>=
+def commit_changes(self, message: str = "Update from nytid"):
+  """
+  Commits and pushes all changes in the repository.
+  For local repositories without remotes, only commits locally.
+  
+  Args:
+    message: Commit message
+  """
+  try:
+    # Stage all changes
+    run_git_command(["add", "-A"], cwd=self.__repo_path)
+    
+    # Check if there are changes to commit
+    try:
+      run_git_command(
+        ["diff", "--cached", "--quiet"], 
+        cwd=self.__repo_path
+      )
+      # No changes to commit
+      return
+    except GitError:
+      # Changes exist, proceed with commit
+      pass
+    
+    # Commit changes
+    run_git_command(
+      ["commit", "-m", message], 
+      cwd=self.__repo_path
+    )
+    
+    # Try to push changes if there's a remote configured
+    try:
+      run_git_command(["push"], cwd=self.__repo_path)
+    except GitError:
+      # No remote configured or push failed - that's OK for local repos
+      pass
+  except GitError as err:
+    raise GitError(f"Failed to commit changes: {err}")
+@
+
+We also provide a method to pull the latest changes explicitly.
+<<Git storage methods>>=
+def pull_changes(self):
+  """
+  Pulls the latest changes from the remote repository.
+  """
+  try:
+    run_git_command(["pull"], cwd=self.__repo_path)
+  except GitError as err:
+    raise GitError(f"Failed to pull changes: {err}")
+@
+
+
+\section{Access control methods}
+
+The base [[StorageRoot]] class defines [[grant_access]] and [[revoke_access]] 
+methods.
+For basic Git storage, we cannot implement access control as it requires 
+interaction with the Git hosting platform.
+
+We override these methods to raise [[NotImplementedError]] with a helpful 
+message.
+<<Git storage methods>>=
+def grant_access(self, user):
+  """
+  Access control is not available for basic Git storage.
+  Use the GitHub storage backend for access control.
+  """
+  raise NotImplementedError(
+    "Access control requires a Git hosting platform. "
+    "Use nytid.storage.github for GitHub repositories."
+  )
+
+def revoke_access(self, user):
+  """
+  Access control is not available for basic Git storage.
+  Use the GitHub storage backend for access control.
+  """
+  raise NotImplementedError(
+    "Access control requires a Git hosting platform. "
+    "Use nytid.storage.github for GitHub repositories."
+  )
+@
+
+
+\section{Testing the Git storage module}
+
+We test the Git storage module using a temporary Git repository.
+We use pytest fixtures for proper setup and teardown.
+<<test fixture>>=
+@pytest.fixture(scope="module")
+def test_repo():
+  """Create a temporary Git repository for testing"""
+  # Create a temporary directory for test repositories
+  test_dir = tempfile.mkdtemp()
+  test_repo_path = pathlib.Path(test_dir) / "test-repo"
+
+  # Initialize a test Git repository
+  test_repo_path.mkdir(parents=True)
+  orig_dir = os.getcwd()
+  os.chdir(test_repo_path)
+  subprocess.run(["git", "init"], check=True, capture_output=True)
+  subprocess.run(
+    ["git", "config", "user.email", "test@example.com"],
+    check=True,
+    capture_output=True
+  )
+  subprocess.run(
+    ["git", "config", "user.name", "Test User"],
+    check=True,
+    capture_output=True
+  )
+
+  # Create initial commit
+  (test_repo_path / "README.md").write_text("# Test Repository\n")
+  subprocess.run(["git", "add", "README.md"], check=True, capture_output=True)
+  subprocess.run(
+    ["git", "commit", "-m", "Initial commit"],
+    check=True,
+    capture_output=True
+  )
+  
+  os.chdir(orig_dir)
+  
+  yield test_repo_path
+  
+  # Cleanup
+  shutil.rmtree(test_dir)
+@
+
+We test basic repository cloning and file operations.
+<<test functions>>=
+def test_clone_and_read(test_repo):
+  """Test cloning a repository and reading a file"""
+  root = StorageRoot(str(test_repo))
+  
+  with root.open("README.md", "r") as f:
+    content = f.read()
+    assert "Test Repository" in content
+  
+  root.close()
+@
+
+We test writing to a file and committing changes.
+<<test functions>>=
+def test_write_and_commit(test_repo):
+  """Test writing a file and committing changes"""
+  root = StorageRoot(str(test_repo))
+  
+  with root.open("test.txt", "w") as f:
+    f.write("Test content")
+  
+  root.commit_changes("Add test file")
+  
+  # Verify the file exists
+  with root.open("test.txt", "r") as f:
+    assert f.read() == "Test content"
+  
+  root.close()
+@
+
+We test that access control methods raise [[NotImplementedError]].
+<<test functions>>=
+def test_access_control_not_implemented(test_repo):
+  """Test that access control methods are not implemented"""
+  root = StorageRoot(str(test_repo))
+  
+  try:
+    root.grant_access("test_user")
+    assert False, "Should have raised NotImplementedError"
+  except NotImplementedError as err:
+    assert "GitHub" in str(err)
+  
+  try:
+    root.revoke_access("test_user")
+    assert False, "Should have raised NotImplementedError"
+  except NotImplementedError as err:
+    assert "GitHub" in str(err)
+@
+
+We test repository name extraction from various URL formats.
+<<test functions>>=
+def test_extract_repo_name():
+  """Test extracting repository name from various URL formats"""
+  assert extract_repo_name("git@github.com:user/repo.git") == "user_repo"
+  assert extract_repo_name("https://github.com/user/repo.git") == "user_repo"
+  assert extract_repo_name("https://github.com/user/repo") == "user_repo"
+  assert extract_repo_name("/path/to/user/repo.git") == "user_repo"
+@
