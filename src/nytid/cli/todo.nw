@@ -84,6 +84,7 @@ cli = typer.Typer(
 <<editor infrastructure>>
 <<binary search priority>>
 <<autocompletion functions>>
+<<github helpers>>
 <<subcommands>>
 @
 
@@ -189,6 +190,13 @@ the task was conceived---solving the common problem of \enquote{where
 was I working on this?} The [[command]] field defaults to [[$SHELL]]
 but can be set to tools like [[claude]] or [[opencode]].
 
+The optional [[github]] field links a todo to a GitHub issue or pull
+request, enabling bidirectional synchronization. We store
+the repository, item type, and number as a dictionary rather than
+a URL string because the [[gh]] CLI needs these components
+individually---parsing them back from a URL would be fragile and
+redundant.
+
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
 track, which manages mutable state with batch semantics.
@@ -217,6 +225,7 @@ class TodoItem:
     wd: Optional[str] = None
     env: Optional[Dict[str, str]] = None
     command: Optional[str] = None
+    github: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -821,9 +830,9 @@ def parse_yaml_block(text):
 def parse_yaml_value(value):
     """Parse a single YAML value.
 
-    Recognizes: bracketed lists, floats, integers,
-    and plain strings. Quoted strings have quotes
-    stripped.
+    Recognizes: bracketed lists, brace-delimited dicts,
+    floats, integers, and plain strings. Quoted strings
+    have quotes stripped.
     """
     if not value:
         return ""
@@ -835,6 +844,17 @@ def parse_yaml_value(value):
             v.strip().strip("'\"")
             for v in inner.split(",")
         ]
+    if value.startswith("{") and value.endswith("}"):
+        inner = value[1:-1]
+        if not inner.strip():
+            return {}
+        result = {}
+        for pair in inner.split(","):
+            if ":" not in pair:
+                continue
+            k, _, v = pair.partition(":")
+            result[k.strip()] = v.strip()
+        return result
     if value.startswith(("'", '"')):
         return value.strip("'\"")
     try:
@@ -871,6 +891,11 @@ def render_yaml_block(metadata):
         if isinstance(value, list):
             items = ", ".join(str(v) for v in value)
             lines.append(f"{key}: [{items}]")
+        elif isinstance(value, dict):
+            items = ", ".join(
+                f"{k}: {v}" for k, v in value.items()
+            )
+            lines.append(f"{key}: {{{items}}}")
         else:
             lines.append(f"{key}: {value}")
     lines.append("---")
@@ -1201,6 +1226,8 @@ def build_item_metadata(item):
         meta["estimate"] = item.estimated
     if item.who:
         meta["who"] = item.who
+    if item.github:
+        meta["github"] = item.github
     return meta
 @
 
@@ -1276,6 +1303,26 @@ def test_render_todo_markdown():
     assert len(parsed.children) == 2
     assert parsed.children[0].title == "Download"
     assert parsed.children[1].title == "Run tests"
+
+
+def test_github_field_roundtrip():
+    """GitHub field survives editor roundtrip."""
+    item = TodoItem(
+        id=1, title="GH issue",
+        github={
+            "repo": "owner/repo",
+            "type": "issue",
+            "number": "42",
+        },
+    )
+    meta = build_item_metadata(item)
+    assert "github" in meta
+    yaml_str = render_yaml_block(meta)
+    parsed = parse_yaml_block(
+        yaml_str.replace("---\n", "").rstrip("---")
+    )
+    assert parsed["github"]["repo"] == "owner/repo"
+    assert parsed["github"]["number"] == "42"
 @
 
 \subsection{Editor Invocation}
@@ -1594,6 +1641,329 @@ def complete_todo_workers(ctx, args, incomplete):
         return []
 @
 
+\section{GitHub Integration}
+
+Users often track work across both local todos and GitHub issues or
+pull requests. Rather than building a full GitHub API client, we use
+the [[gh]] CLI tool---consistent with how the project uses external
+tools like AFS commands and editors. The [[gh]] CLI handles
+authentication out of the box and provides JSON output suitable for
+parsing.
+
+Why not use the GitHub REST API directly? Because [[gh]] manages
+OAuth tokens, handles rate limiting, and supports both
+github.com and GitHub Enterprise without extra configuration. The
+subprocess overhead is negligible for interactive use.
+
+\subsection{GitHub Helper Functions}
+
+Why wrap every [[gh]] call in its own function rather than calling
+[[subprocess.run]] directly? Because the wrappers handle error
+checking and JSON parsing uniformly, and they make the commands
+testable---tests can mock the wrapper functions rather than
+inspecting [[subprocess]] call arguments. Errors produce
+actionable messages (install [[gh]], run [[gh auth login]]).
+
+<<github helpers>>=
+def gh_available():
+    """Check if gh CLI is installed and authenticated.
+
+    Returns True if ``gh auth status`` exits successfully.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+@
+
+Before running any GitHub command we check availability and give
+a helpful error message pointing users to the right fix:
+
+<<github helpers>>=
+def require_gh():
+    """Ensure gh CLI is available, exit with help if not."""
+    if not gh_available():
+        typer.echo(
+            "Error: gh CLI not available. "
+            "Install with: sudo apt install gh "
+            "or brew install gh\n"
+            "Then authenticate with: gh auth login",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+Fetching a single issue or pull request returns the full JSON
+object including comments, which we use for the [[view]] command:
+
+<<github helpers>>=
+def gh_fetch_issue(repo, number):
+    """Fetch a GitHub issue with comments.
+
+    Returns parsed JSON with title, body, state,
+    comments, and labels.
+    """
+    result = subprocess.run(
+        [
+            "gh", "issue", "view",
+            str(number), "-R", repo,
+            "--json",
+            "title,body,state,comments,labels",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue view failed: "
+            f"{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+
+
+def gh_fetch_pr(repo, number):
+    """Fetch a GitHub pull request with comments.
+
+    Returns parsed JSON with title, body, state,
+    comments, and labels.
+    """
+    result = subprocess.run(
+        [
+            "gh", "pr", "view",
+            str(number), "-R", repo,
+            "--json",
+            "title,body,state,comments,labels",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh pr view failed: "
+            f"{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+@
+
+Closing requires separate functions for issues and PRs because
+[[gh]] uses distinct subcommands ([[gh issue close]] vs
+[[gh pr close]])---unlike commenting, which uses a shared
+endpoint:
+
+<<github helpers>>=
+def gh_close_issue(repo, number):
+    """Close a GitHub issue."""
+    result = subprocess.run(
+        [
+            "gh", "issue", "close",
+            str(number), "-R", repo,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue close failed: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def gh_close_pr(repo, number):
+    """Close a GitHub pull request."""
+    result = subprocess.run(
+        [
+            "gh", "pr", "close",
+            str(number), "-R", repo,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh pr close failed: "
+            f"{result.stderr.strip()}"
+        )
+@
+
+Listing issues and PRs returns summaries for bulk import. We
+include [[createdAt]] because the age-based priority heuristic
+in the [[import]] command needs timestamps to rank items:
+
+<<github helpers>>=
+def gh_list_issues(repo):
+    """List open issues from a GitHub repository.
+
+    Returns a list of dicts with number, title, body,
+    state, labels, and createdAt fields.
+    """
+    result = subprocess.run(
+        [
+            "gh", "issue", "list",
+            "-R", repo,
+            "--json",
+            "number,title,body,state,"
+            "labels,createdAt",
+            "--limit", "100",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue list failed: "
+            f"{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+
+
+def gh_list_prs(repo):
+    """List open pull requests from a repository.
+
+    Returns a list of dicts with number, title, body,
+    state, labels, and createdAt fields.
+    """
+    result = subprocess.run(
+        [
+            "gh", "pr", "list",
+            "-R", repo,
+            "--json",
+            "number,title,body,state,"
+            "labels,createdAt",
+            "--limit", "100",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh pr list failed: "
+            f"{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+@
+
+Adding a comment works identically for issues and PRs because
+GitHub's API treats them as the same comment endpoint. We use
+[[gh issue comment]] which handles both:
+
+<<github helpers>>=
+def gh_add_comment(repo, number, body):
+    """Add a comment to a GitHub issue or PR.
+
+    Works for both issues and pull requests since
+    GitHub uses a shared comment endpoint.
+    """
+    result = subprocess.run(
+        [
+            "gh", "issue", "comment",
+            str(number), "-R", repo,
+            "--body", body,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh comment failed: "
+            f"{result.stderr.strip()}"
+        )
+@
+
+\subsection{Testing GitHub Helpers}
+
+We test the helper functions using mocked [[subprocess.run]]
+calls. This verifies our argument construction and JSON parsing
+without requiring a live [[gh]] installation or network access.
+
+<<test functions>>=
+def test_gh_available_when_installed():
+    """gh_available returns True when gh auth succeeds."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        assert gh_available() is True
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["gh", "auth", "status"]
+
+
+def test_gh_available_when_not_installed():
+    """gh_available returns False on FileNotFoundError."""
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        side_effect=FileNotFoundError,
+    ):
+        assert gh_available() is False
+
+
+def test_gh_fetch_issue():
+    """gh_fetch_issue parses JSON response correctly."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps({
+        "title": "Bug report",
+        "body": "Something is broken",
+        "state": "OPEN",
+        "comments": [],
+        "labels": [{"name": "bug"}],
+    })
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        data = gh_fetch_issue("owner/repo", 42)
+        assert data["title"] == "Bug report"
+        assert data["state"] == "OPEN"
+
+
+def test_gh_list_issues():
+    """gh_list_issues returns list of issue dicts."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 1,
+            "title": "First issue",
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 2,
+            "title": "Second issue",
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        items = gh_list_issues("owner/repo")
+        assert len(items) == 2
+        assert items[0]["number"] == 1
+
+
+def test_gh_add_comment():
+    """gh_add_comment calls gh with correct args."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        gh_add_comment("owner/repo", 42, "Hello")
+        args = mock_run.call_args[0][0]
+        assert "comment" in args
+        assert "42" in args
+        assert "--body" in args
+@
+
 \section{Subcommands}
 
 We organize commands by workflow: adding and listing items, completing
@@ -1605,6 +1975,7 @@ exporting to calendars.
 <<status change commands>>
 <<tracking commands>>
 <<export commands>>
+<<github commands>>
 @
 
 <<item management commands>>=
@@ -2496,9 +2867,63 @@ if item.wd:
     typer.echo(f"  WD: {item.wd}")
 if item.command:
     typer.echo(f"  Command: {item.command}")
+if item.github:
+    gh = item.github
+    typer.echo(
+        f"  GitHub: {gh['repo']}"
+        f"#{gh['number']} ({gh.get('type', 'issue')})"
+    )
 if item.description:
     typer.echo(f"  Description: {item.description}")
-if item.notes:
+<<display notes>>
+@
+
+For GitHub-linked items, we fetch the issue body and comments
+directly from GitHub so the user always sees the latest content.
+For local-only items, we display the stored [[notes]] field. This
+design means GitHub is the source of truth for notes on linked
+items---we never cache them locally, avoiding stale data.
+
+<<display notes>>=
+if item.github:
+    try:
+        gh = item.github
+        repo = gh["repo"]
+        number = gh["number"]
+        item_type = gh.get("type", "issue")
+        if item_type == "pr":
+            data = gh_fetch_pr(repo, number)
+        else:
+            data = gh_fetch_issue(repo, number)
+        if data.get("body"):
+            typer.echo("")
+            typer.echo("Description:")
+            for line in data["body"].splitlines():
+                typer.echo(f"  {line}")
+        comments = data.get("comments", [])
+        if comments:
+            typer.echo("")
+            typer.echo("Comments:")
+            for comment in comments:
+                author = comment.get(
+                    "author", {}
+                ).get("login", "unknown")
+                created = comment.get(
+                    "createdAt", ""
+                )[:10]
+                typer.echo(
+                    f"  [{author} {created}]"
+                )
+                body = comment.get("body", "")
+                for line in body.splitlines():
+                    typer.echo(f"    {line}")
+                typer.echo("")
+    except Exception as e:
+        typer.echo(
+            f"  (Could not fetch GitHub data: {e})",
+            err=True,
+        )
+elif item.notes:
     typer.echo("")
     typer.echo("Notes:")
     for line in item.notes.splitlines():
@@ -2696,6 +3121,8 @@ if "estimate" in meta:
     item.estimated = meta["estimate"]
 if "who" in meta:
     item.who = meta["who"]
+if "github" in meta:
+    item.github = meta["github"]
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -2893,6 +3320,7 @@ def done(
     typer.echo(f"Done: #{todo_id} {item.title}")
 
     <<stop tracking if active>>
+    <<close github issue>>
     <<check parent auto-completion>>
 
     save_todos(next_id, todos)
@@ -2921,6 +3349,34 @@ except ImportError:
     pass
 @
 
+When a todo linked to a GitHub issue or PR is marked done, we also
+close the corresponding item on GitHub. This keeps the two systems
+in sync without requiring a separate [[sync]] step. We catch
+errors gracefully---network issues should not prevent the local
+state change from completing.
+
+<<close github issue>>=
+if item.github:
+    try:
+        repo = item.github["repo"]
+        number = item.github["number"]
+        item_type = item.github.get("type", "issue")
+        if item_type == "pr":
+            gh_close_pr(repo, number)
+        else:
+            gh_close_issue(repo, number)
+        typer.echo(
+            f"  Closed {item_type} #{number} "
+            f"on {repo}"
+        )
+    except Exception as e:
+        typer.echo(
+            f"  Warning: could not close "
+            f"GitHub {item_type}: {e}",
+            err=True,
+        )
+@
+
 <<check parent auto-completion>>=
 if item.parent_id is not None:
     if check_parent_completion(todos, item.parent_id):
@@ -2934,6 +3390,43 @@ if item.parent_id is not None:
                 f"  Parent #{parent_item.id} "
                 f"auto-completed: {parent_item.title}"
             )
+@
+
+Let's verify that completing a GitHub-linked todo also closes the
+issue on GitHub:
+
+<<test functions>>=
+def test_done_closes_github_issue(temp_todo_dir):
+    """Completing a GitHub-linked todo closes the issue."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Fix bug",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "42",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["done", "1"],
+        )
+        assert result.exit_code == 0
+        assert "Closed issue #42" in result.output
+        # Verify gh issue close was called
+        calls = mock_run.call_args_list
+        close_call = [
+            c for c in calls
+            if "close" in c[0][0]
+        ]
+        assert len(close_call) >= 1
 @
 
 \subsection{The \texttt{rm} Command}
@@ -3780,6 +4273,574 @@ def generate_schedule_ics(
     return str(cal)
 @
 
+\subsection{The \texttt{import} Command}
+
+The [[import]] command fetches GitHub issues and/or pull requests
+and creates local todo items for them. This is the primary
+onboarding path for GitHub-tracked work into the local priority
+system.
+
+The [[--skip-priority]] flag deserves special attention. When
+importing many items, running interactive binary search for each
+would be tedious. Instead, we offer an age-based heuristic:
+older issues get lower priority, since items that have lingered
+are implicitly less urgent than recent ones. We scale
+[[created_at]] timestamps linearly across the batch so the
+newest item gets the highest priority.
+
+<<github commands>>=
+<<import command>>
+<<sync command>>
+<<note command>>
+@
+
+<<import command>>=
+@cli.command(name="import")
+def import_github(
+    repo: str = typer.Argument(
+        ..., help="GitHub repo (owner/repo)",
+    ),
+    label: Optional[List[str]] = typer.Option(
+        None, "--label", "-l",
+        help="Add label to imported items",
+    ),
+    item_type: str = typer.Option(
+        "all", "--type", "-t",
+        help="Import type: issue, pr, or all",
+    ),
+    skip_priority: bool = typer.Option(
+        False, "--skip-priority",
+        help="Use age-based priority heuristic",
+    ),
+):
+    """Import GitHub issues/PRs as todo items."""
+    require_gh()
+    next_id, todos = load_todos()
+
+    <<fetch github items>>
+    <<filter already imported>>
+    <<create todos from github items>>
+
+    save_todos(next_id, todos)
+    typer.echo(f"Imported {imported_count} items.")
+@
+
+We fetch issues, PRs, or both depending on the [[--type]] flag:
+
+<<fetch github items>>=
+gh_items = []
+if item_type in ("all", "issue"):
+    for issue in gh_list_issues(repo):
+        issue["_type"] = "issue"
+        gh_items.append(issue)
+if item_type in ("all", "pr"):
+    for pr in gh_list_prs(repo):
+        pr["_type"] = "pr"
+        gh_items.append(pr)
+@
+
+We skip items that already exist locally by matching on repo,
+type, and number---preventing duplicate imports:
+
+<<filter already imported>>=
+existing = set()
+for t in todos:
+    if t.github:
+        key = (
+            t.github["repo"],
+            t.github.get("type", "issue"),
+            t.github["number"],
+        )
+        existing.add(key)
+
+new_items = []
+for gh_item in gh_items:
+    key = (
+        repo,
+        gh_item["_type"],
+        str(gh_item["number"]),
+    )
+    if key not in existing:
+        new_items.append(gh_item)
+@
+
+The age-based priority heuristic scales creation timestamps
+linearly so that the newest item in the batch gets the highest
+priority. If the user prefers interactive ranking, we fall back
+to binary search:
+
+<<create todos from github items>>=
+if skip_priority and new_items:
+    <<compute age-based priorities>>
+else:
+    priorities = {}
+
+imported_count = 0
+for gh_item in new_items:
+    gh_labels = [
+        lb["name"]
+        for lb in gh_item.get("labels", [])
+    ]
+    if label:
+        gh_labels.extend(label)
+
+    gh_state = gh_item.get("state", "OPEN")
+    status = (
+        "done"
+        if gh_state in ("CLOSED", "MERGED")
+        else "pending"
+    )
+
+    if skip_priority:
+        priority = priorities.get(
+            gh_item["number"], 0.0
+        )
+    else:
+        active = [
+            t for t in todos
+            if t.status != "done"
+            and t.parent_id is None
+        ]
+        active.sort(
+            key=effective_priority, reverse=True
+        )
+        priority = binary_search_priority(
+            active, gh_item["title"]
+        )
+
+    item = TodoItem(
+        id=next_id,
+        title=gh_item["title"],
+        labels=gh_labels,
+        priority=priority,
+        status=status,
+        created=(
+            datetime.datetime.now().isoformat()
+        ),
+        github={
+            "repo": repo,
+            "type": gh_item["_type"],
+            "number": str(gh_item["number"]),
+        },
+    )
+    todos.append(item)
+    next_id += 1
+    imported_count += 1
+    typer.echo(
+        f"  #{item.id} {item.title} "
+        f"({gh_item['_type']} "
+        f"#{gh_item['number']})"
+    )
+@
+
+The age heuristic maps creation dates to priorities in the
+range~$[0, 1]$, with the oldest item at~0 and the newest at~1.
+Users can later reprioritize individual items to interleave
+them with existing work.
+
+Items missing a [[createdAt]] field (malformed API responses) get a
+far-past fallback so they sort to the bottom of the batch:
+
+<<constants>>=
+GH_FALLBACK_CREATED = "2020-01-01T00:00:00Z"
+@
+
+<<compute age-based priorities>>=
+timestamps = []
+for gh_item in new_items:
+    created = gh_item.get(
+        "createdAt", GH_FALLBACK_CREATED
+    )
+    dt = datetime.datetime.fromisoformat(
+        created.replace("Z", "+00:00")
+    )
+    timestamps.append((dt, gh_item["number"]))
+
+timestamps.sort()
+n = len(timestamps)
+if n == 1:
+    priorities = {timestamps[0][1]: 0.0}
+else:
+    priorities = {}
+    for i, (dt, num) in enumerate(timestamps):
+        priorities[num] = float(i) / (n - 1)
+@
+
+Let's verify that importing skips items already present locally,
+preventing duplicates on repeated imports:
+
+<<test functions>>=
+def test_import_skips_duplicates(temp_todo_dir):
+    """Import should not create duplicates."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Existing issue",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "1",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 1,
+            "title": "Existing issue",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 2,
+            "title": "New issue",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1 items" in result.output
+        _, todos = load_todos()
+        assert len(todos) == 2
+        assert todos[1].title == "New issue"
+        assert todos[1].github["number"] == "2"
+@
+
+\subsection{The \texttt{sync} Command}
+
+The [[sync]] command implements bidirectional synchronization:
+local done status propagates to GitHub (close the issue), and
+GitHub closed status propagates locally (mark as done). Title
+changes on GitHub are also pulled in.
+
+We intentionally continue on individual item failures---a
+network blip for one issue should not prevent syncing the rest.
+
+<<sync command>>=
+@cli.command()
+def sync(
+    repo: Optional[str] = typer.Option(
+        None, "--repo", "-r",
+        help="Only sync items from this repo",
+    ),
+):
+    """Sync todo items with GitHub issues/PRs."""
+    require_gh()
+    next_id, todos = load_todos()
+    changes = 0
+
+    for item in todos:
+        if not item.github:
+            continue
+        if repo and item.github["repo"] != repo:
+            continue
+
+        gh = item.github
+        item_type = gh.get("type", "issue")
+        try:
+            if item_type == "pr":
+                data = gh_fetch_pr(
+                    gh["repo"], gh["number"]
+                )
+            else:
+                data = gh_fetch_issue(
+                    gh["repo"], gh["number"]
+                )
+        except Exception as e:
+            typer.echo(
+                f"  Warning: #{item.id} "
+                f"fetch failed: {e}",
+                err=True,
+            )
+            continue
+
+        gh_state = data.get("state", "OPEN")
+        <<sync state from github>>
+        <<sync state to github>>
+        <<sync title from github>>
+
+    save_todos(next_id, todos)
+    typer.echo(f"Sync complete. {changes} changes.")
+@
+
+If GitHub shows the item as closed but our local copy is still
+open, we mark it done locally and stop tracking if active:
+
+<<sync state from github>>=
+if (
+    gh_state in ("CLOSED", "MERGED")
+    and item.status != "done"
+):
+    item.status = "done"
+    changes += 1
+    typer.echo(
+        f"  #{item.id} marked done "
+        f"(closed on GitHub)"
+    )
+    try:
+        from nytid.cli.track import (
+            load_active_session,
+            save_active_session,
+            add_completed_entries,
+        )
+        worker = item.who or "me"
+        session = load_active_session(worker)
+        todo_label = f"todo:{item.id}"
+        if todo_label in (
+            session.get_active_labels()
+        ):
+            entries = session.stop_labels(
+                [todo_label]
+            )
+            if entries:
+                add_completed_entries(entries)
+                save_active_session(
+                    session, worker
+                )
+    except ImportError:
+        pass
+@
+
+Conversely, if our local item is done but GitHub still shows
+it as open, we close it on GitHub:
+
+<<sync state to github>>=
+if (
+    item.status == "done"
+    and gh_state == "OPEN"
+):
+    try:
+        if item_type == "pr":
+            gh_close_pr(
+                gh["repo"], gh["number"]
+            )
+        else:
+            gh_close_issue(
+                gh["repo"], gh["number"]
+            )
+        changes += 1
+        typer.echo(
+            f"  #{item.id} closed on GitHub"
+        )
+    except Exception as e:
+        typer.echo(
+            f"  Warning: #{item.id} "
+            f"close failed: {e}",
+            err=True,
+        )
+@
+
+Title drift is common---someone edits the issue title on GitHub
+and the local copy gets stale. We silently update to match:
+
+<<sync title from github>>=
+gh_title = data.get("title", "")
+if gh_title and gh_title != item.title:
+    old_title = item.title
+    item.title = gh_title
+    changes += 1
+    typer.echo(
+        f"  #{item.id} title updated: "
+        f"{old_title} -> {gh_title}"
+    )
+@
+
+We verify that sync correctly marks a local item as done when
+the corresponding GitHub issue has been closed:
+
+<<test functions>>=
+def test_sync_marks_done_from_github(
+    temp_todo_dir,
+):
+    """Sync marks local item done when GitHub is closed."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Old issue",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "10",
+            },
+        ),
+    ])
+    auth_result = MagicMock()
+    auth_result.returncode = 0
+    view_result = MagicMock()
+    view_result.returncode = 0
+    view_result.stdout = json.dumps({
+        "title": "Old issue",
+        "body": "",
+        "state": "CLOSED",
+        "comments": [],
+        "labels": [],
+    })
+
+    def mock_subprocess(cmd, **kwargs):
+        if "auth" in cmd:
+            return auth_result
+        return view_result
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        side_effect=mock_subprocess,
+    ):
+        result = runner.invoke(
+            cli, ["sync"],
+        )
+        assert result.exit_code == 0
+        assert "marked done" in result.output
+        _, todos = load_todos()
+        assert todos[0].status == "done"
+@
+
+\subsection{The \texttt{note} Command}
+
+The [[note]] command adds a note to a todo item. For
+GitHub-linked items, it posts a comment on the issue or PR. For
+local items, it appends to the [[notes]] field.
+
+Message source follows a priority chain: [[--message]] flag
+first, [[--edit]] opens an editor, and if neither is given, we
+read from standard input. This mirrors [[git commit]]'s
+[[--message]] vs editor workflow.
+
+<<note command>>=
+@cli.command()
+def note(
+    todo_id: int = typer.Argument(
+        ..., help="Todo ID to add note to",
+        autocompletion=complete_todo_ids,
+    ),
+    message: Optional[str] = typer.Option(
+        None, "--message", "-m",
+        help="Note text (inline)",
+    ),
+    edit: bool = typer.Option(
+        False, "--edit", "-E",
+        help="Open editor for note",
+    ),
+):
+    """Add a note to a todo item."""
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    <<resolve note text>>
+    <<post or append note>>
+@
+
+<<resolve note text>>=
+if message:
+    note_text = message
+elif edit:
+    initial = ""
+    if not item.github and item.notes:
+        initial = item.notes
+    note_text = open_editor(initial)
+    if not note_text.strip():
+        typer.echo("Empty note, cancelled.")
+        raise typer.Exit(0)
+else:
+    note_text = sys.stdin.read()
+    if not note_text.strip():
+        typer.echo("Empty note, cancelled.")
+        raise typer.Exit(0)
+@
+
+<<post or append note>>=
+if item.github:
+    require_gh()
+    gh = item.github
+    gh_add_comment(
+        gh["repo"], gh["number"], note_text
+    )
+    typer.echo(
+        f"Comment posted on "
+        f"{gh['repo']}#{gh['number']}"
+    )
+else:
+    if item.notes:
+        item.notes += "\n" + note_text
+    else:
+        item.notes = note_text
+    save_todos(next_id, todos)
+    typer.echo(f"Note added to #{todo_id}")
+@
+
+The [[note]] command routes through two paths: GitHub comments for
+linked items, or local append for unlinked items. Let's verify
+both:
+
+<<test functions>>=
+def test_note_posts_github_comment(temp_todo_dir):
+    """Note command posts comment for GitHub items."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="GH issue",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "5",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli,
+            ["note", "1", "-m", "Test comment"],
+        )
+        assert result.exit_code == 0
+        assert "Comment posted" in result.output
+
+
+def test_note_appends_locally(temp_todo_dir):
+    """Note command appends for local items."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="Existing note",
+        ),
+    ])
+    result = runner.invoke(
+        cli,
+        ["note", "1", "-m", "New note"],
+    )
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert "Existing note" in todos[0].notes
+    assert "New note" in todos[0].notes
+@
+
 \section{Tests}
 
 The test file follows the same pattern as [[track.nw]]: a fixture
@@ -3824,6 +4885,15 @@ from nytid.cli.todo import (
     render_yaml_block,
     build_item_metadata,
     DEFAULT_MAX_BOOST,
+    gh_available,
+    gh_fetch_issue,
+    gh_fetch_pr,
+    gh_close_issue,
+    gh_close_pr,
+    gh_list_issues,
+    gh_list_prs,
+    gh_add_comment,
+    require_gh,
 )
 
 runner = CliRunner()
