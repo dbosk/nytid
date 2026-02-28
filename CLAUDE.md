@@ -34,53 +34,74 @@ cd tests && make test  # Expected: 14/24 tests pass (failures due to missing Can
 poetry run nytid --help
 ```
 
-**Key commands:**
-- `make clean && make all` - Clean rebuild
-- `poetry run nytid courses ls` - List courses
-- `poetry run nytid schedule show` - Show schedules
-- `poetry run nytid hr --help` - HR/timesheet commands
-- `poetry run nytid todo --help` - Task management
-- `poetry run nytid track --help` - Time tracking
+**Commonly used commands:**
+- `make clean && make all` — Clean rebuild of all generated files
+- `cd tests && make test` — Run full test suite
+- `cd tests && poetry run pytest test_courses.py -v` — Run a single test file
+- `cd tests && poetry run pytest test_courses.py::test_function_name -v` — Run a single test function
+- `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
 
-## Repository Structure
+## Architecture
+
+### CLI Auto-Discovery
+
+The entry point is `nytid.cli:cli` (defined in `pyproject.toml`). The CLI module (`src/nytid/cli/__init__.py`, generated from `init.nw`) dynamically discovers and loads all sibling Python modules in the `cli/` package. Each CLI module (courses, schedule, hr, todo, track, etc.) exports a `cli` Typer instance which gets registered as a subcommand group automatically. To add a new CLI subcommand group, create a new `.nw` file in `src/nytid/cli/` that defines a `cli = typer.Typer(...)` and register the generated `.py` file in `src/nytid/cli/Makefile` under `MODULES`.
+
+### Build System (Cascading Makefiles)
+
+The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.mk`:
+- `subdir.mk` recurses into directories listed in `SUBDIR` for goals listed in `SUBDIR_GOALS`
+- `noweb.mk` provides rules to tangle `.nw` → `.py` (via `notangle`) and weave `.nw` → `.tex` (via `noweave`), then formats Python with `black`
+- Each subdirectory has its own `Makefile` declaring `MODULES` (generated `.py` files) and `SUBDIR` (child directories)
+- The build cascades: root `Makefile` → `src/nytid/Makefile` → `cli/Makefile`, `storage/Makefile`, etc.
+
+### Generated vs Handwritten Files
+
+**Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`). The `.gitignore` lists all generated paths. The only handwritten Python files are:
+- `src/nytid/__init__.py` (empty package marker)
+- `src/nytid/signup/__init__.py`
+- `src/nytid/signup/hr/timesheet/__init__.py`
+- `src/nytid/httputils.py` (legacy, being replaced by `http_utils.nw`)
+
+### Documentation and Source Relationship
+
+`doc/nytid.tex` is the main document that `\input`s the `.tex` files woven from each `.nw` source file. **When adding a new `.nw` file in `src/`, you must also add a corresponding `\input{../src/...}` line in `doc/nytid.tex`**, otherwise it won't appear in the built documentation.
+
+The document is organized into parts mirroring the source tree:
+- Part I "The CLI" — `src/nytid/cli/*.tex`
+- Part II "Storage" — `src/nytid/storage/*.tex`
+- Part III "Managing courses" — `src/nytid/courses/*.tex`
+- Part IV "Core library" — `src/nytid/schedules.tex`, `src/nytid/signup/*.tex`
+
+**Keep these three descriptions in sync** — they all describe what nytid is and does:
+- `doc/abstract.tex` — LaTeX abstract for the PDF documentation
+- `README.md` — GitHub project description
+- `src/nytid/cli/init.nw` — the `<<nytid description>>` chunk (becomes the CLI `--help` text)
+
+### Module Layers
 
 ```
-nytid/
-├── src/nytid/           # Source code (literate programming .nw files)
-│   ├── cli/             # Command-line interface modules
-│   │   ├── courses.nw   #   Course management commands
-│   │   ├── hr.nw        #   HR/timesheet commands
-│   │   ├── schedule.nw  #   Schedule display commands
-│   │   ├── signupsheets.nw # Sign-up sheet commands
-│   │   ├── todo.nw      #   Task management commands
-│   │   ├── track.nw     #   Time tracking commands
-│   │   └── utils/       #   Utility subcommands (rooms, etc.)
-│   ├── courses/         # Course management
-│   ├── signup/          # Sign-up sheet management
-│   ├── storage/         # Storage backends (AFS)
-│   ├── http_utils.nw    # HTTP utilities
-│   └── schedules.nw     # Schedule handling
-├── tests/               # Test suite (generates from .nw files)
-├── doc/                 # Documentation (LaTeX/PDF generation)
-├── makefiles/           # Build system (git submodule)
-├── pyproject.toml       # Poetry configuration
-└── poetry.lock          # Dependency lock file
+CLI layer (src/nytid/cli/)     → Typer commands, user-facing interface
+  ↓ uses
+Library layer (src/nytid/)     → schedules.nw, courses/, signup/, storage/
+  ↓ integrates with
+External services              → Canvas LMS, LADOK, AFS
 ```
 
 ## Literate Programming
 
 This project uses literate programming (noweb) with two fundamental goals:
-1. **Explain to human beings what we want a computer to do** - Write for human readers
-2. **Present concepts in psychological order** - Introduce ideas when easiest to understand, not when the compiler needs them
+1. **Explain to human beings what we want a computer to do** — Write for human readers
+2. **Present concepts in psychological order** — Introduce ideas when easiest to understand, not when the compiler needs them
 
 ### Core Principles
 
-- **Explain the "why"** - If you find yourself writing code comments to explain logic, that explanation belongs in the documentation chunks instead
-- **Write documentation first** - Start with explanation, then add code
-- **Keep lines under 80 characters** - Both in documentation and code chunks
-- **Use meaningful chunk names** - Describe purpose like pseudocode (2-5 words)
-- **Decompose by concept** - Break code into chunks based on logical units
-- **Never commit generated files** - Only commit .nw files; .py and .tex files are build artifacts
+- **Explain the "why"** — If you find yourself writing code comments to explain logic, that explanation belongs in the documentation chunks instead
+- **Write documentation first** — Start with explanation, then add code
+- **Keep lines under 80 characters** — Both in documentation and code chunks
+- **Use meaningful chunk names** — Describe purpose like pseudocode (2-5 words)
+- **Decompose by concept** — Break code into chunks based on logical units
+- **Never commit generated files** — Only commit .nw files; .py and .tex files are build artifacts
 
 ### Noweb File Format
 
@@ -112,10 +133,10 @@ if n <= 1:
 ### Variation Theory Structure
 
 Structure literate programs using variation theory patterns:
-- **Start with the whole** - Present the complete picture first
-- **Use contrast** - Show what something IS vs what it is NOT
-- **Examine parts** - Break down and explain each component
-- **Reassemble** - Show how parts work together
+- **Start with the whole** — Present the complete picture first
+- **Use contrast** — Show what something IS vs what it is NOT
+- **Examine parts** — Break down and explain each component
+- **Reassemble** — Show how parts work together
 
 ### Progressive Disclosure with Chunk Concatenation
 
@@ -141,6 +162,10 @@ next: bool = False
 @
 ```
 
+### Chunk Dependency Hazard
+
+When a code chunk is defined in multiple concatenated blocks (e.g., `<<options for filtering>>` above), every code path that uses values from those blocks must appear AFTER all the blocks. If implementation code references a variable set in a later concatenation block, `notangle` will produce code where the variable is used before it's defined — causing `UnboundLocalError` at runtime.
+
 ### Test Organization
 
 Tests should appear AFTER the functionality they verify:
@@ -162,7 +187,7 @@ def test_feature_x():
 ### Workflow for Modifying .nw Files
 
 1. **Read the existing file** to understand current structure and narrative
-2. **Plan with literate programming in mind** - What is the "why"? How does it fit the narrative?
+2. **Plan with literate programming in mind** — What is the "why"? How does it fit the narrative?
 3. **Design documentation BEFORE writing code**
 4. **Decompose code into well-named chunks**
 5. **Regenerate with `make all` and test**
