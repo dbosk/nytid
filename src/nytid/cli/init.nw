@@ -1954,58 +1954,149 @@ To check what the agent has been assigned:
   \mintinline{bash}{nytid todo ls --who dan-claude}
 \end{description}
 
-The [[who]] field assigns ownership of a todo; the [[command]] field tells the
-system how to launch the agent when the task is started.
-When \mintinline{bash}{nytid todo start <id>} is run for a todo assigned to
-[[dan-claude]] with a [[command]] set, it spawns the command as a subprocess in
-the todo's working directory with the stored environment.
-This is how the agent is bootstrapped: through the [[--run]]/[[command]]
-mechanism documented in \cref{cli.todo}.
+The [[who]] field assigns ownership of a todo; the [[command]]
+field tells the system how to launch the agent when the task is
+started.  When \mintinline{bash}{nytid todo start <id>} is run
+for a todo assigned to [[dan-claude]] with a [[command]] set, it
+spawns the command as a subprocess in the todo's working directory
+with the stored environment.  This is how the agent is
+bootstrapped: through the [[--run]]/[[command]] mechanism
+documented in \cref{cli.todo}.
+
+The auto-parenting feature is central to the agent workflow.
+When [[todo start]] marks a task as in-progress and pushes it
+onto the active stack, any subsequent [[todo add]] calls
+automatically create sub-items under the active task.  This is
+how the agent decomposes a large task into trackable pieces:
+\begin{minted}{bash}
+nytid todo start 5         # push parent -> stack: [5]
+  nytid todo add -t "sub"  # auto-parents under 5
+  nytid todo start 7       # push child  -> stack: [5, 7]
+  nytid todo done          # pop 7       -> stack: [5]
+nytid todo done            # pop 5       -> stack: []
+\end{minted}
 
 \subsection{Agent headless workflow}
 
 The agent runs autonomously in priority order, one task at a time.
-It queries its assigned todos, picks the highest-priority pending item, works on
-it, and either completes it or hands it back with notes explaining the blocker.
+The [[todo next]] command encapsulates the decision loop: if a task
+is currently in-progress, start the highest-priority pending child;
+otherwise start the highest-priority pending task overall.  With
+[[--headless]], it skips interactive prompts so cron can drive it.
 
-\begin{description}
-\item[Agent]
-  \mintinline{bash}{nytid todo ls --who dan-claude} --- find next task
-\item[Agent]
-  \mintinline{bash}{nytid todo start <id>} --- starts tracking as
-  [[--who dan-claude]]
-\item[Agent]
-  \mintinline{bash}{nytid todo done <id>} --- on completion
-\end{description}
+The full cycle looks like this:
+\begin{enumerate}
+\item [[todo next --who dan-claude --headless]] picks and starts
+  the next task.  The stored [[command]] (e.g.\ [[claude]])
+  spawns as a subprocess.
+\item The [[claude]] subprocess decomposes the task into
+  sub-items via [[todo add -t "sub-task"]] (auto-parented).
+\item The subprocess completes sub-tasks via [[todo done]],
+  which pops the active stack.
+\item When all children are done, the parent auto-completes.
+\item If the agent gets stuck, it adds notes and reassigns:
+\begin{minted}{bash}
+nytid todo note <id> -m "Blocked: need access"
+nytid todo edit <id> --reassign dbosk
+\end{minted}
+\end{enumerate}
 
-If the agent gets stuck, it adds notes explaining the blocker and reassigns the
-task back to the teacher:
-\begin{description}
-\item[Agent]
-  \mintinline{bash}{nytid todo edit <id>} --- add notes about the blocker
-\item[Agent]
-  \mintinline{bash}{nytid todo edit <id> --reassign dbosk}
-\end{description}
-
-The teacher can then review the agent's feedback:
+The teacher can review the agent's progress and feedback:
 \begin{description}
 \item[Teacher]
-  \mintinline{bash}{nytid todo ls --who me}
+  \mintinline{bash}{nytid todo ls --who dan-claude --status done}
+\item[Teacher]
+  \mintinline{bash}{nytid todo ls --who me} --- check reassigned
+  items
 \end{description}
 
+\subsection{Automating the agent}
+
 To automate this, we add agent processing to
-[[nytid.hourly.sh]].
-Hooking into the existing hourly job avoids the complexity of a
-separate daemon process. Since agent feedback is asynchronous, an
-hourly polling interval is more than responsive enough.
+[[nytid.hourly.sh]].  Hooking into the existing hourly job avoids
+the complexity of a separate daemon process.  Since agent feedback
+is asynchronous, an hourly polling interval is more than responsive
+enough.
+
+The script is decomposed into three concerns: preventing
+overlapping runs, starting the next task with a timeout, and
+capturing output as notes on the todo item for the teacher to
+review.
+
 <<[[nytid.hourly.sh]]>>=
 ### Run agent todo processing ###
+<<agent concurrency control>>
+<<agent run next task>>
+<<agent capture output>>
+@
 
-for id in $(nytid todo ls --who dan-claude \
-              --format csv | awk -F'\t' 'NR>1{print $1}')
-do
-  nytid todo start ${id}
-done
+\paragraph{Concurrency control.}
+A lock file prevents overlapping cron invocations.  If a previous
+run is still going (its PID is alive), we skip.  Stale lock files
+(dead PID) are cleaned up automatically.
+
+<<agent concurrency control>>=
+AGENT_LOCKFILE="/tmp/nytid-agent.lock"
+AGENT_LOG="${HOME}/.nytid/agent.log"
+mkdir -p "$(dirname "${AGENT_LOG}")"
+trap 'rm -f "${AGENT_LOCKFILE}"' EXIT
+
+if [ -f "${AGENT_LOCKFILE}" ]; then
+  AGENT_PID=$(cat "${AGENT_LOCKFILE}" 2>/dev/null)
+  if kill -0 "${AGENT_PID}" 2>/dev/null; then
+    echo "$(date): Agent running (PID ${AGENT_PID})" \
+      >> "${AGENT_LOG}"
+    exit 0
+  fi
+  rm -f "${AGENT_LOCKFILE}"
+fi
+echo $$ > "${AGENT_LOCKFILE}"
+@
+
+\paragraph{Start the next task.}
+The [[todo next]] command handles all the logic: picking the
+right task, starting it, spawning the subprocess.  The 50-minute
+timeout leaves headroom before the next hourly run.  Output is
+captured to a temporary file.
+
+<<agent run next task>>=
+AGENT_OUTPUT=$(mktemp)
+echo "$(date): Running agent" >> "${AGENT_LOG}"
+timeout 50m nytid todo next --who dan-claude \
+  --headless > "${AGENT_OUTPUT}" 2>&1
+AGENT_EXIT=$?
+@
+
+\paragraph{Capture output as notes.}
+The agent's stdout/stderr is piped into [[nytid todo note]] so
+the teacher can review what the agent did directly on the todo
+item.  On timeout, we log the event and reassign to the teacher.
+
+<<agent capture output>>=
+ACTIVE_ID=$(nytid todo ls --who dan-claude \
+  --status in-progress --format csv \
+  | awk -F'\t' '{print $1; exit}')
+
+if [ -n "${ACTIVE_ID}" ] && [ -s "${AGENT_OUTPUT}" ]; then
+  nytid todo note "${ACTIVE_ID}" \
+    -m "$(cat "${AGENT_OUTPUT}")"
+fi
+
+if [ ${AGENT_EXIT} -eq 124 ]; then
+  echo "$(date): Agent timed out" >> "${AGENT_LOG}"
+  if [ -n "${ACTIVE_ID}" ]; then
+    nytid todo note "${ACTIVE_ID}" \
+      -m "Agent timed out after 50 minutes"
+    nytid todo edit "${ACTIVE_ID}" \
+      --reassign dbosk
+  fi
+elif [ ${AGENT_EXIT} -ne 0 ]; then
+  echo "$(date): Agent exited ${AGENT_EXIT}" \
+    >> "${AGENT_LOG}"
+else
+  echo "$(date): Agent completed" >> "${AGENT_LOG}"
+fi
+rm -f "${AGENT_OUTPUT}"
 @
 
 
