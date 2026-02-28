@@ -2,16 +2,13 @@
          the \texttt{schedule} subcommands}%
 \label{cli.schedule}
 
-In this chapter we introduce the subommands found under [[nytid schedule]],
+In this chapter we introduce the subcommands found under [[nytid schedule]],
 it's the [[cli.schedule]] module.
 <<[[schedule.py]]>>=
 import datetime
 from enum import Enum
-import ics.icalendar
 import ics.event
 import logging
-import os
-import sys
 import typer
 import typerconf as config
 from typing import List
@@ -100,6 +97,7 @@ def ics_cmd(<<argument for matching courses>> = ".*",
 <<set list [[courses]] to ((course, register), config)-pairs>>
 
 schedule = ics.icalendar.Calendar()
+<<set refresh rate for [[schedule]]>>
 <<set refresh rate for [[schedule]], same as TimeEdit>>
 
 booked = []
@@ -272,10 +270,12 @@ However, the ICS library we're using doesn't, but it supports custom properties
 that we can use.
 We can set custom properties by using the [[.extra]] attribute.
 
-There are seemingly two ways to do this.
-One is to set the [[REFRESH-INTERVAL]] property.
-Another, found by inspecting TimeEdit exports, is to set method to [[PUBLISH]] 
-and then add a property [[X-PUBLISHED-TTL]].
+There are seemingly two ways to do this, and we use both for maximum
+client compatibility.
+The standards-track approach is the [[REFRESH-INTERVAL]] property.
+A complementary method, found by inspecting TimeEdit exports, is to set
+method to [[PUBLISH]] and add a property [[X-PUBLISHED-TTL]]; some older
+calendar clients only honour this vendor extension.
 <<set refresh rate for [[schedule]]>>=
 schedule.extra += [ContentLine("REFRESH-INTERVAL",
                                {"VALUE": ["DURATION"]},
@@ -315,7 +315,7 @@ We will use regex to match the courses and registers.
 def show(<<argument for matching courses>> = ".*",
          <<option for matching registers, default to mine>>,
          <<option for username to filter for>>,
-          <<default arguments for start and end dates>>,
+         <<default arguments for start and end dates>>,
          <<options for external calendar sources>>,
          <<printing control options>>):
   """
@@ -426,6 +426,7 @@ def external_rm(source: str):
   """
   sources = [s for s in get_external_sources() if s != source]
   set_external_sources(sources)
+  print(source)
 @
 
 To support scripts and one-off runs, [[schedule show]] can include additional
@@ -522,6 +523,151 @@ def event_bounds(events):
       bounds.append((begin, end))
 
   return bounds
+@
+
+\paragraph{Testing [[local_naive]] and [[event_bounds]]}
+
+The [[local_naive]] function must handle both timezone-aware and naive
+datetimes, since ICS events may arrive in either form.
+The [[event_bounds]] function converts events to plain start/end pairs,
+skipping any events that lack either endpoint.
+<<test functions>>=
+def test_local_naive_with_naive_datetime():
+  dt = datetime.datetime(2024, 6, 1, 10, 0)
+  assert local_naive(dt) == dt
+
+def test_local_naive_with_aware_datetime():
+  import zoneinfo
+  tz = zoneinfo.ZoneInfo("UTC")
+  dt = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=tz)
+  result = local_naive(dt)
+  assert result.tzinfo is None
+
+def test_event_bounds_skips_missing_times():
+  class FakeEvent:
+    def __init__(self, begin, end):
+      self.begin = begin
+      self.end = end
+
+  class FakeArrow:
+    def __init__(self, dt):
+      self._dt = dt
+    @property
+    def datetime(self):
+      return self._dt
+
+  e1 = FakeEvent(
+    FakeArrow(datetime.datetime(2024, 1, 1, 9, 0)),
+    FakeArrow(datetime.datetime(2024, 1, 1, 10, 0)),
+  )
+  e2 = FakeEvent(None, FakeArrow(datetime.datetime(2024, 1, 1, 11, 0)))
+
+  result = event_bounds([e1, e2])
+  assert len(result) == 1
+  assert result[0] == (
+    datetime.datetime(2024, 1, 1, 9, 0),
+    datetime.datetime(2024, 1, 1, 10, 0),
+  )
+@
+
+\paragraph{Testing [[compute_free_slots]]}
+
+Free-slot computation is the core scheduling algorithm.
+Given a set of occupied intervals and a date range, it returns the
+gaps during work hours.
+We test with a fixed work window to avoid dependency on configuration.
+<<test functions>>=
+def test_compute_free_slots_no_events(monkeypatch):
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  # 2024-01-01 is a Monday
+  start = datetime.datetime(2024, 1, 1, 0, 0)
+  end = datetime.datetime(2024, 1, 1, 23, 59)
+
+  # Freeze "now" to the start of the day so it doesn't
+  # clip the work window.
+  monkeypatch.setattr(
+    "nytid.cli.schedule.datetime",
+    type("dt", (), {
+      "datetime": type("inner", (), {
+        "now": staticmethod(lambda: start),
+        "combine": datetime.datetime.combine,
+      }),
+      "timedelta": datetime.timedelta,
+      "time": datetime.time,
+      "date": datetime.date,
+    }),
+  )
+
+  slots = compute_free_slots([], start, end)
+  assert len(slots) == 1
+  assert slots[0] == (
+    datetime.datetime(2024, 1, 1, 9, 0),
+    datetime.datetime(2024, 1, 1, 12, 0),
+  )
+
+def test_compute_free_slots_with_event(monkeypatch):
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  start = datetime.datetime(2024, 1, 1, 0, 0)
+  end = datetime.datetime(2024, 1, 1, 23, 59)
+
+  monkeypatch.setattr(
+    "nytid.cli.schedule.datetime",
+    type("dt", (), {
+      "datetime": type("inner", (), {
+        "now": staticmethod(lambda: start),
+        "combine": datetime.datetime.combine,
+      }),
+      "timedelta": datetime.timedelta,
+      "time": datetime.time,
+      "date": datetime.date,
+    }),
+  )
+
+  occupied = [
+    (datetime.datetime(2024, 1, 1, 10, 0),
+     datetime.datetime(2024, 1, 1, 11, 0)),
+  ]
+  slots = compute_free_slots(occupied, start, end)
+  assert len(slots) == 2
+  assert slots[0] == (
+    datetime.datetime(2024, 1, 1, 9, 0),
+    datetime.datetime(2024, 1, 1, 10, 0),
+  )
+  assert slots[1] == (
+    datetime.datetime(2024, 1, 1, 11, 0),
+    datetime.datetime(2024, 1, 1, 12, 0),
+  )
+
+def test_compute_free_slots_skips_non_work_days(monkeypatch):
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "17:00", ["mon"]),
+  )
+  # 2024-01-02 is a Tuesday
+  start = datetime.datetime(2024, 1, 2, 0, 0)
+  end = datetime.datetime(2024, 1, 2, 23, 59)
+
+  monkeypatch.setattr(
+    "nytid.cli.schedule.datetime",
+    type("dt", (), {
+      "datetime": type("inner", (), {
+        "now": staticmethod(lambda: start),
+        "combine": datetime.datetime.combine,
+      }),
+      "timedelta": datetime.timedelta,
+      "time": datetime.time,
+      "date": datetime.date,
+    }),
+  )
+
+  slots = compute_free_slots([], start, end)
+  assert slots == []
 @
 
 We use the same work-hour settings as [[todo]], so planning behaviour is
@@ -679,14 +825,22 @@ def schedule_todo_events(user, start, end, occupied):
   return scheduled_events
 @
 
-Once we have the course schedule, we merge external calendars and then add
-scheduled todo events.
+Once we have the course schedule, we merge external calendars and then
+schedule todos into the remaining free slots.
+The order matters: external calendar events must be merged \emph{before}
+we compute free slots for todos, because [[compute_free_slots]] treats
+every event already in [[schedule]] as occupied time.
+If we scheduled todos first, they would overlap with external commitments
+that hadn't been added yet.
 <<add external calendar events to [[schedule]]>>=
 external_sources = get_external_sources(external)
 external_calendar = schedutils.read_calendars(external_sources)
 schedule.events.update(external_calendar.events)
 @
 
+With all occupied time now in [[schedule]], we extract the busy intervals
+and greedily fill the remaining work-hour slots with todos, sorted by
+effective priority.
 <<add scheduled todo events to [[schedule]]>>=
 occupied = event_bounds(schedule.events)
 schedule.events.update(schedule_todo_events(user,
