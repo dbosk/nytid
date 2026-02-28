@@ -2443,8 +2443,16 @@ save_todos(next_id, todos)
 We build a metadata dictionary from CLI flags so the editor opens
 with a pre-populated YAML block. The key names match those used by
 [[parse_yaml_block]] and [[build_item_metadata]], ensuring
-round-trip consistency. We omit keys whose values are empty or
-at their defaults to keep the editor uncluttered.
+round-trip consistency. We omit keys whose values are empty to keep
+the editor uncluttered.
+
+We always emit [[who]] even when it matches [[default_username]].
+This serves two purposes: it makes the assignment explicit so the
+user can see who will own the task, and --- crucially --- it
+reminds the user of the exact attribute name when they want to
+assign a sub-item to someone else.  Without a visible [[who:]]
+key in the parent block, a user adding children has no obvious
+cue that children can carry their own [[who]] field.
 
 <<build initial editor metadata>>=
 initial_meta = {}
@@ -2454,7 +2462,7 @@ if deadline:
     initial_meta["deadline"] = deadline
 if estimate:
     initial_meta["estimate"] = estimate
-if who and who != default_username:
+if who:
     initial_meta["who"] = who
 if wd_path:
     initial_meta["wd"] = os.path.abspath(wd_path)
@@ -2516,22 +2524,31 @@ typer.echo(
 @
 
 Children are created recursively. Each child inherits the parent's
-labels and deadline unless its own YAML block overrides them.
-Priorities are distributed within the range computed by
-[[compute_child_priority_range]] so that children sort between their
-parent and the parent's next-lower sibling in flat view:
+labels, deadline, and assignee unless its own YAML block overrides
+them.  We pass [[parent_who]] explicitly rather than reading
+[[default_username]] again inside the function: the caller already
+knows the resolved assignee (which may be a custom [[--who]] value),
+so passing it through avoids a second lookup and keeps the function
+independent of global state.  Priorities are distributed within the
+range computed by [[compute_child_priority_range]] so that children
+sort between their parent and the parent's next-lower sibling in
+flat view:
 
 <<create children from parsed>>=
 def create_children_from_parsed(
     parsed_children, parent_id,
     parent_labels, parent_deadline,
     priority_high, priority_low,
+    parent_who=None,
 ):
     """Recursively create TodoItems from parsed
     children.
 
     Priorities are distributed evenly in the range
-    (priority_low, priority_high).
+    (priority_low, priority_high).  Each child
+    inherits ``parent_who`` as its assignee unless
+    the child's own YAML block specifies a
+    ``who`` key.
     """
     nonlocal next_id, todos
     priorities = distribute_priorities_in_range(
@@ -2552,12 +2569,17 @@ def create_children_from_parsed(
                 child_labels,
                 child_deadline,
                 nested_high, nested_low,
+                child_who,
             )
 @
 
 Each child overrides its metadata (labels, deadline, working
-directory) from the YAML block in the editor, falling back to the
-parent's values when not specified.  We also capture [[os.environ]]
+directory, assignee) from the YAML block in the editor, falling
+back to the parent's values when not specified.  The [[who]]
+inheritance is especially important: without it, children typed
+in the editor without an explicit [[who:]] key would be created
+unassigned, even though the user intended the whole task tree to
+belong to the same person.  We also capture [[os.environ]]
 at creation time when the child has an explicit working directory,
 so [[todo start]] can restore the environment where it makes sense.
 <<resolve child metadata>>=
@@ -2568,6 +2590,7 @@ child_labels = child_meta.get(
 child_deadline = child_meta.get(
     "deadline", parent_deadline
 )
+child_who = child_meta.get("who", parent_who)
 child_wd = child_meta.get("wd")
 child_env = (
     dict(os.environ) if child_wd else None
@@ -2587,7 +2610,7 @@ child = TodoItem(
     deadline=child_deadline,
     estimated=child_meta.get("estimate"),
     parent_id=parent_id,
-    who=child_meta.get("who"),
+    who=child_who,
     notes=parsed_child.notes,
     wd=child_wd,
     env=child_env,
@@ -2615,7 +2638,8 @@ else:
 @
 
 The call site computes the parent's priority range from its sibling
-context:
+context and passes the parent's [[who]] so that any child lacking
+an explicit [[who:]] in its YAML block inherits the same assignee:
 
 <<create children from parsed>>=
 prio_high, prio_low = compute_child_priority_range(
@@ -2627,14 +2651,18 @@ create_children_from_parsed(
     parent_item.labels,
     parent_item.deadline,
     prio_high, prio_low,
+    parent_item.who,
 )
 @
 
 \subsection{The [[ls]] Command}
 
 The list command shows todos sorted by effective priority. By default
-it displays a tree structure: top-level items with their children
-indented below. The [[--flat]] option disables tree display.
+it shows only top-level items (those without a parent), keeping the
+list scannable without drowning the user in sub-tasks. The [[--all]]
+option enables the full tree view: top-level items with their children
+indented below. The [[--flat]] option shows a flat priority-sorted
+list instead of the indented tree.
 
 We query tracked time by looking for entries with [[todo:<id>]] labels
 in the track data, connecting the todo system to actual time spent.
@@ -2649,9 +2677,17 @@ def ls(
         None, help="Filter by label",
         autocompletion=complete_labels,
     ),
-    all_items: bool = typer.Option(
-        False, "--all", "-a",
+    include_done: bool = typer.Option(
+        False, "--done", "-d",
         help="Include done items",
+    ),
+    show_tree: bool = typer.Option(
+        False, "--all", "-a",
+        help="Show full tree including subtasks",
+    ),
+    count: Optional[int] = typer.Option(
+        None, "-n",
+        help="Limit output to top N items",
     ),
     who_filter: Optional[str] = typer.Option(
         default_username, "--who", "-w",
@@ -2661,7 +2697,7 @@ def ls(
     ),
     flat: bool = typer.Option(
         False, "--flat",
-        help="Flat list (no tree)",
+        help="Flat list (no tree); useful with --all",
     ),
     output_format: str = typer.Option(
         "table", "--format", "-f",
@@ -2682,8 +2718,11 @@ def ls(
 ):
     """List todo items sorted by effective priority.
 
-    By default only shows items assigned to the current user
-    ([[--who]] defaults to [[\\$USER]]); pass an empty string
+    By default shows only top-level items assigned to the current
+    user. Pass [[--all]] to see the full tree including subtasks,
+    or [[-n N]] to cap the output at N items.
+
+    [[--who]] defaults to [[\\$USER]]; pass an empty string
     ([[--who '']]) to show all assignees.
 
     Output format defaults to [[table]], which auto-detects the
@@ -2694,6 +2733,7 @@ def ls(
 
     <<filter todos>>
     <<query tracked time>>
+    <<restrict to top-level when not show_tree>>
 
     <<determine effective format>>
 
@@ -2708,7 +2748,7 @@ def ls(
 The [[--status]] option enables exact status filtering, which the
 agent workflow needs to query only pending tasks without fragile
 [[awk]] filtering in shell scripts.  When [[--status]] is given, it
-takes precedence over [[--all]] since the user has expressed a
+takes precedence over [[--done]] since the user has expressed a
 more specific intent.
 
 <<filter todos>>=
@@ -2718,7 +2758,7 @@ if status_filter:
         t for t in filtered
         if t.status == status_filter
     ]
-elif not all_items:
+elif not include_done:
     filtered = [
         t for t in filtered if t.status != "done"
     ]
@@ -2801,6 +2841,127 @@ except ImportError:
     pass
 @
 
+When [[--all]] is not given, we restrict [[filtered]] to top-level
+items only---those with no parent.  Showing only top-level items
+by default keeps the list scannable: child tasks are subordinate
+detail that the user can reveal on demand.  Applying the restriction
+before the format-selection branch ensures JSON, CSV, and rich
+table output are all consistent.
+
+<<restrict to top-level when not show_tree>>=
+if not show_tree:
+    filtered = [
+        t for t in filtered
+        if t.parent_id is None
+    ]
+@
+
+When [[--all]] is given the tree renderer already handles building
+the top-level list itself, so we leave [[filtered]] untouched.
+
+Let's verify the three new behaviours: the default top-level-only
+view, the [[--all]] tree expansion, and the [[-n]] limit.
+
+<<test functions>>=
+def test_ls_default_hides_children(temp_todo_dir):
+    """Default ls shows only top-level items."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=1,
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "--who", ""]
+    )
+    assert "Parent task" in result.output
+    assert "Child task" not in result.output
+
+
+def test_ls_all_shows_children(temp_todo_dir):
+    """The --all flag reveals the full tree."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=1,
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "--all", "--who", ""]
+    )
+    assert "Parent task" in result.output
+    assert "Child task" in result.output
+
+
+def test_ls_n_limits_output(temp_todo_dir):
+    """The -n flag caps the number of items shown."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="High prio",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=10.0,
+        ),
+        TodoItem(
+            id=2, title="Medium prio",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=3, title="Low prio",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=1.0,
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "-n", "2", "--who", ""]
+    )
+    assert "High prio" in result.output
+    assert "Medium prio" in result.output
+    assert "Low prio" not in result.output
+
+
+def test_ls_done_flag_includes_done(temp_todo_dir):
+    """The --done flag includes completed items."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Active task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Finished task",
+            created="2026-02-20T10:00:00",
+            status="done", who="me",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "--who", ""]
+    )
+    assert "Finished task" not in result.output
+
+    result = runner.invoke(
+        cli, ["ls", "--done", "--who", ""]
+    )
+    assert "Active task" in result.output
+    assert "Finished task" in result.output
+@
 When [[--format]] is [[table]] (the default) we auto-detect the
 output context: a rich table when writing to a terminal, and
 tab-separated CSV otherwise. This lets shell pipelines and
@@ -2825,11 +2986,23 @@ else:
     )
 @
 
+JSON output sorts by effective priority and respects the [[-n]] limit
+just like the rich and CSV paths.  We sort here because JSON consumers
+(scripts, agents) should receive items in the same priority order the
+user would see interactively, and slicing with [[[:count]]] is a
+no-op when [[count]] is [[None]].
+
 <<output json>>=
 import json as json_mod
 
+now = datetime.datetime.now()
+sorted_filtered = sorted(
+    filtered,
+    key=lambda t: effective_priority(t, now),
+    reverse=True,
+)[:count]
 output = []
-for t in filtered:
+for t in sorted_filtered:
     d = t.to_dict()
     d["effective_priority"] = effective_priority(t)
     d["tracked_hours"] = tracked_times.get(t.id, 0)
@@ -2885,7 +3058,7 @@ sorted_items = sorted(
     filtered,
     key=lambda t: effective_priority(t, now),
     reverse=True,
-)
+)[:count]
 for item in sorted_items:
     <<add item row to rich table>>
 @
@@ -2898,6 +3071,7 @@ top_level.sort(
     key=lambda t: effective_priority(t, now),
     reverse=True,
 )
+top_level = top_level[:count]
 for item in top_level:
     <<add item row to rich table>>
     children = sorted(
@@ -3013,7 +3187,7 @@ sorted_items = sorted(
     filtered,
     key=lambda t: effective_priority(t, now),
     reverse=True,
-)
+)[:count]
 dest = open(output, "w", newline="") if output else sys.stdout
 writer = csv.writer(dest, delimiter="\t")
 if output or sys.stdout.isatty():
@@ -3425,6 +3599,10 @@ priorities = distribute_priorities_in_range(
 
 For each child in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
+New children inherit [[who]] from the parent ([[item]]) when their
+YAML block does not specify one --- the same rule as in
+[[create_children_from_parsed]] --- so that adding a sub-task in
+the editor never silently leaves it unassigned.
 We use a set to track which existing children were seen; any that
 remain unseen after this loop were removed in the editor.
 <<update or create each parsed child>>=
@@ -3467,7 +3645,7 @@ for i, parsed_child in enumerate(parsed.children):
                 "deadline", item.deadline
             ),
             parent_id=todo_id,
-            who=child_meta.get("who"),
+            who=child_meta.get("who", item.who),
             notes=parsed_child.notes,
             wd=child_meta.get("wd"),
             command=child_meta.get("command"),
@@ -3517,6 +3695,65 @@ def test_edit_interactive_reconcile():
     assert len(parsed.children) == 1
     assert (
         parsed.children[0].title == "Existing child"
+    )
+
+def test_child_who_appears_in_editor():
+    """Child who field survives render/parse roundtrip.
+
+    Once a child carries a who value the editor must
+    show it so the user can inspect or change it.
+    Without this, the attribute would be invisible
+    during interactive editing and could never be
+    corrected by the user.
+    """
+    parent = TodoItem(
+        id=1, title="Parent",
+        who="alice",
+        created="2026-02-20T10:00:00",
+    )
+    child = TodoItem(
+        id=2, title="Sub-task",
+        parent_id=1, priority=1.0,
+        who="alice",
+        created="2026-02-20T10:00:00",
+    )
+    todos = [parent, child]
+    md = render_todo_markdown(parent, todos)
+    parsed = parse_editor_content(md)
+
+    assert len(parsed.children) == 1
+    assert (
+        parsed.children[0].metadata.get("who")
+        == "alice"
+    )
+
+def test_child_who_override():
+    """A child can override the parent's who field.
+
+    Inheritance is the fallback, not a forced
+    assignment.  A child with an explicit who in
+    its YAML block must keep that value so work can
+    be delegated to someone other than the owner of
+    the parent task.
+    """
+    parent = TodoItem(
+        id=1, title="Parent",
+        who="alice",
+        created="2026-02-20T10:00:00",
+    )
+    child = TodoItem(
+        id=2, title="Delegated sub-task",
+        parent_id=1, priority=1.0,
+        who="bob",
+        created="2026-02-20T10:00:00",
+    )
+    todos = [parent, child]
+    md = render_todo_markdown(parent, todos)
+    parsed = parse_editor_content(md)
+
+    assert (
+        parsed.children[0].metadata.get("who")
+        == "bob"
     )
 @
 
