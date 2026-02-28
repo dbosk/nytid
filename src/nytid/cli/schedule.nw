@@ -11,7 +11,7 @@ import ics.event
 import logging
 import typer
 import typerconf as config
-from typing import List
+from typing import List, Optional
 from typing_extensions import Annotated
 
 from nytid.cli import courses as coursescli
@@ -37,19 +37,6 @@ The first argument we need is to identify a set of courses.
 For this we might also have to identify a set of registers.
 We'll use the argument and option defined in the [[cli.courses]] module.
 We'll default to all courses ([[.*]]) in the register of the [[mine]] command.
-<<constants>>=
-SCHEDULE_EXTERNAL_ICS_CONFIG = "schedule.external_ics"
-
-TODO_WORK_START_CONFIG = "todo.work_start"
-TODO_WORK_END_CONFIG = "todo.work_end"
-TODO_WORK_DAYS_CONFIG = "todo.work_days"
-
-DEFAULT_WORK_START = "08:00"
-DEFAULT_WORK_END = "17:00"
-DEFAULT_WORK_DAYS = "mon,tue,wed,thu,fri"
-DEFAULT_ESTIMATED_HOURS = 1.0
-@
-
 <<argument for matching courses>>=
 course: Annotated[str, coursescli.course_arg_regex]
 <<option for matching registers, default to mine>>=
@@ -392,6 +379,11 @@ def test_update_end_date_equal():
 External calendars can be added once and reused in every
 [[schedule show]] run.
 These events are both displayed and used as occupied time when scheduling todos.
+We persist the list of external sources under the following config key.
+<<constants>>=
+SCHEDULE_EXTERNAL_ICS_CONFIG = "schedule.external_ics"
+@
+
 <<external calendar commands>>=
 externalcli = typer.Typer(name="external",
                           help="Manage external ICS calendars")
@@ -500,6 +492,13 @@ def test_as_list_list():
 
 We combine all visible events into one occupied timeline and schedule todos in
 the remaining work-hour slots.
+
+\paragraph{Stripping timezone information}
+
+ICS events carry timezone-aware Arrow timestamps, but the free-slot
+algorithm uses plain Python [[datetime]] comparisons.
+Rather than repeat the [[astimezone().replace(tzinfo=None)]] conversion
+at every call site, we factor it into [[local_naive]].
 <<helper functions>>=
 def local_naive(dt):
   """
@@ -508,7 +507,32 @@ def local_naive(dt):
   if dt.tzinfo:
     return dt.astimezone().replace(tzinfo=None)
   return dt
+@
 
+The function must handle both timezone-aware and naive datetimes, since
+ICS events may arrive in either form.
+<<test functions>>=
+def test_local_naive_with_naive_datetime():
+  dt = datetime.datetime(2024, 6, 1, 10, 0)
+  assert local_naive(dt) == dt
+
+def test_local_naive_with_aware_datetime():
+  import zoneinfo
+  tz = zoneinfo.ZoneInfo("UTC")
+  dt = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=tz)
+  result = local_naive(dt)
+  assert result.tzinfo is None
+@
+
+\paragraph{Extracting busy intervals}
+
+The free-slot algorithm works with plain [[datetime]] pairs rather than
+ICS event objects, because it needs to merge and compare intervals
+without depending on the calendar library.
+[[event_bounds]] converts events to those pairs, silently skipping
+events that lack either endpoint---all-day events in some calendar
+clients set [[begin]] but leave [[end]] unset.
+<<helper functions>>=
 def event_bounds(events):
   """
   Converts events to (start, end) datetime pairs.
@@ -525,24 +549,7 @@ def event_bounds(events):
   return bounds
 @
 
-\paragraph{Testing [[local_naive]] and [[event_bounds]]}
-
-The [[local_naive]] function must handle both timezone-aware and naive
-datetimes, since ICS events may arrive in either form.
-The [[event_bounds]] function converts events to plain start/end pairs,
-skipping any events that lack either endpoint.
 <<test functions>>=
-def test_local_naive_with_naive_datetime():
-  dt = datetime.datetime(2024, 6, 1, 10, 0)
-  assert local_naive(dt) == dt
-
-def test_local_naive_with_aware_datetime():
-  import zoneinfo
-  tz = zoneinfo.ZoneInfo("UTC")
-  dt = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=tz)
-  result = local_naive(dt)
-  assert result.tzinfo is None
-
 def test_event_bounds_skips_missing_times():
   class FakeEvent:
     def __init__(self, begin, end):
@@ -568,6 +575,146 @@ def test_event_bounds_skips_missing_times():
     datetime.datetime(2024, 1, 1, 9, 0),
     datetime.datetime(2024, 1, 1, 10, 0),
   )
+@
+
+\paragraph{Work hours configuration}
+
+We share work-hour settings with [[todo]] so that slot availability is
+computed identically in both commands---a user who sets
+[[todo.work_start]] will see the same work window in [[schedule show]].
+<<constants>>=
+TODO_WORK_START_CONFIG = "todo.work_start"
+TODO_WORK_END_CONFIG = "todo.work_end"
+TODO_WORK_DAYS_CONFIG = "todo.work_days"
+
+DEFAULT_WORK_START = "08:00"
+DEFAULT_WORK_END = "17:00"
+DEFAULT_WORK_DAYS = "mon,tue,wed,thu,fri"
+@
+
+<<helper functions>>=
+def work_window():
+  """
+  Returns (work_start, work_end, work_days).
+  """
+  try:
+    work_start = config.get(TODO_WORK_START_CONFIG)
+  except KeyError:
+    work_start = DEFAULT_WORK_START
+
+  try:
+    work_end = config.get(TODO_WORK_END_CONFIG)
+  except KeyError:
+    work_end = DEFAULT_WORK_END
+
+  try:
+    work_days = config.get(TODO_WORK_DAYS_CONFIG)
+  except KeyError:
+    work_days = DEFAULT_WORK_DAYS
+
+  if isinstance(work_days, list):
+    work_days = ",".join(str(day) for day in work_days)
+
+  work_days = [d.strip().lower() for d in work_days.split(",")]
+  return work_start, work_end, work_days
+@
+
+\paragraph{Computing free slots}
+
+Given a list of occupied intervals and a date range,
+[[compute_free_slots]] returns all contiguous free intervals that fall
+within configured work hours.
+The algorithm is a day-by-day sweep: for each work day in the range it
+clips the work window to the search bounds, subtracts the occupied
+intervals (sorted by start), and appends any remaining gaps.
+We clip to \emph{now} on the current day so that past time is never
+offered as available---a todo scheduled in a slot that has already
+passed would be confusing.
+<<helper functions>>=
+def compute_free_slots(occupied, start, end):
+  """
+  Returns free slots in [start, end] during work hours.
+  """
+  <<parse work hours>>
+  day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+  now = datetime.datetime.now()
+  free_slots = []
+
+  date = start.date()
+  while date <= end.date():
+    <<skip non-work days>>
+    <<build work window for this day>>
+    <<clip work window to search range and today>>
+    if day_start >= day_end:
+      date += datetime.timedelta(days=1)
+      continue
+    <<subtract occupied intervals>>
+    date += datetime.timedelta(days=1)
+
+  return free_slots
+@
+
+We start by parsing the configuration-sourced time strings into integer
+hours and minutes.
+<<parse work hours>>=
+work_start, work_end, work_days = work_window()
+start_h, start_m = map(int, work_start.split(":"))
+end_h, end_m = map(int, work_end.split(":"))
+@
+
+Weekends and days not listed in [[work_days]] are silently skipped.
+<<skip non-work days>>=
+day_name = day_names[date.weekday()]
+if day_name not in work_days:
+  date += datetime.timedelta(days=1)
+  continue
+@
+
+We construct nominal work-day boundaries as [[datetime]] objects so
+they can be compared directly with event timestamps.
+<<build work window for this day>>=
+day_start = datetime.datetime.combine(
+  date,
+  datetime.time(start_h, start_m),
+)
+day_end = datetime.datetime.combine(
+  date,
+  datetime.time(end_h, end_m),
+)
+@
+
+Three constraints shrink the work window: the overall search [[start]]
+and [[end]] bounds, and the current time on today's date so we never
+schedule in the past.
+<<clip work window to search range and today>>=
+day_start = max(day_start, start)
+day_end = min(day_end, end)
+
+if date == now.date() and now > day_start:
+  day_start = now.replace(second=0, microsecond=0)
+@
+
+We clip each event to the current day's window, sort by start time,
+then walk a cursor forward through the sorted events, appending each
+gap between the cursor and the next event start.
+<<subtract occupied intervals>>=
+day_events = sorted(
+  [
+    (max(s, day_start), min(e, day_end))
+    for s, e in occupied
+    if s < day_end and e > day_start
+  ],
+  key=lambda x: x[0],
+)
+
+cursor = day_start
+for event_start, event_end in day_events:
+  if cursor < event_start:
+    free_slots.append((cursor, event_start))
+  cursor = max(cursor, event_end)
+
+if cursor < day_end:
+  free_slots.append((cursor, day_end))
 @
 
 \paragraph{Testing [[compute_free_slots]]}
@@ -670,111 +817,22 @@ def test_compute_free_slots_skips_non_work_days(monkeypatch):
   assert slots == []
 @
 
-We use the same work-hour settings as [[todo]], so planning behaviour is
-consistent across the CLI.
-<<helper functions>>=
-def work_window():
-  """
-  Returns (work_start, work_end, work_days).
-  """
-  try:
-    work_start = config.get(TODO_WORK_START_CONFIG)
-  except KeyError:
-    work_start = DEFAULT_WORK_START
-
-  try:
-    work_end = config.get(TODO_WORK_END_CONFIG)
-  except KeyError:
-    work_end = DEFAULT_WORK_END
-
-  try:
-    work_days = config.get(TODO_WORK_DAYS_CONFIG)
-  except KeyError:
-    work_days = DEFAULT_WORK_DAYS
-
-  if isinstance(work_days, list):
-    work_days = ",".join(str(day) for day in work_days)
-
-  work_days = [d.strip().lower() for d in work_days.split(",")]
-  return work_start, work_end, work_days
-
-def compute_free_slots(occupied, start, end):
-  """
-  Returns free slots in [start, end] during work hours.
-  """
-  work_start, work_end, work_days = work_window()
-
-  start_h, start_m = map(int, work_start.split(":"))
-  end_h, end_m = map(int, work_end.split(":"))
-
-  day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-  now = datetime.datetime.now()
-  free_slots = []
-
-  date = start.date()
-  while date <= end.date():
-    day_name = day_names[date.weekday()]
-    if day_name not in work_days:
-      date += datetime.timedelta(days=1)
-      continue
-
-    day_start = datetime.datetime.combine(
-      date,
-      datetime.time(start_h, start_m),
-    )
-    day_end = datetime.datetime.combine(
-      date,
-      datetime.time(end_h, end_m),
-    )
-
-    day_start = max(day_start, start)
-    day_end = min(day_end, end)
-
-    if date == now.date() and now > day_start:
-      day_start = now.replace(second=0, microsecond=0)
-
-    if day_start >= day_end:
-      date += datetime.timedelta(days=1)
-      continue
-
-    day_events = sorted(
-      [
-        (max(s, day_start), min(e, day_end))
-        for s, e in occupied
-        if s < day_end and e > day_start
-      ],
-      key=lambda x: x[0],
-    )
-
-    cursor = day_start
-    for event_start, event_end in day_events:
-      if cursor < event_start:
-        free_slots.append((cursor, event_start))
-      cursor = max(cursor, event_end)
-
-    if cursor < day_end:
-      free_slots.append((cursor, day_end))
-
-    date += datetime.timedelta(days=1)
-
-  return free_slots
-@
+\paragraph{Scheduling todos into free slots}
 
 Todo scheduling uses the same priority model as [[todo ls]]: we sort by
 effective priority and greedily fill the earliest free slots.
+When a todo has no time estimate, we fall back to a default of one hour
+so that every task occupies at least a minimal slot.
+<<constants>>=
+DEFAULT_ESTIMATED_HOURS = 1.0
+@
+
 <<helper functions>>=
 def schedule_todo_events(user, start, end, occupied):
   """
   Returns VEVENTs for scheduled todos.
   """
-  from nytid.cli import todo as todocli
-
-  _, todos = todocli.load_todos()
-  todos = [t for t in todos if t.status != "done"]
-
-  if user:
-    todos = [t for t in todos if t.who == user]
-
+  <<load and filter todos>>
   if not todos:
     return []
 
@@ -782,47 +840,72 @@ def schedule_todo_events(user, start, end, occupied):
   if not free_slots:
     return []
 
-  now = datetime.datetime.now()
-  todos.sort(
-    key=lambda t: todocli.effective_priority(t, now),
-    reverse=True,
-  )
+  <<sort todos by priority>>
 
   scheduled_events = []
   remaining_slots = list(free_slots)
 
   for item in todos:
-    hours_needed = item.estimated or DEFAULT_ESTIMATED_HOURS
-    while hours_needed > 0 and remaining_slots:
-      slot_start, slot_end = remaining_slots[0]
-      slot_hours = (slot_end - slot_start).total_seconds() / 3600
-      if slot_hours <= 0:
-        remaining_slots.pop(0)
-        continue
-
-      if hours_needed >= slot_hours:
-        event_end = slot_end
-        hours_needed -= slot_hours
-        remaining_slots.pop(0)
-      else:
-        event_end = slot_start + datetime.timedelta(hours=hours_needed)
-        remaining_slots[0] = (event_end, slot_end)
-        hours_needed = 0
-
-      event = ics.event.Event()
-      event.name = f"[TODO] {item.title}"
-      event.begin = slot_start
-      event.end = event_end
-      event.location = "TODO"
-      if item.description:
-        event.description = item.description
-      elif item.labels:
-        event.description = "; ".join(item.labels)
-      else:
-        event.description = ""
-      scheduled_events.append(event)
+    <<assign todo to slots>>
 
   return scheduled_events
+@
+
+We import [[todo]] here rather than at the top of the file to avoid a
+circular import: [[todo]] imports [[schedule]] for scheduling its items,
+and [[schedule]] needs [[todo]] only for this helper.
+<<load and filter todos>>=
+from nytid.cli import todo as todocli
+
+_, todos = todocli.load_todos()
+todos = [t for t in todos if t.status != "done"]
+
+if user:
+  todos = [t for t in todos if t.who == user]
+@
+
+Sorting by effective priority means high-urgency items claim the
+earliest available slots.
+<<sort todos by priority>>=
+now = datetime.datetime.now()
+todos.sort(
+  key=lambda t: todocli.effective_priority(t, now),
+  reverse=True,
+)
+@
+
+We greedily consume slots until the todo's estimated hours are
+satisfied, splitting a slot if the todo needs less than the full slot.
+<<assign todo to slots>>=
+hours_needed = item.estimated or DEFAULT_ESTIMATED_HOURS
+while hours_needed > 0 and remaining_slots:
+  slot_start, slot_end = remaining_slots[0]
+  slot_hours = (slot_end - slot_start).total_seconds() / 3600
+  if slot_hours <= 0:
+    remaining_slots.pop(0)
+    continue
+
+  if hours_needed >= slot_hours:
+    event_end = slot_end
+    hours_needed -= slot_hours
+    remaining_slots.pop(0)
+  else:
+    event_end = slot_start + datetime.timedelta(hours=hours_needed)
+    remaining_slots[0] = (event_end, slot_end)
+    hours_needed = 0
+
+  event = ics.event.Event()
+  event.name = f"[TODO] {item.title}"
+  event.begin = slot_start
+  event.end = event_end
+  event.location = "TODO"
+  if item.description:
+    event.description = item.description
+  elif item.labels:
+    event.description = "; ".join(item.labels)
+  else:
+    event.description = ""
+  scheduled_events.append(event)
 @
 
 Once we have the course schedule, we merge external calendars and then
@@ -873,7 +956,9 @@ for event in schedule.timeline:
 \subsection{Output format}
 
 Like [[todo ls]], we use auto-format by default: rich table in a terminal,
-tab-separated CSV when piped.
+tab-separated CSV when piped.  The [[--output]] option writes CSV to a
+file instead of stdout; it also treats the output as non-interactive, so
+the header row is included for self-documentation.
 <<argument and option definitions>>=
 class OutputFormat(str, Enum):
   table = "table"
@@ -889,7 +974,9 @@ output_format: Annotated[OutputFormat, output_format_opt] = "table",
 
 <<determine effective output format>>=
 if output_format == OutputFormat.table:
-  effective_output_format = "rich" if sys.stdout.isatty() else "csv"
+  effective_output_format = (
+    "csv" if (output or not sys.stdout.isatty()) else "rich"
+  )
 elif output_format == OutputFormat.rich:
   effective_output_format = "rich"
 else:
@@ -949,9 +1036,19 @@ for event in events:
 console.print(table)
 @
 
-CSV is always tab-separated by default, so shell tools can process it directly.
+CSV is always tab-separated by default, so shell tools can process it
+directly.  When writing to a file we include a header row so the file is
+self-describing.  When piping to another process we omit the header so
+that tools such as [[awk]] and [[cut]] can process rows without skipping a
+line.  The same rule applies when a TTY is attached: the header is shown
+for readability.
 <<print [[events]] as CSV>>=
-csvout = csv.writer(sys.stdout, delimiter=delimiter)
+if output:
+  dest = open(output, "w", newline="")
+else:
+  dest = sys.stdout
+
+csvout = csv.writer(dest, delimiter=delimiter)
 
 header = []
 if week:
@@ -960,10 +1057,15 @@ header += ["start", "event"]
 if location:
   header.append("location")
 header.append("description")
-csvout.writerow(header)
+if output or sys.stdout.isatty():
+  csvout.writerow(header)
 
 for event in events:
   csvout.writerow(schedutils.format_event_csv(event, week, location))
+
+if output:
+  dest.close()
+  typer.echo(f"Wrote schedule to {output}")
 <<imports>>=
 import csv
 import sys
@@ -986,6 +1088,16 @@ Finally, CSV uses a configurable delimiter with tab as default.
 delimiter: Annotated[str, delimiter_opt] = "\t",
 <<argument and option definitions>>=
 delimiter_opt = typer.Option(help="Delimiter for CSV output")
+@
+
+The [[--output]] option redirects CSV output to a named file.  Specifying
+a file is equivalent to a non-TTY destination: the format auto-detects as
+CSV and a header row is always written.
+<<printing control options>>=
+output: Annotated[Optional[str], output_opt] = None,
+<<argument and option definitions>>=
+output_opt = typer.Option(None, "--output", "-o",
+                          help="Write CSV output to file")
 @
 
 
