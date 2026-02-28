@@ -79,6 +79,7 @@ cli = typer.Typer(
 <<data model>>
 <<effective priority>>
 <<storage functions>>
+<<active stack helpers>>
 <<sub-item helpers>>
 <<child priority helpers>>
 <<editor infrastructure>>
@@ -482,6 +483,75 @@ def test_save_and_load(temp_todo_dir):
     assert todos[0].title == "Test"
 @
 
+\section{Active Task Stack}
+
+The todo system supports nested work: start a parent task, decompose
+it into sub-tasks, work on children one at a time.  To track
+\emph{which} task is innermost-active, we maintain a stack of
+in-progress todo IDs stored separately from [[todos.json]].
+
+Why a separate file rather than a field in [[todos.json]]?  Because
+the stack tracks ephemeral execution state (what is being worked on
+\emph{right now}), while [[todos.json]] tracks persistent data state
+(the tasks themselves).  Keeping them separate avoids changing the
+[[load_todos]]/[[save_todos]] signature, which has many call sites,
+and allows atomic reads/writes without locking the main todo file.
+
+The stack obeys LIFO discipline:
+\begin{description}
+\item[Push] [[todo start <id>]] appends to the stack.
+\item[Pop] [[todo done]] (no argument) pops the top and marks
+  it done.
+\item[Remove] [[todo done <id>]] removes that specific ID from
+  anywhere in the stack.
+\end{description}
+
+<<active stack helpers>>=
+def get_active_stack_file() -> pathlib.Path:
+    """Return path to the active-task stack file."""
+    return get_todo_dir() / "active_stack.json"
+
+
+def load_active_stack() -> List[int]:
+    """Load the stack of active todo IDs.
+
+    Returns an empty list if the file doesn't exist.
+    """
+    stack_file = get_active_stack_file()
+    if not stack_file.exists():
+        return []
+    try:
+        with open(stack_file) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_active_stack(stack: List[int]):
+    """Save the active-task stack to persistent storage."""
+    ensure_todo_dir()
+    stack_file = get_active_stack_file()
+    with open(stack_file, "w") as f:
+        json.dump(stack, f)
+@
+
+Let's verify the stack round-trips correctly:
+
+<<test functions>>=
+def test_active_stack_roundtrip(temp_todo_dir):
+    """Stack persists and loads in order."""
+    save_active_stack([5, 7, 3])
+    assert load_active_stack() == [5, 7, 3]
+
+
+def test_active_stack_empty(temp_todo_dir):
+    """Empty stack returns empty list."""
+    assert load_active_stack() == []
+@
+
 \section{Sub-item Helpers}
 
 Sub-items create a tree structure within the flat todo list. We need
@@ -543,16 +613,63 @@ def check_parent_completion(
     if not children:
         return False
     return all(c.status == "done" for c in children)
+@
 
+The [[next]] command and the cron script both need to find the
+highest-priority pending task, optionally scoped to a specific
+parent.  Extracting this into a function (rather than a reusable
+chunk) makes the dependency on [[todos]] and [[who]] explicit
+through parameters:
 
+<<sub-item helpers>>=
+def find_pending_by_priority(
+    todos: List[TodoItem],
+    who: Optional[str] = None,
+    parent_id: Optional[int] = None,
+) -> Optional[TodoItem]:
+    """Find highest-priority pending task.
+
+    Optionally filtered by assignee regex and parent.
+    Returns None if no matching task is found.
+    """
+    candidates = [
+        t for t in todos
+        if t.status == "pending"
+        and (parent_id is None
+             or t.parent_id == parent_id)
+    ]
+    if who:
+        candidates = [
+            t for t in candidates
+            if t.who and re.search(who, t.who)
+        ]
+    candidates.sort(
+        key=effective_priority, reverse=True
+    )
+    return candidates[0] if candidates else None
+@
+
+Auto-parenting needs to know which task is \emph{innermost}-active.
+A linear scan for the first in-progress item would always return
+the parent in a nested workflow; the active stack gives us the
+correct answer (the most recently started child):
+
+<<sub-item helpers>>=
 def get_currently_tracked_todo(
     todos: List[TodoItem],
 ) -> Optional[TodoItem]:
-    """Find the todo currently being tracked (in-progress).
+    """Find the innermost active todo for auto-parenting.
 
-    Used for auto-parenting: new todos added while tracking
-    become children of the active todo.
+    Uses the active stack (top = most recently started).
+    Falls back to scanning for in-progress items when the
+    stack is empty, for backward compatibility.
     """
+    stack = load_active_stack()
+    if stack:
+        top_id = stack[-1]
+        for t in todos:
+            if t.id == top_id:
+                return t
     for t in todos:
         if t.status == "in-progress":
             return t
@@ -2010,6 +2127,7 @@ exporting to calendars.
 <<status change commands>>=
 <<done command>>
 <<remove command>>
+<<next command>>
 @
 
 <<tracking commands>>=
@@ -2552,6 +2670,11 @@ def ls(
             " rich, csv, json"
         ),
     ),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s",
+        help="Filter by status: "
+             "pending, in-progress, done",
+    ),
     output: Optional[str] = typer.Option(
         None, "--output", "-o",
         help="Write CSV output to file",
@@ -2582,9 +2705,20 @@ def ls(
         <<output csv>>
 @
 
+The [[--status]] option enables exact status filtering, which the
+agent workflow needs to query only pending tasks without fragile
+[[awk]] filtering in shell scripts.  When [[--status]] is given, it
+takes precedence over [[--all]] since the user has expressed a
+more specific intent.
+
 <<filter todos>>=
 filtered = todos
-if not all_items:
+if status_filter:
+    filtered = [
+        t for t in filtered
+        if t.status == status_filter
+    ]
+elif not all_items:
     filtered = [
         t for t in filtered if t.status != "done"
     ]
@@ -2598,6 +2732,45 @@ if who_filter:
         t for t in filtered
         if t.who and re.search(who_filter, t.who)
     ]
+@
+
+Let's verify that the [[--status]] filter correctly isolates items
+by their current state:
+
+<<test functions>>=
+def test_ls_status_filter(temp_todo_dir):
+    """The --status flag filters to exact status."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Pending task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Active task",
+            created="2026-02-20T10:00:00",
+            status="in-progress", who="me",
+        ),
+        TodoItem(
+            id=3, title="Done task",
+            created="2026-02-20T10:00:00",
+            status="done", who="me",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "--status", "pending",
+              "--who", ""]
+    )
+    assert "Pending task" in result.output
+    assert "Active task" not in result.output
+    assert "Done task" not in result.output
+
+    result = runner.invoke(
+        cli, ["ls", "--status", "in-progress",
+              "--who", ""]
+    )
+    assert "Active task" in result.output
+    assert "Pending task" not in result.output
 @
 
 To show tracked time, we load track data and sum durations for
@@ -2879,16 +3052,37 @@ children in a readable format. This is the read-only counterpart to
 the editor---you can see exactly what [[--edit]] would show, without
 opening an editor.
 
+When no ID is given, [[view]] shows the task at the top of the
+active stack---the one you're currently working on.  This is the
+natural question a returning user asks: \enquote{What was I doing?}
+
 <<view command>>=
 @cli.command()
 def view(
-    todo_id: int = typer.Argument(
-        ..., help="Todo ID to view",
+    todo_id: Optional[int] = typer.Argument(
+        None,
+        help="Todo ID to view (default: stack top)",
         autocompletion=complete_todo_ids,
     ),
 ):
-    """View a todo item with full details."""
+    """View a todo item with full details.
+
+    If no ID given, shows the currently active task
+    (top of the active stack).
+    """
     _, todos = load_todos()
+
+    if todo_id is None:
+        stack = load_active_stack()
+        if not stack:
+            typer.echo(
+                "No active todo. "
+                "Specify an ID to view.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        todo_id = stack[-1]
+
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
@@ -3389,34 +3583,98 @@ Marking a todo as done also stops any active tracking for that item.
 If the item has a parent, we check whether all siblings are now done
 and auto-complete the parent.
 
+When no ID is given, [[done]] pops the top of the active stack---the
+most recently started task.  This enables a natural nested workflow:
+[[todo start 5]], [[todo start 7]], [[todo done]] (pops~7),
+[[todo done]] (pops~5).  When an explicit ID is given, that ID is
+removed from wherever it appears in the stack.
+
 <<done command>>=
 @cli.command()
 def done(
-    todo_id: int = typer.Argument(
-        ..., help="Todo ID to mark done",
+    todo_id: Optional[int] = typer.Argument(
+        None, help="Todo ID to mark done "
+        "(default: stack top)",
         autocompletion=complete_todo_ids,
     ),
 ):
-    """Mark a todo item as done."""
+    """Mark a todo item as done.
+
+    If no ID given, completes the most recently
+    started task (top of the active stack).
+    """
     next_id, todos = load_todos()
-    item = next(
-        (t for t in todos if t.id == todo_id), None
-    )
-    if item is None:
-        typer.echo(
-            f"Error: todo #{todo_id} not found",
-            err=True,
-        )
-        raise typer.Exit(1)
+
+    <<resolve done todo from stack>>
 
     item.status = "done"
     typer.echo(f"Done: #{todo_id} {item.title}")
 
+    <<remove from active stack>>
     <<stop tracking if active>>
     <<close github issue>>
     <<check parent auto-completion>>
 
     save_todos(next_id, todos)
+@
+
+<<resolve done todo from stack>>=
+if todo_id is None:
+    stack = load_active_stack()
+    if not stack:
+        typer.echo(
+            "No active todo on the stack.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    todo_id = stack[-1]
+item = next(
+    (t for t in todos if t.id == todo_id), None
+)
+if item is None:
+    typer.echo(
+        f"Error: todo #{todo_id} not found",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Once the item is marked done, we remove it from the active stack.
+When an explicit ID was given, [[remove]] finds it anywhere in the
+stack (not just the top), since the user may complete tasks out of
+order:
+
+<<remove from active stack>>=
+stack = load_active_stack()
+if todo_id in stack:
+    stack.remove(todo_id)
+    save_active_stack(stack)
+@
+
+Let's verify that [[done]] without an argument pops the stack
+correctly in a nested workflow:
+
+<<test functions>>=
+def test_done_pops_stack(temp_todo_dir):
+    """Done without ID pops top of active stack."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+        ),
+    ])
+    save_active_stack([1, 2])
+    result = runner.invoke(cli, ["done"])
+    assert result.exit_code == 0
+    assert "Child" in result.output
+    assert load_active_stack() == [1]
 @
 
 <<stop tracking if active>>=
@@ -3573,6 +3831,127 @@ def rm(
         )
 @
 
+\subsection{The [[next]] Command}
+
+The [[next]] command answers the question \enquote{What should I work
+on now?}  It encapsulates the agent's decision loop into a single
+CLI call, replacing fragile shell-script logic with a first-class
+command.
+
+The behaviour depends on whether a task is currently active:
+\begin{description}
+\item[Stack non-empty] Start the highest-priority pending
+  \emph{child} of the stack-top task.  This is the decomposition
+  workflow: you started a parent, created sub-tasks, and now
+  [[next]] picks the most urgent child.
+\item[Stack empty] Start the highest-priority pending task
+  overall (filtered by [[--who]]).
+\end{description}
+
+If there is nothing to do (no pending tasks match), the command
+exits with code~1 so that callers (like the cron script) can
+detect the idle state.
+
+<<next command>>=
+@cli.command(name="next")
+def next_cmd(
+    who: Optional[str] = typer.Option(
+        default_username, "--who", "-w",
+        help="Filter by assignee",
+    ),
+    headless: bool = typer.Option(
+        False, "--headless",
+        help="Non-interactive mode (no prompts)",
+    ),
+    run: Optional[str] = typer.Option(
+        None, "--run", "-r",
+        help="Override command to run",
+    ),
+):
+    """Start the next highest-priority task.
+
+    If a task is in-progress, starts its next pending
+    child. Otherwise starts the highest-priority
+    pending task.
+    """
+    _, todos = load_todos()
+    stack = load_active_stack()
+
+    <<find next task to start>>
+
+    if target is None:
+        typer.echo("No pending tasks to start.")
+        raise typer.Exit(1)
+
+    start(
+        todo_id=target.id,
+        headless=headless,
+        run=run,
+    )
+@
+
+<<find next task to start>>=
+if stack:
+    target = find_pending_by_priority(
+        todos, who=who, parent_id=stack[-1]
+    )
+else:
+    target = find_pending_by_priority(
+        todos, who=who
+    )
+@
+
+Let's verify the [[next]] command picks the right task:
+
+<<test functions>>=
+def test_next_picks_highest_priority(temp_todo_dir):
+    """next starts the highest-priority pending task."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Low",
+            created="2026-02-20T10:00:00",
+            priority=1.0, who="me",
+        ),
+        TodoItem(
+            id=2, title="High",
+            created="2026-02-20T10:00:00",
+            priority=5.0, who="me",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["next", "--who", ""]
+    )
+    assert result.exit_code == 0
+    assert "High" in result.output
+
+
+def test_next_picks_child(temp_todo_dir):
+    """next picks pending child of stack-top task."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child A",
+            created="2026-02-20T10:00:00",
+            priority=1.0, parent_id=1,
+        ),
+        TodoItem(
+            id=3, title="Child B",
+            created="2026-02-20T10:00:00",
+            priority=5.0, parent_id=1,
+        ),
+    ])
+    save_active_stack([1])
+    result = runner.invoke(
+        cli, ["next", "--who", ""]
+    )
+    assert result.exit_code == 0
+    assert "Child B" in result.output
+@
+
 \subsection{The [[start]] Command}
 
 Starting a todo delegates to the track system. We start tracking with
@@ -3619,11 +3998,42 @@ def start(
 
     item.status = "in-progress"
     save_todos(next_id, todos)
+
+    <<push onto active stack>>
+
     typer.echo(
         f"Started: #{todo_id} {item.title}"
     )
 
     <<spawn subprocess if wd or run>>
+@
+
+Restarting an already-active task (e.g.\ after a failed run) must
+not push a duplicate onto the stack, otherwise [[todo done]] would
+only remove one copy and leave a stale entry.  We check membership
+before appending:
+
+<<push onto active stack>>=
+stack = load_active_stack()
+if todo_id not in stack:
+    stack.append(todo_id)
+    save_active_stack(stack)
+@
+
+Let's verify that starting a task pushes it onto the stack:
+
+<<test functions>>=
+def test_start_pushes_stack(temp_todo_dir):
+    """Start pushes todo ID onto active stack."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(cli, ["start", "1"])
+    assert result.exit_code == 0
+    assert load_active_stack() == [1]
 @
 
 The [[--run]] option lets the user override the todo's stored command
@@ -3633,6 +4043,19 @@ at start time:
 run: Optional[str] = typer.Option(
     None, "--run", "-r",
     help="Override command to run",
+),
+@
+
+For cron and agent workflows, we need a non-interactive mode that
+skips the [[typer.confirm]] prompt after subprocess exit.  In headless
+mode, the logic is: if the subprocess (e.g.\ [[claude]]) already called
+[[todo done]] during its run, the task is done; otherwise we reset to
+pending so the next invocation can retry.
+
+<<start command options>>=
+headless: bool = typer.Option(
+    False, "--headless",
+    help="Non-interactive mode (no prompts)",
 ),
 @
 
@@ -3760,7 +4183,9 @@ except FileNotFoundError:
 
 After the subprocess exits, we reload todos (the file may have
 changed during the session), stop tracking, and prompt the user
-about completion status.
+about completion status.  In headless mode we skip the prompt: if
+the subprocess already marked the todo done (via [[todo done]]),
+we respect that; otherwise we reset to pending for retry.
 
 <<handle subprocess exit>>=
 # Reload in case file changed during session
@@ -3773,13 +4198,23 @@ if item is None:
 
 <<stop tracking after subprocess>>
 
-if typer.confirm(
+if item.status == "done":
+    pass
+elif headless:
+    item.status = "pending"
+elif typer.confirm(
     f"Mark todo #{todo_id} as done?"
 ):
     item.status = "done"
     <<check parent auto-completion>>
 else:
     item.status = "pending"
+
+# Remove from stack regardless of outcome
+stack = load_active_stack()
+if todo_id in stack:
+    stack.remove(todo_id)
+    save_active_stack(stack)
 
 save_todos(next_id, todos)
 @
@@ -3840,16 +4275,39 @@ def stop(
     save_todos(next_id, todos)
 @
 
+When auto-detecting which todo to stop, we prefer the active stack
+(which tracks the most recently started task) over a linear scan of
+in-progress items.  A stale stack entry---where the ID was deleted
+from [[todos.json]] but not yet cleaned from the stack---must be
+caught, otherwise downstream code would dereference [[None]]:
+
 <<resolve which todo to stop>>=
 if todo_id is None:
-    in_progress = [
-        t for t in todos if t.status == "in-progress"
-    ]
-    if not in_progress:
-        typer.echo("No todo is currently in-progress.")
-        raise typer.Exit(0)
-    item = in_progress[0]
-    todo_id = item.id
+    stack = load_active_stack()
+    if stack:
+        todo_id = stack[-1]
+        item = next(
+            (t for t in todos if t.id == todo_id),
+            None,
+        )
+        if item is None:
+            typer.echo(
+                f"Error: todo #{todo_id} not found",
+                err=True,
+            )
+            raise typer.Exit(1)
+    else:
+        in_progress = [
+            t for t in todos
+            if t.status == "in-progress"
+        ]
+        if not in_progress:
+            typer.echo(
+                "No todo is currently in-progress."
+            )
+            raise typer.Exit(0)
+        item = in_progress[0]
+        todo_id = item.id
 else:
     item = next(
         (t for t in todos if t.id == todo_id), None
@@ -3895,6 +4353,10 @@ state:
 
 <<update todo status after stop>>=
 item.status = "pending"
+stack = load_active_stack()
+if todo_id in stack:
+    stack.remove(todo_id)
+    save_active_stack(stack)
 typer.echo(f"Stopped: #{todo_id} {item.title}")
 @
 
@@ -4780,6 +5242,10 @@ from nytid.cli.todo import (
     gh_list_prs,
     gh_add_comment,
     require_gh,
+    load_active_stack,
+    save_active_stack,
+    get_active_stack_file,
+    find_pending_by_priority,
 )
 
 runner = CliRunner()
