@@ -92,8 +92,8 @@ cli = typer.Typer(
 
 The todo system stores its data in a configurable directory, defaulting
 to [[~/.nytid/todos]]. We also allow configuring the maximum deadline
-boost, work hours for scheduling, and a calendar URL for reading
-existing events.
+boost and work hours used when scheduling todos through
+[[nytid schedule show]].
 
 Why a separate directory from track data? Because todos have a different
 lifecycle---they are created, prioritized, and completed, whereas track
@@ -114,7 +114,6 @@ TODO_MAX_BOOST_CONFIG = "todo.max_boost"
 TODO_WORK_START_CONFIG = "todo.work_start"
 TODO_WORK_END_CONFIG = "todo.work_end"
 TODO_WORK_DAYS_CONFIG = "todo.work_days"
-TODO_CALENDAR_CONFIG = "todo.calendar_url"
 
 
 def get_todo_dir() -> pathlib.Path:
@@ -2010,7 +2009,6 @@ exporting to calendars.
 
 <<export commands>>=
 <<export command>>
-<<schedule command>>
 @
 
 \subsection{The \texttt{add} Command}
@@ -3813,11 +3811,8 @@ typer.echo(f"Stopped: #{todo_id} {item.title}")
 
 \section{ICS Export}
 
-The export command supports two modes: VTODO (task list) and scheduled
-VEVENT (calendar blocks). VTODO is the default---it exports todos as
-iCalendar task components that calendar apps can import. The schedule
-mode is more ambitious: it reads an existing calendar, finds free
-slots, and schedules todos into them.
+The export command supports VTODO (task list) export.
+It maps todos to iCalendar task components that calendar apps can import.
 
 \subsection{The \texttt{export} Command}
 
@@ -3834,10 +3829,10 @@ def export(
     ),
     format: str = typer.Option(
         "vtodo", "--format", "-f",
-        help="Export format (vtodo, schedule)",
+        help="Export format (vtodo)",
     ),
 ):
-    """Export todos as ICS (VTODO or scheduled VEVENT)."""
+    """Export todos as ICS (VTODO)."""
     _, todos = load_todos()
 
     if not all_items:
@@ -3849,13 +3844,6 @@ def export(
 
     if format == "vtodo":
         ics_data = export_vtodo(todos)
-    elif format == "schedule":
-        typer.echo(
-            "Use 'nytid todo schedule' for "
-            "scheduled export.",
-            err=True,
-        )
-        raise typer.Exit(1)
     else:
         typer.echo(
             f"Unknown format: {format}", err=True
@@ -3956,341 +3944,6 @@ status_map = {
 todo.status = status_map.get(
     item.status, "NEEDS-ACTION"
 )
-@
-
-\subsection{The \texttt{schedule} Command}
-
-The schedule command is the most complex subcommand. It reads an
-existing calendar to find occupied slots, generates free time windows
-within configured work hours, and assigns todos to those windows in
-priority order.
-
-Why read an existing calendar? Because teachers already have meetings,
-lectures, and other commitments. Scheduling todos into already-occupied
-slots would produce a useless calendar.
-
-<<schedule command>>=
-@cli.command()
-def schedule(
-    calendar_source: Optional[str] = typer.Option(
-        None, "--calendar", "-c",
-        help="ICS file or URL for existing events",
-    ),
-    days: int = typer.Option(
-        DEFAULT_PLANNING_DAYS, "--days",
-        help="Planning horizon in days",
-    ),
-    output: Optional[str] = typer.Option(
-        None, "--output", "-o",
-        help="Output file (stdout if not specified)",
-    ),
-    all_items: bool = typer.Option(
-        False, "--all", "-a",
-        help="Include done items",
-    ),
-):
-    """Schedule todos into free calendar slots.
-
-    Reads existing events from an ICS file or URL,
-    finds free time within work hours, and assigns
-    todos to slots in priority order.
-    """
-    _, todos = load_todos()
-    if not all_items:
-        todos = [t for t in todos if t.status != "done"]
-
-    if not todos:
-        typer.echo(
-            "No schedulable todos.",
-            err=True,
-        )
-        return
-
-    <<load existing calendar>>
-    <<compute free slots>>
-    <<assign todos to slots>>
-    <<output scheduled events>>
-@
-
-We support both local ICS files and URLs. If no source is given, we
-try the configured calendar URL.
-
-<<load existing calendar>>=
-existing_events = []
-source = calendar_source
-if source is None:
-    try:
-        source = config.get(TODO_CALENDAR_CONFIG)
-    except KeyError:
-        source = None
-
-if source:
-    existing_events = load_calendar_events(source)
-@
-
-<<schedule command>>=
-def load_calendar_events(source: str) -> list:
-    """Load events from an ICS file or URL.
-
-    Returns a list of (start, end) datetime tuples.
-    """
-    try:
-        from ics import Calendar
-    except ImportError:
-        typer.echo(
-            "Scheduling requires the 'ics' package.",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    ics_text = ""
-    if source.startswith(("http://", "https://")):
-        try:
-            import requests
-
-            resp = requests.get(source, timeout=30)
-            resp.raise_for_status()
-            ics_text = resp.text
-        except Exception as e:
-            typer.echo(
-                f"Error fetching calendar: {e}",
-                err=True,
-            )
-            return []
-    else:
-        try:
-            with open(source, "r") as f:
-                ics_text = f.read()
-        except FileNotFoundError:
-            typer.echo(
-                f"Calendar file not found: {source}",
-                err=True,
-            )
-            return []
-
-    cal = Calendar(ics_text)
-    events = []
-    for event in cal.events:
-        if event.begin and event.end:
-            events.append((
-                event.begin.datetime,
-                event.end.datetime,
-            ))
-    return events
-@
-
-\subsubsection{Free Slot Computation}
-
-We generate candidate time slots within work hours for each work day
-in the planning horizon, then subtract occupied times from existing
-calendar events.
-
-<<schedule command>>=
-def compute_free_slots(
-    existing_events: list,
-    days: int,
-) -> list:
-    """Compute free time slots within work hours.
-
-    Returns list of (start, end) datetime tuples
-    representing available time slots.
-    """
-    work_start_str = get_work_start()
-    work_end_str = get_work_end()
-    work_days = get_work_days()
-
-    day_names = [
-        "mon", "tue", "wed", "thu", "fri",
-        "sat", "sun",
-    ]
-
-    work_start_h, work_start_m = map(
-        int, work_start_str.split(":")
-    )
-    work_end_h, work_end_m = map(
-        int, work_end_str.split(":")
-    )
-
-    now = datetime.datetime.now()
-    free_slots = []
-
-    for day_offset in range(days):
-        date = now.date() + datetime.timedelta(
-            days=day_offset
-        )
-        day_name = day_names[date.weekday()]
-
-        if day_name not in work_days:
-            continue
-
-        day_start = datetime.datetime.combine(
-            date,
-            datetime.time(work_start_h, work_start_m),
-        )
-        day_end = datetime.datetime.combine(
-            date,
-            datetime.time(work_end_h, work_end_m),
-        )
-
-        if day_offset == 0 and now > day_start:
-            day_start = now.replace(
-                second=0, microsecond=0
-            )
-            if day_start >= day_end:
-                continue
-
-        <<subtract occupied times from day>>
-        free_slots.extend(day_free)
-
-    return free_slots
-@
-
-To subtract occupied events from a work-day window, we sort events by
-start time and walk through them, collecting the gaps.
-
-<<subtract occupied times from day>>=
-day_events = sorted(
-    [
-        (max(s, day_start), min(e, day_end))
-        for s, e in existing_events
-        if s < day_end and e > day_start
-    ],
-    key=lambda x: x[0],
-)
-
-day_free = []
-cursor = day_start
-for evt_start, evt_end in day_events:
-    if cursor < evt_start:
-        day_free.append((cursor, evt_start))
-    cursor = max(cursor, evt_end)
-if cursor < day_end:
-    day_free.append((cursor, day_end))
-@
-
-<<compute free slots>>=
-free_slots = compute_free_slots(
-    existing_events, days
-)
-if not free_slots:
-    typer.echo(
-        "No free slots found in the planning horizon.",
-        err=True,
-    )
-    return
-@
-
-\subsubsection{Assigning Todos to Slots}
-
-We walk todos in effective-priority order (highest first) and greedily
-assign each to the earliest available slot(s). If a todo's estimated
-time exceeds a single slot, it gets split across multiple slots.
-
-When no estimate has been set, we use [[DEFAULT_ESTIMATED_HOURS]] (one
-hour) as a stand-in. Requiring an explicit estimate on every todo would
-create friction that discourages scheduling entirely; a conservative
-one-hour default keeps all todos in play while still producing a
-realistic calendar.
-
-<<constants>>=
-DEFAULT_ESTIMATED_HOURS = 1.0
-@
-
-<<assign todos to slots>>=
-scheduled_events = []
-now = datetime.datetime.now()
-sorted_todos = sorted(
-    todos,
-    key=lambda t: effective_priority(t, now),
-    reverse=True,
-)
-
-remaining_slots = list(free_slots)
-
-for item in sorted_todos:
-    hours_needed = (
-        item.estimated or DEFAULT_ESTIMATED_HOURS
-    )
-    <<schedule item into available slots>>
-@
-
-<<schedule item into available slots>>=
-while hours_needed > 0 and remaining_slots:
-    slot_start, slot_end = remaining_slots[0]
-    slot_hours = (
-        (slot_end - slot_start).total_seconds() / 3600
-    )
-
-    if slot_hours <= 0:
-        remaining_slots.pop(0)
-        continue
-
-    if hours_needed >= slot_hours:
-        scheduled_events.append((
-            item, slot_start, slot_end
-        ))
-        hours_needed -= slot_hours
-        remaining_slots.pop(0)
-    else:
-        event_end = slot_start + datetime.timedelta(
-            hours=hours_needed
-        )
-        scheduled_events.append((
-            item, slot_start, event_end
-        ))
-        remaining_slots[0] = (event_end, slot_end)
-        hours_needed = 0
-@
-
-\subsubsection{Outputting Scheduled Events}
-
-We generate VEVENT components for each scheduled block, using the
-todo's title and labels.
-
-<<output scheduled events>>=
-ics_data = generate_schedule_ics(scheduled_events)
-if output:
-    with open(output, "w") as f:
-        f.write(ics_data)
-    typer.echo(
-        f"Scheduled {len(scheduled_events)} events "
-        f"to {output}"
-    )
-else:
-    print(ics_data)
-@
-
-<<schedule command>>=
-def generate_schedule_ics(
-    scheduled_events: list,
-) -> str:
-    """Generate ICS with VEVENT for scheduled todos.
-
-    Each entry is a (TodoItem, start, end) tuple.
-    """
-    try:
-        from ics import Calendar, Event
-    except ImportError:
-        typer.echo(
-            "Scheduling requires the 'ics' package.",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    cal = Calendar()
-
-    for item, start, end in scheduled_events:
-        event = Event()
-        event.name = f"[TODO] {item.title}"
-        event.begin = start
-        event.end = end
-        if item.description:
-            event.description = item.description
-        if item.labels:
-            event.categories = set(item.labels)
-        cal.events.add(event)
-
-    return str(cal)
 @
 
 \subsection{The \texttt{import} Command}
@@ -5017,7 +4670,6 @@ from nytid.cli.todo import (
     assign_priority_at_position,
     compute_child_priority_range,
     distribute_priorities_in_range,
-    compute_free_slots,
     parse_editor_content,
     render_todo_markdown,
     parse_yaml_block,
@@ -5166,14 +4818,6 @@ def test_export_vtodo(temp_todo_dir):
     assert result.exit_code == 0
     assert "VTODO" in result.stdout
     assert "Export me" in result.stdout
-
-
-def test_free_slot_computation():
-    """Test free slot computation with no events."""
-    slots = compute_free_slots([], 1)
-    # Should have at least one slot (today if work day)
-    # or zero if weekend; just verify no crash
-    assert isinstance(slots, list)
 
 
 def test_parent_auto_done(temp_todo_dir):
