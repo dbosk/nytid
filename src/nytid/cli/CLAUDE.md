@@ -1,9 +1,11 @@
 <claude-mem-context>
 # Recent Activity
 
-### Feb 24, 2026
+### Mar 1, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #571 | 9:37 PM | 🔵 | Existing ICS Export and CLI Infrastructure for Todo Command | ~497 |
+| #696 | 12:57 PM | 🔵 | next command delegates to start command with headless parameter | ~317 |
+| #694 | " | 🔵 | Existing --headless option in nytid todo next command | ~341 |
+| #693 | 12:56 PM | 🔵 | Current agent automation structure in nytid.hourly.sh | ~319 |
 </claude-mem-context>
