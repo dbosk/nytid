@@ -2040,6 +2040,249 @@ def add(
     )
 @
 
+\subsection{Shared Entry Filtering}
+
+Three analysis commands ([[ls]], [[stats]], [[export]]) share the same
+load-then-filter pattern.  When the filtering logic was inlined in each
+command, adding a new filter dimension (such as the [[--who]] flag)
+required updating every command in lock-step --- a maintenance hazard
+that invited subtle inconsistencies.  Extracting the pipeline into a
+single helper means that a new filter dimension is added once and all
+commands benefit.  Each command still owns its error messages and
+early-return logic, keeping presentation concerns separate from
+filtering policy.
+
+<<helper functions>>=
+def filter_entries(
+    days=None, who=None, labels=None
+):
+    """Load and filter tracking entries.
+
+    Returns filtered list, or None if no data file
+    exists or it is empty.
+    """
+    entries = load_tracking_data()
+    if not entries:
+        return None
+
+    if days is not None:
+        cutoff = (
+            datetime.datetime.now()
+            - datetime.timedelta(days=days)
+        )
+        entries = [
+            e for e in entries
+            if e.start_time >= cutoff
+        ]
+
+    if who is not None:
+        entries = [
+            e for e in entries
+            if e.who == who
+        ]
+
+    if labels:
+        entries = [
+            e for e in entries
+            if any(label in e.labels for label in labels)
+        ]
+
+    return entries
+@
+
+We unit-test the shared [[filter_entries]] helper directly to confirm
+each filter dimension works independently:
+
+<<test functions>>=
+def test_filter_entries(temp_tracking_dir):
+    """Test the shared filter_entries helper."""
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--who", "alice"
+    ])
+    runner.invoke(cli, [
+        "add", "DD1321", "lecture",
+        "--duration", "45",
+        "--who", "bob"
+    ])
+
+    # No filters --- returns all
+    all_entries = filter_entries()
+    assert len(all_entries) == 2
+
+    # Filter by worker
+    alice = filter_entries(who="alice")
+    assert len(alice) == 1
+    assert alice[0].who == "alice"
+
+    # Filter by label
+    grading = filter_entries(labels=["grading"])
+    assert len(grading) == 1
+    assert "grading" in grading[0].labels
+
+    # Filter by days (all recent)
+    recent = filter_entries(days=1)
+    assert len(recent) == 2
+
+    # Combined filters
+    result = filter_entries(
+        who="alice", labels=["DD1310"]
+    )
+    assert len(result) == 1
+@
+
+\subsection{Listing Tracked Sessions}
+
+The [[ls]] command fills a gap between [[status]] (which shows only the
+\emph{currently active} session) and [[stats]] (which shows
+\emph{aggregated} totals).  Sometimes you just want to see the last few
+individual entries --- for example, to verify that yesterday's grading
+session was recorded, or to eyeball recent work before writing a
+timesheet.  The [[ls]] command provides this quick, per-entry view.
+
+Unlike [[stats]], which defaults to a 7-day time window, [[ls]] uses a
+count limit ([[-n]]) instead.  A time window would hide old entries even
+when the user explicitly asks \enquote{show me my last 20 sessions}.
+The count-based approach always returns exactly as many entries as
+requested (or fewer if the history is shorter).
+
+<<ls command>>=
+@cli.command(name="ls")
+def ls_entries(
+    labels: List[str] = typer.Argument(
+        None,
+        help="Filter by labels "
+             "(shows all if not specified)",
+        autocompletion=complete_historical_labels),
+    n: int = typer.Option(
+        10, "--number", "-n",
+        help="Number of entries to show"),
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Filter by worker "
+             "(shows all if omitted)",
+        autocompletion=complete_workers),
+):
+    """
+    List recent tracked time entries.
+
+    Shows individual completed sessions, most recent
+    first. Use -n to control how many entries appear.
+    """
+    <<load and filter for ls>>
+    <<display ls entries>>
+@
+
+We use the shared [[filter_entries]] helper but skip the time-window
+filter --- the count limit ([[-n]]) controls how many entries appear
+instead:
+
+<<load and filter for ls>>=
+entries = filter_entries(who=who, labels=labels)
+if not entries:
+    typer.echo("No tracking data available.")
+    return
+@
+
+Entries are sorted most-recent-first because the typical use case is
+checking recent work --- older entries scroll off the terminal rather
+than consuming attention.  The format is deliberately plain text (not a
+Rich table) to stay consistent with [[status]] and [[stats]], and to
+remain pipeable to tools like [[grep]] or [[awk]]:
+
+<<display ls entries>>=
+entries.sort(
+    key=lambda e: e.start_time, reverse=True
+)
+for entry in entries[:n]:
+    ts = entry.start_time.strftime("%Y-%m-%d %H:%M")
+    dur = format_duration(entry.duration())
+    lbl = get_labels_display(entry.labels)
+    parts = [f"{ts}  {dur}  {lbl}"]
+    parts.append(f"[{entry.who}]")
+    if entry.description:
+        parts.append(f"- {entry.description}")
+    typer.echo("  ".join(parts))
+@
+
+The basic case confirms that labels and duration appear in the output
+--- if the command ran but produced no recognisable content, the
+user would have no way to tell whether their session was recorded:
+
+<<test functions>>=
+def test_ls_default(temp_tracking_dir):
+    """Test ls shows recent entries."""
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--description", "Graded homework"
+    ])
+    runner.invoke(cli, [
+        "add", "DD1310", "lecture",
+        "--duration", "45"
+    ])
+    result = runner.invoke(cli, ["ls"])
+    assert result.exit_code == 0
+    assert "DD1310" in result.output
+    assert "grading" in result.output or \
+        "lecture" in result.output
+@
+
+The [[-n]] limit is the primary output-size control; if the slice
+[[entries[:n]]] were missing or the argument ignored, the command
+would always dump the full history regardless of what the user asked:
+
+<<test functions>>=
+def test_ls_limit(temp_tracking_dir):
+    """Test -n flag limits output."""
+    for i in range(5):
+        runner.invoke(cli, [
+            "add", f"label{i}",
+            "--duration", "30"
+        ])
+    result = runner.invoke(cli, ["ls", "-n", "2"])
+    assert result.exit_code == 0
+    lines = [
+        line for line in result.output.strip().splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 2
+@
+
+Label filtering must exclude entries whose labels do not match ---
+without this check a broken filter would silently show everything,
+making it indistinguishable from running [[ls]] with no arguments:
+
+<<test functions>>=
+def test_ls_filter_labels(temp_tracking_dir):
+    """Test label filtering in ls."""
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60"
+    ])
+    runner.invoke(cli, [
+        "add", "DD1321", "lecture",
+        "--duration", "45"
+    ])
+    result = runner.invoke(cli, ["ls", "DD1310"])
+    assert result.exit_code == 0
+    assert "DD1310" in result.output
+    assert "DD1321" not in result.output
+@
+
+With no tracking data the command must print a helpful message and
+exit cleanly rather than crashing with an unhandled [[None]] return
+from [[filter_entries]]:
+
+<<test functions>>=
+def test_ls_empty(temp_tracking_dir):
+    """Test ls with no data."""
+    result = runner.invoke(cli, ["ls"])
+    assert result.exit_code == 0
+    assert "No tracking data" in result.output
+@
+
 \subsection{Stats Command}
 
 The stats command answers a question teachers ask constantly:
@@ -2107,36 +2350,21 @@ if daily_limit is None:
     daily_limit = get_default_daily_limit()
 @
 
-We apply three successive filters: time window, worker, and labels.
-The order matters --- the time-window filter runs first to keep the
-working set small before the more expensive label-membership check:
+With the shared helper handling the mechanical filtering, this chunk
+focuses on the stats-specific concerns: constructing [[label_filter_msg]]
+for the summary header, and distinguishing \enquote{no data at all}
+([[None]]) from \enquote{data exists but nothing matched the window}:
 
 <<load and filter entries for stats>>=
-entries = load_tracking_data()
+recent_entries = filter_entries(
+    days=days, who=who, labels=labels
+)
 
-if not entries:
+if recent_entries is None:
     typer.echo("No tracking data available")
     return
 
-now = datetime.datetime.now()
-cutoff_date = now - datetime.timedelta(days=days)
-
-recent_entries = [
-    e for e in entries
-    if e.start_time >= cutoff_date
-]
-
-if who is not None:
-    recent_entries = [
-        e for e in recent_entries
-        if e.who == who
-    ]
-
 if labels:
-    recent_entries = [
-        e for e in recent_entries
-        if any(label in e.labels for label in labels)
-    ]
     label_filter_msg = (
         f" for labels: {', '.join(labels)}"
     )
@@ -2338,24 +2566,13 @@ def export(
     Export tracking data in various formats.
     Supports ICS (calendar), JSON, and CSV formats.
     """
-    entries = load_tracking_data()
+    filtered_entries = filter_entries(
+        days=days, who=who
+    )
 
-    if not entries:
+    if filtered_entries is None:
         typer.echo("No tracking data to export", err=True)
         return
-
-    now = datetime.datetime.now()
-    cutoff_date = now - datetime.timedelta(days=days)
-    filtered_entries = [
-        e for e in entries
-        if e.start_time >= cutoff_date
-    ]
-
-    if who is not None:
-        filtered_entries = [
-            e for e in filtered_entries
-            if e.who == who
-        ]
 
     if not filtered_entries:
         typer.echo(
@@ -2525,6 +2742,7 @@ Analysis commands provide insights into tracked time through statistics
 and data export:
 
 <<analysis commands>>=
+<<ls command>>
 <<stats command>>
 <<export command>>
 <<ics export function>>
@@ -2583,6 +2801,7 @@ from nytid.cli.track import (
     get_tracking_dir, get_tracking_data_file,
     get_current_session_file,
     load_tracking_data, load_active_session,
+    filter_entries,
     parse_offset, parse_at_time,
     sanitize_who, complete_workers,
     default_username

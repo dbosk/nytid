@@ -3585,6 +3585,10 @@ def edit(
         help="Reassign to worker",
         autocompletion=complete_todo_workers,
     ),
+    parent: Optional[int] = typer.Option(
+        None, "--parent", "-p",
+        help="New parent ID (0 = make top-level)",
+    ),
 ):
     """Edit an existing todo item."""
     next_id, todos = load_todos()
@@ -3623,6 +3627,39 @@ if description is not None:
     item.description = description
 if reassign is not None:
     item.who = reassign
+@
+
+The [[--parent]] flag moves an item in the hierarchy.  Items are
+accidentally created as children when the user runs [[todo add]]
+while another item is on the active stack --- the add command
+automatically parents new items to the active one.  Without a way to
+reparent, the only fix would be to delete and re-add the item,
+losing its creation timestamp and any notes.
+
+We use [[0]] as a sentinel for \enquote{promote to top-level}
+because valid IDs always start from [[1]], so [[0]] is unambiguous.
+Passing a positive integer instead reassigns the item under a
+different parent.  Because the item's existing priority was computed
+relative to its old siblings, it may sort oddly after a reparent ---
+the user can run [[reprioritize]] afterwards to restore the intended
+ordering:
+
+<<edit via cli flags>>=
+if parent is not None:
+    if parent == 0:
+        item.parent_id = None
+    else:
+        new_parent = next(
+            (t for t in todos if t.id == parent),
+            None,
+        )
+        if new_parent is None:
+            typer.echo(
+                f"Error: parent #{parent} not found",
+                err=True,
+            )
+            raise typer.Exit(1)
+        item.parent_id = parent
 
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
@@ -3868,6 +3905,79 @@ def test_child_who_override():
     )
 @
 
+\subsection{Testing the [[--parent]] Flag}
+
+Reparenting addresses the common accident of creating a todo as a
+child of an active item when a top-level item was intended.  We
+verify both directions: promoting a child to the top level and
+moving it under a different parent.  We also confirm that supplying
+an invalid parent ID is rejected with a non-zero exit code rather
+than silently storing a dangling reference.
+
+<<test functions>>=
+def test_edit_reparent_toplevel(temp_todo_dir):
+    """--parent 0 promotes a child to top-level."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            priority=0.5,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "2", "--parent", "0"],
+    )
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    child = next(t for t in todos if t.id == 2)
+    assert child.parent_id is None
+
+def test_edit_reparent_to_other(temp_todo_dir):
+    """--parent N moves a child under a new parent."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent A",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Child", parent_id=1,
+            priority=0.5,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "3", "--parent", "2"],
+    )
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    child = next(t for t in todos if t.id == 3)
+    assert child.parent_id == 2
+
+def test_edit_reparent_invalid(temp_todo_dir):
+    """--parent with a non-existent ID is an error."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Orphan",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "1", "--parent", "99"],
+    )
+    assert result.exit_code != 0
+@
+
 \subsection{The [[reprioritize]] Command}
 
 When priorities shift, a todo may need repositioning among its
@@ -3960,6 +4070,7 @@ def done(
 
     <<remove from active stack>>
     <<stop tracking if active>>
+    <<clean stale todo labels>>
     <<close github issue>>
     <<check parent auto-completion>>
 
@@ -4037,13 +4148,118 @@ try:
     session = load_active_session(worker)
     todo_label = f"todo:{todo_id}"
     if todo_label in session.get_active_labels():
-        entries = session.stop_labels([todo_label])
+        labels_to_stop = [todo_label] + [
+            l for l in item.labels
+            if l in session.get_active_labels()
+        ]
+        entries = session.stop_labels(
+            labels_to_stop
+        )
         if entries:
             add_completed_entries(entries)
-            save_active_session(session, worker)
-            typer.echo(
-                f"  Stopped tracking todo:{todo_id}"
+        save_active_session(session, worker)
+        typer.echo(
+            f"  Stopped tracking todo:{todo_id}"
+        )
+except ImportError:
+    pass
+@
+
+Stopping the specific todo's labels is not enough: labels from
+previously removed or completed todos may linger in the session
+as \emph{stale labels}.  Every time a new todo is started, these
+stale labels get restarted alongside the real ones, creating
+phantom zero-duration entries in the tracking log.  To prevent
+this, we scan the session for any [[todo:N]] labels where [[N]]
+no longer corresponds to an active (non-done) todo, and stop
+those as well.
+
+We only clean the current worker's session, since [[done]] and
+[[rm]] operate on a single item with a known worker.  The
+[[sync]] command uses a broader variant that sweeps all workers.
+
+<<clean stale todo labels>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        add_completed_entries,
+    )
+    import re
+
+    worker = item.who or default_username
+    session = load_active_session(worker)
+    todo_ids = {t.id for t in todos}
+    stale = [
+        l for l in session.get_active_labels()
+        if re.match(r"^todo:(\d+)$", l)
+        and int(l.split(":")[1]) not in todo_ids
+    ]
+    if stale:
+        entries = session.stop_labels(stale)
+        if entries:
+            add_completed_entries(entries)
+        save_active_session(session, worker)
+        typer.echo(
+            f"  Cleaned {len(stale)} stale "
+            f"label(s): {', '.join(stale)}"
+        )
+except ImportError:
+    pass
+@
+
+The [[sync]] command may touch multiple workers' sessions during
+a single run, so we sweep all session files rather than just the
+current worker's.  We reuse the same stale-detection logic:
+
+<<clean stale todo labels from all workers>>=
+try:
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        add_completed_entries,
+        get_tracking_dir,
+    )
+    import re
+
+    todo_ids = {t.id for t in todos}
+    tracking_dir = get_tracking_dir()
+    if tracking_dir.exists():
+        for f in sorted(
+            tracking_dir.glob(
+                "current_session*.json"
             )
+        ):
+            name = f.stem.replace(
+                "current_session_", ""
+            )
+            if name == "current_session":
+                name = default_username
+            session = load_active_session(name)
+            stale = [
+                l
+                for l in (
+                    session.get_active_labels()
+                )
+                if re.match(r"^todo:(\d+)$", l)
+                and int(l.split(":")[1])
+                not in todo_ids
+            ]
+            if stale:
+                entries = session.stop_labels(
+                    stale
+                )
+                if entries:
+                    add_completed_entries(entries)
+                save_active_session(
+                    session, name
+                )
+                typer.echo(
+                    f"  Cleaned {len(stale)} "
+                    f"stale label(s) for "
+                    f"{name}: "
+                    f"{', '.join(stale)}"
+                )
 except ImportError:
     pass
 @
@@ -4131,7 +4347,10 @@ def test_done_closes_github_issue(temp_todo_dir):
 \subsection{The [[rm]] Command}
 
 Removing a todo requires confirmation. If the item has children,
-those are removed as well.
+those are removed as well.  We stop any active tracking for the
+removed item and clean up stale labels left by previously removed
+todos---otherwise orphaned [[todo:N]] labels accumulate in the
+session and generate phantom tracking entries.
 
 <<remove command>>=
 @cli.command()
@@ -4170,6 +4389,9 @@ def rm(
     ids_to_remove = {todo_id}
     ids_to_remove.update(c.id for c in children)
     todos = [t for t in todos if t.id not in ids_to_remove]
+
+    <<stop tracking if active>>
+    <<clean stale todo labels>>
 
     save_todos(next_id, todos)
     typer.echo(f"Removed #{todo_id}: {item.title}")
@@ -5514,6 +5736,7 @@ def sync(
         <<sync title from github>>
 
     save_todos(next_id, todos)
+    <<clean stale todo labels from all workers>>
     typer.echo(f"Sync complete. {changes} changes.")
 @
 
@@ -5546,14 +5769,20 @@ if (
         if todo_label in (
             session.get_active_labels()
         ):
+            labels_to_stop = [todo_label] + [
+                l for l in item.labels
+                if l in (
+                    session.get_active_labels()
+                )
+            ]
             entries = session.stop_labels(
-                [todo_label]
+                labels_to_stop
             )
             if entries:
                 add_completed_entries(entries)
-                save_active_session(
-                    session, worker
-                )
+            save_active_session(
+                session, worker
+            )
     except ImportError:
         pass
 @
