@@ -10,15 +10,11 @@ endef
 
 TESTS=	$(shell ${find_tests})
 
-CONFTEST_SRC=	../src/nytid/cli/conftest.nw
-
 .PHONY: all
-all: conftest.py $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
+all: $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
+all: conftest.py conftest.tex
 
 $(foreach files,${TESTS},$(eval $(call def_target, ${files})))
-
-conftest.py: ${CONFTEST_SRC}
-	notangle ${NOTANGLEFLAGS.py} -R"conftest.py" $< > $@
 
 .PHONY: test
 test: all
@@ -29,7 +25,7 @@ clean:
 	${RM} $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
 	${RM} -Rf __pycache__
 	${RM} test_*.py
-	${RM} conftest.py
+	${RM} conftest.py conftest.tex
 	${RM} ~/.config/pytest/config.json
 
 .PHONY: distclean
