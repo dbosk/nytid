@@ -12,6 +12,7 @@ TESTS=	$(shell ${find_tests})
 
 .PHONY: all
 all: $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
+all: conftest.py conftest.tex
 
 $(foreach files,${TESTS},$(eval $(call def_target, ${files})))
 
@@ -24,6 +25,7 @@ clean:
 	${RM} $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
 	${RM} -Rf __pycache__
 	${RM} test_*.py
+	${RM} conftest.py conftest.tex
 	${RM} ~/.config/pytest/config.json
 
 .PHONY: distclean
