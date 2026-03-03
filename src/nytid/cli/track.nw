@@ -63,6 +63,21 @@ without retyping label names:
   [[nytid track start]] resumes mail tracking.
 \end{itemize}
 
+\subsection{Switch Functionality}
+\label{sec:design-switch-functionality}
+
+The [[switch]] command provides a context-switch mechanism: interrupt
+the current work, do something else, then pick up exactly where you
+left off.  Calling [[nytid track switch email]] stops the most
+recently started batch, saves those labels on a \emph{stack}, and
+starts [[email]].  Calling [[nytid track switch]] with no arguments
+reverses the last switch---popping the stack and restarting the saved
+labels.
+
+The stack design allows chaining: switch from A to B, then to C, then
+unwind C\,\textrightarrow\,B\,\textrightarrow\,A with two bare
+[[switch]] calls.  Each forward switch pushes; each bare switch pops.
+
 \subsection{Independent Label Tracking}
 Each label in an active session tracks time independently with its own start time.
 Labels can be:
@@ -815,6 +830,10 @@ class ActiveSession:
         self.next_batch_id: int = 1
         # Remember last stopped labels for resume functionality
         self.last_stopped: List[str] = []
+        # Stack of label lists for switch-back functionality.
+        # Each forward switch pushes the stopped labels here;
+        # a bare switch pops and restarts them.
+        self.switch_stack: List[List[str]] = []
         
     def start_labels(
         self,
@@ -1079,7 +1098,8 @@ def test_discard_labels(temp_tracking_dir):
             'label_order': self.label_order,
             'batches': self.batches,
             'next_batch_id': self.next_batch_id,
-            'last_stopped': self.last_stopped
+            'last_stopped': self.last_stopped,
+            'switch_stack': self.switch_stack
         }
     
     @classmethod
@@ -1132,6 +1152,8 @@ def test_discard_labels(temp_tracking_dir):
                 session.next_batch_id = data['next_batch_id']
             if 'last_stopped' in data:
                 session.last_stopped = data['last_stopped']
+            if 'switch_stack' in data:
+                session.switch_stack = data['switch_stack']
         
         return session
 @
@@ -1912,6 +1934,298 @@ def test_resume_functionality(temp_tracking_dir):
     assert result.exit_code == 0
     assert "Resuming:" in result.stdout
     assert "DD1310" in result.stdout or "lecture" in result.stdout
+@
+
+\subsection{Switch Command}
+
+The [[switch]] command is the user-facing realisation of the
+context-switch design described in
+\cref{sec:design-switch-functionality}.  It wraps the operations
+stop-batch / push-stack / start-new into one atomic step, mirroring
+the way an operating-system context switch saves and restores state.
+
+We allow an optional [[-a]]/[[--all]] flag so the user can clear
+\emph{all} active labels rather than just the most recent batch when
+making the switch.  Timing options ([[--offset]], [[--at]]) are
+supported for the same reason they exist on [[stop]] and [[start]]:
+correcting mistakes after the fact.
+
+<<switch command>>=
+@cli.command()
+def switch(
+    labels: Optional[List[str]] = typer.Argument(
+        None,
+        help="Labels to switch to. "
+             "If empty, switches back to saved labels.",
+        autocompletion=complete_historical_labels),
+    <<switch command options>>
+):
+    """
+    Switch tracking context, saving the current labels.
+
+    Stops the most recent batch and starts the given labels.
+    The stopped labels are pushed onto a stack so a later
+    call to switch (with no arguments) restores them.
+
+    Multiple forward switches stack up:
+      nytid track switch email    # A -> email, stack: [A]
+      nytid track switch meeting  # email -> meeting
+      nytid track switch          # meeting -> email
+      nytid track switch          # email -> A
+
+    Examples:
+      nytid track switch email
+      nytid track switch --all meeting
+      nytid track switch --offset -15m DD1310
+      nytid track switch              # switch back
+    """
+    session = load_active_session(who)
+    <<validate switch time options>>
+    <<compute switch time>>
+    if labels:
+        <<switch to new labels>>
+    else:
+        <<switch back to saved labels>>
+@
+
+\subsubsection{Options}
+
+When several unrelated batches are running simultaneously, it is
+useful to get a clean slate before the switch rather than only
+interrupting the most recent batch.  The [[-a]]/[[--all]] flag
+provides this choice, mirroring the same option on [[stop]].
+
+Timing options are needed because users often realise they should
+have switched context some minutes ago---the [[--offset]] and [[--at]]
+options allow backdating the moment of the switch so the recorded
+durations remain accurate.
+
+<<switch command options>>=
+    all_labels: bool = typer.Option(
+        False, "--all", "-a",
+        help="Stop all active labels, "
+             "not just most recent batch"),
+    offset: Optional[str] = typer.Option(
+        None, "--offset", "-o",
+        help="Offset switch time "
+             "(e.g., '-30m', '-1.5h', '30')"),
+    at: Optional[str] = typer.Option(
+        None, "--at",
+        help="Switch at specific time "
+             "(e.g., '14:30' or '2024-12-13 14:30')"),
+    who: str = typer.Option(
+        default_username, "--who", "-w",
+        help="Worker identity (default: $USER)",
+        autocompletion=complete_workers)
+@
+
+\subsubsection{Computing the Switch Time}
+
+The same constraint that applies to [[stop]] and [[start]] applies
+here: [[--offset]] and [[--at]] are mutually exclusive because they
+express the same quantity (the moment of the switch) through
+different representations.
+
+<<validate switch time options>>=
+if offset is not None and at is not None:
+    typer.echo(
+        "Error: Cannot use both --offset "
+        "and --at options", err=True
+    )
+    raise typer.Exit(1)
+@
+
+<<compute switch time>>=
+switch_time = datetime.datetime.now()
+if at is not None:
+    try:
+        switch_time = parse_at_time(at)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+elif offset is not None:
+    try:
+        switch_time += parse_offset(offset)
+    except ValueError as e:
+        typer.echo(
+            f"Error parsing offset '{offset}': {e}",
+            err=True
+        )
+        raise typer.Exit(1)
+@
+
+\subsubsection{Switching to New Labels}
+
+When labels are given we stop the current tracking, record the
+stopped labels on [[switch_stack]] so they can be restored later,
+and start the new labels.
+
+If nothing is active at all, we push an empty list.  This ensures
+that a subsequent bare [[switch]] correctly restores \enquote{nothing
+was active} rather than erroring---the user may switch from an idle
+state and still want the symmetry of being able to undo it.
+
+<<switch to new labels>>=
+if session.is_active():
+    if all_labels:
+        completed = session.stop_labels(
+            count=len(session.label_order),
+            end_time=switch_time, who=who)
+    else:
+        completed = session.stop_labels(
+            end_time=switch_time,
+            stop_batch=True, who=who)
+    add_completed_entries(completed)
+    for entry in completed:
+        typer.echo(
+            f"Stopped: "
+            f"{get_labels_display(entry.labels)}"
+            f" ({format_duration(entry.duration())})"
+        )
+    stopped_labels = [
+        label
+        for entry in completed
+        for label in entry.labels
+    ]
+else:
+    stopped_labels = []
+session.switch_stack.append(stopped_labels)
+session.start_labels(labels, switch_time)
+save_active_session(session, who)
+typer.echo(f"Switched to: {', '.join(labels)}")
+if at is not None or offset is not None:
+    typer.echo(
+        f"Switch time: "
+        f"{switch_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+@
+
+\subsubsection{Switching Back to Saved Labels}
+
+Without labels we pop the top of [[switch_stack]].  A non-empty
+popped list is restarted; an empty list (pushed when nothing was
+active) results in all tracking simply being stopped.
+
+We stop the current labels first (again honouring [[-a]]) so the
+time between the forward switch and this reverse switch is recorded
+properly before restoring the saved context.
+
+<<switch back to saved labels>>=
+if not session.switch_stack:
+    typer.echo(
+        "No saved labels to switch back to",
+        err=True
+    )
+    raise typer.Exit(1)
+if session.is_active():
+    if all_labels:
+        completed = session.stop_labels(
+            count=len(session.label_order),
+            end_time=switch_time, who=who)
+    else:
+        completed = session.stop_labels(
+            end_time=switch_time,
+            stop_batch=True, who=who)
+    add_completed_entries(completed)
+    for entry in completed:
+        typer.echo(
+            f"Stopped: "
+            f"{get_labels_display(entry.labels)}"
+            f" ({format_duration(entry.duration())})"
+        )
+saved_labels = session.switch_stack.pop()
+if saved_labels:
+    session.start_labels(saved_labels, switch_time)
+    typer.echo(
+        f"Switched back to: "
+        f"{', '.join(saved_labels)}"
+    )
+else:
+    typer.echo(
+        "Switched back "
+        "(nothing was active before)"
+    )
+save_active_session(session, who)
+if at is not None or offset is not None:
+    typer.echo(
+        f"Switch time: "
+        f"{switch_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+@
+
+\subsubsection{Testing the Switch Command}
+
+The tests cover the forward switch, the stack-unwind path, the
+error when the stack is empty, switching from an idle state, and
+switching back to an idle state.
+
+<<test functions>>=
+def test_switch_basic(temp_tracking_dir):
+    """Test basic switch from one set of labels to another"""
+    runner.invoke(cli, ["start", "DD1310", "lecture"])
+    result = runner.invoke(cli, ["switch", "grading"])
+    assert result.exit_code == 0
+    assert "Stopped:" in result.stdout
+    assert "Switched to: grading" in result.stdout
+    session = load_active_session()
+    assert "grading" in session.get_active_labels()
+    assert "DD1310" not in session.get_active_labels()
+    assert len(session.switch_stack) == 1
+
+def test_switch_back(temp_tracking_dir):
+    """Test switching back to original labels"""
+    runner.invoke(cli, ["start", "DD1310", "lecture"])
+    runner.invoke(cli, ["switch", "grading"])
+    result = runner.invoke(cli, ["switch"])
+    assert result.exit_code == 0
+    assert "Switched back to:" in result.stdout
+    session = load_active_session()
+    active = session.get_active_labels()
+    assert "DD1310" in active or "lecture" in active
+    assert "grading" not in active
+    assert len(session.switch_stack) == 0
+
+def test_switch_stack_multiple(temp_tracking_dir):
+    """Test multiple switches build a stack and unwind in order"""
+    runner.invoke(cli, ["start", "A"])
+    runner.invoke(cli, ["switch", "B"])
+    runner.invoke(cli, ["switch", "C"])
+    session = load_active_session()
+    assert "C" in session.get_active_labels()
+    assert len(session.switch_stack) == 2
+    runner.invoke(cli, ["switch"])
+    session = load_active_session()
+    assert "B" in session.get_active_labels()
+    assert len(session.switch_stack) == 1
+    runner.invoke(cli, ["switch"])
+    session = load_active_session()
+    assert "A" in session.get_active_labels()
+    assert len(session.switch_stack) == 0
+
+def test_switch_back_empty_stack(temp_tracking_dir):
+    """Test switch back with empty stack gives error"""
+    runner.invoke(cli, ["start", "DD1310"])
+    result = runner.invoke(cli, ["switch"])
+    assert result.exit_code == 1
+    assert "No saved labels" in result.stdout
+
+def test_switch_from_nothing(temp_tracking_dir):
+    """Test switch when nothing is currently active"""
+    result = runner.invoke(cli, ["switch", "grading"])
+    assert result.exit_code == 0
+    assert "Switched to: grading" in result.stdout
+    session = load_active_session()
+    assert "grading" in session.get_active_labels()
+    assert session.switch_stack == [[]]
+
+def test_switch_back_to_nothing(temp_tracking_dir):
+    """Test switching back when nothing was active before"""
+    runner.invoke(cli, ["switch", "grading"])
+    result = runner.invoke(cli, ["switch"])
+    assert result.exit_code == 0
+    assert "nothing was active before" in result.stdout
+    session = load_active_session()
+    assert not session.is_active()
 @
 
 \subsection{Status Command}
@@ -3090,6 +3404,7 @@ and checking the status of active tracking sessions:
 <<status command>>
 <<start command>>
 <<stop command>>
+<<switch command>>
 <<notes command>>
 @
 
