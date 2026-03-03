@@ -328,12 +328,16 @@ def get_labels_display(labels: List[str]) -> str:
     return ", ".join(sorted(labels)) if labels else "No labels"
 @
 
+\subsubsection{Merging Overlapping Intervals}
+
 Naively summing [[entry.duration()]] across all entries double-counts
 wall-clock time whenever labels overlap---for instance, two labels
 tracked from 09:00 to 10:00 would report two hours instead of one.
 We avoid this by merging overlapping intervals before summing.  The
 algorithm sorts intervals by start time, then greedily extends the
-current interval as long as the next one overlaps:
+current merged interval as long as the next one overlaps; whenever
+there is a gap it flushes the accumulated interval and starts a new
+one.
 
 <<helper functions>>=
 def merge_intervals(
@@ -355,10 +359,8 @@ def merge_intervals(
 
     for start, end in intervals[1:]:
         if start <= cur_end:
-            # Overlapping or adjacent --- extend
             cur_end = max(cur_end, end)
         else:
-            # Gap --- flush the current interval
             merged_total += cur_end - cur_start
             cur_start, cur_end = start, end
 
@@ -366,10 +368,13 @@ def merge_intervals(
     return merged_total
 @
 
+\subsubsection{Daily Wall-Clock Breakdown}
+
 The daily breakdown needs wall-clock time per calendar date.  An entry
 that spans midnight must be split across the two dates; otherwise all
-its time would land on the start date.  We split each entry at midnight
-boundaries first, then merge overlapping intervals within each date:
+its time would land on the start date.  We therefore split each entry
+at midnight boundaries first, then apply [[merge_intervals]]'s
+greedy-merge within each date:
 
 <<helper functions>>=
 def compute_daily_wall_clock(
@@ -381,8 +386,6 @@ def compute_daily_wall_clock(
     ``datetime.timedelta``, with overlapping intervals
     merged within each date.
     """
-    # Split entries at midnight boundaries into
-    # per-date (start, end) intervals
     date_intervals = {}
     for entry in entries:
         start = entry.start_time
@@ -396,14 +399,11 @@ def compute_daily_wall_clock(
                 start.date(), []
             ).append((start, midnight))
             start = midnight
-        # Remaining portion (or whole entry if no
-        # midnight crossing)
         if start < end:
             date_intervals.setdefault(
                 start.date(), []
             ).append((start, end))
 
-    # Merge overlapping intervals within each date
     daily_totals = {}
     for date, intervals in date_intervals.items():
         intervals.sort()
@@ -420,6 +420,8 @@ def compute_daily_wall_clock(
 
     return daily_totals
 @
+
+\subsubsection{Shell Completion Helpers}
 
 Shell-completion functions help the user discover available labels and
 worker names interactively.  They silently return an empty list on any
@@ -931,7 +933,90 @@ class ActiveSession:
             entries.append(entry)
 
         return entries
-    
+@
+
+\subsubsection{Discarding an Active Session}
+
+Sometimes a user wants to \emph{correct} the start time of a label that
+is already being tracked---for example, after realising they forgot to
+start tracking thirty minutes ago.  Simply calling [[stop_labels]]
+followed by [[start_labels]] would save a spurious short entry to the
+history, polluting the data.
+
+[[discard_labels]] solves this by removing the active entry without
+producing a [[TrackingEntry]].  The only structural difference from
+[[stop_labels]] is the absence of the grouping-and-emit step.
+
+Removing a label must also clean up its batch record: if the discarded
+label was the sole member of its batch, the batch key is deleted.
+Leaving an empty batch would let stale batch IDs accumulate and could
+confuse later calls to [[stop_labels]] that look up batches by ID.
+
+<<active session class>>=
+    def discard_labels(
+        self,
+        labels: List[str]
+    ) -> List[str]:
+        """
+        Remove labels from active tracking without creating entries.
+
+        Unlike stop_labels, no TrackingEntry is produced---the in-progress
+        session is silently erased.  This is used when the user wants to
+        correct the start time of an active label via --replace: the old
+        entry is thrown away so the label can be restarted at the desired
+        time.
+
+        Args:
+            labels: Labels to discard from active tracking
+
+        Returns:
+            List of labels that were actually discarded
+        """
+        discarded = []
+        for label in labels:
+            if label not in self.active_labels:
+                continue
+            _, _, batch_id = self.active_labels.pop(label)
+            if label in self.label_order:
+                self.label_order.remove(label)
+            if batch_id in self.batches:
+                self.batches[batch_id] = [
+                    l for l in self.batches[batch_id]
+                    if l != label
+                ]
+                if not self.batches[batch_id]:
+                    del self.batches[batch_id]
+            discarded.append(label)
+        return discarded
+
+@
+
+Let's verify that discarding leaves no trace in either the active labels
+or the history:
+
+<<test functions>>=
+def test_discard_labels(temp_tracking_dir):
+    """Discarding removes labels silently; no history entry is created."""
+    session = ActiveSession()
+    t0 = datetime.datetime.now()
+    session.start_labels(["labelA", "labelB"], t0)
+
+    discarded = session.discard_labels(["labelA"])
+    assert discarded == ["labelA"]
+    assert "labelA" not in session.active_labels
+    assert "labelB" in session.active_labels
+
+    # Discarding a non-active label is a no-op
+    discarded = session.discard_labels(["labelA"])
+    assert discarded == []
+
+    # Stopping the remaining label produces exactly one entry (not two)
+    entries = session.stop_labels(["labelB"])
+    assert len(entries) == 1
+    assert entries[0].labels == ["labelB"]
+@
+
+<<active session class>>=
     def add_notes(self, label: str, notes: str) -> bool:
         """
         Add or update notes for an active label.
@@ -1321,9 +1406,28 @@ if not labels:
         raise typer.Exit(1)
 @
 
-After resolving labels, we start tracking and report what happened:
+After resolving labels, we start tracking and report what happened.
+Before calling [[start_labels]], we optionally discard any already-active
+matching labels---the discarded labels will then appear in [[started]]
+rather than [[already_tracking]], so the rest of the reporting logic
+needs no special case:
+
+<<replace active labels if requested>>=
+if replace:
+    to_discard = [
+        l for l in labels
+        if session.get_label_info(l) is not None
+    ]
+    discarded = session.discard_labels(to_discard)
+    if discarded:
+        typer.echo(
+            f"Replaced: "
+            f"{', '.join(sorted(discarded))}"
+        )
+@
 
 <<start tracking and report results>>=
+<<replace active labels if requested>>
 started = session.start_labels(labels, start_time)
 already_tracking = [
     l for l in labels if l not in started
@@ -1385,6 +1489,36 @@ nytid track start                             # Resume last stopped labels
 nytid track start DD1310 --who Dan-Claude     # Track as Dan-Claude
 @
 
+\subsubsection{Replacing an Already-Active Label}
+
+Without [[--replace]], re-issuing [[track start labelA]] when [[labelA]]
+is already active has no effect: the label is silently continued and
+reported as \enquote{Already tracking}.  This is the safe default---a
+typo does not corrupt history.
+
+With [[--replace]], the active session for the named labels is discarded
+first via [[discard_labels]], and those labels are then re-started at the
+offset or absolute time.  The typical use case is time-correction: the
+user forgot to start tracking and now wants to backdate the session.  The
+abandoned entry never reaches the history file, so no cleanup is needed
+afterwards.
+
+The flag is only meaningful for labels that are already active; for labels
+that are not yet tracked, [[--replace]] has no observable effect---it just
+starts them normally.
+
+<<start command options>>=
+replace: bool = typer.Option(
+    False, "--replace", "-r",
+    help="If a label is already active, discard its current "
+         "session and restart it from the given offset/time."
+),
+@
+
+<<start command docstring examples>>=
+nytid track start labelA --offset -60m --replace  # Backdate active session
+@
+
 \subsubsection{Worker Identity}
 
 The [[--who]] option identifies which worker is tracking. This enables
@@ -1401,16 +1535,17 @@ who: str = typer.Option(
 
 \subsubsection{Calculating Start Time}
 
-Now we implement the start time calculation, handling the [[--offset]] and 
-[[--at]] options. These options are mutually exclusive---using both is an error.
+[[--offset]] and [[--at]] are mutually exclusive: both address the same
+question (when did this session start?) from different angles, and
+combining them would be ambiguous.  We treat this as a user error rather
+than picking one silently, so the mistake is surfaced immediately instead
+of producing a confusing entry with an unexpected timestamp.
 
 <<calculate start time>>=
-# Check for conflicting options
 if offset is not None and at is not None:
     typer.echo("Error: Cannot use both --offset and --at options", err=True)
     raise typer.Exit(1)
 
-# Calculate start time
 start_time = datetime.datetime.now()
 
 if at is not None:
@@ -1502,6 +1637,53 @@ def test_conflicting_time_options(temp_tracking_dir):
     ])
     assert result.exit_code == 1
     assert "Cannot use both --offset and --at" in result.stdout
+
+def test_start_replace_backdates_active_label(temp_tracking_dir):
+    """--replace discards the current session and restarts with the new time."""
+    # Start normally, then immediately replace with a backdated start.
+    runner.invoke(cli, ["start", "labelA"])
+    result = runner.invoke(cli, [
+        "start", "labelA", "--offset", "-60m", "--replace"
+    ])
+    assert result.exit_code == 0
+    assert "Replaced: labelA" in result.stdout
+    assert "Started tracking: labelA" in result.stdout
+
+    # The session file should record a start time ~60 min ago, not ~0 min ago.
+    session = load_active_session(default_username)
+    start_time, _, _ = session.get_label_info("labelA")
+    delta = datetime.datetime.now() - start_time
+    assert delta.total_seconds() > 50 * 60, (
+        "Start time should be roughly 60 minutes in the past"
+    )
+
+def test_start_replace_does_not_affect_other_labels(temp_tracking_dir):
+    """--replace only touches the named labels; siblings are untouched."""
+    runner.invoke(cli, ["start", "labelA", "labelB"])
+    result = runner.invoke(cli, [
+        "start", "labelA", "--offset", "-30m", "--replace"
+    ])
+    assert result.exit_code == 0
+    assert "Replaced: labelA" in result.stdout
+
+    session = load_active_session(default_username)
+    # labelB must still be active with its original (recent) start time.
+    assert session.get_label_info("labelB") is not None
+    b_start, _, _ = session.get_label_info("labelB")
+    b_delta = datetime.datetime.now() - b_start
+    assert b_delta.total_seconds() < 10, (
+        "labelB start time should not have been changed"
+    )
+
+def test_start_without_replace_keeps_original(temp_tracking_dir):
+    """Without --replace, re-starting an active label is still a no-op."""
+    runner.invoke(cli, ["start", "labelA"])
+    result = runner.invoke(cli, [
+        "start", "labelA", "--offset", "-60m"
+    ])
+    assert result.exit_code == 0
+    assert "Already tracking: labelA" in result.stdout
+    assert "Replaced" not in result.stdout
 @
 
 \subsection{Stop Command}
@@ -2085,7 +2267,17 @@ def run(
 
 \subsection{Add Command}
 
-The add command allows adding arbitrary time intervals.
+The [[add]] command lets users record time spent away from the computer:
+meetings at the whiteboard, phone calls, travel.  The entry is complete
+(it has both a start and an end time) from the moment it is created, so
+it goes straight to the history file without touching the active session.
+
+The original implementation had a [[--start-offset]] option that accepted
+an integer (minutes only).  This was inconsistent with the string-based
+[[--offset]] option on [[track start]] which accepts suffixes like
+\enquote{30m} or \enquote{1.5h}.  We replace [[--start-offset]] with the
+same [[--offset]] and [[--at]] pair used by [[track start]], so users need
+to learn only one set of time-specification options.
 
 <<add command>>=
 @cli.command()
@@ -2096,10 +2288,14 @@ def add(
     duration_minutes: int = typer.Option(
         ..., "--duration", "-d",
         help="Duration in minutes"),
-    start_offset_minutes: int = typer.Option(
-        0, "--start-offset",
-        help="Start time offset in minutes from now "
-             "(negative for past)"),
+    offset: Optional[str] = typer.Option(
+        None, "--offset", "-o",
+        help="Offset start time (e.g. '-60m', '-1.5h', "
+             "'30' for minutes).  Default: start now."),
+    at: Optional[str] = typer.Option(
+        None, "--at",
+        help="Start at specific time "
+             "(e.g. '14:30' or '2024-12-13 14:30')"),
     description: str = typer.Option(
         "", "--description",
         help="Description for this time entry"),
@@ -2109,9 +2305,15 @@ def add(
         autocompletion=complete_workers)
 ):
     """
-    Add a time entry for work done when not at the
-    computer. Useful for recording time spent in
-    meetings, at whiteboards, etc.
+    Add a completed time entry for offline work.
+
+    Useful for recording meetings, whiteboard sessions, or
+    any activity done away from the computer.
+
+    Examples:
+      nytid track add meeting --duration 60
+      nytid track add meeting --duration 60 --offset -90m
+      nytid track add meeting --duration 60 --at 14:00
     """
     if not labels:
         typer.echo(
@@ -2127,10 +2329,8 @@ def add(
         )
         raise typer.Exit(1)
 
-    now = datetime.datetime.now()
-    start_time = now + datetime.timedelta(
-        minutes=start_offset_minutes
-    )
+    <<resolve add start time>>
+
     end_time = start_time + datetime.timedelta(
         minutes=duration_minutes
     )
@@ -2152,6 +2352,38 @@ def add(
         f"Time: {start_time.strftime('%H:%M')} - "
         f"{end_time.strftime('%H:%M')}"
     )
+@
+
+[[--offset]] and [[--at]] are mutually exclusive for the same reason as
+in [[track start]]: they address the same question (when did this session
+start?) from two different angles, and combining them would be ambiguous.
+
+<<resolve add start time>>=
+if offset is not None and at is not None:
+    typer.echo(
+        "Error: Cannot use both --offset and --at",
+        err=True
+    )
+    raise typer.Exit(1)
+
+now = datetime.datetime.now()
+start_time = now
+
+if at is not None:
+    try:
+        start_time = parse_at_time(at)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+elif offset is not None:
+    try:
+        start_time += parse_offset(offset)
+    except ValueError as e:
+        typer.echo(
+            f"Error parsing offset '{offset}': {e}",
+            err=True
+        )
+        raise typer.Exit(1)
 @
 
 \subsection{Shared Entry Filtering}
@@ -2903,6 +3135,47 @@ def test_add_error_cases(temp_tracking_dir):
     ])
     assert result.exit_code == 1
     assert "Duration must be positive" in result.stdout
+
+def test_add_with_offset(temp_tracking_dir):
+    """--offset backdates the start of an added entry."""
+    result = runner.invoke(cli, [
+        "add", "meeting",
+        "--duration", "30",
+        "--offset", "-60m"
+    ])
+    assert result.exit_code == 0
+    assert "Added entry: meeting" in result.stdout
+    # Start time should be ~60 min ago, end ~30 min ago.
+    entries = load_tracking_data()
+    assert len(entries) == 1
+    delta_start = datetime.datetime.now() - entries[0].start_time
+    delta_end = datetime.datetime.now() - entries[0].end_time
+    assert 55 * 60 < delta_start.total_seconds() < 65 * 60
+    assert 25 * 60 < delta_end.total_seconds() < 35 * 60
+
+def test_add_with_at_time(temp_tracking_dir):
+    """--at sets an explicit start time for an added entry."""
+    result = runner.invoke(cli, [
+        "add", "meeting",
+        "--duration", "45",
+        "--at", "2024-06-15 10:00"
+    ])
+    assert result.exit_code == 0
+    entries = load_tracking_data()
+    assert len(entries) == 1
+    assert entries[0].start_time == datetime.datetime(2024, 6, 15, 10, 0)
+    assert entries[0].end_time == datetime.datetime(2024, 6, 15, 10, 45)
+
+def test_add_offset_and_at_are_exclusive(temp_tracking_dir):
+    """Using both --offset and --at together is an error."""
+    result = runner.invoke(cli, [
+        "add", "meeting",
+        "--duration", "30",
+        "--offset", "-60m",
+        "--at", "14:00"
+    ])
+    assert result.exit_code == 1
+    assert "Cannot use both --offset and --at" in result.stdout
 @
 
 \section{Comprehensive Testing}
@@ -3037,32 +3310,32 @@ def test_stats_filtered_by_labels(temp_tracking_dir):
 def test_stats_co_occurring_labels(temp_tracking_dir):
     """Test stats command shows co-occurring labels when filtering"""
     # Add data with co-occurring labels.
-    # Use --start-offset so entries don't overlap in
+    # Use --offset so entries don't overlap in
     # wall-clock time --- overlapping entries are merged
     # by stats, which would change the expected totals.
     # devel + nytid (120 min, starting 300 min ago)
     runner.invoke(cli, [
         "add", "devel", "nytid",
         "--duration", "120",
-        "--start-offset", "-300"
+        "--offset", "-300m"
     ])
     # devel + canvaslms (90 min, starting 180 min ago)
     runner.invoke(cli, [
         "add", "devel", "canvaslms",
         "--duration", "90",
-        "--start-offset", "-180"
+        "--offset", "-180m"
     ])
     # devel + nytid + testing (60 min, starting 90 min ago)
     runner.invoke(cli, [
         "add", "devel", "nytid", "testing",
         "--duration", "60",
-        "--start-offset", "-90"
+        "--offset", "-90m"
     ])
     # Just nytid (no devel) (30 min, starting 30 min ago)
     runner.invoke(cli, [
         "add", "nytid", "docs",
         "--duration", "30",
-        "--start-offset", "-30"
+        "--offset", "-30m"
     ])
     
     # Get stats for devel - should show co-occurring labels
@@ -3136,7 +3409,7 @@ def test_all_tracking_module_functions(temp_tracking_dir):
         "add", "manual_label",
         "--duration", "30",
         "--description", "Manual entry",
-        "--start-offset", "-60"  # -60 minutes = -1 hour
+        "--offset", "-60m"  # started 60 minutes ago
     ])
     assert result.exit_code == 0
 
