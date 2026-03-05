@@ -6,7 +6,7 @@ all: ${TARGETS}
 
 nytid-storage.pdf: nytid-storage.svg
 timesheet-dbosk.pdf: timesheet-dbosk.xlsx
-	loffice --convert-to pdf $<
+	loffice --headless --convert-to pdf $<
 
 .PHONY: clean
 clean:
