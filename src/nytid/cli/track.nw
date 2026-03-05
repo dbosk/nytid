@@ -831,10 +831,11 @@ class ActiveSession:
         self.next_batch_id: int = 1
         # Remember last stopped labels for resume functionality
         self.last_stopped: List[str] = []
-        # Stack of label lists for switch-back functionality.
-        # Each forward switch pushes the stopped labels here;
-        # a bare switch pops and restarts them.
-        self.switch_stack: List[List[str]] = []
+        # The other side of the toggle for switch.
+        # A forward switch saves stopped labels here; a bare
+        # switch toggles between current and this saved set.
+        # None means there is no saved set to toggle back to.
+        self.switch_other: Optional[List[str]] = None
         
     def start_labels(
         self,
@@ -1100,7 +1101,7 @@ def test_discard_labels(temp_tracking_dir):
             'batches': self.batches,
             'next_batch_id': self.next_batch_id,
             'last_stopped': self.last_stopped,
-            'switch_stack': self.switch_stack
+            'switch_other': self.switch_other
         }
     
     @classmethod
@@ -1153,8 +1154,13 @@ def test_discard_labels(temp_tracking_dir):
                 session.next_batch_id = data['next_batch_id']
             if 'last_stopped' in data:
                 session.last_stopped = data['last_stopped']
-            if 'switch_stack' in data:
-                session.switch_stack = data['switch_stack']
+            if 'switch_other' in data:
+                # New format: single saved set (toggle semantics)
+                session.switch_other = data['switch_other']
+            elif 'switch_stack' in data and data['switch_stack']:
+                # Old format: stack — migrate by taking the most
+                # recently pushed entry as the saved set.
+                session.switch_other = data['switch_stack'][-1]
         
         return session
 @
@@ -1967,25 +1973,35 @@ def switch(
     <<switch command options>>
 ):
     """
-    Switch tracking context, saving the current labels.
+    Switch tracking context, toggling between two label sets.
 
-    Stops the most recent batch and starts the given labels.
-    The stopped labels are pushed onto a stack so a later
-    call to switch (with no arguments) restores them.
+    Stops the current tracking and starts the given labels.
+    The stopped labels are saved so a bare switch toggles
+    back to them.  Another bare switch toggles forward again.
+    There is at most one saved set at any time.
 
     \b
-    Multiple forward switches stack up:
-      nytid track switch email    # A -> email, stack: [A]
-      nytid track switch meeting  # email -> meeting
-      nytid track switch          # meeting -> email
-      nytid track switch          # email -> A
+    Toggle example:
+      nytid track switch email      # A -> email, saved: A
+      nytid track switch            # email -> A, saved: email
+      nytid track switch            # A -> email, saved: A
+
+    \b
+    Use --pop to discard the current context without saving:
+      nytid track switch --pop      # email -> A, no saved set
+
+    \b
+    When labels are given with --pop, they replace current
+    tracking without saving the stopped labels:
+      nytid track switch grading --pop
 
     \b
     Examples:
       nytid track switch email
       nytid track switch --all meeting
       nytid track switch --offset -15m DD1310
-      nytid track switch              # switch back
+      nytid track switch              # toggle back
+      nytid track switch --pop        # discard current
     """
     session = load_active_session(who)
     <<validate switch time options>>
@@ -2008,11 +2024,23 @@ have switched context some minutes ago---the [[--offset]] and [[--at]]
 options allow backdating the moment of the switch so the recorded
 durations remain accurate.
 
+The [[--pop]] flag suppresses the save step.  Without it, stopped
+labels are always stored as the \enquote{other} side of the toggle.
+With it, the stopped labels are simply discarded.  When [[--pop]] is
+used with explicit labels the new labels start without saving what was
+running---useful for one-off interruptions you never want to return to.
+When [[--pop]] is used without labels the toggle flips to the saved set
+and then clears it, leaving only one active set in play.
+
 <<switch command options>>=
     all_labels: bool = typer.Option(
         False, "--all", "-a",
         help="Stop all active labels, "
              "not just most recent batch"),
+    pop: bool = typer.Option(
+        False, "--pop", "-p",
+        help="Do not save the stopped labels; "
+             "discard the current context"),
     offset: Optional[str] = typer.Option(
         None, "--offset", "-o",
         help="Offset switch time "
@@ -2064,14 +2092,16 @@ elif offset is not None:
 
 \subsubsection{Switching to New Labels}
 
-When labels are given we stop the current tracking, record the
-stopped labels on [[switch_stack]] so they can be restored later,
-and start the new labels.
+The key question when labels are given is whether the current context
+should be preserved for a later toggle.  By default it is: stopping
+the current labels and storing them in [[switch_other]] keeps the two
+contexts symmetric---a bare [[switch]] always returns you to where
+you were.  With [[--pop]] you are declaring that the interrupted work
+is disposable; [[switch_other]] is left unchanged so the toggle slot
+is not polluted by a context you will never return to.
 
-If nothing is active at all, we push an empty list.  This ensures
-that a subsequent bare [[switch]] correctly restores \enquote{nothing
-was active} rather than erroring---the user may switch from an idle
-state and still want the symmetry of being able to undo it.
+If nothing is active we still record an empty list (unless [[--pop]])
+so a subsequent bare [[switch]] correctly restores the idle state.
 
 <<switch to new labels>>=
 if session.is_active():
@@ -2097,7 +2127,8 @@ if session.is_active():
     ]
 else:
     stopped_labels = []
-session.switch_stack.append(stopped_labels)
+if not pop:
+    session.switch_other = stopped_labels
 session.start_labels(labels, switch_time)
 save_active_session(session, who)
 typer.echo(f"Switched to: {', '.join(labels)}")
@@ -2110,21 +2141,27 @@ if at is not None or offset is not None:
 
 \subsubsection{Switching Back to Saved Labels}
 
-Without labels we pop the top of [[switch_stack]].  A non-empty
-popped list is restarted; an empty list (pushed when nothing was
-active) results in all tracking simply being stopped.
+Without labels we toggle: the saved set in [[switch_other]] becomes
+active and the just-stopped labels become the new [[switch_other]]
+---unless [[--pop]] was given, in which case [[switch_other]] is
+cleared so there is nothing left to toggle back to.
 
-We stop the current labels first (again honouring [[-a]]) so the
-time between the forward switch and this reverse switch is recorded
+If [[switch_other]] is [[None]] there is only one label set in play
+and no toggle is possible.  We print an informational message and
+exit cleanly rather than treating this as an error, because the user
+may simply have forgotten they haven't set up a second context yet.
+
+We stop the current labels first (honouring [[-a]]) so the time
+between the forward switch and this reverse switch is recorded
 properly before restoring the saved context.
 
 <<switch back to saved labels>>=
-if not session.switch_stack:
+if session.switch_other is None:
     typer.echo(
-        "No saved labels to switch back to",
-        err=True
+        "Nothing to switch back to: "
+        "only one label set in play."
     )
-    raise typer.Exit(1)
+    raise typer.Exit(0)
 if session.is_active():
     if all_labels:
         completed = session.stop_labels(
@@ -2141,7 +2178,18 @@ if session.is_active():
             f"{get_labels_display(entry.labels)}"
             f" ({format_duration(entry.duration())})"
         )
-saved_labels = session.switch_stack.pop()
+    stopped_labels = [
+        label
+        for entry in completed
+        for label in entry.labels
+    ]
+else:
+    stopped_labels = []
+saved_labels = session.switch_other
+if pop:
+    session.switch_other = None
+else:
+    session.switch_other = stopped_labels
 if saved_labels:
     session.start_labels(saved_labels, switch_time)
     typer.echo(
@@ -2163,9 +2211,10 @@ if at is not None or offset is not None:
 
 \subsubsection{Testing the Switch Command}
 
-The tests cover the forward switch, the stack-unwind path, the
-error when the stack is empty, switching from an idle state, and
-switching back to an idle state.
+The tests cover the forward switch, the toggle (back-and-forth)
+path, the informational message when there is nothing to toggle
+back to, switching from an idle state, switching back to an idle
+state, and the [[--pop]] flag.
 
 <<test functions>>=
 def test_switch_basic(temp_tracking_dir):
@@ -2178,7 +2227,7 @@ def test_switch_basic(temp_tracking_dir):
     session = load_active_session()
     assert "grading" in session.get_active_labels()
     assert "DD1310" not in session.get_active_labels()
-    assert len(session.switch_stack) == 1
+    assert session.switch_other is not None
 
 def test_switch_back(temp_tracking_dir):
     """Test switching back to original labels"""
@@ -2191,31 +2240,45 @@ def test_switch_back(temp_tracking_dir):
     active = session.get_active_labels()
     assert "DD1310" in active or "lecture" in active
     assert "grading" not in active
-    assert len(session.switch_stack) == 0
+    # grading is now the saved set ready for another toggle
+    assert session.switch_other is not None
 
-def test_switch_stack_multiple(temp_tracking_dir):
-    """Test multiple switches build a stack and unwind in order"""
+def test_switch_toggle(temp_tracking_dir):
+    """Test that bare switch toggles between two label sets"""
     runner.invoke(cli, ["start", "A"])
     runner.invoke(cli, ["switch", "B"])
-    runner.invoke(cli, ["switch", "C"])
-    session = load_active_session()
-    assert "C" in session.get_active_labels()
-    assert len(session.switch_stack) == 2
-    runner.invoke(cli, ["switch"])
+    # A -> B, saved: A
     session = load_active_session()
     assert "B" in session.get_active_labels()
-    assert len(session.switch_stack) == 1
     runner.invoke(cli, ["switch"])
+    # B -> A, saved: B
     session = load_active_session()
     assert "A" in session.get_active_labels()
-    assert len(session.switch_stack) == 0
+    runner.invoke(cli, ["switch"])
+    # A -> B, saved: A
+    session = load_active_session()
+    assert "B" in session.get_active_labels()
 
-def test_switch_back_empty_stack(temp_tracking_dir):
-    """Test switch back with empty stack gives error"""
+def test_switch_multiple_forward_uses_last(temp_tracking_dir):
+    """A second forward switch replaces the saved set"""
+    runner.invoke(cli, ["start", "A"])
+    runner.invoke(cli, ["switch", "B"])
+    # saved: A; active: B
+    runner.invoke(cli, ["switch", "C"])
+    # saved: B (A is gone); active: C
+    session = load_active_session()
+    assert "C" in session.get_active_labels()
+    runner.invoke(cli, ["switch"])
+    # C -> B, saved: C
+    session = load_active_session()
+    assert "B" in session.get_active_labels()
+
+def test_switch_no_saved_set(temp_tracking_dir):
+    """Bare switch with no saved set gives info message, exit 0"""
     runner.invoke(cli, ["start", "DD1310"])
     result = runner.invoke(cli, ["switch"])
-    assert result.exit_code == 1
-    assert "No saved labels" in result.stdout
+    assert result.exit_code == 0
+    assert "only one label set in play" in result.stdout
 
 def test_switch_from_nothing(temp_tracking_dir):
     """Test switch when nothing is currently active"""
@@ -2224,7 +2287,8 @@ def test_switch_from_nothing(temp_tracking_dir):
     assert "Switched to: grading" in result.stdout
     session = load_active_session()
     assert "grading" in session.get_active_labels()
-    assert session.switch_stack == [[]]
+    # saved set is the empty list (nothing was running)
+    assert session.switch_other == []
 
 def test_switch_back_to_nothing(temp_tracking_dir):
     """Test switching back when nothing was active before"""
@@ -2234,6 +2298,33 @@ def test_switch_back_to_nothing(temp_tracking_dir):
     assert "nothing was active before" in result.stdout
     session = load_active_session()
     assert not session.is_active()
+
+def test_switch_pop_no_labels(temp_tracking_dir):
+    """--pop discards current labels without saving them"""
+    runner.invoke(cli, ["start", "A"])
+    runner.invoke(cli, ["switch", "B"])
+    # saved: A; active: B
+    result = runner.invoke(cli, ["switch", "--pop"])
+    assert result.exit_code == 0
+    assert "Switched back to:" in result.stdout
+    session = load_active_session()
+    assert "A" in session.get_active_labels()
+    # saved set is now cleared
+    assert session.switch_other is None
+
+def test_switch_pop_with_labels(temp_tracking_dir):
+    """--pop with labels switches without saving stopped labels"""
+    runner.invoke(cli, ["start", "A"])
+    runner.invoke(cli, ["switch", "B"])
+    # saved: A; active: B
+    result = runner.invoke(cli, ["switch", "C", "--pop"])
+    assert result.exit_code == 0
+    assert "Switched to: C" in result.stdout
+    session = load_active_session()
+    assert "C" in session.get_active_labels()
+    # saved set unchanged (still A from the first switch)
+    assert session.switch_other is not None
+    assert "A" in session.switch_other
 @
 
 \subsection{Status Command}
