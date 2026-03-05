@@ -137,6 +137,7 @@ The main module structure follows nytid's standard patterns:
 <<[[track.py]]>>=
 import datetime
 from enum import Enum
+import functools
 import json
 import logging
 import os
@@ -206,6 +207,14 @@ We use nytid's StorageRoot system for managing tracking data files, which provid
 a consistent interface with other nytid components and supports different storage
 backends (local filesystem, AFS, etc.).
 
+[[get_tracking_dir]] is called on every subcommand that touches a file —
+[[status]], [[start]], [[stop]], etc.\ all need the directory path.
+Each call without caching re-reads the configuration store; with dozens
+of callers inside a single invocation this adds up.
+The config value is stable for the lifetime of a process, so caching with
+[[functools.lru_cache]] is safe and reduces the repeated config look-ups
+to a single one per process.
+
 <<configuration management>>=
 # Configuration keys for track system
 TRACKING_DIR_CONFIG = "track.data_dir"
@@ -229,8 +238,9 @@ def get_tracking_storage() -> storage.StorageRoot:
     
     return storage.StorageRoot(tracking_dir)
 
+@functools.lru_cache(maxsize=None)
 def get_tracking_dir() -> pathlib.Path:
-    """Get the tracking data directory path (for compatibility)"""
+    """Get the tracking data directory path (cached for performance)."""
     return get_tracking_storage()._StorageRoot__path
 
 def get_tracking_data_file() -> pathlib.Path:
@@ -2289,6 +2299,12 @@ When no [[--who]] is specified, we discover all active workers by
 globbing for session files in the tracking directory. This gives a
 quick overview of who is currently tracking time.
 
+Each [[load_active_session(worker)]] call would re-derive the session
+file path through [[get_current_session_file]] → [[get_tracking_dir]].
+In the loop we already hold the [[pathlib.Path]] from the glob, so we
+read it directly to avoid that redundant path computation for each
+worker file we found.
+
 <<show all workers status>>=
 tracking_dir = get_tracking_dir()
 found_any = False
@@ -2300,7 +2316,14 @@ if tracking_dir.exists():
         worker = session_file.stem.replace(
             "current_session_", ""
         )
-        session = load_active_session(worker)
+        try:
+            with open(session_file, 'r') as _f:
+                session = ActiveSession.from_dict(json.load(_f))
+        except (json.JSONDecodeError, KeyError, ValueError) as _e:
+            logging.warning(
+                f"Error loading session {session_file}: {_e}"
+            )
+            session = ActiveSession()
         if session.is_active():
             found_any = True
             typer.echo(f"Currently tracking ({worker}):")
