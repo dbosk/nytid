@@ -5,7 +5,6 @@ SUBDIR+=	storage
 SUBDIR+=	courses
 SUBDIR+=	signup
 
-MODULES+=	http_utils.py
 MODULES+=	schedules.py
 
 .PHONY: all

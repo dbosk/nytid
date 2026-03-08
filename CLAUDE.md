@@ -61,7 +61,7 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 - `src/nytid/__init__.py` (empty package marker)
 - `src/nytid/signup/__init__.py`
 - `src/nytid/signup/hr/timesheet/__init__.py`
-- `src/nytid/httputils.py` (legacy, being replaced by `http_utils.nw`)
+- `src/nytid/httputils.py` (legacy, unused)
 
 ### Documentation and Source Relationship
 
