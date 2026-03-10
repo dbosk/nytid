@@ -2340,16 +2340,20 @@ description: Optional[str] = typer.Option(
 Like the UNIX [[at]] command, we can capture the current working
 directory and environment at creation time. The [[--here]] flag is a
 convenient shorthand that captures both [[os.getcwd()]] and
-[[os.environ]], while [[--wd]] allows specifying an explicit
-directory. When either is used, the environment is also captured so
-that [[todo start]] can restore the full context later. The [[--run]]
-option sets a default command (such as [[claude]] or [[opencode]]) to
-launch when starting the todo.
+[[os.environ]]. For finer control, [[--wd]] stores only an explicit
+directory while [[--env]] stores only the current environment. This
+lets the user update one without silently rewriting the other. The
+[[--run]] option sets a default command (such as [[claude]] or
+[[opencode]]) to launch when starting the todo.
 
 <<add command options>>=
 wd_path: Optional[str] = typer.Option(
     None, "--wd", "-C",
     help="Working directory to capture",
+),
+capture_env: bool = typer.Option(
+    False, "--env",
+    help="Capture current environment",
 ),
 here: bool = typer.Option(
     False, "--here",
@@ -2490,10 +2494,10 @@ priority = binary_search_priority(
 @
 
 When [[--here]] is used, we capture the current working directory and
-the full environment---just like UNIX [[at]]. When [[--wd]] is given
-explicitly, we also capture the environment since the user intends to
-restore context later. The two flags are mutually exclusive in
-practice, but [[--here]] takes precedence.
+the full environment---just like UNIX [[at]].  The separate [[--wd]]
+and [[--env]] flags let the user update only one side of that context.
+If several are supplied, [[--here]] simply provides defaults that the
+more specific flags can still override.
 
 <<resolve wd and env for new todo>>=
 resolved_wd = None
@@ -2501,8 +2505,9 @@ resolved_env = None
 if here:
     resolved_wd = os.getcwd()
     resolved_env = dict(os.environ)
-elif wd_path:
+if wd_path:
     resolved_wd = os.path.abspath(wd_path)
+if capture_env:
     resolved_env = dict(os.environ)
 @
 
@@ -2553,6 +2558,12 @@ front\-matter block so the user can review and adjust them before
 saving. Without this pre-population the flags would still take effect
 (they are merged in [[<<create parent from parsed>>]]), but the user
 would never see them in the editor---a confusing silent override.
+
+We intentionally do 
+not render [[--env]] into the editor preamble: a captured process
+environment is often large, noisy, and not something the user wants to
+edit as front matter.  The flag still applies when saving, just without
+dumping the whole environment into the buffer.
 
 <<add via editor>>=
 <<build initial editor metadata>>
@@ -2615,13 +2626,12 @@ meta = parsed.metadata
 resolved_wd = meta.get("wd") or (
     os.getcwd() if here else None
 )
-resolved_env = (
-    dict(os.environ)
-    if resolved_wd or here
-    else None
-)
+resolved_env = None
 if wd_path:
     resolved_wd = os.path.abspath(wd_path)
+if here:
+    resolved_env = dict(os.environ)
+elif capture_env:
     resolved_env = dict(os.environ)
 parent_item = TodoItem(
     id=next_id,
@@ -2658,12 +2668,16 @@ typer.echo(
 @
 
 Children are created recursively. Each child inherits the parent's
-labels, deadline, and assignee unless its own YAML block overrides
-them.  We pass [[parent_who]] explicitly rather than reading
+labels, deadline, assignee, and environment unless its own YAML block
+overrides them.  We pass [[parent_who]] and [[parent_env]] explicitly
+rather than reading
 [[default_username]] again inside the function: the caller already
 knows the resolved assignee (which may be a custom [[--who]] value),
 so passing it through avoids a second lookup and keeps the function
-independent of global state.  Priorities are distributed within the
+independent of global state.  Passing the environment explicitly serves
+the same purpose for context restoration: if the parent captured an
+environment, children created in the editor inherit it unless they say
+otherwise. Priorities are distributed within the
 range computed by [[compute_child_priority_range]] so that children
 sort between their parent and the parent's next-lower sibling in
 flat view:
@@ -2674,6 +2688,7 @@ def create_children_from_parsed(
     parent_labels, parent_deadline,
     priority_high, priority_low,
     parent_who=None,
+    parent_env=None,
 ):
     """Recursively create TodoItems from parsed
     children.
@@ -2682,7 +2697,10 @@ def create_children_from_parsed(
     (priority_low, priority_high).  Each child
     inherits ``parent_who`` as its assignee unless
     the child's own YAML block specifies a
-    ``who`` key.
+    ``who`` key.  Children inherit ``parent_env``
+    unless they explicitly specify an ``env``
+    block or request [[--here]]/[[--env]] on the
+    command line before entering the editor.
     """
     nonlocal next_id, todos
     priorities = distribute_priorities_in_range(
@@ -2704,18 +2722,19 @@ def create_children_from_parsed(
                 child_deadline,
                 nested_high, nested_low,
                 child_who,
+                child_env,
             )
 @
 
 Each child overrides its metadata (labels, deadline, working
-directory, assignee) from the YAML block in the editor, falling
-back to the parent's values when not specified.  The [[who]]
+directory, assignee, environment) from the YAML block in the editor,
+falling back to the parent's values when not specified.  The [[who]]
 inheritance is especially important: without it, children typed
 in the editor without an explicit [[who:]] key would be created
 unassigned, even though the user intended the whole task tree to
-belong to the same person.  We also capture [[os.environ]]
-at creation time when the child has an explicit working directory,
-so [[todo start]] can restore the environment where it makes sense.
+belong to the same person.  Environment inheritance follows the same
+logic: changing the directory should not silently replace the stored
+environment, so [[wd]] and [[env]] are inherited independently.
 <<resolve child metadata>>=
 child_meta = parsed_child.metadata
 child_labels = child_meta.get(
@@ -2726,9 +2745,7 @@ child_deadline = child_meta.get(
 )
 child_who = child_meta.get("who", parent_who)
 child_wd = child_meta.get("wd")
-child_env = (
-    dict(os.environ) if child_wd else None
-)
+child_env = child_meta.get("env", parent_env)
 @
 
 We append the new item to [[todos]] immediately so that recursive
@@ -2786,6 +2803,7 @@ create_children_from_parsed(
     parent_item.deadline,
     prio_high, prio_low,
     parent_item.who,
+    parent_item.env,
 )
 @
 
@@ -3665,8 +3683,13 @@ task at the top of the active stack.  This keeps the common
 \enquote{resume what I was working on} workflow short without removing
 the explicit escape hatch.
 
-Without [[-E]], the command works as before: CLI flags update
-individual fields.
+Without [[-E]], the command updates individual fields directly.  We
+reuse the same context-capture options as [[add]]: [[--who]] changes
+ownership, [[--wd]] stores an explicit working directory,
+[[--env]] refreshes the stored environment,
+[[--here]] captures the current directory and environment, and
+[[--run]] updates the default command to launch when the task is
+started.
 
 <<edit command>>=
 @cli.command()
@@ -3700,10 +3723,26 @@ def edit(
         None, "--description",
         help="New description",
     ),
-    reassign: Optional[str] = typer.Option(
-        None, "--reassign",
-        help="Reassign to worker",
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Assign to worker",
         autocompletion=complete_todo_workers,
+    ),
+    wd_path: Optional[str] = typer.Option(
+        None, "--wd", "-C",
+        help="New working directory",
+    ),
+    capture_env: bool = typer.Option(
+        False, "--env",
+        help="Capture current environment",
+    ),
+    here: bool = typer.Option(
+        False, "--here",
+        help="Capture current directory and environment",
+    ),
+    run_command: Optional[str] = typer.Option(
+        None, "--run", "-r",
+        help="New default command to run on start",
     ),
     parent: Optional[int] = typer.Option(
         None, "--parent", "-p",
@@ -3750,8 +3789,18 @@ if label is not None:
     item.labels = list(label)
 if description is not None:
     item.description = description
-if reassign is not None:
-    item.who = reassign
+if who is not None:
+    item.who = who
+if here:
+    item.wd = os.getcwd()
+    item.env = dict(os.environ)
+else:
+    if wd_path:
+        item.wd = os.path.abspath(wd_path)
+    if capture_env:
+        item.env = dict(os.environ)
+if run_command is not None:
+    item.command = run_command
 @
 
 The [[--parent]] flag moves an item in the hierarchy.  Items are
@@ -5184,21 +5233,34 @@ proc_wd = item.wd or os.getcwd()
 @
 
 The command resolution follows a priority chain: [[--run]] overrides
-the stored [[command]], which overrides [[$SHELL]]. Special commands
-like [[claude]] and [[opencode]] receive the todo's notes or
-description as a prompt argument, so the AI tool starts with context.
+the stored [[command]], which overrides [[$SHELL]].  We parse command
+strings with [[shlex.split]] so quoted arguments survive intact.
+When the resolved launcher is [[claude]] or [[opencode]] and the user
+specified only the bare command, we append the todo's notes or
+description as a prompt argument.  If the user already supplied flags
+such as [[-p]], we respect that command line exactly.
+
+This gives two distinct workflows.  Storing plain [[claude]] means the
+todo text itself is the prompt source, so later edits to notes or
+description automatically change what the agent sees.  Storing
+[[claude -p "..."]], by contrast, freezes the prompt in the command,
+which is useful when the launcher instruction should stay stable even if
+the todo text evolves.
 
 <<determine command to run>>=
 cmd_str = run or item.command
 if cmd_str:
     prompt_text = item.notes or item.description
-    if cmd_str in ("claude", "opencode"):
-        if prompt_text:
-            cmd = [cmd_str, prompt_text]
-        else:
-            cmd = [cmd_str]
-    else:
-        cmd = cmd_str.split()
+    cmd = shlex.split(cmd_str)
+    if not cmd:
+        cmd = [os.environ.get("SHELL", "/bin/sh")]
+    elif cmd[0] in ("claude", "opencode"):
+        has_prompt = any(
+            part in ("-p", "--prompt")
+            for part in cmd[1:]
+        )
+        if prompt_text and not has_prompt:
+            cmd = cmd + [prompt_text]
 else:
     cmd = [os.environ.get("SHELL", "/bin/sh")]
 @
@@ -6999,6 +7061,202 @@ def test_edit_command(temp_todo_dir):
     assert todos[0].title == "Updated"
 
 
+def test_edit_who_flag(temp_todo_dir):
+    """Edit uses --who for assignee updates."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["edit", "1", "--who", "dan-claude"],
+    )
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].who == "dan-claude"
+
+
+def test_edit_wd_flag_preserves_env(temp_todo_dir):
+    """Edit --wd updates wd without rewriting env."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            env={"PATH": "/usr/local/bin"},
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with patch.dict(
+        os.environ,
+        {"PATH": "/usr/bin", "HOME": "/tmp/home"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            ["edit", "1", "--wd", "project"],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.abspath("project")
+    assert todos[0].env == {"PATH": "/usr/local/bin"}
+
+
+def test_edit_env_flag_captures_environment(temp_todo_dir):
+    """Edit --env refreshes the stored environment."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            wd="/tmp/project",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with patch.dict(
+        os.environ,
+        {"PATH": "/usr/bin", "HOME": "/tmp/home"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            ["edit", "1", "--env"],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == "/tmp/project"
+    assert todos[0].env == {
+        "PATH": "/usr/bin",
+        "HOME": "/tmp/home",
+    }
+
+
+def test_edit_here_flag_captures_current_directory(
+    temp_todo_dir,
+):
+    """Edit --here stores cwd and environment."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with patch.dict(
+        os.environ,
+        {"HOME": "/tmp/home", "USER": "alice"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            ["edit", "1", "--here"],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == os.getcwd()
+    assert todos[0].env == {
+        "HOME": "/tmp/home",
+        "USER": "alice",
+    }
+
+
+def test_add_wd_does_not_capture_env(temp_todo_dir):
+    """Add --wd stores only the working directory."""
+    with patch.dict(
+        os.environ,
+        {"PATH": "/usr/bin", "HOME": "/tmp/home"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Context task",
+                "--wd", "project",
+                "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.abspath("project")
+    assert todos[0].env is None
+
+
+def test_add_env_captures_environment(temp_todo_dir):
+    """Add --env stores only the current environment."""
+    with patch.dict(
+        os.environ,
+        {"PATH": "/usr/bin", "HOME": "/tmp/home"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Env task",
+                "--env",
+                "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd is None
+    assert todos[0].env == {
+        "PATH": "/usr/bin",
+        "HOME": "/tmp/home",
+    }
+
+
+def test_add_here_captures_wd_and_env(temp_todo_dir):
+    """Add --here stores cwd together with environment."""
+    with patch.dict(
+        os.environ,
+        {"HOME": "/tmp/home", "USER": "alice"},
+        clear=True,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Here task",
+                "--here",
+                "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == os.getcwd()
+    assert todos[0].env == {
+        "HOME": "/tmp/home",
+        "USER": "alice",
+    }
+
+
+def test_edit_run_flag_updates_command(temp_todo_dir):
+    """Edit --run updates the stored command."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            command="claude",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["edit", "1", "--run", "opencode"],
+    )
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].command == "opencode"
+
+
 def test_export_vtodo(temp_todo_dir):
     """Test VTODO export."""
     save_todos(2, [
@@ -7132,4 +7390,39 @@ def test_start_special_command(temp_todo_dir):
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "claude"
         assert "Fix the login bug" in cmd[1]
+
+
+def test_start_special_command_respects_explicit_prompt(
+    temp_todo_dir,
+):
+    """Explicit prompt flags suppress auto-appended notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="AI task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+            command=(
+                'claude -p "Use nytid todo to track work."'
+            ),
+            notes="Fix the login bug",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1"],
+            input="n\n",
+        )
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == [
+            "claude",
+            "-p",
+            "Use nytid todo to track work.",
+        ]
 @
