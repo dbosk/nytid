@@ -6151,6 +6151,11 @@ Imported items are assigned to the current user by default
 [[todo ls]]. This ensures that imported items appear when
 filtering by worker, without requiring an extra flag.
 
+As [[todo import]] grows beyond simple issue ingestion, it should feel
+like the batch counterpart of [[todo add]]: imported items may belong
+under the currently active parent task, carry deadlines or estimates,
+and capture the working context in which we discovered them.
+
 <<github commands>>=
 <<import command>>
 <<sync command>>
@@ -6171,6 +6176,7 @@ def import_github(
         None, "--label", "-l",
         help="Add label to imported items",
     ),
+    <<import metadata options>>
     item_type: str = typer.Option(
         "all", "--type", "-t",
         help="Import type: issue, pr, or all",
@@ -6189,16 +6195,113 @@ def import_github(
         autocompletion=complete_todo_workers,
     ),
 ):
-    """Import GitHub issues/PRs as todo items."""
+    """Import GitHub issues/PRs as todo items.
+
+    \b
+    Examples:
+      nytid todo import dbosk/prgi24-issues
+      nytid todo import dbosk/prgi24-issues --wd ~/courses/DD1310/labs
+      nytid todo import dbosk/prgi24-issues --top-level --github-labels
+    """
     require_gh()
     next_id, todos = load_todos()
 
+    <<resolve import parent and inherited metadata>>
     <<fetch github items>>
     <<filter already imported>>
     <<create todos from github items>>
 
     save_todos(next_id, todos)
     typer.echo(f"Imported {imported_count} items.")
+@
+
+The metadata and placement options mirror [[todo add]] where they make
+sense for batch imports.  [[--parent]] places imported items explicitly,
+while [[--top-level]] suppresses the new auto-parenting behaviour.  When
+neither is given, we reuse the currently tracked todo as the parent so a
+teacher can start a broad task such as
+\enquote{prepare course backlog} and import discovered GitHub work under
+it naturally.
+
+<<import metadata options>>=
+deadline: Optional[str] = typer.Option(
+    None, "--deadline", "-d",
+    help="Deadline (ISO datetime or YYYY-MM-DD)",
+),
+estimate: Optional[float] = typer.Option(
+    None, "--estimate", "-e",
+    help="Estimated hours",
+),
+description: Optional[str] = typer.Option(
+    "", "--description",
+    help="Longer description",
+),
+wd_path: Optional[str] = typer.Option(
+    None, "--wd", "-C",
+    help="Working directory to capture",
+),
+capture_env: bool = typer.Option(
+    False, "--env",
+    help="Capture current environment",
+),
+here: bool = typer.Option(
+    False, "--here",
+    help="Capture current directory and environment",
+),
+run_command: Optional[str] = typer.Option(
+    None, "--run", "-r",
+    help="Default command to run on start",
+),
+parent: Optional[int] = typer.Option(
+    None, "--parent", "-p",
+    help="Parent todo ID",
+    autocompletion=complete_todo_ids,
+),
+top_level: bool = typer.Option(
+    False, "--top-level",
+    help="Add at root level (override auto-parenting)",
+),
+@
+
+Parent inheritance works slightly differently for imports than for plain
+[[todo add]].  Imported items always retain their repository label
+because that is how users later find all issues from one project, but a
+parent can still contribute its own labels and deadline when the user
+does not specify overrides.  This lets a parent like [[DD1310]] provide
+course context while [[owner/repo]] still marks the GitHub source.
+
+<<resolve import parent and inherited metadata>>=
+resolved_parent = parent
+parent_item = None
+if parent is None and not top_level:
+    active = get_currently_tracked_todo(todos)
+    if active is not None:
+        resolved_parent = active.id
+        typer.echo(
+            f"Auto-parenting under: "
+            f"#{active.id} {active.title}"
+        )
+if resolved_parent is not None:
+    parent_item = next(
+        (t for t in todos if t.id == resolved_parent),
+        None,
+    )
+    if parent_item is None:
+        typer.echo(
+            f"Error: parent #{resolved_parent} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+inherited_labels = []
+inherited_deadline = deadline
+if resolved_parent is not None:
+    if not label and parent_item.labels:
+        inherited_labels = list(parent_item.labels)
+    if deadline is None and parent_item.deadline:
+        inherited_deadline = parent_item.deadline
+
+<<resolve wd and env for new todo>>
 @
 
 When [[--number]] is given we bypass the list API entirely and
@@ -6303,7 +6406,9 @@ else:
 
 imported_count = 0
 for gh_item in new_items:
-    gh_labels = [repo]
+    gh_labels = list(inherited_labels)
+    if repo not in gh_labels:
+        gh_labels.append(repo)
     if github_labels:
         gh_labels.extend(
             lb["name"]
@@ -6324,16 +6429,16 @@ for gh_item in new_items:
             gh_item["number"], 0.0
         )
     else:
-        active = [
-            t for t in todos
-            if t.status != "done"
-            and t.parent_id is None
-        ]
-        active.sort(
-            key=effective_priority, reverse=True
+        temp = TodoItem(
+            id=0,
+            title=gh_item["title"],
+            parent_id=resolved_parent,
         )
+        active = get_active_siblings(todos, temp)
         priority = binary_search_priority(
-            active, gh_item["title"]
+            active, gh_item["title"],
+            parent=parent_item,
+            todos=todos,
         )
 
     item = TodoItem(
@@ -6346,6 +6451,13 @@ for gh_item in new_items:
         created=(
             datetime.datetime.now().isoformat()
         ),
+        deadline=inherited_deadline,
+        estimated=estimate,
+        description=description or "",
+        parent_id=resolved_parent,
+        wd=resolved_wd,
+        env=resolved_env,
+        command=run_command,
         github={
             "repo": repo,
             "type": gh_item["_type"],
@@ -6365,7 +6477,11 @@ for gh_item in new_items:
 The age heuristic maps creation dates to priorities in the
 range~$[0, 1]$, with the oldest item at~0 and the newest at~1.
 Users can later reprioritize individual items to interleave
-them with existing work.
+them with existing work.  When we import under a parent, however,
+those priorities must stay within the parent's child range or flat view
+would scatter them outside their subtree.  In that case we scale the
+same oldest-to-newest ordering into the interval returned by
+[[compute_child_priority_range]].
 
 Items missing a [[createdAt]] field (malformed API responses) get a
 far-past fallback so they sort to the bottom of the batch:
@@ -6387,7 +6503,17 @@ for gh_item in new_items:
 
 timestamps.sort()
 n = len(timestamps)
-if n == 1:
+if resolved_parent is not None and parent_item is not None:
+    high, low = compute_child_priority_range(
+        todos, parent_item
+    )
+    values = distribute_priorities_in_range(
+        n, high, low
+    )
+    priorities = {}
+    for i, (dt, num) in enumerate(reversed(timestamps)):
+        priorities[num] = values[i]
+elif n == 1:
     priorities = {timestamps[0][1]: 0.0}
 else:
     priorities = {}
@@ -6493,6 +6619,271 @@ def test_import_single_issue(temp_todo_dir):
             if "view" in c[0][0]
         ]
         assert len(view_calls) >= 1
+@
+
+Import should carry the same task-context metadata as [[todo add]].
+Let's verify that explicit flags for parent placement and working
+directory are written to the imported item:
+
+<<test functions>>=
+def test_import_applies_parent_and_wd(temp_todo_dir):
+    """Import stores explicit parent and working directory."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Parent task",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            labels=["DD1310"],
+            deadline="2026-03-01",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 2,
+            "title": "Imported child",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+                "--parent", "1",
+                "--wd", "project",
+            ],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    child = todos[1]
+    assert child.parent_id == 1
+    assert child.wd == os.path.abspath("project")
+    assert child.env is None
+    assert child.deadline == "2026-03-01"
+    assert child.labels == ["DD1310", "owner/repo"]
+@
+
+When [[--skip-priority]] is combined with parenting, the newest imported
+item should still receive the highest child priority within the
+parent's range:
+
+<<test functions>>=
+def test_import_parented_skip_priority_keeps_newest_highest(
+    temp_todo_dir,
+):
+    """Parented age heuristic still prefers newer items."""
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent task",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2,
+            title="Lower sibling",
+            priority=3.0,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 2,
+            "title": "Older import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 3,
+            "title": "Newer import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+                "--parent", "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    older = next(t for t in todos if t.title == "Older import")
+    newer = next(t for t in todos if t.title == "Newer import")
+    assert 3.0 < older.priority < 5.0
+    assert 3.0 < newer.priority < 5.0
+    assert newer.priority > older.priority
+@
+
+Auto-parenting should work for imports just as it does for manual
+adds, but [[--top-level]] must still let users opt out when they are
+collecting a batch that should remain at the root.
+
+<<test functions>>=
+def test_import_auto_parents_under_active_todo(
+    temp_todo_dir,
+):
+    """Import inherits the active todo as parent."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Active parent",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["course"],
+            deadline="2026-03-02",
+            who="alice",
+        ),
+    ])
+    save_active_stack([1])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 3,
+            "title": "Imported under active",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 Active parent" in result.stdout
+    _, todos = load_todos()
+    child = todos[1]
+    assert child.parent_id == 1
+    assert child.deadline == "2026-03-02"
+    assert child.labels == ["course", "owner/repo"]
+
+
+def test_import_top_level_overrides_auto_parenting(
+    temp_todo_dir,
+):
+    """Import --top-level bypasses active-parent detection."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Active parent",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    save_active_stack([1])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 4,
+            "title": "Root import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+                "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under:" not in result.stdout
+    _, todos = load_todos()
+    child = todos[1]
+    assert child.parent_id is None
+
+
+def test_import_here_captures_wd_and_env(temp_todo_dir):
+    """Import --here stores cwd together with environment."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 5,
+            "title": "Context import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch.dict(
+        os.environ,
+        {"HOME": "/tmp/home", "USER": "alice"},
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.todo.subprocess.run",
+            return_value=mock_result,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "import", "owner/repo",
+                    "--type", "issue",
+                    "--skip-priority",
+                    "--here",
+                ],
+            )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    item = todos[0]
+    assert item.wd == os.getcwd()
+    assert item.env == {
+        "HOME": "/tmp/home",
+        "USER": "alice",
+    }
 @
 
 \subsection{The [[sync]] Command}
