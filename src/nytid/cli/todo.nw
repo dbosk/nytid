@@ -58,6 +58,7 @@ import math
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -4693,6 +4694,12 @@ on now?}  It encapsulates the agent's decision loop into a single
 CLI call, replacing fragile shell-script logic with a first-class
 command.
 
+Because [[next]] delegates its launch step to [[start]], it also passes
+through execution-mode options such as [[--headless]], [[--pane]], and
+[[--window]].  This keeps the policy question 
+\enquote{what should start?}
+separate from the execution question \enquote{how should it run?}
+
 The behaviour depends on whether a task is currently active:
 \begin{description}
 \item[Stack non-empty] Start the highest-priority pending
@@ -4717,6 +4724,14 @@ def next_cmd(
     headless: bool = typer.Option(
         False, "--headless",
         help="Non-interactive mode (no prompts)",
+    ),
+    pane: bool = typer.Option(
+        False, "--pane", "-P",
+        help="Run in a new tmux pane",
+    ),
+    window: bool = typer.Option(
+        False, "--window", "-W",
+        help="Run in a new tmux window",
     ),
     run: Optional[str] = typer.Option(
         None, "--run", "-r",
@@ -4750,6 +4765,8 @@ def next_cmd(
     start(
         todo_id=target.id,
         headless=headless,
+        pane=pane,
+        window=window,
         run=run,
         timeout=timeout,
         reassign_to=reassign_to,
@@ -5040,6 +5057,48 @@ reassign_to: Optional[str] = typer.Option(
 ),
 @
 
+Tmux gives us a middle ground between blocking the current terminal and
+running fully headless.  [[--pane]] keeps the task visible beside the
+current shell, while [[--window]] moves it to another tmux window in the
+same session.  Because both modes rely on tmux owning the terminal, they
+require [[TMUX]] to be set and cannot be combined with [[--headless]].
+
+<<start command options>>=
+pane: bool = typer.Option(
+    False, "--pane", "-P",
+    help="Run in a new tmux pane",
+),
+window: bool = typer.Option(
+    False, "--window", "-W",
+    help="Run in a new tmux window",
+),
+@
+
+We reject impossible combinations before building the subprocess command.
+This keeps the later chunks focused on one execution mode at a time and
+produces clear CLI errors for mutually exclusive options.
+
+<<validate tmux options>>=
+if pane and window:
+    typer.echo(
+        "Error: --pane and --window are mutually exclusive",
+        err=True,
+    )
+    raise typer.Exit(1)
+if (pane or window) and headless:
+    typer.echo(
+        "Error: --pane/--window cannot be used with --headless",
+        err=True,
+    )
+    raise typer.Exit(1)
+if (pane or window) and not os.environ.get("TMUX"):
+    typer.echo(
+        "Error: --pane/--window require an active tmux session",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
 We import and use the track module's session management directly
 rather than shelling out to the CLI. This is more reliable and avoids
 subprocess overhead.
@@ -5078,24 +5137,28 @@ except ImportError:
 
 \subsubsection{Spawning a Subprocess}
 
-When the todo has a [[wd]] (or [[--run]] is given), we spawn a
-subprocess with the stored environment restored. The environment
-restoration starts from the stored [[env]] (if available) and
-overlays terminal-related variables ([[TERM]], [[DISPLAY]],
-[[SSH_*]]) from the current environment to ensure the terminal
-works correctly.
+When the todo has a [[wd]], when [[--run]] is given, or when the user
+explicitly requests [[--pane]]/[[--window]], we spawn a subprocess with
+the stored environment restored. The environment restoration starts
+from the stored [[env]] (if available) and overlays terminal-related
+variables ([[TERM]], [[DISPLAY]], [[SSH_*]]) from the current
+environment to ensure the terminal works correctly.
 
 The PS1 prefix shows the todo ID so the user always knows which
 task they're working on---following the same pattern as the
 [[courses data]] shell command.
 
 <<spawn subprocess if wd or run>>=
-if item.wd or run:
+if item.wd or run or pane or window:
+    <<validate tmux options>>
     <<prepare subprocess environment>>
     <<determine command to run>>
-    <<adjust shell command for prompt>>
-    <<run subprocess>>
-    <<handle subprocess exit>>
+    if pane or window:
+        <<run in tmux>>
+    else:
+        <<adjust shell command for prompt>>
+        <<run subprocess>>
+        <<handle subprocess exit>>
 @
 
 <<prepare subprocess environment>>=
@@ -5138,6 +5201,238 @@ if cmd_str:
         cmd = cmd_str.split()
 else:
     cmd = [os.environ.get("SHELL", "/bin/sh")]
+@
+
+Tmux already gives the subprocess its own terminal, so we can hand work
+off asynchronously instead of waiting in the current shell.  We pass the
+resolved working directory with [[-c]], forward the restored
+environment with repeated [[-e]] flags, and give new windows a
+descriptive name so they are easy to find later.
+
+<<run in tmux>>=
+tmux_args = [
+    "tmux",
+    "new-window" if window else "split-window",
+]
+for key, value in sorted(proc_env.items()):
+    tmux_args.extend([
+        "-e",
+        f"{key}={value}",
+    ])
+if window:
+    tmux_args.extend([
+        "-n",
+        f"todo:{todo_id} {item.title}",
+    ])
+tmux_args.extend([
+    "-c",
+    proc_wd,
+    shlex.join(cmd),
+])
+try:
+    subprocess.run(tmux_args, check=True)
+except subprocess.CalledProcessError as exc:
+    typer.echo(
+        f"tmux failed with exit code {exc.returncode}",
+        err=True,
+    )
+    raise typer.Exit(1)
+except FileNotFoundError:
+    typer.echo("tmux not found", err=True)
+    raise typer.Exit(1)
+return
+@
+
+Now let's verify tmux integration starts the subprocess in tmux instead
+of attaching it to the current terminal:
+
+<<test functions>>=
+def test_start_pane_calls_tmux_split(temp_todo_dir):
+    """--pane uses tmux split-window."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+            command="make test",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.todo.subprocess.run"
+        ) as mock_run:
+            result = runner.invoke(
+                cli, ["start", "1", "--pane"]
+            )
+    assert result.exit_code == 0
+    mock_run.assert_called_once_with(
+        [
+            "tmux",
+            "split-window",
+            "-e",
+            "PS1=todo:1 \\w\\n$ ",
+            "-e",
+            "TMUX=session",
+            "-c",
+            "/tmp/project",
+            "make test",
+        ],
+        check=True,
+    )
+
+
+def test_start_window_calls_tmux_new_window(
+    temp_todo_dir,
+):
+    """--window uses tmux new-window."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+            command="python -m pytest",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.todo.subprocess.run"
+        ) as mock_run:
+            result = runner.invoke(
+                cli, ["start", "1", "--window"]
+            )
+    assert result.exit_code == 0
+    mock_run.assert_called_once_with(
+        [
+            "tmux",
+            "new-window",
+            "-e",
+            "PS1=todo:1 \\w\\n$ ",
+            "-e",
+            "TMUX=session",
+            "-n",
+            "todo:1 Review PR",
+            "-c",
+            "/tmp/project",
+            "python -m pytest",
+        ],
+        check=True,
+    )
+
+
+def test_start_pane_without_tmux_fails(temp_todo_dir):
+    """--pane requires an active tmux session."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch.dict(os.environ, {}, clear=True):
+        result = runner.invoke(
+            cli, ["start", "1", "--pane"]
+        )
+    assert result.exit_code == 1
+    assert (
+        "require an active tmux session"
+        in result.output
+    )
+
+
+def test_start_pane_and_window_mutually_exclusive(
+    temp_todo_dir,
+):
+    """--pane and --window cannot be combined."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}):
+        result = runner.invoke(
+            cli,
+            ["start", "1", "--pane", "--window"],
+        )
+    assert result.exit_code == 1
+    assert (
+        "--pane and --window are mutually exclusive"
+        in result.output
+    )
+
+
+def test_start_pane_and_headless_mutually_exclusive(
+    temp_todo_dir,
+):
+    """--pane and --headless cannot be combined."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}):
+        result = runner.invoke(
+            cli,
+            ["start", "1", "--pane", "--headless"],
+        )
+    assert result.exit_code == 1
+    assert (
+        "cannot be used with --headless"
+        in result.output
+    )
+
+
+def test_next_pane_forwards_to_start(temp_todo_dir):
+    """next forwards --pane to start."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Low",
+            created="2026-02-20T10:00:00",
+            priority=1.0, who="me",
+        ),
+        TodoItem(
+            id=2, title="High",
+            created="2026-02-20T10:00:00",
+            priority=5.0, who="me",
+        ),
+    ])
+    with patch("nytid.cli.todo.start") as mock_start:
+        result = runner.invoke(
+            cli, ["next", "--who", "", "--pane"]
+        )
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args.kwargs
+    assert call_kwargs["todo_id"] == 2
+    assert call_kwargs["pane"] is True
+    assert call_kwargs["window"] is False
+
+
+def test_next_window_forwards_to_start(temp_todo_dir):
+    """next forwards --window to start."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Low",
+            created="2026-02-20T10:00:00",
+            priority=1.0, who="me",
+        ),
+        TodoItem(
+            id=2, title="High",
+            created="2026-02-20T10:00:00",
+            priority=5.0, who="me",
+        ),
+    ])
+    with patch("nytid.cli.todo.start") as mock_start:
+        result = runner.invoke(
+            cli, ["next", "--who", "", "--window"]
+        )
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args.kwargs
+    assert call_kwargs["todo_id"] == 2
+    assert call_kwargs["pane"] is False
+    assert call_kwargs["window"] is True
 @
 
 Shell init files ([[~/.bashrc]] for bash, [[~/.zshrc]] for zsh) run
