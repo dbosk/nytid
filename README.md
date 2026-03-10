@@ -1,15 +1,20 @@
 # nytid
 
-Manage TA bookings, schedules, time tracking, and task management for teaching.
+Manage TA bookings, schedules, time tracking, and task management.
 
 Example:
 
 ```bash
 nytid todo start 5
 nytid todo note -m "Blocked on student reply"
-nytid todo edit --reassign dbosk
+nytid todo edit --who dbosk
 nytid todo done
 ```
+
+For agent-run tasks, `--run claude` and `--run 'claude -p "..."'` mean
+different things: plain `claude` uses the todo's notes or description as
+the prompt source, while `claude -p "..."` stores a complete command with
+a fixed prompt.
 
 After `nytid todo start 5`, task 5 is on top of the active stack, so
 subsequent single-item commands can omit the ID. This shortcut works for
