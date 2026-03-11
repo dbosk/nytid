@@ -1,6 +1,7 @@
 # nytid
 
-Manage TA bookings, schedules, time tracking, and task management.
+Manage TA bookings, schedules, time tracking, task management, GitHub
+integration, and agent-assisted task processing.
 
 Example:
 
