@@ -2265,6 +2265,7 @@ exporting to calendars.
 <<tracking commands>>=
 <<start command>>
 <<stop command>>
+<<detached finalize command>>
 @
 
 <<export commands>>=
@@ -4782,6 +4783,10 @@ def next_cmd(
         False, "--window", "-W",
         help="Run in a new tmux window",
     ),
+    block: bool = typer.Option(
+        True, "--block/--no-block",
+        help="Wait for tmux-launched command to exit",
+    ),
     run: Optional[str] = typer.Option(
         None, "--run", "-r",
         help="Override command to run",
@@ -4816,6 +4821,7 @@ def next_cmd(
         headless=headless,
         pane=pane,
         window=window,
+        block=block,
         run=run,
         timeout=timeout,
         reassign_to=reassign_to,
@@ -4985,6 +4991,105 @@ def start(
     <<spawn subprocess if wd or run>>
 @
 
+Detached tmux cleanup happens after the pane process exits, so it cannot
+reuse the in-memory todo item from the original [[start]] call.  We
+therefore provide a hidden helper command that reloads the todo,
+stops tracking, and applies the same post-run policy in a fresh process.
+
+That helper must be robust against exactly the kinds of changes that may
+happen during a long-running task.  The working directory might have been
+renamed or deleted before the pane exits, so cleanup must not depend on
+[[cd]] into [[wd]].  Likewise, [[nytid]] may be running inside a Poetry
+environment or another non-system interpreter, so the detached helper
+must reuse [[sys.executable]] rather than assuming [[python3]] points at
+the correct environment.
+
+<<helpers>>=
+def finalize_detached_todo(
+    todo_id, exit_code=1, exit_code_file=None
+):
+    """Finish a non-blocking tmux-backed todo run."""
+    if exit_code_file is not None:
+        exit_code = read_detached_exit_code(
+            exit_code_file
+        )
+    next_id, todos = load_todos()
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        return
+
+    result = type(
+        "DetachedResult", (),
+        {
+            "returncode": exit_code,
+            "stdout": None,
+        },
+    )()
+
+    <<stop tracking after subprocess>>
+
+    if item.status != "done":
+        item.status = "pending"
+
+    stack = load_active_stack()
+    if todo_id in stack:
+        stack.remove(todo_id)
+        save_active_stack(stack)
+
+    save_todos(next_id, todos)
+
+
+def run_todo_tmux_command(*args, **kwargs):
+    """Delegate tmux launches to the track module helper."""
+    from nytid.cli.track import run_tmux_command
+    return run_tmux_command(*args, **kwargs)
+
+
+def read_detached_exit_code(exit_code_file):
+    """Read a tmux-recorded exit code for detached todo cleanup."""
+    try:
+        from nytid.cli.track import read_tmux_exit_status
+        return read_tmux_exit_status(exit_code_file)
+    except ImportError:
+        return 1
+
+
+def build_detached_todo_finalize_command(
+    todo_id, proc_wd, exit_code_file
+):
+    """Return shell command to finalize a detached todo run."""
+    pythonpath = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", ".."
+        )
+    )
+    return (
+        f"PYTHONPATH={shlex.quote(pythonpath)} "
+        f"{shlex.quote(sys.executable)} "
+        "-c 'from nytid.cli.todo import cli; cli()' "
+        f"_finalize-detached {todo_id} "
+        f"--exit-code-file {shlex.quote(exit_code_file)}"
+        f"; rm -f {shlex.quote(exit_code_file)}"
+    )
+@
+
+<<detached finalize command>>=
+@cli.command(name="_finalize-detached", hidden=True)
+def finalize_detached_cmd(
+    todo_id: int = typer.Argument(...),
+    exit_code: int = typer.Argument(1),
+    exit_code_file: Optional[str] = typer.Option(
+        None, "--exit-code-file"
+    ),
+):
+    """Finalize a detached tmux-backed todo run."""
+    finalize_detached_todo(
+        todo_id, exit_code, exit_code_file
+    )
+@
+
 Restarting an already-active task (e.g.\ after a failed run) must
 not push a duplicate onto the stack, otherwise [[todo done]] would
 only remove one copy and leave a stale entry.  We check membership
@@ -5111,6 +5216,11 @@ running fully headless.  [[--pane]] keeps the task visible beside the
 current shell, while [[--window]] moves it to another tmux window in the
 same session.  Because both modes rely on tmux owning the terminal, they
 require [[TMUX]] to be set and cannot be combined with [[--headless]].
+By default todo launches still block so the caller can decide whether the
+task is done when the command exits.  [[--no-block]] switches to a fully
+detached tmux workflow: when the pane command exits, tracking stops and
+the todo resets to pending unless it was already marked done from inside
+the pane.
 
 <<start command options>>=
 pane: bool = typer.Option(
@@ -5121,6 +5231,10 @@ window: bool = typer.Option(
     False, "--window", "-W",
     help="Run in a new tmux window",
 ),
+block: bool = typer.Option(
+    True, "--block/--no-block",
+    help="Wait for tmux-launched command to exit",
+),
 @
 
 We reject impossible combinations before building the subprocess command.
@@ -5128,11 +5242,24 @@ This keeps the later chunks focused on one execution mode at a time and
 produces clear CLI errors for mutually exclusive options.
 
 <<validate tmux options>>=
-if pane and window:
-    typer.echo(
-        "Error: --pane and --window are mutually exclusive",
-        err=True,
-    )
+try:
+    from nytid.cli.track import validate_tmux_options
+    validate_tmux_options(pane, window)
+except ImportError:
+    if pane and window:
+        typer.echo(
+            "Error: --pane and --window are mutually exclusive",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if (pane or window) and not os.environ.get("TMUX"):
+        typer.echo(
+            "Error: --pane/--window require an active tmux session",
+            err=True,
+        )
+        raise typer.Exit(1)
+except ValueError as exc:
+    typer.echo(str(exc), err=True)
     raise typer.Exit(1)
 if (pane or window) and headless:
     typer.echo(
@@ -5140,9 +5267,11 @@ if (pane or window) and headless:
         err=True,
     )
     raise typer.Exit(1)
-if (pane or window) and not os.environ.get("TMUX"):
+if block and not (pane or window):
+    pass
+if not block and not (pane or window):
     typer.echo(
-        "Error: --pane/--window require an active tmux session",
+        "Error: --no-block requires --pane or --window",
         err=True,
     )
     raise typer.Exit(1)
@@ -5204,6 +5333,8 @@ if item.wd or run or pane or window:
     <<determine command to run>>
     if pane or window:
         <<run in tmux>>
+        if block:
+            <<handle subprocess exit>>
     else:
         <<adjust shell command for prompt>>
         <<run subprocess>>
@@ -5265,42 +5396,74 @@ else:
     cmd = [os.environ.get("SHELL", "/bin/sh")]
 @
 
-Tmux already gives the subprocess its own terminal, so we can hand work
-off asynchronously instead of waiting in the current shell.  We pass the
-resolved working directory with [[-c]], forward the restored
-environment with repeated [[-e]] flags, and give new windows a
-descriptive name so they are easy to find later.
+Tmux gives the subprocess its own terminal while keeping the launch
+under our control.  We reuse the [[track]] module's helper so both
+commands share the same pane startup handshake, exit-status recording,
+and blocking semantics.  For detached todo runs we swap the blocking
+wait channel for a follow-up shell command that re-enters [[todo]] and
+applies the pending/done cleanup policy after the pane process exits.
 
 <<run in tmux>>=
-tmux_args = [
-    "tmux",
-    "new-window" if window else "split-window",
-]
-for key, value in sorted(proc_env.items()):
-    tmux_args.extend([
-        "-e",
-        f"{key}={value}",
-    ])
-if window:
-    tmux_args.extend([
-        "-n",
-        f"todo:{todo_id} {item.title}",
-    ])
-tmux_args.extend([
-    "-c",
-    proc_wd,
-    shlex.join(cmd),
-])
 try:
-    subprocess.run(tmux_args, check=True)
+    exit_code_file = None
+    if block:
+        result = type(
+            "TmuxResult", (),
+            {
+                "returncode": run_todo_tmux_command(
+                    cmd,
+                    cwd=proc_wd,
+                    env=proc_env,
+                    window=window,
+                    window_name=(
+                        f"todo:{todo_id} {item.title}"
+                        if window else None
+                    ),
+                ),
+                "stdout": None,
+            },
+        )()
+    else:
+        exit_fd, exit_code_file = tempfile.mkstemp(
+            prefix="nytid-todo-",
+            suffix=".status",
+        )
+        os.close(exit_fd)
+        finalize_cmd = build_detached_todo_finalize_command(
+            todo_id, proc_wd, exit_code_file
+        )
+        run_todo_tmux_command(
+            cmd,
+            cwd=proc_wd,
+            env=proc_env,
+            window=window,
+            window_name=(
+                f"todo:{todo_id} {item.title}"
+                if window else None
+            ),
+            block=False,
+            exit_status_file=exit_code_file,
+            on_exit_shell=finalize_cmd,
+        )
+        result = None
 except subprocess.CalledProcessError as exc:
     typer.echo(
         f"tmux failed with exit code {exc.returncode}",
         err=True,
     )
+    if exit_code_file is not None:
+        try:
+            os.unlink(exit_code_file)
+        except OSError:
+            pass
     raise typer.Exit(1)
 except FileNotFoundError:
     typer.echo("tmux not found", err=True)
+    if exit_code_file is not None:
+        try:
+            os.unlink(exit_code_file)
+        except OSError:
+            pass
     raise typer.Exit(1)
 return
 @
@@ -5321,25 +5484,22 @@ def test_start_pane_calls_tmux_split(temp_todo_dir):
     ])
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
-            "nytid.cli.todo.subprocess.run"
+            "nytid.cli.todo.run_todo_tmux_command",
+            return_value=0,
         ) as mock_run:
             result = runner.invoke(
                 cli, ["start", "1", "--pane"]
             )
     assert result.exit_code == 0
     mock_run.assert_called_once_with(
-        [
-            "tmux",
-            "split-window",
-            "-e",
-            "PS1=todo:1 \\w\\n$ ",
-            "-e",
-            "TMUX=session",
-            "-c",
-            "/tmp/project",
-            "make test",
-        ],
-        check=True,
+        ["make", "test"],
+        cwd="/tmp/project",
+        env={
+            "PS1": "todo:1 \\w\\n$ ",
+            "TMUX": "session",
+        },
+        window=False,
+        window_name=None,
     )
 
 
@@ -5357,27 +5517,22 @@ def test_start_window_calls_tmux_new_window(
     ])
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
-            "nytid.cli.todo.subprocess.run"
+            "nytid.cli.todo.run_todo_tmux_command",
+            return_value=0,
         ) as mock_run:
             result = runner.invoke(
                 cli, ["start", "1", "--window"]
             )
     assert result.exit_code == 0
     mock_run.assert_called_once_with(
-        [
-            "tmux",
-            "new-window",
-            "-e",
-            "PS1=todo:1 \\w\\n$ ",
-            "-e",
-            "TMUX=session",
-            "-n",
-            "todo:1 Review PR",
-            "-c",
-            "/tmp/project",
-            "python -m pytest",
-        ],
-        check=True,
+        ["python", "-m", "pytest"],
+        cwd="/tmp/project",
+        env={
+            "PS1": "todo:1 \\w\\n$ ",
+            "TMUX": "session",
+        },
+        window=True,
+        window_name="todo:1 Review PR",
     )
 
 
@@ -5447,6 +5602,136 @@ def test_start_pane_and_headless_mutually_exclusive(
     )
 
 
+def test_start_no_block_requires_tmux_mode(
+    temp_todo_dir,
+):
+    """--no-block requires --pane or --window."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+            command="make test",
+        ),
+    ])
+    result = runner.invoke(
+        cli,
+        ["start", "1", "--no-block"],
+    )
+    assert result.exit_code == 1
+    assert "--no-block requires --pane or --window" in result.output
+
+
+def test_start_pane_no_block_uses_tmux_helper(
+    temp_todo_dir,
+):
+    """Detached tmux start uses the shared tmux helper."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+            command="make test",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.todo.run_todo_tmux_command",
+            return_value=None,
+        ) as mock_tmux:
+            result = runner.invoke(
+                cli,
+                ["start", "1", "--pane", "--no-block"],
+            )
+    assert result.exit_code == 0
+    assert mock_tmux.call_args.kwargs["block"] is False
+    assert "on_exit_shell" in mock_tmux.call_args.kwargs
+    assert "exit_status_file" in mock_tmux.call_args.kwargs
+    assert "_finalize-detached 1 --exit-code-file" in (
+        mock_tmux.call_args.kwargs["on_exit_shell"]
+    )
+
+
+def test_finalize_detached_todo_resets_pending(
+    temp_todo_dir,
+):
+    """Detached finalize resets unfinished todos to pending."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["review"],
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(1, 0)
+    _, todos = load_todos()
+    assert todos[0].status == "pending"
+    assert load_active_stack() == []
+
+
+def test_finalize_detached_todo_reads_status_file(
+    temp_todo_dir,
+):
+    """Detached finalize can read exit code from status file."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["review"],
+        ),
+    ])
+    save_active_stack([1])
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write("status=7\nsignal=\n")
+        status_path = f.name
+    try:
+        finalize_detached_todo(
+            1, exit_code_file=status_path
+        )
+    finally:
+        os.unlink(status_path)
+    _, todos = load_todos()
+    assert todos[0].status == "pending"
+
+
+def test_read_detached_exit_code_parses_signal(
+    temp_todo_dir,
+):
+    """Detached exit-code reader uses tmux signal mapping."""
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write("status=\nsignal=9\n")
+        status_path = f.name
+    try:
+        assert read_detached_exit_code(status_path) == 137
+    finally:
+        os.unlink(status_path)
+
+
+def test_finalize_detached_todo_keeps_done(
+    temp_todo_dir,
+):
+    """Detached finalize keeps todos already marked done."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="done",
+            labels=["review"],
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(1, 0)
+    _, todos = load_todos()
+    assert todos[0].status == "done"
+    assert load_active_stack() == []
+
+
 def test_next_pane_forwards_to_start(temp_todo_dir):
     """next forwards --pane to start."""
     save_todos(3, [
@@ -5470,6 +5755,7 @@ def test_next_pane_forwards_to_start(temp_todo_dir):
     assert call_kwargs["todo_id"] == 2
     assert call_kwargs["pane"] is True
     assert call_kwargs["window"] is False
+    assert call_kwargs["block"] is True
 
 
 def test_next_window_forwards_to_start(temp_todo_dir):
@@ -5495,6 +5781,33 @@ def test_next_window_forwards_to_start(temp_todo_dir):
     assert call_kwargs["todo_id"] == 2
     assert call_kwargs["pane"] is False
     assert call_kwargs["window"] is True
+    assert call_kwargs["block"] is True
+
+
+def test_next_no_block_forwards_to_start(
+    temp_todo_dir,
+):
+    """next forwards --no-block to start."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Low",
+            created="2026-02-20T10:00:00",
+            priority=1.0, who="me",
+        ),
+        TodoItem(
+            id=2, title="High",
+            created="2026-02-20T10:00:00",
+            priority=5.0, who="me",
+        ),
+    ])
+    with patch("nytid.cli.todo.start") as mock_start:
+        result = runner.invoke(
+            cli,
+            ["next", "--who", "", "--pane", "--no-block"],
+        )
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args.kwargs
+    assert call_kwargs["block"] is False
 @
 
 Shell init files ([[~/.bashrc]] for bash, [[~/.zshrc]] for zsh) run
@@ -7329,6 +7642,8 @@ from nytid.cli.todo import (
     save_active_stack,
     get_active_stack_file,
     find_pending_by_priority,
+    finalize_detached_todo,
+    read_detached_exit_code,
     parse_timeout,
     append_note_to_item,
 )

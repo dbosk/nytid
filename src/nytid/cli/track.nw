@@ -141,9 +141,11 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import signal
 import sys
 import subprocess
+import tempfile
 import typer
 import typerconf as config
 from typing_extensions import Annotated
@@ -2587,6 +2589,255 @@ def notes(
         raise typer.Exit(1)
 @
 
+\subsection{Tmux-Managed Commands}
+
+Tmux-launched commands need a different waiting strategy from direct
+[[subprocess.run]].  The [[tmux split-window]] and [[new-window]]
+commands return as soon as the pane exists, not when the program inside
+the pane finishes.  To preserve [[track run]]'s semantics we therefore
+make tmux notify us when the pane's command exits.
+
+The main race is at startup: a very short-lived command could finish
+before we manage to install any hook on its pane.  We avoid that by
+launching a tiny shell wrapper that first blocks on a tmux
+[[wait-for]] channel, then [[exec]]s the real command.  Once the parent
+has learned the new [[pane_id]] and installed pane-scoped exit hooks, it
+signals that channel so the wrapped command can start.
+
+The wrapper intentionally uses a plain non-login [[/bin/sh]] process.
+This wrapper is not a user shell session---it is just a rendezvous point
+between tmux and the real command---so reading login startup files would
+only add risk.  A login shell can emit errors, alter the environment, or
+delay startup before the hook handshake is in place.
+
+On exit, tmux can wake the waiting parent immediately with another
+[[wait-for]] channel.  Because [[wait-for]] carries only a signal and no
+payload, the hook also stores the exit status (or terminating signal) in
+a temporary file before waking the parent.  That file gives us a durable
+handoff even if the pane disappears immediately afterwards.
+
+<<helper functions>>=
+def validate_tmux_options(
+    pane: bool, window: bool
+) -> None:
+    """Reject invalid tmux option combinations."""
+    if pane and window:
+        raise ValueError(
+            "Error: --pane and --window are mutually exclusive"
+        )
+    if (pane or window) and not os.environ.get("TMUX"):
+        raise ValueError(
+            "Error: --pane/--window require an active tmux session"
+        )
+
+
+def make_tmux_channel(prefix: str) -> str:
+    """Return a unique tmux wait-for channel name."""
+    return (
+        f"nytid-{prefix}-"
+        f"{os.getpid()}-{time.time_ns()}"
+    )
+
+
+def build_tmux_wait_wrapper(
+    command_args: List[str],
+    ready_channel: str,
+) -> List[str]:
+    """Return a wrapper that waits before execing the child."""
+    return [
+        "/bin/sh",
+        "-c",
+        (
+            f"tmux wait-for {shlex.quote(ready_channel)}; "
+            'exec "$@"'
+        ),
+        "sh",
+    ] + command_args
+
+
+def build_tmux_hook_command(
+    *,
+    status_file: Optional[str] = None,
+    wait_channel: Optional[str] = None,
+    on_exit_shell: Optional[str] = None,
+) -> str:
+    """Build the tmux hook command for pane exit."""
+    tmux_commands = []
+    shell_commands = []
+
+    if status_file is not None:
+        shell_commands.append(
+            "printf '%s\\n%s\\n' "
+            "'status=#{pane_dead_status}' "
+            "'signal=#{pane_dead_signal}' "
+            f"> {shlex.quote(status_file)}"
+        )
+    if on_exit_shell is not None:
+        shell_commands.append(on_exit_shell)
+    if shell_commands:
+        tmux_commands.append(
+            "run-shell "
+            + shlex.quote("; ".join(shell_commands))
+        )
+    if wait_channel is not None:
+        tmux_commands.append(
+            "wait-for -S " + shlex.quote(wait_channel)
+        )
+    return "; ".join(tmux_commands)
+
+
+def install_tmux_exit_hooks(
+    pane_id: str,
+    hook_command: str,
+) -> None:
+    """Install pane exit hooks for a newly created pane."""
+    for hook_name in ("pane-exited", "pane-died"):
+        subprocess.run(
+            [
+                "tmux",
+                "set-hook",
+                "-p",
+                "-t",
+                pane_id,
+                hook_name,
+                hook_command,
+            ],
+            check=True,
+        )
+
+
+def parse_tmux_exit_status(text: str) -> int:
+    """Parse tmux hook status text into a shell exit code."""
+    data = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value
+
+    signal_str = data.get("signal", "")
+    if signal_str:
+        return 128 + int(signal_str)
+
+    status_str = data.get("status", "")
+    if status_str:
+        return int(status_str)
+
+    return 1
+
+
+def read_tmux_exit_status(status_file: str) -> int:
+    """Read the exit code recorded by the tmux hook."""
+    try:
+        with open(status_file) as f:
+            return parse_tmux_exit_status(f.read())
+    except OSError:
+        return 1
+
+
+def run_tmux_command(
+    command_args: List[str],
+    *,
+    cwd: str,
+    env: Dict[str, str],
+    window: bool = False,
+    window_name: Optional[str] = None,
+    block: bool = True,
+    exit_status_file: Optional[str] = None,
+    on_exit_shell: Optional[str] = None,
+) -> Optional[int]:
+    """Run a command in tmux and optionally wait for exit."""
+    ready_channel = make_tmux_channel("ready")
+    wrapped_command = build_tmux_wait_wrapper(
+        command_args, ready_channel
+    )
+    wait_channel = None
+    status_file = exit_status_file
+    pane_id = None
+    remove_status_file = False
+
+    if block and status_file is None:
+        fd, status_file = tempfile.mkstemp(
+            prefix="nytid-tmux-",
+            suffix=".status",
+        )
+        os.close(fd)
+        remove_status_file = True
+    if block:
+        wait_channel = make_tmux_channel("done")
+
+    hook_command = build_tmux_hook_command(
+        status_file=status_file,
+        wait_channel=wait_channel,
+        on_exit_shell=on_exit_shell,
+    )
+
+    tmux_args = [
+        "tmux",
+        "new-window" if window else "split-window",
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ]
+    for key, value in sorted(env.items()):
+        tmux_args.extend([
+            "-e",
+            f"{key}={value}",
+        ])
+    if window and window_name:
+        tmux_args.extend(["-n", window_name])
+    tmux_args.extend([
+        "-c",
+        cwd,
+        shlex.join(wrapped_command),
+    ])
+
+    old_sigint = None
+    if block:
+        old_sigint = signal.signal(
+            signal.SIGINT, signal.SIG_IGN
+        )
+
+    try:
+        result = subprocess.run(
+            tmux_args,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pane_id = result.stdout.strip()
+        install_tmux_exit_hooks(pane_id, hook_command)
+        subprocess.run(
+            ["tmux", "wait-for", "-S", ready_channel],
+            check=True,
+        )
+        if not block:
+            return None
+        subprocess.run(
+            ["tmux", "wait-for", wait_channel],
+            check=True,
+        )
+        return read_tmux_exit_status(status_file)
+    except Exception:
+        if pane_id:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-pane", "-t", pane_id],
+                    check=False,
+                )
+            except OSError:
+                pass
+        raise
+    finally:
+        if block and old_sigint is not None:
+            signal.signal(signal.SIGINT, old_sigint)
+        if remove_status_file and status_file is not None:
+            try:
+                os.unlink(status_file)
+            except OSError:
+                pass
+@
+
 \subsection{Run Command}
 
 The [[run]] command wraps an arbitrary command: it starts a tracking
@@ -2612,6 +2863,11 @@ session cleanly.  The original handler is restored in a [[finally]]
 clause so it is always reinstated even if the child raises another
 exception.
 
+The tmux variants preserve the same contract.  They still block until
+the tracked process ends, but the waiting happens through tmux pane
+hooks rather than by waiting directly on the child process in the
+current terminal.
+
 <<run command>>=
 @cli.command()
 def run(
@@ -2622,6 +2878,14 @@ def run(
         help="Additional labels for this tracking "
              "session",
         autocompletion=complete_historical_labels),
+    pane: bool = typer.Option(
+        False, "--pane", "-P",
+        help="Run in a new tmux pane",
+    ),
+    window: bool = typer.Option(
+        False, "--window", "-W",
+        help="Run in a new tmux window",
+    ),
     who: str = typer.Option(
         default_username, "--who", "-w",
         help="Worker identity (default: $USER)",
@@ -2639,6 +2903,12 @@ def run(
         typer.echo(
             "Error: Command is required", err=True
         )
+        raise typer.Exit(1)
+
+    try:
+        validate_tmux_options(pane, window)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
         raise typer.Exit(1)
 
     command_name = command_args[0]
@@ -2668,22 +2938,40 @@ def run(
         f"labels: {', '.join(sorted(all_labels))}"
     )
 
-    old_sigint = signal.signal(
-        signal.SIGINT, signal.SIG_IGN
-    )
     try:
-        result = subprocess.run(
-            command_args, capture_output=False
+        if pane or window:
+            exit_code = run_tmux_command(
+                command_args,
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                window=window,
+                window_name=(
+                    full_command if window else None
+                ),
+            )
+        else:
+            old_sigint = signal.signal(
+                signal.SIGINT, signal.SIG_IGN
+            )
+            try:
+                result = subprocess.run(
+                    command_args, capture_output=False
+                )
+                exit_code = result.returncode
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+    except subprocess.CalledProcessError as exc:
+        typer.echo(
+            f"tmux failed with exit code {exc.returncode}",
+            err=True,
         )
-        exit_code = result.returncode
+        exit_code = 1
     except FileNotFoundError:
         typer.echo(
             f"Command not found: {command_name}",
             err=True
         )
         exit_code = 127
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
 
     end_time = datetime.datetime.now()
     completed_entries = session.stop_labels(
@@ -3640,9 +3928,11 @@ Here we assemble the final test file:
 <<test [[clitrack.py]]>>=
 import datetime
 import json
+import os
 import tempfile
 import pytest
 from typer.testing import CliRunner
+from unittest.mock import patch
 
 import sys
 sys.path.insert(0, '../src')
@@ -3652,6 +3942,7 @@ from nytid.cli.track import (
     load_tracking_data, load_active_session,
     filter_entries,
     parse_offset, parse_at_time,
+    parse_tmux_exit_status,
     sanitize_who, complete_workers,
     default_username
 )
@@ -3924,6 +4215,94 @@ def test_run_command_with_additional_labels(temp_tracking_dir):
     assert "DD1310" in result.stdout
     assert "admin" in result.stdout
     assert "echo" in result.stdout
+
+
+def test_run_command_pane_uses_tmux_helper(
+    temp_tracking_dir,
+):
+    """--pane routes run through the tmux helper."""
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.track.run_tmux_command",
+            return_value=0,
+        ) as mock_tmux:
+            result = runner.invoke(
+                cli,
+                ["run", "--pane", "echo", "test"],
+            )
+    assert result.exit_code == 0
+    mock_tmux.assert_called_once_with(
+        ["echo", "test"],
+        cwd=os.getcwd(),
+        env={"TMUX": "session"},
+        window=False,
+        window_name=None,
+    )
+
+
+def test_run_command_window_uses_tmux_helper(
+    temp_tracking_dir,
+):
+    """--window routes run through tmux helper."""
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.track.run_tmux_command",
+            return_value=3,
+        ) as mock_tmux:
+            result = runner.invoke(
+                cli,
+                ["run", "--window", "echo", "test"],
+            )
+    assert result.exit_code == 3
+    mock_tmux.assert_called_once_with(
+        ["echo", "test"],
+        cwd=os.getcwd(),
+        env={"TMUX": "session"},
+        window=True,
+        window_name="echo test",
+    )
+
+
+def test_run_command_pane_requires_tmux(
+    temp_tracking_dir,
+):
+    """--pane requires an active tmux session."""
+    with patch.dict(os.environ, {}, clear=True):
+        result = runner.invoke(
+            cli,
+            ["run", "--pane", "echo", "test"],
+        )
+    assert result.exit_code == 1
+    assert "require an active tmux session" in result.stdout
+
+
+def test_run_command_pane_and_window_conflict(
+    temp_tracking_dir,
+):
+    """--pane and --window are mutually exclusive."""
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        result = runner.invoke(
+            cli,
+            [
+                "run",
+                "--pane",
+                "--window",
+                "echo",
+                "test",
+            ],
+        )
+    assert result.exit_code == 1
+    assert "mutually exclusive" in result.stdout
+
+
+def test_parse_tmux_exit_status_signal():
+    """Signals map to shell-style exit codes."""
+    assert parse_tmux_exit_status("signal=15\n") == 143
+
+
+def test_parse_tmux_exit_status_code():
+    """Normal exits use the recorded status code."""
+    assert parse_tmux_exit_status("status=7\nsignal=\n") == 7
 
 def test_tracking_entry_with_who():
     """Test TrackingEntry serialization with who field"""
