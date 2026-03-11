@@ -175,11 +175,11 @@ nytid components.
 The track system supports the following configuration options:
 
 \begin{description}
-\item[[[track.data\_dir]]] Directory where tracking data is stored.
+\item[[[track.data_dir]]] Directory where tracking data is stored.
   Defaults to \texttt{\~{}/.nytid/tracking} if not configured.
-\item[[[track.weekly\_limit]]] Default weekly hour limit for warnings
+\item[[[track.weekly_limit]]] Default weekly hour limit for warnings
   in statistics. Defaults to 40.0 hours if not configured.
-\item[[[track.daily\_limit]]] Default daily hour limit for warnings
+\item[[[track.daily_limit]]] Default daily hour limit for warnings
   in statistics. Defaults to 8.0 hours if not configured.
 \end{description}
 
@@ -2600,9 +2600,9 @@ make tmux notify us when the pane's command exits.
 The main race is at startup: a very short-lived command could finish
 before we manage to install any hook on its pane.  We avoid that by
 launching a tiny shell wrapper that first blocks on a tmux
-[[wait-for]] channel, then [[exec]]s the real command.  Once the parent
-has learned the new [[pane_id]] and installed pane-scoped exit hooks, it
-signals that channel so the wrapped command can start.
+[[wait-for]] channel.  Once the parent has learned the new [[pane_id]]
+and installed pane-scoped exit hooks, it signals that channel so the
+wrapped command can start.
 
 The wrapper intentionally uses a plain non-login [[/bin/sh]] process.
 This wrapper is not a user shell session---it is just a rendezvous point
@@ -2610,11 +2610,18 @@ between tmux and the real command---so reading login startup files would
 only add risk.  A login shell can emit errors, alter the environment, or
 delay startup before the hook handshake is in place.
 
-On exit, tmux can wake the waiting parent immediately with another
-[[wait-for]] channel.  Because [[wait-for]] carries only a signal and no
-payload, the hook also stores the exit status (or terminating signal) in
-a temporary file before waking the parent.  That file gives us a durable
-handoff even if the pane disappears immediately afterwards.
+Normal completion now flows through the wrapper itself: after the child
+command exits, the wrapper records its exit status and signals the
+waiting parent directly.  That keeps the common [[exit]]/Ctrl+D path
+independent of tmux hook delivery.  We still install pane-scoped exit
+hooks as a fallback for abnormal cases such as an explicit
+[[kill-pane]]---the wrapper cannot run cleanup after it has been killed,
+but tmux can still report that the pane died.
+
+Both paths share one atomic completion guard.  The first path to claim
+that guard writes the status file, runs any follow-up shell command, and
+wakes the parent.  Later signals become harmless no-ops instead of
+double-running cleanup.
 
 <<helper functions>>=
 def validate_tmux_options(
@@ -2639,18 +2646,80 @@ def make_tmux_channel(prefix: str) -> str:
     )
 
 
+def make_tmux_completion_guard(
+    status_file: Optional[str],
+) -> Optional[str]:
+    """Return the atomic completion guard path."""
+    if status_file is None:
+        return None
+    return status_file + ".guard"
+
+
+def build_tmux_completion_shell(
+    *,
+    status_file: Optional[str] = None,
+    wait_channel: Optional[str] = None,
+    on_exit_shell: Optional[str] = None,
+    completion_guard: Optional[str] = None,
+    status_arg: str,
+    signal_arg: str,
+) -> str:
+    """Return shell code for one-shot tmux completion."""
+    shell_commands = []
+
+    if status_file is not None:
+        shell_commands.append(
+            "printf 'status=%s\\nsignal=%s\\n' "
+            f"{status_arg} {signal_arg} "
+            f"> {shlex.quote(status_file)}"
+        )
+    if on_exit_shell is not None:
+        shell_commands.append(on_exit_shell)
+    if wait_channel is not None:
+        shell_commands.append(
+            "tmux wait-for -S " + shlex.quote(wait_channel)
+        )
+
+    body = "; ".join(shell_commands) or ":"
+    if completion_guard is None:
+        return body
+    return (
+        f"if mkdir {shlex.quote(completion_guard)} 2>/dev/null; then "
+        f"{body}; "
+        "fi"
+    )
+
+
 def build_tmux_wait_wrapper(
     command_args: List[str],
     ready_channel: str,
+    *,
+    status_file: Optional[str] = None,
+    wait_channel: Optional[str] = None,
+    on_exit_shell: Optional[str] = None,
+    completion_guard: Optional[str] = None,
 ) -> List[str]:
-    """Return a wrapper that waits before execing the child."""
+    """Return a wrapper that waits and records normal exit."""
+    script_parts = [
+        f"tmux wait-for {shlex.quote(ready_channel)} || exit $?",
+        '"$@"',
+        "status=$?",
+    ]
+    completion_shell = build_tmux_completion_shell(
+        status_file=status_file,
+        wait_channel=wait_channel,
+        on_exit_shell=on_exit_shell,
+        completion_guard=completion_guard,
+        status_arg='"$status"',
+        signal_arg="''",
+    )
+    if completion_shell != ":":
+        script_parts.append(completion_shell)
+    script_parts.append('exit "$status"')
     return [
         "/bin/sh",
         "-c",
-        (
-            f"tmux wait-for {shlex.quote(ready_channel)}; "
-            'exec "$@"'
-        ),
+        "; ".join(script_parts),
         "sh",
     ] + command_args
 
@@ -2660,30 +2729,20 @@ def build_tmux_hook_command(
     status_file: Optional[str] = None,
     wait_channel: Optional[str] = None,
     on_exit_shell: Optional[str] = None,
+    completion_guard: Optional[str] = None,
 ) -> str:
-    """Build the tmux hook command for pane exit."""
-    tmux_commands = []
-    shell_commands = []
-
-    if status_file is not None:
-        shell_commands.append(
-            "printf '%s\\n%s\\n' "
-            "'status=#{pane_dead_status}' "
-            "'signal=#{pane_dead_signal}' "
-            f"> {shlex.quote(status_file)}"
-        )
-    if on_exit_shell is not None:
-        shell_commands.append(on_exit_shell)
-    if shell_commands:
-        tmux_commands.append(
-            "run-shell "
-            + shlex.quote("; ".join(shell_commands))
-        )
-    if wait_channel is not None:
-        tmux_commands.append(
-            "wait-for -S " + shlex.quote(wait_channel)
-        )
-    return "; ".join(tmux_commands)
+    """Build the tmux hook command for abnormal pane exit."""
+    shell_command = build_tmux_completion_shell(
+        status_file=status_file,
+        wait_channel=wait_channel,
+        on_exit_shell=on_exit_shell,
+        completion_guard=completion_guard,
+        status_arg=shlex.quote("#{pane_dead_status}"),
+        signal_arg=shlex.quote("#{pane_dead_signal}"),
+    )
+    if shell_command == ":":
+        return ""
+    return "run-shell " + shlex.quote(shell_command)
 
 
 def install_tmux_exit_hooks(
@@ -2691,6 +2750,8 @@ def install_tmux_exit_hooks(
     hook_command: str,
 ) -> None:
     """Install pane exit hooks for a newly created pane."""
+    if not hook_command:
+        return
     for hook_name in ("pane-exited", "pane-died"):
         subprocess.run(
             [
@@ -2748,13 +2809,11 @@ def run_tmux_command(
 ) -> Optional[int]:
     """Run a command in tmux and optionally wait for exit."""
     ready_channel = make_tmux_channel("ready")
-    wrapped_command = build_tmux_wait_wrapper(
-        command_args, ready_channel
-    )
     wait_channel = None
     status_file = exit_status_file
     pane_id = None
     remove_status_file = False
+    completion_guard = None
 
     if block and status_file is None:
         fd, status_file = tempfile.mkstemp(
@@ -2765,11 +2824,24 @@ def run_tmux_command(
         remove_status_file = True
     if block:
         wait_channel = make_tmux_channel("done")
+        completion_guard = make_tmux_completion_guard(
+            status_file
+        )
+
+    wrapped_command = build_tmux_wait_wrapper(
+        command_args,
+        ready_channel,
+        status_file=status_file,
+        wait_channel=wait_channel,
+        on_exit_shell=on_exit_shell,
+        completion_guard=completion_guard,
+    )
 
     hook_command = build_tmux_hook_command(
         status_file=status_file,
         wait_channel=wait_channel,
         on_exit_shell=on_exit_shell,
+        completion_guard=completion_guard,
     )
 
     tmux_args = [
@@ -2789,8 +2861,8 @@ def run_tmux_command(
     tmux_args.extend([
         "-c",
         cwd,
-        shlex.join(wrapped_command),
     ])
+    tmux_args.append(shlex.join(wrapped_command))
 
     old_sigint = None
     if block:
@@ -2834,6 +2906,11 @@ def run_tmux_command(
         if remove_status_file and status_file is not None:
             try:
                 os.unlink(status_file)
+            except OSError:
+                pass
+        if completion_guard is not None:
+            try:
+                os.rmdir(completion_guard)
             except OSError:
                 pass
 @
@@ -3943,6 +4020,9 @@ from nytid.cli.track import (
     filter_entries,
     parse_offset, parse_at_time,
     parse_tmux_exit_status,
+    make_tmux_completion_guard,
+    build_tmux_wait_wrapper,
+    build_tmux_hook_command,
     sanitize_who, complete_workers,
     default_username
 )
@@ -4303,6 +4383,49 @@ def test_parse_tmux_exit_status_signal():
 def test_parse_tmux_exit_status_code():
     """Normal exits use the recorded status code."""
     assert parse_tmux_exit_status("status=7\nsignal=\n") == 7
+
+
+def test_build_tmux_wait_wrapper_signals_done_once():
+    """Wrapper records normal exit and wakes waiters."""
+    status_file = "/tmp/nytid.status"
+    guard = make_tmux_completion_guard(status_file)
+
+    wrapper = build_tmux_wait_wrapper(
+        ["python", "-V"],
+        "ready-chan",
+        status_file=status_file,
+        wait_channel="done-chan",
+        on_exit_shell="cleanup-command",
+        completion_guard=guard,
+    )
+
+    assert wrapper[:3] == ["/bin/sh", "-c", wrapper[2]]
+    assert "tmux wait-for ready-chan" in wrapper[2]
+    assert "status=$?" in wrapper[2]
+    assert "mkdir /tmp/nytid.status.guard" in wrapper[2]
+    assert "printf 'status=%s\\nsignal=%s\\n' \"$status\" ''" in (
+        wrapper[2]
+    )
+    assert "cleanup-command" in wrapper[2]
+    assert "tmux wait-for -S done-chan" in wrapper[2]
+    assert wrapper[3:] == ["sh", "python", "-V"]
+
+
+def test_build_tmux_hook_command_uses_guarded_run_shell():
+    """Pane exit hooks become a guarded fallback path."""
+    hook = build_tmux_hook_command(
+        status_file="/tmp/nytid.status",
+        wait_channel="done-chan",
+        on_exit_shell="cleanup-command",
+        completion_guard="/tmp/nytid.status.guard",
+    )
+
+    assert hook.startswith("run-shell ")
+    assert "mkdir /tmp/nytid.status.guard" in hook
+    assert "#{pane_dead_status}" in hook
+    assert "#{pane_dead_signal}" in hook
+    assert "cleanup-command" in hook
+    assert "tmux wait-for -S done-chan" in hook
 
 def test_tracking_entry_with_who():
     """Test TrackingEntry serialization with who field"""
