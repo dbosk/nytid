@@ -355,23 +355,17 @@ We avoid this by merging overlapping intervals before summing.  The
 algorithm sorts intervals by start time, then greedily extends the
 current merged interval as long as the next one overlaps; whenever
 there is a gap it flushes the accumulated interval and starts a new
-one.
+one.  We expose the interval-merging step directly because the stats
+command needs it in two places: once for overall day totals, and once
+for exact label combinations within a day.
 
 <<helper functions>>=
-def merge_intervals(
-    entries: "List[TrackingEntry]",
-) -> datetime.timedelta:
-    """Compute wall-clock time covered by entries.
-
-    Overlapping intervals are merged so that concurrent
-    labels do not inflate the total.
-    """
-    if not entries:
+def merge_interval_pairs(intervals) -> datetime.timedelta:
+    """Compute wall-clock time covered by ``(start, end)`` pairs."""
+    intervals = sorted(intervals)
+    if not intervals:
         return datetime.timedelta()
 
-    intervals = sorted(
-        (e.start_time, e.end_time) for e in entries
-    )
     merged_total = datetime.timedelta()
     cur_start, cur_end = intervals[0]
 
@@ -384,15 +378,38 @@ def merge_intervals(
 
     merged_total += cur_end - cur_start
     return merged_total
+
+def merge_intervals(
+    entries: "List[TrackingEntry]",
+) -> datetime.timedelta:
+    """Compute wall-clock time covered by entries.
+
+    Overlapping intervals are merged so that concurrent
+    labels do not inflate the total.
+    """
+    return merge_interval_pairs(
+        (e.start_time, e.end_time) for e in entries
+    )
 @
 
-\subsubsection{Daily Wall-Clock Breakdown}
+\subsubsection{Daily Aggregation}
 
-The daily breakdown needs wall-clock time per calendar date.  An entry
-that spans midnight must be split across the two dates; otherwise all
-its time would land on the start date.  We therefore split each entry
-at midnight boundaries first, then apply [[merge_intervals]]'s
-greedy-merge within each date:
+The stats report works per calendar date.  An entry that spans midnight
+must be split across the two dates; otherwise all its time would land on
+the start date.  We therefore split each entry at midnight boundaries
+first.
+
+There are two useful views of the split data:
+\begin{description}
+\item[Daily wall-clock totals] Merge all intervals within a day so
+  overlapping labels do not inflate the day's total.
+\item[Daily label-set totals] Keep exact label combinations together so
+  repeated sessions with the same labels collapse into one line, while
+  still merging overlaps within that label set.
+\end{description}
+
+We also generate the requested date range explicitly so that days off
+remain visible as [[0s]] rather than disappearing from the report.
 
 <<helper functions>>=
 def compute_daily_wall_clock(
@@ -424,19 +441,54 @@ def compute_daily_wall_clock(
 
     daily_totals = {}
     for date, intervals in date_intervals.items():
-        intervals.sort()
-        total = datetime.timedelta()
-        cur_start, cur_end = intervals[0]
-        for s, e in intervals[1:]:
-            if s <= cur_end:
-                cur_end = max(cur_end, e)
-            else:
-                total += cur_end - cur_start
-                cur_start, cur_end = s, e
-        total += cur_end - cur_start
-        daily_totals[date] = total
+        daily_totals[date] = merge_interval_pairs(intervals)
 
     return daily_totals
+
+def compute_daily_label_set_totals(
+    entries: "List[TrackingEntry]",
+) -> Dict[datetime.date, Dict[tuple, datetime.timedelta]]:
+    """Compute merged time per date and exact label set."""
+    date_label_intervals = {}
+    for entry in entries:
+        labels_key = tuple(sorted(entry.labels))
+        start = entry.start_time
+        end = entry.end_time
+        while start.date() < end.date():
+            midnight = datetime.datetime.combine(
+                start.date() + datetime.timedelta(days=1),
+                datetime.time.min,
+            )
+            date_label_intervals.setdefault(
+                start.date(), {}
+            ).setdefault(labels_key, []).append((start, midnight))
+            start = midnight
+        if start < end:
+            date_label_intervals.setdefault(
+                start.date(), {}
+            ).setdefault(labels_key, []).append((start, end))
+
+    daily_totals = {}
+    for date, label_intervals in date_label_intervals.items():
+        daily_totals[date] = {
+            labels_key: merge_interval_pairs(intervals)
+            for labels_key, intervals in label_intervals.items()
+        }
+
+    return daily_totals
+
+def make_stats_dates(
+    days: int,
+    now: Optional[datetime.datetime] = None,
+) -> List[datetime.date]:
+    """Return the reporting dates, newest first."""
+    if now is None:
+        now = datetime.datetime.now()
+
+    return [
+        now.date() - datetime.timedelta(days=offset)
+        for offset in range(days)
+    ]
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -3290,7 +3342,7 @@ individual entries --- for example, to verify that yesterday's grading
 session was recorded, or to eyeball recent work before writing a
 timesheet.  The [[ls]] command provides this quick, per-entry view.
 
-Unlike [[stats]], which defaults to a 7-day time window, [[ls]] uses a
+Unlike [[stats]], which defaults to a 1-day time window, [[ls]] uses a
 count limit ([[-n]]) instead.  A time window would hide old entries even
 when the user explicitly asks \enquote{show me my last 20 sessions}.
 The count-based approach always returns exactly as many entries as
@@ -3435,13 +3487,23 @@ def test_ls_empty(temp_tracking_dir):
 \subsection{Stats Command}
 
 The stats command answers a question teachers ask constantly:
-\enquote{How much time did I actually spend on this?}  A 7-day default
-window is chosen because it aligns with the natural planning cycle of a
-work week --- long enough to see patterns, short enough that the numbers
-remain actionable.  Warnings are expressed as a prorated fraction of the
-configured weekly limit so that partial-week windows still trigger at the
-right threshold: if you have 20 hours of a 40-hour week remaining, the
-warning fires at 20 hours, not 40.
+\enquote{How much time did I actually spend on this?}  The default view
+answers the most immediate version of that question:
+\enquote{what did today look like?}  A one-day default makes [[stats]] a
+quick daily review, while [[-n]]/[[--days]] expands the window when the
+user wants a longer retrospective.
+
+The default output is aggregated, but not flattened into individual
+labels.  Teachers often work in repeated bursts on the same combination
+of tags, such as [[nytid]], [[devel]], and [[work]].  Listing each
+session separately is noisy, but listing each label individually falsely
+suggests a hierarchy.  Grouping by the exact label set keeps the tags
+equal while still collapsing repeated work into one line per day.
+
+Warnings remain part of the optional summary view.  Their threshold is
+prorated: if the window is 3 days and the weekly limit is 40 hours, we
+warn after 40 * 3/7 ≈ 17 hours rather than a fixed 40. This keeps the
+warning meaningful for both short and long windows.
 
 <<stats command>>=
 @cli.command()
@@ -3452,7 +3514,7 @@ def stats(
              "(shows all if not specified)",
         autocompletion=complete_historical_labels),
     days: int = typer.Option(
-        7, "--days",
+        1, "--days", "-n",
         help="Number of days to include in stats"),
     weekly_limit: Optional[float] = typer.Option(
         None, "--weekly-limit",
@@ -3465,13 +3527,16 @@ def stats(
     who: Optional[str] = typer.Option(
         None, "--who", "-w",
         help="Filter by worker (shows all if omitted)",
-        autocompletion=complete_workers)
+        autocompletion=complete_workers),
+    summary: bool = typer.Option(
+        False, "--summary",
+        help="Include an overall summary for the whole window")
 ):
     """
     Show statistics about tracked time.
 
-    Can filter by specific labels to see time spent on
-    particular activities.
+    By default, shows one aggregated report per day, with
+    repeated entries merged by exact label combination.
 
     \b
     For example: nytid track stats DD1310 lecture
@@ -3486,9 +3551,8 @@ def stats(
     """
     <<resolve stats limits>>
     <<load and filter entries for stats>>
-    <<calculate and display totals>>
-    <<display daily breakdown>>
-    <<display label breakdown>>
+    <<display stats summary when requested>>
+    <<display grouped daily breakdown>>
 @
 
 The [[--weekly-limit]] and [[--daily-limit]] flags are optional because
@@ -3505,8 +3569,11 @@ if daily_limit is None:
 
 With the shared helper handling the mechanical filtering, this chunk
 focuses on the stats-specific concerns: constructing [[label_filter_msg]]
-for the summary header, and distinguishing \enquote{no data at all}
-([[None]]) from \enquote{data exists but nothing matched the window}:
+for headers, generating the full requested date range, and
+distinguishing \enquote{no data at all} ([[None]]) from
+\enquote{data exists but nothing matched the filter}.  We no longer
+return early on an empty result, because an empty day still belongs in a
+daily report as [[0s]]:
 
 <<load and filter entries for stats>>=
 recent_entries = filter_entries(
@@ -3524,155 +3591,161 @@ if labels:
 else:
     label_filter_msg = ""
 
-if not recent_entries:
-    if labels:
-        typer.echo(
-            f"No tracking data in the last {days} days"
-            f" for specified labels"
-        )
-    else:
-        typer.echo(
-            f"No tracking data in the last {days} days"
-        )
-    return
+stats_dates = make_stats_dates(days)
+daily_totals = compute_daily_wall_clock(recent_entries)
+daily_label_set_totals = compute_daily_label_set_totals(
+    recent_entries
+)
 @
 
-The warning threshold is prorated: if the window is 3 days and the
-weekly limit is 40 hours, we warn after 40 * 3/7 ≈ 17 hours rather
-than a fixed 40. This makes the warning meaningful for both short and
-long windows.
+The optional summary keeps the old big-picture view for users who want a
+single total for the whole window before the daily details:
 
-We compute wall-clock time by merging overlapping intervals rather
-than naively summing entry durations.  Without merging, two labels
-tracked concurrently from 09:00 to 10:00 would report two hours
-instead of one:
-
-<<calculate and display totals>>=
+<<display stats summary when requested>>=
 total_time = merge_intervals(recent_entries)
 total_hours = total_time.total_seconds() / 3600
 
-typer.echo(
-    f"Statistics for the last {days} days"
-    f"{label_filter_msg}:"
-)
-typer.echo(
-    f"Total time: {format_duration(total_time)}"
-    f" ({total_hours:.1f} hours)"
-)
-typer.echo(
-    f"Average per day: {total_hours/days:.1f} hours"
-)
-
-if total_hours > (weekly_limit * days / 7):
+if summary:
     typer.echo(
-        f"⚠️  Warning: Exceeding weekly limit of"
-        f" {weekly_limit} hours per week",
-        err=True,
+        f"Statistics for the last {days} days"
+        f"{label_filter_msg}:"
     )
+    typer.echo(
+        f"Total time: {format_duration(total_time)}"
+        f" ({total_hours:.1f} hours)"
+    )
+    typer.echo(
+        f"Average per day: {total_hours/days:.1f} hours"
+    )
+
+    if total_hours > (weekly_limit * days / 7):
+        typer.echo(
+            f"⚠️  Warning: Exceeding weekly limit of"
+            f" {weekly_limit} hours per week",
+            err=True,
+        )
+    typer.echo()
 @
 
-We sort reverse-chronologically so the most recent day appears first,
-which is the natural reading order for a time report.  As with the
-total, we merge overlapping intervals so that concurrent labels are
-not double-counted.  Entries that span midnight are split at the day
-boundary by [[compute_daily_wall_clock]]:
+The default report iterates across the full requested date range, newest
+first, so days without activity still appear.  Within each day we sort
+label sets by duration descending and render the tags with commas to
+emphasise that they are peers rather than a hierarchy.
 
-<<display daily breakdown>>=
-typer.echo(f"\nDaily breakdown:")
-daily_totals = compute_daily_wall_clock(
-    recent_entries
-)
+Presentation matters here because stats is read comparatively: users
+scan down a column to compare durations and across a row to connect a
+day with its label sets.  We therefore render the data as a table.  In a
+terminal we use [[rich]] for aligned columns; when stdout is not a tty we
+fall back to a plain-text table so redirected output and tests stay
+readable.
 
-for date in sorted(
-    daily_totals.keys(), reverse=True
-):
-    duration = daily_totals[date]
+We keep row construction separate from rendering.  That gives both the
+rich and plain-text paths the same content, and it makes the dependency
+explicit: renderers consume precomputed [[rows]] rather than rebuilding
+the report format themselves.
+
+<<display grouped daily breakdown>>=
+<<build stats table rows>>
+<<render stats table>>
+@
+
+<<build stats table rows>>=
+rows = []
+for date in stats_dates:
+    label_totals = daily_label_set_totals.get(date, {})
+    duration = daily_totals.get(date, datetime.timedelta())
     hours = duration.total_seconds() / 3600
-    warning = " ⚠️" if hours > daily_limit else ""
-    typer.echo(
-        f"  {date}: {format_duration(duration)}"
-        f" ({hours:.1f}h){warning}"
-    )
+    total_text = format_duration(duration)
+    if hours > daily_limit:
+        total_text += " !"
+
+    if not label_totals:
+        rows.append((str(date), total_text, "(off)", "0s"))
+        continue
+
+    first_row = True
+
+    for labels_key, labels_duration in sorted(
+        label_totals.items(),
+        key=lambda item: (-item[1].total_seconds(), item[0]),
+    ):
+        rows.append(
+            (
+                str(date) if first_row else "",
+                total_text if first_row else "",
+                ", ".join(labels_key),
+                format_duration(labels_duration),
+            )
+        )
+        first_row = False
 @
 
-When the user filters by label we show \emph{co-occurring} labels ---
-the other tags that appeared in the same entry --- rather than the
-filter labels themselves. This answers \enquote{When I worked on
-DD1310, what was I doing?} without duplicating the filter label in the
-output.  When there is no filter we show a simple total-by-label
-breakdown, sorted by time descending so the most expensive activities
-appear first.  Because [[total_time]] is wall-clock time, percentages
-for individual labels can exceed 100\,\% when labels were tracked
-concurrently --- this honestly reflects that, for example, one hour of
-concurrent \enquote{lecture} and \enquote{DD1310} is 100\,\% of the
-wall-clock time for each:
+The renderer now has a single job: choose the presentation layer.  The
+TTY path gets [[rich]] with column-aware wrapping, while the fallback
+path stays pure ASCII and aligned for pipes, logs, and tests:
 
-<<display label breakdown>>=
-if labels:
-    typer.echo(
-        f"\nTime breakdown for co-occurring labels:"
-    )
-    typer.echo(
-        f"  (shows other labels that appeared"
-        f" alongside {', '.join(labels)})"
-    )
-    co_occurring_label_totals = {}
-    for entry in recent_entries:
-        for label in entry.labels:
-            if label not in labels:
-                if label not in co_occurring_label_totals:
-                    co_occurring_label_totals[label] = (
-                        datetime.timedelta()
-                    )
-                co_occurring_label_totals[label] += (
-                    entry.duration()
-                )
-
-    if co_occurring_label_totals:
-        for label, duration in sorted(
-            co_occurring_label_totals.items(),
-            key=lambda x: x[1], reverse=True
-        ):
-            hours = duration.total_seconds() / 3600
-            pct = (
-                duration.total_seconds()
-                / total_time.total_seconds() * 100
-            )
-            typer.echo(
-                f"  {label}: "
-                f"{format_duration(duration)}"
-                f" ({hours:.1f}h, {pct:.1f}%)"
-            )
-    else:
-        typer.echo(
-            f"  (no other labels co-occurred"
-            f" with {', '.join(labels)})"
-        )
+<<render stats table>>=
+if sys.stdout.isatty():
+    <<render stats table with rich>>
 else:
-    typer.echo(f"\nTime by labels:")
-    label_totals = {}
-    for entry in recent_entries:
-        for label in entry.labels:
-            if label not in label_totals:
-                label_totals[label] = (
-                    datetime.timedelta()
-                )
-            label_totals[label] += entry.duration()
+    <<render stats table as plain columns>>
+@
 
-    for label, duration in sorted(
-        label_totals.items(),
-        key=lambda x: x[1], reverse=True
-    ):
-        hours = duration.total_seconds() / 3600
-        pct = (
-            duration.total_seconds()
-            / total_time.total_seconds() * 100
-        )
-        typer.echo(
-            f"  {label}: "
-            f"{format_duration(duration)}"
-            f" ({hours:.1f}h, {pct:.1f}%)"
-        )
+The two rendering paths share the same rows so they differ only in
+presentation, not in content.  Rich gets automatic column sizing and box
+drawing, while the plain-text path computes widths and prints an aligned
+ASCII table:
+
+<<render stats table with rich>>=
+from rich.console import Console
+from rich import box
+from rich.table import Table
+
+console = Console()
+table = Table(
+    show_header=True,
+    header_style="bold",
+    box=box.SIMPLE,
+    show_edge=False,
+    pad_edge=False,
+)
+table.add_column("Date", style="cyan", no_wrap=True)
+table.add_column("Total", justify="right", no_wrap=True)
+table.add_column("Labels", overflow="fold")
+table.add_column("Time", justify="right", no_wrap=True)
+
+for row in rows:
+    table.add_row(*row)
+
+console.print(table)
+@
+
+<<render stats table as plain columns>>=
+headers = ("Date", "Total", "Labels", "Time")
+date_width = max(len(headers[0]), *(len(row[0]) for row in rows))
+total_width = max(len(headers[1]), *(len(row[1]) for row in rows))
+labels_width = max(len(headers[2]), *(len(row[2]) for row in rows))
+time_width = max(len(headers[3]), *(len(row[3]) for row in rows))
+
+typer.echo(
+    f"{headers[0]:<{date_width}}  "
+    f"{headers[1]:<{total_width}}  "
+    f"{headers[2]:<{labels_width}}  "
+    f"{headers[3]:>{time_width}}"
+)
+typer.echo(
+    f"{'-' * date_width}  "
+    f"{'-' * total_width}  "
+    f"{'-' * labels_width}  "
+    f"{'-' * time_width}"
+)
+for date, total, labels_text, labels_time in rows:
+    typer.echo(
+        f"{date:<{date_width}}  "
+        f"{total:<{total_width}}  "
+        f"{labels_text:<{labels_width}}  "
+        f"{labels_time:>{time_width}}".rstrip()
+    )
 @
 
 \subsection{Export Command}
@@ -4044,101 +4117,149 @@ def test_stats_no_data(temp_tracking_dir):
     assert "No tracking data available" in result.stdout
 
 def test_stats_with_data(temp_tracking_dir):
-    """Test stats command with data"""
-    # Add some data
+    """Default stats show today's grouped label sets."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
-        "--duration", "60"
+        "--duration", "60",
+        "--at", f"{today} 10:00"
     ])
-    
+
     result = runner.invoke(cli, ["stats"])
     assert result.exit_code == 0
-    assert "Statistics for the last 7 days:" in result.stdout
-    assert "DD1310:" in result.stdout
+    assert "Date" in result.stdout
+    assert "Total" in result.stdout
+    assert "Labels" in result.stdout
+    assert "Time" in result.stdout
+    assert today in result.stdout
+    assert "DD1310, grading" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "Statistics for the last" not in result.stdout
 
-def test_stats_filtered_by_labels(temp_tracking_dir):
-    """Test stats command with label filtering"""
-    # Add data for multiple labels
+def test_stats_groups_matching_label_sets(temp_tracking_dir):
+    """Repeated sessions with the same labels collapse together."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "nytid", "devel", "work",
+        "--duration", "30",
+        "--at", f"{today} 09:00"
+    ])
+    runner.invoke(cli, [
+        "add", "work", "nytid", "devel",
+        "--duration", "45",
+        "--at", f"{today} 11:00"
+    ])
+
+    result = runner.invoke(cli, ["stats"])
+    assert result.exit_code == 0
+    assert "devel, nytid, work" in result.stdout
+    assert result.stdout.count("devel, nytid, work") == 1
+    assert "1h 15m 0s" in result.stdout
+
+def test_stats_show_empty_days_as_zero(temp_tracking_dir):
+    """Requested windows include off-days as explicit zeros."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
-        "--duration", "60"
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "-n", "2"])
+    assert result.exit_code == 0
+    yesterday = (
+        datetime.datetime.now().date()
+        - datetime.timedelta(days=1)
+    ).isoformat()
+    assert today in result.stdout
+    assert yesterday in result.stdout
+    assert "(off)" in result.stdout
+    assert "0s" in result.stdout
+
+def test_stats_summary_flag_shows_aggregate_totals(temp_tracking_dir):
+    """--summary restores the overall window totals."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "--summary"])
+    assert result.exit_code == 0
+    assert "Statistics for the last 1 days:" in result.stdout
+    assert "Total time: 1h 0m 0s (1.0 hours)" in result.stdout
+
+def test_stats_days_short_option(temp_tracking_dir):
+    """-n is a shorthand for --days on stats."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "-n", "3", "--summary"])
+    assert result.exit_code == 0
+    assert "Statistics for the last 3 days:" in result.stdout
+
+def test_stats_filtered_by_labels(temp_tracking_dir):
+    """Label filters retain grouped daily output."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 09:00"
     ])
     runner.invoke(cli, [
         "add", "DD1321", "lecture",
-        "--duration", "90"
+        "--duration", "90",
+        "--at", f"{today} 11:00"
     ])
     runner.invoke(cli, [
         "add", "DD1310", "lecture",
-        "--duration", "45"
+        "--duration", "45",
+        "--at", f"{today} 14:00"
     ])
-    
+
     # Get stats for DD1310 only
     result = runner.invoke(cli, ["stats", "DD1310"])
     assert result.exit_code == 0
-    assert "for labels: DD1310" in result.stdout
-    assert "DD1310:" in result.stdout
-    
+    assert "DD1310, grading" in result.stdout
+    assert "DD1310, lecture" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "45m 0s" in result.stdout
+    assert "DD1321, lecture" not in result.stdout
+
     # Get stats for lecture only
     result = runner.invoke(cli, ["stats", "lecture"])
     assert result.exit_code == 0
-    assert "for labels: lecture" in result.stdout
-    assert "lecture:" in result.stdout
-    
+    assert "DD1321, lecture" in result.stdout
+    assert "DD1310, lecture" in result.stdout
+    assert "1h 30m 0s" in result.stdout
+    assert "45m 0s" in result.stdout
+
     # Get stats for multiple labels
-    result = runner.invoke(cli, ["stats", "DD1310", "DD1321"])
+    result = runner.invoke(
+        cli, ["stats", "DD1310", "DD1321", "--summary"]
+    )
     assert result.exit_code == 0
     assert "for labels: DD1310, DD1321" in result.stdout
 
-def test_stats_co_occurring_labels(temp_tracking_dir):
-    """Test stats command shows co-occurring labels when filtering"""
-    # Add data with co-occurring labels.
-    # Use --offset so entries don't overlap in
-    # wall-clock time --- overlapping entries are merged
-    # by stats, which would change the expected totals.
-    # devel + nytid (120 min, starting 300 min ago)
+def test_stats_filtered_days_without_matches_show_zero(
+    temp_tracking_dir,
+):
+    """Filtered windows still show empty days explicitly."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
-        "add", "devel", "nytid",
-        "--duration", "120",
-        "--offset", "-300m"
-    ])
-    # devel + canvaslms (90 min, starting 180 min ago)
-    runner.invoke(cli, [
-        "add", "devel", "canvaslms",
-        "--duration", "90",
-        "--offset", "-180m"
-    ])
-    # devel + nytid + testing (60 min, starting 90 min ago)
-    runner.invoke(cli, [
-        "add", "devel", "nytid", "testing",
-        "--duration", "60",
-        "--offset", "-90m"
-    ])
-    # Just nytid (no devel) (30 min, starting 30 min ago)
-    runner.invoke(cli, [
-        "add", "nytid", "docs",
+        "add", "nytid", "work",
         "--duration", "30",
-        "--offset", "-30m"
+        "--at", f"{today} 10:00"
     ])
-    
-    # Get stats for devel - should show co-occurring labels
-    result = runner.invoke(cli, ["stats", "devel"])
+
+    result = runner.invoke(cli, ["stats", "grading", "-n", "2"])
     assert result.exit_code == 0
-    assert "for labels: devel" in result.stdout
-    # Total time should be 120 + 90 + 60 = 270 minutes
-    assert "4h 30m" in result.stdout or "4.5" in result.stdout
-    
-    # Should show co-occurring labels breakdown
-    assert "co-occurring labels" in result.stdout
-    assert "nytid:" in result.stdout  # 120 + 60 = 180 min
-    assert "canvaslms:" in result.stdout  # 90 min
-    assert "testing:" in result.stdout  # 60 min
-    # Should NOT show devel itself in co-occurring
-    
-    # Verify nytid alone doesn't show as much time
-    result2 = runner.invoke(cli, ["stats", "nytid"])
-    assert result2.exit_code == 0
-    # nytid appears in 120 + 60 + 30 = 210 min = 3.5h
-    assert "3h 30m" in result2.stdout or "3.5" in result2.stdout
+    assert result.stdout.count("(off)") == 2
 
 def test_all_tracking_module_functions(temp_tracking_dir):
     """Comprehensive test of all tracking module functions"""
@@ -4529,14 +4650,16 @@ def test_status_shows_all_workers(temp_tracking_dir):
     assert "coding" in result.stdout
 
 def test_stats_with_who_filter(temp_tracking_dir):
-    """Test filtering stats by worker"""
-    # Add entries for different workers
+    """Worker filters apply before daily grouping."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
-        "add", "DD1310", "--duration", "60"
+        "add", "DD1310", "--duration", "60",
+        "--at", f"{today} 09:00"
     ])
     runner.invoke(cli, [
         "add", "coding", "--duration", "90",
-        "--who", "Dan-Claude"
+        "--who", "Dan-Claude",
+        "--at", f"{today} 11:00"
     ])
 
     # Stats for Dan-Claude only
@@ -4545,6 +4668,8 @@ def test_stats_with_who_filter(temp_tracking_dir):
     ])
     assert result.exit_code == 0
     assert "coding" in result.stdout
+    assert "1h 30m 0s" in result.stdout
+    assert "DD1310" not in result.stdout
 
     # Stats for default worker only
     result = runner.invoke(
@@ -4552,6 +4677,8 @@ def test_stats_with_who_filter(temp_tracking_dir):
     )
     assert result.exit_code == 0
     assert "DD1310" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "coding" not in result.stdout
 
 def test_complete_workers(temp_tracking_dir):
     """Test autocompletion returns known workers"""
