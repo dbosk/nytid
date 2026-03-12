@@ -58,7 +58,7 @@ without retyping label names:
 \item After stopping labels, [[nytid track start]] (without arguments)
   resumes them.
 \item Useful when interrupted and wanting to continue the same activity.
-\item Example: [[nytid track run -l mail -- mutt]] is interrupted,
+\item Example: [[nytid track start mail]] is interrupted,
   [[nytid track stop]] stops mail tracking; later
   [[nytid track start]] resumes mail tracking.
 \end{itemize}
@@ -1402,7 +1402,7 @@ this by collapsing duplicates automatically and emitting a
 through a repair workflow.
 
 Concurrent history writers create a second hazard.  Commands such as
-[[stop]], [[run]], and the history-editing commands all use a
+[[stop]], launch-enabled [[start]], and the history-editing commands all use a
 read-modify-write cycle; without coordination, one process can silently
 overwrite another's freshly written entry.  A simple lock file around the
 critical section keeps history updates serialized, while a temporary file
@@ -1686,8 +1686,13 @@ is organized with its documentation, implementation, and tests together.
 
 \subsection{Start Command}
 
-The start command begins tracking time with the specified labels. Labels are 
+The start command begins tracking time with the specified labels. Labels are
 independent tags that can be started individually or in groups.
+
+For work that is tied to a subprocess, [[start]] can also launch a command
+with [[--command]] or open a tracked shell in tmux via [[--pane]] or
+[[--window]].  In those modes, the tracking session still starts first, but
+the labels are stopped automatically when the subprocess exits.
 
 We use noweb's chunk concatenation to build up the command's options 
 incrementally. The [[<<start command options>>]] chunk accumulates function 
@@ -1705,13 +1710,15 @@ def start(
     <<start command options>>
 ):
     """
-    Start tracking time with the given labels.
+    Start tracking labels, optionally tied to a command or tmux shell.
 
-    If no labels are provided, resumes tracking the most recently stopped labels.
+    Use this for everyday work such as starting a course/activity pair,
+    correcting a late start, resuming the previous context, or launching a tool
+    while the labels are active.
 
     \b
     Examples:
-      nytid track start DD1310 lecture preparation
+      nytid track start DD1310 lecture
       <<start command docstring examples>>
     """
     <<start command implementation>>
@@ -1720,12 +1727,15 @@ def start(
 \subsubsection{Core Implementation}
 
 The implementation handles loading the session, resolving labels (including 
-resume functionality), calculating the start time, and reporting results.
+resume functionality), calculating the start time, optionally preparing a
+subprocess launch, and reporting results.
 
 <<start command implementation>>=
 <<load session and resolve labels>>
 <<calculate start time>>
+<<prepare launch mode>>
 <<start tracking and report results>>
+<<launch subprocess if requested>>
 @
 
 We load the active session first, since we need it both for resume 
@@ -1736,7 +1746,9 @@ session = load_active_session(who)
 
 # If no labels provided, try to resume last stopped labels
 if not labels:
-    if session.last_stopped:
+    if command is not None:
+        labels = []
+    elif session.last_stopped:
         labels = session.last_stopped
         typer.echo(
             f"Resuming: {', '.join(sorted(labels))}"
@@ -1762,7 +1774,7 @@ needs no special case:
 <<replace active labels if requested>>=
 if replace:
     to_discard = [
-        l for l in labels
+        l for l in tracking_labels
         if session.get_label_info(l) is not None
     ]
     discarded = session.discard_labels(to_discard)
@@ -1773,11 +1785,100 @@ if replace:
         )
 @
 
+When [[start]] launches a command or tmux shell, it may need to derive one
+extra label from the command name, validate tmux usage, and prepare a shell
+prompt that makes the tracking context visible.
+
+Launch mode also needs a clear ownership rule for labels.  If a label is already
+active and we launch a child process without [[--replace]], the command would
+appear to belong to that label but the automatic shutdown path would leave the
+old session running.  We therefore require launch-bound labels to be inactive
+unless the user explicitly asks to replace them.
+
+<<prepare launch mode>>=
+launch_requested = command is not None or pane or window
+tracking_labels = list(labels)
+command_args = None
+command_text = None
+proc_env = None
+proc_cwd = os.getcwd()
+prompt_file = None
+prompt_dir = None
+window_name = None
+
+if launch_requested:
+    try:
+        validate_tmux_options(pane, window)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    proc_env = os.environ.copy()
+
+    conflicting_launch_labels = [
+        label for label in labels
+        if session.get_label_info(label) is not None
+    ]
+    if conflicting_launch_labels and not replace:
+        typer.echo(
+            "Error: launch mode requires inactive labels or "
+            f"--replace: {', '.join(sorted(conflicting_launch_labels))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if command is not None:
+        try:
+            command_args = shlex.split(command)
+        except ValueError as exc:
+            typer.echo(f"Error parsing command: {exc}", err=True)
+            raise typer.Exit(1)
+        if not command_args:
+            typer.echo("Error: Command cannot be empty", err=True)
+            raise typer.Exit(1)
+        command_text = command
+        tracking_labels.append(command_args[0])
+    else:
+        command_args, prompt_file, prompt_dir = (
+            build_tracking_shell_command(
+                tracking_labels, proc_env
+            )
+        )
+
+    if window:
+        window_name = join_tracking_labels(
+            tracking_labels
+        )
+@
+
+When a launched command is recorded in history, we store the full command
+string as the batch description.  We attach it to every newly started label in
+that batch so the grouped entry keeps the description regardless of which label
+is encountered first during shutdown.
+
+<<store command description if needed>>=
+if command_text is not None:
+    for label in started:
+        if label not in session.active_labels:
+            continue
+        label_start_time, _, batch_id = (
+            session.active_labels[label]
+        )
+        session.active_labels[label] = (
+            label_start_time,
+            command_text,
+            batch_id,
+        )
+@
+
 <<start tracking and report results>>=
 <<replace active labels if requested>>
-started = session.start_labels(labels, start_time)
+started = session.start_labels(
+    tracking_labels, start_time
+)
+<<store command description if needed>>
 already_tracking = [
-    l for l in labels if l not in started
+    l for l in tracking_labels if l not in started
 ]
 
 save_active_session(session, who)
@@ -1814,7 +1915,7 @@ offset: Optional[str] = typer.Option(
 @
 
 <<start command docstring examples>>=
-nytid track start DD1310 --offset -30m        # Started 30 minutes ago
+nytid track start DD1310 --offset -30m        # Forgot to start on time
 @
 
 \subsubsection{Absolute Time Support}
@@ -1831,9 +1932,9 @@ at: Optional[str] = typer.Option(
 @
 
 <<start command docstring examples>>=
-nytid track start meeting --at 14:30          # Started at 2:30 PM today
+nytid track start meeting --at 14:30          # Meeting began at 2:30 PM
 nytid track start                             # Resume last stopped labels
-nytid track start DD1310 --who Dan-Claude     # Track as Dan-Claude
+nytid track start DD1310 --who Dan-Claude     # Track work for another worker
 @
 
 \subsubsection{Replacing an Already-Active Label}
@@ -1863,7 +1964,7 @@ replace: bool = typer.Option(
 @
 
 <<start command docstring examples>>=
-nytid track start labelA --offset -60m --replace  # Backdate active session
+nytid track start labelA --offset -60m --replace  # Restart active label earlier
 @
 
 \subsubsection{Worker Identity}
@@ -1877,7 +1978,43 @@ who: str = typer.Option(
     default_username, "--who", "-w",
     help="Worker identity (default: $USER)",
     autocompletion=complete_workers
-)
+),
+@
+
+\subsubsection{Launching a Command or a Tmux Shell}
+
+Sometimes starting a label should immediately hand control to another tool:
+mail in [[mutt]], a build in [[make]], or a shell in a dedicated tmux pane.
+Rather than keeping a separate subcommand for that workflow, we let
+[[start]] grow into it.
+
+With [[--command]], the command name becomes an additional implicit label.
+For example, [[nytid track start work --command mutt]] tracks both
+[[work]] and [[mutt]], and stores the full command string as the description
+so the history still records what was launched.  With [[--pane]] or [[--window]] but no
+command, [[start]] opens the user's default shell inside tmux and prefixes the
+prompt with the active labels.
+
+<<start command options>>=
+command: Optional[str] = typer.Option(
+    None, "--command", "-c",
+    help="Program and arguments to run while tracking "
+         "(parsed with shlex; no shell syntax)",
+),
+pane: bool = typer.Option(
+    False, "--pane", "-P",
+    help="Run in a new tmux pane",
+),
+window: bool = typer.Option(
+    False, "--window", "-W",
+    help="Run in a new tmux window",
+),
+@
+
+<<start command docstring examples>>=
+nytid track start email -c "mutt"            # Track email while launching mutt
+nytid track start grading -P                  # Open a tracked shell in tmux pane
+nytid track start admin -W                    # Open a tracked shell in tmux window
 @
 
 \subsubsection{Calculating Start Time}
@@ -2031,6 +2168,34 @@ def test_start_without_replace_keeps_original(temp_tracking_dir):
     assert result.exit_code == 0
     assert "Already tracking: labelA" in result.stdout
     assert "Replaced" not in result.stdout
+
+def test_start_launch_requires_replace_for_active_labels(
+    temp_tracking_dir,
+):
+    """Launch mode rejects already-active labels unless --replace is used."""
+    runner.invoke(cli, ["start", "labelA"])
+
+    result = runner.invoke(cli, [
+        "start", "labelA", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 1
+    assert "launch mode requires inactive labels or --replace" in result.stdout
+
+
+def test_start_launch_with_replace_restarts_active_label(
+    temp_tracking_dir,
+):
+    """Launch mode works with active labels when --replace is given."""
+    runner.invoke(cli, ["start", "labelA"])
+
+    result = runner.invoke(cli, [
+        "start", "labelA", "--replace", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 0
+    assert "Replaced: labelA" in result.stdout
+    assert "Running 'echo test'" in result.stdout
 @
 
 \subsection{Stop Command}
@@ -2068,28 +2233,20 @@ def stop(
         autocompletion=complete_workers)
 ):
     """
-    Stop tracking. By default, stops the most recently started batch of labels.
-    
-    When labels are started together in one command, they form a "batch" and
-    are stopped together.
+    Stop tracking for the current batch, specific labels, or everything.
+
+    Use the default form to unwind the most recent context, name labels when
+    only part of the session should stop, or backdate the stop time after
+    forgetting to stop on time.
 
     \b
-    For example:
-      nytid track start DD1310          # Start DD1310 (batch 1)
-      nytid track start lecture prep    # Start lecture and prep (batch 2)  
-      nytid track stop                  # Stops batch 2 (lecture and prep)
-      nytid track stop                  # Stops batch 1 (DD1310)
-    
-    Use --all to stop all active tracking, or specify labels to stop specific ones.
-    
-    \b
     Examples:
-      nytid track stop                   # Stop most recent batch
-      nytid track stop --all             # Stop all active labels
-      nytid track stop DD1310            # Stop only DD1310 label
-      nytid track stop DD1310 lecture    # Stop DD1310 and lecture labels
-      nytid track stop --offset -30m     # Stopped 30 minutes ago
-      nytid track stop --at 16:00        # Stopped at 4:00 PM
+      nytid track stop
+      nytid track stop --all
+      nytid track stop DD1310
+      nytid track stop DD1310 lecture
+      nytid track stop --offset -30m
+      nytid track stop --at 16:00
     """
     session = load_active_session(who)
 
@@ -2290,35 +2447,19 @@ def switch(
     <<switch command options>>
 ):
     """
-    Switch tracking context, toggling between two label sets.
+    Switch from the current labels to another context, with toggle support.
 
-    Stops the current tracking and starts the given labels.
-    The stopped labels are saved so a bare switch toggles
-    back to them.  Another bare switch toggles forward again.
-    There is at most one saved set at any time.
-
-    \b
-    Toggle example:
-      nytid track switch email      # A -> email, saved: A
-      nytid track switch            # email -> A, saved: email
-      nytid track switch            # A -> email, saved: A
-
-    \b
-    Use --pop to discard the current context without saving:
-      nytid track switch --pop      # email -> A, no saved set
-
-    \b
-    When labels are given with --pop, they replace current
-    tracking without saving the stopped labels:
-      nytid track switch grading --pop
+    Use this when work is interrupted by email, meetings, or a new task and you
+    want one command to stop the old context and start the new one.
 
     \b
     Examples:
       nytid track switch email
       nytid track switch --all meeting
       nytid track switch --offset -15m DD1310
-      nytid track switch              # toggle back
-      nytid track switch --pop        # discard current
+      nytid track switch
+      nytid track switch --pop
+      nytid track switch grading --pop
     """
     session = load_active_session(who)
     <<validate switch time options>>
@@ -2659,10 +2800,15 @@ def status(
         autocompletion=complete_workers)
 ):
     """
-    Show current tracking status.
+    Show which labels are currently being tracked.
 
-    Without --who, shows all active workers.
-    With --who, shows only that worker's session.
+    Use this to check what is active right now, either across all workers or
+    for one specific worker.
+
+    \b
+    Examples:
+      nytid track status
+      nytid track status --who Dan-Claude
     """
     if who is not None:
         <<show single worker status>>
@@ -2872,11 +3018,15 @@ def notes(
         autocompletion=complete_workers)
 ):
     """
-    Add or update notes for an active tracking label.
+    Add or replace the note attached to one active label.
+
+    Use notes to capture what happened during the session so the eventual
+    history entry is self-explanatory.
 
     \b
-    Example:
+    Examples:
       nytid track notes DD1310 "Discussing course structure with TA"
+      nytid track notes email "Answered student questions about lab 2"
     """
     session = load_active_session(who)
 
@@ -2909,7 +3059,7 @@ def notes(
 Tmux-launched commands need a different waiting strategy from direct
 [[subprocess.run]].  The [[tmux split-window]] and [[new-window]]
 commands return as soon as the pane exists, not when the program inside
-the pane finishes.  To preserve [[track run]]'s semantics we therefore
+the pane finishes.  To preserve [[track start]]'s launch semantics we therefore
 make tmux notify us when the pane's command exits.
 
 The main race is at startup: a very short-lived command could finish
@@ -2951,6 +3101,86 @@ def validate_tmux_options(
         raise ValueError(
             "Error: --pane/--window require an active tmux session"
         )
+
+
+def join_tracking_labels(labels: List[str]) -> str:
+    """Return labels joined for prompts and tmux names."""
+    return " ".join(labels)
+
+
+def build_tracking_prompt_prefix(
+    labels: List[str],
+) -> str:
+    """Return the prompt prefix for a tracked shell."""
+    label_text = join_tracking_labels(labels)
+    if label_text:
+        return f"track:{label_text}"
+    return "track"
+
+
+def build_tracking_shell_command(
+    labels: List[str],
+    env: Dict[str, str],
+) -> tuple[List[str], Optional[str], Optional[str]]:
+    """Return a shell command with a prompt showing the labels."""
+    shell = env.get("SHELL") or os.environ.get(
+        "SHELL", "/bin/sh"
+    )
+    shell_name = os.path.basename(shell)
+    prefix = build_tracking_prompt_prefix(labels)
+
+    if shell_name == "bash":
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sh", delete=False
+        ) as f:
+            f.write(
+                "[ -f ~/.bashrc ] && source ~/.bashrc\n"
+            )
+            f.write(f'PS1="{prefix} $PS1"\n')
+        return [shell, "--init-file", f.name], f.name, None
+
+    if shell_name == "zsh":
+        prompt_dir = tempfile.mkdtemp()
+        with open(
+            os.path.join(prompt_dir, ".zshrc"), "w"
+        ) as f:
+            f.write(
+                "[ -f ~/.zshrc ] && source ~/.zshrc\n"
+            )
+            f.write(f'PS1="{prefix} $PS1"\n')
+        env["ZDOTDIR"] = prompt_dir
+        return [shell], None, prompt_dir
+
+    if "PS1" in env:
+        env["PS1"] = f"{prefix} {env['PS1']}"
+    else:
+        env["PS1"] = f"{prefix} \\w\\n$ "
+
+    return [shell], None, None
+
+
+def cleanup_tracking_shell_command(
+    prompt_file: Optional[str],
+    prompt_dir: Optional[str],
+) -> None:
+    """Remove temporary prompt artifacts for tracked shells."""
+    if prompt_file is not None:
+        try:
+            os.unlink(prompt_file)
+        except OSError:
+            pass
+
+    if prompt_dir is not None:
+        try:
+            os.unlink(
+                os.path.join(prompt_dir, ".zshrc")
+            )
+        except OSError:
+            pass
+        try:
+            os.rmdir(prompt_dir)
+        except OSError:
+            pass
 
 
 def make_tmux_channel(prefix: str) -> str:
@@ -3230,12 +3460,11 @@ def run_tmux_command(
                 pass
 @
 
-\subsection{Run Command}
+\subsection{Blocking Command Execution}
 
-The [[run]] command wraps an arbitrary command: it starts a tracking
-session, executes the child process, and stops the session when the
-child exits---regardless of whether the child succeeded, failed, or
-was killed by a signal.
+When [[start]] launches a command, it must stop the labels afterwards no
+matter how the child terminates.  That includes normal exit, an error code,
+and signals such as Ctrl+C.
 
 \paragraph{Signal handling.}
 Pressing Ctrl+C in a terminal sends \textsc{sigint} to the entire
@@ -3255,131 +3484,103 @@ session cleanly.  The original handler is restored in a [[finally]]
 clause so it is always reinstated even if the child raises another
 exception.
 
-The tmux variants preserve the same contract.  They still block until
-the tracked process ends, but the waiting happens through tmux pane
-hooks rather than by waiting directly on the child process in the
-current terminal.
+The tmux variants preserve the same contract.  They still block until the
+tracked process ends, but the waiting happens through tmux pane hooks rather
+than by waiting directly on the child process in the current terminal.
 
-<<run command>>=
-@cli.command()
-def run(
-    command_args: List[str] = typer.Argument(
-        ..., help="Command and arguments to run"),
-    labels: List[str] = typer.Option(
-        [], "--label", "-l",
-        help="Additional labels for this tracking "
-             "session",
-        autocompletion=complete_historical_labels),
-    pane: bool = typer.Option(
-        False, "--pane", "-P",
-        help="Run in a new tmux pane",
-    ),
-    window: bool = typer.Option(
-        False, "--window", "-W",
-        help="Run in a new tmux window",
-    ),
-    who: str = typer.Option(
-        default_username, "--who", "-w",
-        help="Worker identity (default: $USER)",
-        autocompletion=complete_workers)
-):
-    """
-    Run a command and track the time spent.
+We keep the launch path split into four phases so the lifecycle is visible in
+the literate source: announce what is about to happen, run the child, stop the
+labels that were started for that launch, and report the result.
 
-    The command name is automatically used as a label,
-    and the full command with arguments is stored as a
-    description. Additional labels can be provided with
-    --label/-l options.
-    """
-    if not command_args:
-        typer.echo(
-            "Error: Command is required", err=True
-        )
-        raise typer.Exit(1)
+<<launch subprocess if requested>>=
+if launch_requested:
+    launch_start_time = datetime.datetime.now()
+    <<announce launch>>
+    <<run launched process>>
+    <<stop launched labels>>
+    <<report launch result>>
+    raise typer.Exit(exit_code)
+@
 
-    try:
-        validate_tmux_options(pane, window)
-    except ValueError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1)
-
-    command_name = command_args[0]
-    full_command = ' '.join(command_args)
-    all_labels = [command_name] + labels
-
-    start_time = datetime.datetime.now()
-
-    session = load_active_session(who)
-    started = session.start_labels(
-        all_labels, start_time
-    )
-
-    # Add the full command as a note/description
-    if command_name in session.active_labels:
-        start_time, _, batch_id = (
-            session.active_labels[command_name]
-        )
-        session.active_labels[command_name] = (
-            start_time, full_command, batch_id
-        )
-
-    save_active_session(session, who)
-
+<<announce launch>>=
+if command_text is not None:
     typer.echo(
-        f"Running '{full_command}' and tracking with "
-        f"labels: {', '.join(sorted(all_labels))}"
+        f"Running '{command_text}' and tracking with "
+        f"labels: {', '.join(sorted(tracking_labels))}"
     )
-
-    try:
-        if pane or window:
-            exit_code = run_tmux_command(
-                command_args,
-                cwd=os.getcwd(),
-                env=os.environ.copy(),
-                window=window,
-                window_name=(
-                    full_command if window else None
-                ),
-            )
-        else:
-            old_sigint = signal.signal(
-                signal.SIGINT, signal.SIG_IGN
-            )
-            try:
-                result = subprocess.run(
-                    command_args, capture_output=False
-                )
-                exit_code = result.returncode
-            finally:
-                signal.signal(signal.SIGINT, old_sigint)
-    except subprocess.CalledProcessError as exc:
-        typer.echo(
-            f"tmux failed with exit code {exc.returncode}",
-            err=True,
-        )
-        exit_code = 1
-    except FileNotFoundError:
-        typer.echo(
-            f"Command not found: {command_name}",
-            err=True
-        )
-        exit_code = 127
-
-    end_time = datetime.datetime.now()
-    completed_entries = session.stop_labels(
-        started, end_time, who=who
+elif pane:
+    typer.echo(
+        f"Opening tracked shell in tmux pane with "
+        f"labels: {', '.join(sorted(tracking_labels))}"
     )
+else:
+    typer.echo(
+        f"Opening tracked shell in tmux window with "
+        f"labels: {', '.join(sorted(tracking_labels))}"
+    )
+@
 
-    save_active_session(session, who)
-    add_completed_entries(completed_entries)
+<<run launched process>>=
+try:
+    if pane or window:
+        exit_code = run_tmux_command(
+            command_args,
+            cwd=proc_cwd,
+            env=proc_env,
+            window=window,
+            window_name=window_name,
+        )
+    else:
+        old_sigint = signal.signal(
+            signal.SIGINT, signal.SIG_IGN
+        )
+        try:
+            result = subprocess.run(
+                command_args, capture_output=False
+            )
+            exit_code = result.returncode
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+except subprocess.CalledProcessError as exc:
+    typer.echo(
+        f"tmux failed with exit code {exc.returncode}",
+        err=True,
+    )
+    exit_code = 1
+except FileNotFoundError:
+    typer.echo(
+        f"Command not found: {command_args[0]}",
+        err=True,
+    )
+    exit_code = 127
+finally:
+    cleanup_tracking_shell_command(
+        prompt_file, prompt_dir
+    )
+@
 
-    duration = end_time - start_time
+<<stop launched labels>>=
+end_time = datetime.datetime.now()
+completed_entries = session.stop_labels(
+    started, end_time, who=who
+)
+
+save_active_session(session, who)
+add_completed_entries(completed_entries)
+@
+
+<<report launch result>>=
+duration = end_time - launch_start_time
+if command_text is not None:
     typer.echo(
         f"Command completed in "
         f"{format_duration(duration)}"
     )
-
-    raise typer.Exit(exit_code)
+else:
+    typer.echo(
+        f"Shell completed in "
+        f"{format_duration(duration)}"
+    )
 @
 
 \subsection{Add Command}
@@ -3422,16 +3623,16 @@ def add(
         autocompletion=complete_workers)
 ):
     """
-    Add a completed time entry for offline work.
+    Add a completed time entry for work that already happened.
 
-    Useful for recording meetings, whiteboard sessions, or
-    any activity done away from the computer.
+    Use this for meetings, hallway conversations, or whiteboard sessions that
+    were never started in the tracker while they were happening.
 
     \b
     Examples:
       nytid track add meeting --duration 60
-      nytid track add meeting --duration 60 --offset -90m
-      nytid track add meeting --duration 60 --at 14:00
+      nytid track add DD1310 supervision --duration 45 --offset -90m
+      nytid track add admin --duration 30 --at 14:00 --description "Timesheet review"
     """
     if not labels:
         typer.echo(
@@ -3710,10 +3911,17 @@ def ls_entries(
         autocompletion=complete_workers),
 ):
     """
-    List recent tracked time entries.
+    List recent completed tracking entries.
 
-    Shows individual completed sessions, most recent
-    first. Use -n to control how many entries appear.
+    Use this to review the last few sessions, filter by course or worker, or
+    show short IDs before editing or removing an entry.
+
+    \b
+    Examples:
+      nytid track ls
+      nytid track ls DD1310 -n 5
+      nytid track ls --id
+      nytid track ls --who Dan-Claude
     """
     <<load and filter for ls>>
     <<display ls entries>>
@@ -3806,7 +4014,16 @@ def render_tracking_entry(entry: TrackingEntry) -> List[str]:
 def show(
     entry_hash: str = typer.Argument(..., help="Tracking entry hash prefix"),
 ):
-    """Show one historical tracking entry."""
+    """
+    Show one historical tracking entry in full detail.
+
+    Use this after `track ls --id` when you want to inspect timestamps,
+    labels, worker, and description before editing or removing an entry.
+
+    \b
+    Example:
+      nytid track show a1b2c3
+    """
     entries = load_tracking_data()
     if not entries:
         typer.echo("No tracking data available.", err=True)
@@ -3847,7 +4064,18 @@ def edit(
         help="Replace the worker identity",
         autocompletion=complete_workers),
 ):
-    """Edit one historical tracking entry."""
+    """
+    Edit one historical tracking entry.
+
+    Use this to fix labels, description, worker, or timestamps after noticing a
+    mistake in recorded history.
+
+    \b
+    Examples:
+      nytid track edit a1b2c3 --description "Weekly planning meeting"
+      nytid track edit a1b2c3 --at 14:00 --end-at 15:30
+      nytid track edit a1b2c3 -l DD1310 -l grading
+    """
     def update_history(entries):
         if not entries:
             raise ValueError("No tracking data available")
@@ -3896,7 +4124,17 @@ def rm(
         False, "--force", "-f",
         help="Skip confirmation"),
 ):
-    """Remove one historical tracking entry."""
+    """
+    Remove one historical tracking entry.
+
+    Use this when a session was recorded by mistake and should disappear rather
+    than be repaired in place.
+
+    \b
+    Examples:
+      nytid track rm a1b2c3
+      nytid track rm a1b2c3 --force
+    """
     entries = load_tracking_data()
     if not entries:
         typer.echo("No tracking data available.", err=True)
@@ -4165,21 +4403,17 @@ def stats(
         help="Include an overall summary for the whole window")
 ):
     """
-    Show statistics about tracked time.
+    Show aggregated statistics for recent tracking history.
 
-    By default, shows one aggregated report per day, with
-    repeated entries merged by exact label combination.
-
-    \b
-    For example: nytid track stats DD1310 lecture
-
-    Uses configured default limits for warnings unless
-    overridden by command options.
+    Use this to see how much time went to a course, compare the last few days,
+    or check whether the workload exceeds configured daily or weekly limits.
 
     \b
-    Default limits can be set using:
-      nytid config track.weekly_limit -s 40.0
-      nytid config track.daily_limit -s 8.0
+    Examples:
+      nytid track stats
+      nytid track stats DD1310 lecture
+      nytid track stats -n 7 --summary
+      nytid track stats --who Dan-Claude
     """
     <<resolve stats limits>>
     <<load and filter entries for stats>>
@@ -4442,8 +4676,16 @@ def export(
         autocompletion=complete_workers)
 ):
     """
-    Export tracking data in various formats.
-    Supports ICS (calendar), JSON, and CSV formats.
+    Export tracking history as ICS, JSON, or CSV.
+
+    Use ICS for calendar import, JSON for scripting, and CSV for spreadsheets
+    or reporting tools.
+
+    \b
+    Examples:
+      nytid track export --format json
+      nytid track export --format csv --output tracking.csv
+      nytid track export --format ics --days 7
     """
     filtered_entries = filter_entries(
         days=days, who=who
@@ -4622,12 +4864,11 @@ and checking the status of active tracking sessions:
 <<notes command>>
 @
 
-Time entry commands allow manual manipulation of tracking data, either by
-adding entries for offline work or running commands with automatic tracking:
+Time entry commands allow manual manipulation of tracking data, such as
+adding entries for offline work and editing recorded history:
 
 <<time entry commands>>=
 <<add command>>
-<<run command>>
 <<show command>>
 <<edit command>>
 <<remove command>>
@@ -5056,51 +5297,49 @@ def test_export_csv(temp_tracking_dir):
     import os
     os.unlink(tmp_path)
 
-def test_run_command(temp_tracking_dir):
-    """Test run command with tracking"""
+def test_start_command_runs_child_process(temp_tracking_dir):
+    """--command runs a child process under tracking."""
     result = runner.invoke(cli, [
-        "run", "--label", "DD1310", "--label", "admin",
-        "echo", "test"
+        "start", "DD1310", "admin",
+        "--command", "echo test"
     ])
     assert result.exit_code == 0
     assert "Running 'echo test'" in result.stdout
     assert "Command completed" in result.stdout
 
-def test_run_command_uses_command_as_label(temp_tracking_dir):
-    """Test that run command uses command name as label and full command as description"""
+def test_start_command_uses_command_as_label(temp_tracking_dir):
+    """--command adds the command name as a label and description."""
     result = runner.invoke(cli, [
-        "run", "echo", "hello", "world"
+        "start", "work", "--command", "echo hello world"
     ])
     assert result.exit_code == 0
     assert "Running 'echo hello world'" in result.stdout
-    assert "tracking with labels: echo" in result.stdout
-    
-    # Check that the tracking data was saved with the command as description
+    assert "work" in result.stdout
+    assert "echo" in result.stdout
+
     entries = load_tracking_data()
     assert len(entries) > 0
-    # The most recent entry should be the run command
     last_entry = entries[-1]
+    assert "work" in last_entry.labels
     assert "echo" in last_entry.labels
     assert last_entry.description == "echo hello world"
 
-def test_run_command_with_additional_labels(temp_tracking_dir):
-    """Test run command with additional labels beyond command name"""
+def test_start_command_without_labels_uses_command_label(
+    temp_tracking_dir,
+):
+    """A command alone still yields its implicit command label."""
     result = runner.invoke(cli, [
-        "run", "--label", "DD1310", "--label", "admin",
-        "echo", "test"
+        "start", "--command", "echo test"
     ])
     assert result.exit_code == 0
     assert "Running 'echo test'" in result.stdout
-    # Should include echo (command name) + additional labels
-    assert "DD1310" in result.stdout
-    assert "admin" in result.stdout
-    assert "echo" in result.stdout
+    assert "tracking with labels: echo" in result.stdout
 
 
-def test_run_command_pane_uses_tmux_helper(
+def test_start_pane_uses_tmux_shell_helper(
     temp_tracking_dir,
 ):
-    """--pane routes run through the tmux helper."""
+    """--pane without command opens a tracked shell in tmux."""
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
             "nytid.cli.track.run_tmux_command",
@@ -5108,22 +5347,25 @@ def test_run_command_pane_uses_tmux_helper(
         ) as mock_tmux:
             result = runner.invoke(
                 cli,
-                ["run", "--pane", "echo", "test"],
+                ["start", "work", "--pane"],
             )
     assert result.exit_code == 0
     mock_tmux.assert_called_once_with(
-        ["echo", "test"],
+        ["/bin/sh"],
         cwd=os.getcwd(),
-        env={"TMUX": "session"},
+        env={
+            "TMUX": "session",
+            "PS1": "track:work \\w\\n$ ",
+        },
         window=False,
         window_name=None,
     )
 
 
-def test_run_command_window_uses_tmux_helper(
+def test_start_window_uses_labels_as_window_name(
     temp_tracking_dir,
 ):
-    """--window routes run through tmux helper."""
+    """--window uses the effective labels as the tmux window name."""
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
             "nytid.cli.track.run_tmux_command",
@@ -5131,7 +5373,7 @@ def test_run_command_window_uses_tmux_helper(
         ) as mock_tmux:
             result = runner.invoke(
                 cli,
-                ["run", "--window", "echo", "test"],
+                ["start", "work", "--window", "-c", "echo test"],
             )
     assert result.exit_code == 3
     mock_tmux.assert_called_once_with(
@@ -5139,24 +5381,24 @@ def test_run_command_window_uses_tmux_helper(
         cwd=os.getcwd(),
         env={"TMUX": "session"},
         window=True,
-        window_name="echo test",
+        window_name="work echo",
     )
 
 
-def test_run_command_pane_requires_tmux(
+def test_start_pane_requires_tmux(
     temp_tracking_dir,
 ):
     """--pane requires an active tmux session."""
     with patch.dict(os.environ, {}, clear=True):
         result = runner.invoke(
             cli,
-            ["run", "--pane", "echo", "test"],
+            ["start", "work", "--pane"],
         )
     assert result.exit_code == 1
     assert "require an active tmux session" in result.stdout
 
 
-def test_run_command_pane_and_window_conflict(
+def test_start_pane_and_window_conflict(
     temp_tracking_dir,
 ):
     """--pane and --window are mutually exclusive."""
@@ -5164,15 +5406,25 @@ def test_run_command_pane_and_window_conflict(
         result = runner.invoke(
             cli,
             [
-                "run",
+                "start",
+                "work",
                 "--pane",
                 "--window",
-                "echo",
-                "test",
             ],
         )
     assert result.exit_code == 1
     assert "mutually exclusive" in result.stdout
+
+
+def test_start_without_launch_options_still_only_starts_tracking(
+    temp_tracking_dir,
+):
+    """Plain start keeps its original non-launching behavior."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run:
+        result = runner.invoke(cli, ["start", "work"])
+    assert result.exit_code == 0
+    mock_run.assert_not_called()
+    assert "Started tracking: work" in result.stdout
 
 
 def test_parse_tmux_exit_status_signal():
