@@ -135,8 +135,12 @@ tools and workflows that teachers use for time management and reporting.
 The main module structure follows nytid's standard patterns:
 
 <<[[track.py]]>>=
+from __future__ import annotations
+
 import datetime
 from enum import Enum
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -162,6 +166,8 @@ cli = typer.Typer(name="track",
 
 <<helper functions>>
 <<data structures>>
+<<tracking history helpers>>
+<<history entry helpers>>
 <<tracking state management>>
 <<subcommands>>
 @
@@ -238,6 +244,10 @@ def get_tracking_dir() -> pathlib.Path:
 def get_tracking_data_file() -> pathlib.Path:
     """Get the path to the tracking data file"""
     return get_tracking_dir() / "tracking_data.json"
+
+def get_tracking_lock_file() -> pathlib.Path:
+    """Get the path to the tracking history lock file."""
+    return get_tracking_dir() / "tracking_data.lock"
 
 def sanitize_who(who: str) -> str:
     """Sanitize a worker name for use in filenames.
@@ -321,6 +331,7 @@ human-readable.
 <<constants>>=
 # Label display separators
 LABEL_SEPARATOR = " > "
+TRACKING_HASH_PREFIX_MIN_LENGTH = 1
 
 # Default time limits for work-life balance warnings
 DEFAULT_WEEKLY_LIMIT_HOURS = 40.0  # Standard full-time work week
@@ -344,6 +355,21 @@ def format_duration(duration: datetime.timedelta) -> str:
 def get_labels_display(labels: List[str]) -> str:
     """Get a display string for labels (as comma-separated tags)"""
     return ", ".join(sorted(labels)) if labels else "No labels"
+
+def abbreviate_hashes(full_hashes: List[str]) -> Dict[str, str]:
+    """Return unique short prefixes for full content hashes."""
+    if not full_hashes:
+        return {}
+
+    prefix_length = TRACKING_HASH_PREFIX_MIN_LENGTH
+    while True:
+        prefixes = {
+            full_hash: full_hash[:prefix_length]
+            for full_hash in full_hashes
+        }
+        if len(set(prefixes.values())) == len(full_hashes):
+            return prefixes
+        prefix_length += 1
 @
 
 \subsubsection{Merging Overlapping Intervals}
@@ -355,23 +381,17 @@ We avoid this by merging overlapping intervals before summing.  The
 algorithm sorts intervals by start time, then greedily extends the
 current merged interval as long as the next one overlaps; whenever
 there is a gap it flushes the accumulated interval and starts a new
-one.
+one.  We expose the interval-merging step directly because the stats
+command needs it in two places: once for overall day totals, and once
+for exact label combinations within a day.
 
 <<helper functions>>=
-def merge_intervals(
-    entries: "List[TrackingEntry]",
-) -> datetime.timedelta:
-    """Compute wall-clock time covered by entries.
-
-    Overlapping intervals are merged so that concurrent
-    labels do not inflate the total.
-    """
-    if not entries:
+def merge_interval_pairs(intervals) -> datetime.timedelta:
+    """Compute wall-clock time covered by ``(start, end)`` pairs."""
+    intervals = sorted(intervals)
+    if not intervals:
         return datetime.timedelta()
 
-    intervals = sorted(
-        (e.start_time, e.end_time) for e in entries
-    )
     merged_total = datetime.timedelta()
     cur_start, cur_end = intervals[0]
 
@@ -384,15 +404,38 @@ def merge_intervals(
 
     merged_total += cur_end - cur_start
     return merged_total
+
+def merge_intervals(
+    entries: "List[TrackingEntry]",
+) -> datetime.timedelta:
+    """Compute wall-clock time covered by entries.
+
+    Overlapping intervals are merged so that concurrent
+    labels do not inflate the total.
+    """
+    return merge_interval_pairs(
+        (e.start_time, e.end_time) for e in entries
+    )
 @
 
-\subsubsection{Daily Wall-Clock Breakdown}
+\subsubsection{Daily Aggregation}
 
-The daily breakdown needs wall-clock time per calendar date.  An entry
-that spans midnight must be split across the two dates; otherwise all
-its time would land on the start date.  We therefore split each entry
-at midnight boundaries first, then apply [[merge_intervals]]'s
-greedy-merge within each date:
+The stats report works per calendar date.  An entry that spans midnight
+must be split across the two dates; otherwise all its time would land on
+the start date.  We therefore split each entry at midnight boundaries
+first.
+
+There are two useful views of the split data:
+\begin{description}
+\item[Daily wall-clock totals] Merge all intervals within a day so
+  overlapping labels do not inflate the day's total.
+\item[Daily label-set totals] Keep exact label combinations together so
+  repeated sessions with the same labels collapse into one line, while
+  still merging overlaps within that label set.
+\end{description}
+
+We also generate the requested date range explicitly so that days off
+remain visible as [[0s]] rather than disappearing from the report.
 
 <<helper functions>>=
 def compute_daily_wall_clock(
@@ -424,19 +467,99 @@ def compute_daily_wall_clock(
 
     daily_totals = {}
     for date, intervals in date_intervals.items():
-        intervals.sort()
-        total = datetime.timedelta()
-        cur_start, cur_end = intervals[0]
-        for s, e in intervals[1:]:
-            if s <= cur_end:
-                cur_end = max(cur_end, e)
-            else:
-                total += cur_end - cur_start
-                cur_start, cur_end = s, e
-        total += cur_end - cur_start
-        daily_totals[date] = total
+        daily_totals[date] = merge_interval_pairs(intervals)
 
     return daily_totals
+
+def compute_daily_label_set_totals(
+    entries: "List[TrackingEntry]",
+) -> Dict[datetime.date, Dict[tuple, datetime.timedelta]]:
+    """Compute merged time per date and exact label set."""
+    date_label_intervals = {}
+    for entry in entries:
+        labels_key = tuple(sorted(entry.labels))
+        start = entry.start_time
+        end = entry.end_time
+        while start.date() < end.date():
+            midnight = datetime.datetime.combine(
+                start.date() + datetime.timedelta(days=1),
+                datetime.time.min,
+            )
+            date_label_intervals.setdefault(
+                start.date(), {}
+            ).setdefault(labels_key, []).append((start, midnight))
+            start = midnight
+        if start < end:
+            date_label_intervals.setdefault(
+                start.date(), {}
+            ).setdefault(labels_key, []).append((start, end))
+
+    daily_totals = {}
+    for date, label_intervals in date_label_intervals.items():
+        daily_totals[date] = {
+            labels_key: merge_interval_pairs(intervals)
+            for labels_key, intervals in label_intervals.items()
+        }
+
+    return daily_totals
+
+def make_stats_dates(
+    days: int,
+    now: Optional[datetime.datetime] = None,
+) -> List[datetime.date]:
+    """Return the reporting dates, newest first."""
+    if now is None:
+        now = datetime.datetime.now()
+
+    return [
+        now.date() - datetime.timedelta(days=offset)
+        for offset in range(days)
+    ]
+
+def filter_entries_for_stats_window(
+    entries: "List[TrackingEntry]",
+    days: int,
+    now: Optional[datetime.datetime] = None,
+) -> "List[TrackingEntry]":
+    """Return entries clipped to the stats calendar window.
+
+    The stats command reports whole calendar days, not a rolling
+    ``24 * days`` hour window. An overnight entry that starts before
+    midnight but continues into today must therefore remain visible,
+    while late work from yesterday should not leak into today's
+    summary just because it happened within the last 24 hours.
+    """
+    if now is None:
+        now = datetime.datetime.now()
+
+    start_date = now.date() - datetime.timedelta(days=days - 1)
+    window_start = datetime.datetime.combine(
+        start_date,
+        datetime.time.min,
+    )
+    window_end = datetime.datetime.combine(
+        now.date() + datetime.timedelta(days=1),
+        datetime.time.min,
+    )
+
+    filtered = []
+    for entry in entries:
+        if entry.end_time <= window_start:
+            continue
+        if entry.start_time >= window_end:
+            continue
+
+        filtered.append(
+            TrackingEntry(
+                start_time=max(entry.start_time, window_start),
+                end_time=min(entry.end_time, window_end),
+                labels=entry.labels,
+                description=entry.description,
+                who=entry.who,
+            )
+        )
+
+    return filtered
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -712,6 +835,21 @@ class TrackingEntry:
             The time difference between end_time and start_time
         """
         return self.end_time - self.start_time
+
+    def content_hash(self) -> str:
+        """Return a stable digest for this entry's content."""
+        canonical = json.dumps(
+            {
+                "start_time": self.start_time.isoformat(),
+                "end_time": self.end_time.isoformat(),
+                "labels": self.labels,
+                "description": self.description,
+                "who": self.who,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         
     def to_dict(self) -> dict:
         """
@@ -778,6 +916,15 @@ def test_tracking_entry_serialization():
     assert entry2.end_time == entry.end_time
     assert entry2.labels == entry.labels
     assert entry2.description == entry.description
+
+def test_tracking_entry_content_hash_is_stable():
+    """Equivalent entries get the same digest."""
+    start = datetime.datetime(2023, 1, 1, 10, 0, 0)
+    end = datetime.datetime(2023, 1, 1, 11, 0, 0)
+    entry1 = TrackingEntry(start, end, ["lecture", "DD1310"], "test")
+    entry2 = TrackingEntry(start, end, ["DD1310", "lecture"], "test")
+
+    assert entry1.content_hash() == entry2.content_hash()
 @
 
 \subsection{ActiveSession Class}
@@ -1246,6 +1393,180 @@ def ensure_tracking_dir():
 
 Historical tracking data is stored in JSON format for all completed time entries.
 
+Hash-based entry identifiers only work if one piece of content maps to
+one historical record.  Exact duplicate entries therefore become a data
+quality problem rather than a meaningful distinction: they produce the
+same [[content_hash()]] and cannot be addressed independently.  We solve
+this by collapsing duplicates automatically and emitting a
+[[logging.warning()]] so the anomaly is visible without forcing the user
+through a repair workflow.
+
+Concurrent history writers create a second hazard.  Commands such as
+[[stop]], [[run]], and the history-editing commands all use a
+read-modify-write cycle; without coordination, one process can silently
+overwrite another's freshly written entry.  A simple lock file around the
+critical section keeps history updates serialized, while a temporary file
+plus [[os.replace()]] ensures readers never see a partially written JSON
+file.
+
+To keep that locking discipline understandable, we separate raw I/O from
+normalization.  The raw helpers only parse or write JSON.  The public
+helpers then build on top of them: reads return a normalized in-memory
+view, while mutation paths normalize and persist under one explicit lock.
+This avoids the brittle half-locked API where callers must guess whether
+a helper already acquired the history lock.
+
+<<tracking history helpers>>=
+def normalize_tracking_entries(
+    entries: List[TrackingEntry],
+) -> tuple[List[TrackingEntry], int]:
+    """Collapse exact duplicate historical entries."""
+    merged = []
+    seen_hashes = set()
+    duplicate_count = 0
+    for entry in entries:
+        entry_hash = entry.content_hash()
+        if entry_hash in seen_hashes:
+            duplicate_count += 1
+            continue
+        seen_hashes.add(entry_hash)
+        merged.append(entry)
+
+    if duplicate_count:
+        logging.warning(
+            "Merged %d duplicate tracking entr%s",
+            duplicate_count,
+            "y" if duplicate_count == 1 else "ies",
+        )
+
+    return merged, duplicate_count
+
+def merge_duplicate_tracking_entries(
+    entries: List[TrackingEntry],
+) -> List[TrackingEntry]:
+    """Return only the normalized entries."""
+    merged, _ = normalize_tracking_entries(entries)
+    return merged
+
+def load_tracking_data_raw() -> List[TrackingEntry]:
+    """Load historical tracking data without normalization."""
+    tracking_file = get_tracking_data_file()
+    if not tracking_file.exists():
+        return []
+
+    try:
+        with open(tracking_file, 'r') as f:
+            data = json.load(f)
+            return [TrackingEntry.from_dict(entry) for entry in data]
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logging.warning(
+            f"Error loading tracking data from {tracking_file}: {e}"
+        )
+        return []
+
+def save_tracking_data_unlocked(entries: List[TrackingEntry]):
+    """Write tracking data atomically without acquiring the lock."""
+    ensure_tracking_dir()
+    tracking_file = get_tracking_data_file()
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(get_tracking_dir()),
+        prefix="tracking_data.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(
+                [entry.to_dict() for entry in entries],
+                f,
+                indent=2,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, tracking_file)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+def mutate_tracking_history(callback):
+    """Run a history mutation under one lock and persist normalization."""
+    ensure_tracking_dir()
+    lock_file = get_tracking_lock_file()
+    with open(lock_file, 'w') as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            entries = load_tracking_data_raw()
+            normalized_entries, _ = normalize_tracking_entries(entries)
+            callback_result = callback(normalized_entries)
+            if isinstance(callback_result, tuple):
+                updated_entries = callback_result[0]
+                extra = callback_result[1:]
+            else:
+                updated_entries = callback_result
+                extra = ()
+            final_entries, _ = normalize_tracking_entries(updated_entries)
+            save_tracking_data_unlocked(final_entries)
+            if extra:
+                return (final_entries, *extra)
+            return final_entries
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+<<history entry helpers>>=
+def resolve_tracking_entry(
+    entries: List[TrackingEntry],
+    hash_prefix: str,
+) -> TrackingEntry:
+    """Resolve a unique history entry from a hash prefix."""
+    matches = [
+        entry for entry in entries
+        if entry.content_hash().startswith(hash_prefix)
+    ]
+    if not matches:
+        raise ValueError(f"No tracking entry matches '{hash_prefix}'")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Tracking entry hash '{hash_prefix}' is ambiguous"
+        )
+    return matches[0]
+
+def replace_tracking_entry(
+    entries: List[TrackingEntry],
+    original: TrackingEntry,
+    updated: TrackingEntry,
+) -> List[TrackingEntry]:
+    """Return a copy with one historical entry replaced."""
+    replaced = False
+    result = []
+    for entry in entries:
+        if not replaced and entry.content_hash() == original.content_hash():
+            result.append(updated)
+            replaced = True
+        else:
+            result.append(entry)
+    if not replaced:
+        raise ValueError(
+            f"No tracking entry matches '{original.content_hash()}'"
+        )
+    return result
+
+def remove_tracking_entry(
+    entries: List[TrackingEntry],
+    target: TrackingEntry,
+) -> List[TrackingEntry]:
+    """Return a copy with one historical entry removed."""
+    removed = False
+    result = []
+    target_hash = target.content_hash()
+    for entry in entries:
+        if not removed and entry.content_hash() == target_hash:
+            removed = True
+            continue
+        result.append(entry)
+    if not removed:
+        raise ValueError(f"No tracking entry matches '{target_hash}'")
+    return result
+
 <<load tracking data>>=
 def load_tracking_data() -> List[TrackingEntry]:
     """
@@ -1255,17 +1576,9 @@ def load_tracking_data() -> List[TrackingEntry]:
         List of TrackingEntry objects, or empty list if file doesn't exist
         or contains invalid data
     """
-    tracking_file = get_tracking_data_file()
-    if not tracking_file.exists():
-        return []
-    
-    try:
-        with open(tracking_file, 'r') as f:
-            data = json.load(f)
-            return [TrackingEntry.from_dict(entry) for entry in data]
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logging.warning(f"Error loading tracking data from {tracking_file}: {e}")
-        return []
+    entries = load_tracking_data_raw()
+    normalized_entries, _ = normalize_tracking_entries(entries)
+    return normalized_entries
 
 def save_tracking_data(entries: List[TrackingEntry]):
     """
@@ -1274,10 +1587,10 @@ def save_tracking_data(entries: List[TrackingEntry]):
     Args:
         entries: List of TrackingEntry objects to save
     """
-    ensure_tracking_dir()
-    tracking_file = get_tracking_data_file()
-    with open(tracking_file, 'w') as f:
-        json.dump([entry.to_dict() for entry in entries], f, indent=2)
+    def persist(_entries):
+        return entries
+
+    mutate_tracking_history(persist)
 
 def add_completed_entries(new_entries: List[TrackingEntry]):
     """
@@ -1291,10 +1604,12 @@ def add_completed_entries(new_entries: List[TrackingEntry]):
     """
     if not new_entries:
         return
-        
-    existing_entries = load_tracking_data()
-    existing_entries.extend(new_entries)
-    save_tracking_data(existing_entries)
+
+    def update_history(existing_entries):
+        existing_entries.extend(new_entries)
+        return existing_entries
+
+    mutate_tracking_history(update_history)
 @
 
 \subsection{Active Session Management}
@@ -3201,6 +3516,13 @@ commands benefit.  Each command still owns its error messages and
 early-return logic, keeping presentation concerns separate from
 filtering policy.
 
+The stats command adds one extra step on top of this shared helper.
+[[ls]] and [[export]] interpret [[--days]] as a rolling age limit, but
+[[stats]] presents named calendar dates.  It therefore narrows the
+already-filtered entries to the requested date range with
+[[filter_entries_for_stats_window()]] so the summary and the daily table
+agree even around midnight.
+
 <<helper functions>>=
 def filter_entries(
     days=None, who=None, labels=None
@@ -3279,6 +3601,71 @@ def test_filter_entries(temp_tracking_dir):
         who="alice", labels=["DD1310"]
     )
     assert len(result) == 1
+
+def test_filter_entries_for_stats_window_uses_calendar_days():
+    """Stats windows use calendar dates, not rolling 24-hour cutoffs."""
+    now = datetime.datetime(2026, 3, 12, 7, 0, 0)
+    entries = [
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 23, 30, 0),
+            datetime.datetime(2026, 3, 12, 1, 0, 0),
+            ["overnight"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 8, 0, 0),
+            datetime.datetime(2026, 3, 11, 9, 0, 0),
+            ["yesterday"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 12, 10, 0, 0),
+            datetime.datetime(2026, 3, 12, 11, 0, 0),
+            ["today"],
+        ),
+    ]
+
+    filtered = filter_entries_for_stats_window(
+        entries,
+        days=1,
+        now=now,
+    )
+
+    assert len(filtered) == 2
+    assert filtered[0].labels == ["overnight"]
+    assert filtered[0].start_time == datetime.datetime(2026, 3, 12, 0, 0, 0)
+    assert filtered[0].end_time == datetime.datetime(2026, 3, 12, 1, 0, 0)
+    assert filtered[1].labels == ["today"]
+
+def test_merge_duplicate_tracking_entries_warns(caplog):
+    """Exact duplicate history rows are collapsed with a warning."""
+    entry = TrackingEntry(
+        datetime.datetime(2026, 3, 12, 10, 0, 0),
+        datetime.datetime(2026, 3, 12, 11, 0, 0),
+        ["lecture"],
+        "Weekly sync",
+        who="dbosk",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        merged = merge_duplicate_tracking_entries([entry, entry])
+
+    assert len(merged) == 1
+    assert "Merged 1 duplicate tracking entry" in caplog.text
+
+def test_normalize_tracking_entries_reports_duplicate_count(caplog):
+    """Normalization reports how many duplicates were removed."""
+    entry = TrackingEntry(
+        datetime.datetime(2026, 3, 12, 10, 0, 0),
+        datetime.datetime(2026, 3, 12, 11, 0, 0),
+        ["lecture"],
+        who="dbosk",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        merged, duplicate_count = normalize_tracking_entries([entry, entry])
+
+    assert len(merged) == 1
+    assert duplicate_count == 1
+    assert "Merged 1 duplicate tracking entry" in caplog.text
 @
 
 \subsection{Listing Tracked Sessions}
@@ -3290,11 +3677,17 @@ individual entries --- for example, to verify that yesterday's grading
 session was recorded, or to eyeball recent work before writing a
 timesheet.  The [[ls]] command provides this quick, per-entry view.
 
-Unlike [[stats]], which defaults to a 7-day time window, [[ls]] uses a
+Unlike [[stats]], which defaults to a 1-day time window, [[ls]] uses a
 count limit ([[-n]]) instead.  A time window would hide old entries even
 when the user explicitly asks \enquote{show me my last 20 sessions}.
 The count-based approach always returns exactly as many entries as
 requested (or fewer if the history is shorter).
+
+When the user wants to repair history, though, a bare timestamp line is
+not enough: they need a stable way to name one specific entry.  The
+optional [[--id]] flag prepends a short, unique prefix of each entry's
+[[content_hash()]], giving us Git-style identification without storing a
+separate persistent identifier.
 
 <<ls command>>=
 @cli.command(name="ls")
@@ -3307,6 +3700,9 @@ def ls_entries(
     n: int = typer.Option(
         10, "--number", "-n",
         help="Number of entries to show"),
+    show_id: bool = typer.Option(
+        False, "--id",
+        help="Show unique content-hash prefixes for entries"),
     who: Optional[str] = typer.Option(
         None, "--who", "-w",
         help="Filter by worker "
@@ -3344,15 +3740,198 @@ remain pipeable to tools like [[grep]] or [[awk]]:
 entries.sort(
     key=lambda e: e.start_time, reverse=True
 )
+hash_prefixes = abbreviate_hashes(
+    [entry.content_hash() for entry in entries]
+)
 for entry in entries[:n]:
     ts = entry.start_time.strftime("%Y-%m-%d %H:%M")
     dur = format_duration(entry.duration())
     lbl = get_labels_display(entry.labels)
     parts = [f"{ts}  {dur}  {lbl}"]
+    if show_id:
+        parts.insert(0, hash_prefixes[entry.content_hash()])
     parts.append(f"[{entry.who}]")
     if entry.description:
         parts.append(f"- {entry.description}")
     typer.echo("  ".join(parts))
+@
+
+The same hash prefixes become the entry point for precise history
+inspection and repair.  [[show]] prints one historical entry in full,
+[[edit]] replaces one entry with updated content, and [[rm]] removes one
+entry after confirmation.  All three resolve a hash prefix against the
+current history so unrelated additions do not shift the user's target.
+
+<<history entry helpers>>=
+def parse_edit_tracking_start_time(
+    at: Optional[str],
+    original: TrackingEntry,
+) -> datetime.datetime:
+    """Return the edited start time for a historical entry."""
+    if at is None:
+        return original.start_time
+    return parse_at_time(at, reference_time=original.start_time)
+
+def parse_edit_tracking_end_time(
+    end_at: Optional[str],
+    duration_minutes: Optional[int],
+    start_time: datetime.datetime,
+    original: TrackingEntry,
+) -> datetime.datetime:
+    """Return the edited end time for a historical entry."""
+    if end_at is not None and duration_minutes is not None:
+        raise ValueError("Cannot use both --end-at and --duration")
+    if end_at is not None:
+        return parse_at_time(end_at, reference_time=original.end_time)
+    if duration_minutes is not None:
+        if duration_minutes <= 0:
+            raise ValueError("Duration must be positive")
+        return start_time + datetime.timedelta(minutes=duration_minutes)
+    return original.end_time
+
+def render_tracking_entry(entry: TrackingEntry) -> List[str]:
+    """Render one historical entry for human inspection."""
+    return [
+        f"ID: {entry.content_hash()}",
+        f"Start: {entry.start_time.isoformat(sep=' ')}",
+        f"End: {entry.end_time.isoformat(sep=' ')}",
+        f"Duration: {format_duration(entry.duration())}",
+        f"Labels: {get_labels_display(entry.labels)}",
+        f"Who: {entry.who}",
+        f"Description: {entry.description}" if entry.description else "Description:",
+    ]
+
+<<show command>>=
+@cli.command()
+def show(
+    entry_hash: str = typer.Argument(..., help="Tracking entry hash prefix"),
+):
+    """Show one historical tracking entry."""
+    entries = load_tracking_data()
+    if not entries:
+        typer.echo("No tracking data available.", err=True)
+        raise typer.Exit(1)
+
+    try:
+        entry = resolve_tracking_entry(entries, entry_hash)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    for line in render_tracking_entry(entry):
+        typer.echo(line)
+@
+
+<<edit command>>=
+@cli.command()
+def edit(
+    entry_hash: str = typer.Argument(..., help="Tracking entry hash prefix"),
+    at: Optional[str] = typer.Option(
+        None, "--at",
+        help="Set start time (e.g. '14:30' or '2024-12-13 14:30')"),
+    end_at: Optional[str] = typer.Option(
+        None, "--end-at",
+        help="Set end time (e.g. '15:45' or '2024-12-13 15:45')"),
+    duration_minutes: Optional[int] = typer.Option(
+        None, "--duration", "-d",
+        help="Set duration in minutes"),
+    label: Optional[List[str]] = typer.Option(
+        None, "--label", "-l",
+        help="Replace all labels",
+        autocompletion=complete_historical_labels),
+    description: Optional[str] = typer.Option(
+        None, "--description",
+        help="Replace the description"),
+    who: Optional[str] = typer.Option(
+        None, "--who", "-w",
+        help="Replace the worker identity",
+        autocompletion=complete_workers),
+):
+    """Edit one historical tracking entry."""
+    def update_history(entries):
+        if not entries:
+            raise ValueError("No tracking data available")
+
+        original = resolve_tracking_entry(entries, entry_hash)
+        start_time = parse_edit_tracking_start_time(at, original)
+        end_time = parse_edit_tracking_end_time(
+            end_at,
+            duration_minutes,
+            start_time,
+            original,
+        )
+        if end_time <= start_time:
+            raise ValueError("End time must be after start time")
+
+        updated = TrackingEntry(
+            start_time=start_time,
+            end_time=end_time,
+            labels=(label if label is not None else original.labels),
+            description=(
+                description if description is not None
+                else original.description
+            ),
+            who=(who if who is not None else original.who),
+        )
+        updated_entries = replace_tracking_entry(entries, original, updated)
+        return updated_entries, original, updated
+
+    try:
+        _, original, updated = mutate_tracking_history(update_history)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(
+        f"Updated {original.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]} -> "
+        f"{updated.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]}"
+    )
+@
+
+<<remove command>>=
+@cli.command(name="rm")
+def rm(
+    entry_hash: str = typer.Argument(..., help="Tracking entry hash prefix"),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Skip confirmation"),
+):
+    """Remove one historical tracking entry."""
+    entries = load_tracking_data()
+    if not entries:
+        typer.echo("No tracking data available.", err=True)
+        raise typer.Exit(1)
+
+    try:
+        target = resolve_tracking_entry(entries, entry_hash)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if not force and not typer.confirm(
+        f"Remove tracking entry {target.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]}?"
+    ):
+        typer.echo("Cancelled.")
+        raise typer.Exit(0)
+
+    def update_history(current_entries):
+        current_target = resolve_tracking_entry(
+            current_entries,
+            target.content_hash(),
+        )
+        updated_entries = remove_tracking_entry(current_entries, current_target)
+        return updated_entries, current_target
+
+    try:
+        _, removed = mutate_tracking_history(update_history)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(
+        f"Removed {removed.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]}: "
+        f"{get_labels_display(removed.labels)}"
+    )
 @
 
 The basic case confirms that labels and duration appear in the output
@@ -3376,6 +3955,111 @@ def test_ls_default(temp_tracking_dir):
     assert "DD1310" in result.output
     assert "grading" in result.output or \
         "lecture" in result.output
+
+def test_ls_show_id_includes_hash_prefix(temp_tracking_dir):
+    """--id prepends a unique digest prefix to each row."""
+    runner.invoke(cli, [
+        "add", "DD1310",
+        "--duration", "60",
+        "--at", "2026-03-12 10:00"
+    ])
+
+    result = runner.invoke(cli, ["ls", "--id", "-n", "1"])
+
+    assert result.exit_code == 0
+    first_field = result.stdout.strip().split()[0]
+    assert len(first_field) >= TRACKING_HASH_PREFIX_MIN_LENGTH
+
+def test_show_tracking_entry_by_hash(temp_tracking_dir):
+    """show prints the selected historical entry."""
+    runner.invoke(cli, [
+        "add", "meeting",
+        "--duration", "30",
+        "--at", "2026-03-12 10:00",
+        "--description", "Discuss roadmap"
+    ])
+    entry = load_tracking_data()[0]
+
+    result = runner.invoke(cli, ["show", entry.content_hash()[:8]])
+
+    assert result.exit_code == 0
+    assert entry.content_hash() in result.stdout
+    assert "Discuss roadmap" in result.stdout
+
+def test_edit_tracking_entry_by_hash(temp_tracking_dir):
+    """edit replaces one historical entry and prints the new hash."""
+    runner.invoke(cli, [
+        "add", "nytid", "work",
+        "--duration", "90",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8],
+        "--duration", "30",
+        "--description", "Trimmed session"
+    ])
+
+    assert result.exit_code == 0
+    entries = load_tracking_data()
+    assert len(entries) == 1
+    assert entries[0].duration() == datetime.timedelta(minutes=30)
+    assert entries[0].description == "Trimmed session"
+    assert entries[0].content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH] in result.stdout
+
+def test_edit_tracking_entry_rejects_invalid_interval(temp_tracking_dir):
+    """edit rejects end times before the start."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "60",
+        "--at", "2026-03-12 10:00"
+    ])
+    entry = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", entry.content_hash()[:8],
+        "--end-at", "2026-03-12 09:00"
+    ])
+
+    assert result.exit_code == 1
+    assert "End time must be after start time" in result.stdout
+
+def test_rm_tracking_entry_by_hash(temp_tracking_dir):
+    """rm removes one historical entry by hash."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "60",
+        "--at", "2026-03-12 10:00"
+    ])
+    entry = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "rm", entry.content_hash()[:8],
+        "--force"
+    ])
+
+    assert result.exit_code == 0
+    assert load_tracking_data() == []
+
+def test_rm_tracking_entry_requires_confirmation(temp_tracking_dir):
+    """rm asks for confirmation unless --force is given."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "60",
+        "--at", "2026-03-12 10:00"
+    ])
+    entry = load_tracking_data()[0]
+
+    result = runner.invoke(
+        cli,
+        ["rm", entry.content_hash()[:8]],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Cancelled." in result.stdout
+    assert len(load_tracking_data()) == 1
 @
 
 The [[-n]] limit is the primary output-size control; if the slice
@@ -3435,13 +4119,23 @@ def test_ls_empty(temp_tracking_dir):
 \subsection{Stats Command}
 
 The stats command answers a question teachers ask constantly:
-\enquote{How much time did I actually spend on this?}  A 7-day default
-window is chosen because it aligns with the natural planning cycle of a
-work week --- long enough to see patterns, short enough that the numbers
-remain actionable.  Warnings are expressed as a prorated fraction of the
-configured weekly limit so that partial-week windows still trigger at the
-right threshold: if you have 20 hours of a 40-hour week remaining, the
-warning fires at 20 hours, not 40.
+\enquote{How much time did I actually spend on this?}  The default view
+answers the most immediate version of that question:
+\enquote{what did today look like?}  A one-day default makes [[stats]] a
+quick daily review, while [[-n]]/[[--days]] expands the window when the
+user wants a longer retrospective.
+
+The default output is aggregated, but not flattened into individual
+labels.  Teachers often work in repeated bursts on the same combination
+of tags, such as [[nytid]], [[devel]], and [[work]].  Listing each
+session separately is noisy, but listing each label individually falsely
+suggests a hierarchy.  Grouping by the exact label set keeps the tags
+equal while still collapsing repeated work into one line per day.
+
+Warnings remain part of the optional summary view.  Their threshold is
+prorated: if the window is 3 days and the weekly limit is 40 hours, we
+warn after 40 * 3/7 ≈ 17 hours rather than a fixed 40. This keeps the
+warning meaningful for both short and long windows.
 
 <<stats command>>=
 @cli.command()
@@ -3452,7 +4146,7 @@ def stats(
              "(shows all if not specified)",
         autocompletion=complete_historical_labels),
     days: int = typer.Option(
-        7, "--days",
+        1, "--days", "-n",
         help="Number of days to include in stats"),
     weekly_limit: Optional[float] = typer.Option(
         None, "--weekly-limit",
@@ -3465,13 +4159,16 @@ def stats(
     who: Optional[str] = typer.Option(
         None, "--who", "-w",
         help="Filter by worker (shows all if omitted)",
-        autocompletion=complete_workers)
+        autocompletion=complete_workers),
+    summary: bool = typer.Option(
+        False, "--summary",
+        help="Include an overall summary for the whole window")
 ):
     """
     Show statistics about tracked time.
 
-    Can filter by specific labels to see time spent on
-    particular activities.
+    By default, shows one aggregated report per day, with
+    repeated entries merged by exact label combination.
 
     \b
     For example: nytid track stats DD1310 lecture
@@ -3486,9 +4183,8 @@ def stats(
     """
     <<resolve stats limits>>
     <<load and filter entries for stats>>
-    <<calculate and display totals>>
-    <<display daily breakdown>>
-    <<display label breakdown>>
+    <<display stats summary when requested>>
+    <<display grouped daily breakdown>>
 @
 
 The [[--weekly-limit]] and [[--daily-limit]] flags are optional because
@@ -3505,17 +4201,36 @@ if daily_limit is None:
 
 With the shared helper handling the mechanical filtering, this chunk
 focuses on the stats-specific concerns: constructing [[label_filter_msg]]
-for the summary header, and distinguishing \enquote{no data at all}
-([[None]]) from \enquote{data exists but nothing matched the window}:
+for headers, generating the full requested date range, and
+distinguishing \enquote{no data at all} ([[None]]) from
+\enquote{data exists but nothing matched the filter}.  We no longer
+return early on an empty result, because an empty day still belongs in a
+daily report as [[0s]].
+
+The extra wrinkle is that the stats report names calendar dates, so its
+window must also be calendar-based.  Using [[filter_entries(days=1)]]
+would mean 
+\enquote{the last 24 hours,} which can exclude early-morning work from
+today while including late-evening work from yesterday.  We therefore
+load by worker and labels first, then apply
+[[filter_entries_for_stats_window()]] with a single captured
+[[stats_now]] timestamp so the filter and the rendered date headers agree:
 
 <<load and filter entries for stats>>=
+stats_now = datetime.datetime.now()
 recent_entries = filter_entries(
-    days=days, who=who, labels=labels
+    who=who, labels=labels
 )
 
 if recent_entries is None:
     typer.echo("No tracking data available")
     return
+
+recent_entries = filter_entries_for_stats_window(
+    recent_entries,
+    days=days,
+    now=stats_now,
+)
 
 if labels:
     label_filter_msg = (
@@ -3524,155 +4239,161 @@ if labels:
 else:
     label_filter_msg = ""
 
-if not recent_entries:
-    if labels:
-        typer.echo(
-            f"No tracking data in the last {days} days"
-            f" for specified labels"
-        )
-    else:
-        typer.echo(
-            f"No tracking data in the last {days} days"
-        )
-    return
+stats_dates = make_stats_dates(days, now=stats_now)
+daily_totals = compute_daily_wall_clock(recent_entries)
+daily_label_set_totals = compute_daily_label_set_totals(
+    recent_entries
+)
 @
 
-The warning threshold is prorated: if the window is 3 days and the
-weekly limit is 40 hours, we warn after 40 * 3/7 ≈ 17 hours rather
-than a fixed 40. This makes the warning meaningful for both short and
-long windows.
+The optional summary keeps the old big-picture view for users who want a
+single total for the whole window before the daily details:
 
-We compute wall-clock time by merging overlapping intervals rather
-than naively summing entry durations.  Without merging, two labels
-tracked concurrently from 09:00 to 10:00 would report two hours
-instead of one:
-
-<<calculate and display totals>>=
+<<display stats summary when requested>>=
 total_time = merge_intervals(recent_entries)
 total_hours = total_time.total_seconds() / 3600
 
-typer.echo(
-    f"Statistics for the last {days} days"
-    f"{label_filter_msg}:"
-)
-typer.echo(
-    f"Total time: {format_duration(total_time)}"
-    f" ({total_hours:.1f} hours)"
-)
-typer.echo(
-    f"Average per day: {total_hours/days:.1f} hours"
-)
-
-if total_hours > (weekly_limit * days / 7):
+if summary:
     typer.echo(
-        f"⚠️  Warning: Exceeding weekly limit of"
-        f" {weekly_limit} hours per week",
-        err=True,
+        f"Statistics for the last {days} days"
+        f"{label_filter_msg}:"
     )
+    typer.echo(
+        f"Total time: {format_duration(total_time)}"
+        f" ({total_hours:.1f} hours)"
+    )
+    typer.echo(
+        f"Average per day: {total_hours/days:.1f} hours"
+    )
+
+    if total_hours > (weekly_limit * days / 7):
+        typer.echo(
+            f"⚠️  Warning: Exceeding weekly limit of"
+            f" {weekly_limit} hours per week",
+            err=True,
+        )
+    typer.echo()
 @
 
-We sort reverse-chronologically so the most recent day appears first,
-which is the natural reading order for a time report.  As with the
-total, we merge overlapping intervals so that concurrent labels are
-not double-counted.  Entries that span midnight are split at the day
-boundary by [[compute_daily_wall_clock]]:
+The default report iterates across the full requested date range, newest
+first, so days without activity still appear.  Within each day we sort
+label sets by duration descending and render the tags with commas to
+emphasise that they are peers rather than a hierarchy.
 
-<<display daily breakdown>>=
-typer.echo(f"\nDaily breakdown:")
-daily_totals = compute_daily_wall_clock(
-    recent_entries
-)
+Presentation matters here because stats is read comparatively: users
+scan down a column to compare durations and across a row to connect a
+day with its label sets.  We therefore render the data as a table.  In a
+terminal we use [[rich]] for aligned columns; when stdout is not a tty we
+fall back to a plain-text table so redirected output and tests stay
+readable.
 
-for date in sorted(
-    daily_totals.keys(), reverse=True
-):
-    duration = daily_totals[date]
+We keep row construction separate from rendering.  That gives both the
+rich and plain-text paths the same content, and it makes the dependency
+explicit: renderers consume precomputed [[rows]] rather than rebuilding
+the report format themselves.
+
+<<display grouped daily breakdown>>=
+<<build stats table rows>>
+<<render stats table>>
+@
+
+<<build stats table rows>>=
+rows = []
+for date in stats_dates:
+    label_totals = daily_label_set_totals.get(date, {})
+    duration = daily_totals.get(date, datetime.timedelta())
     hours = duration.total_seconds() / 3600
-    warning = " ⚠️" if hours > daily_limit else ""
-    typer.echo(
-        f"  {date}: {format_duration(duration)}"
-        f" ({hours:.1f}h){warning}"
-    )
+    total_text = format_duration(duration)
+    if hours > daily_limit:
+        total_text += " !"
+
+    if not label_totals:
+        rows.append((str(date), total_text, "(off)", "0s"))
+        continue
+
+    first_row = True
+
+    for labels_key, labels_duration in sorted(
+        label_totals.items(),
+        key=lambda item: (-item[1].total_seconds(), item[0]),
+    ):
+        rows.append(
+            (
+                str(date) if first_row else "",
+                total_text if first_row else "",
+                ", ".join(labels_key),
+                format_duration(labels_duration),
+            )
+        )
+        first_row = False
 @
 
-When the user filters by label we show \emph{co-occurring} labels ---
-the other tags that appeared in the same entry --- rather than the
-filter labels themselves. This answers \enquote{When I worked on
-DD1310, what was I doing?} without duplicating the filter label in the
-output.  When there is no filter we show a simple total-by-label
-breakdown, sorted by time descending so the most expensive activities
-appear first.  Because [[total_time]] is wall-clock time, percentages
-for individual labels can exceed 100\,\% when labels were tracked
-concurrently --- this honestly reflects that, for example, one hour of
-concurrent \enquote{lecture} and \enquote{DD1310} is 100\,\% of the
-wall-clock time for each:
+The renderer now has a single job: choose the presentation layer.  The
+TTY path gets [[rich]] with column-aware wrapping, while the fallback
+path stays pure ASCII and aligned for pipes, logs, and tests:
 
-<<display label breakdown>>=
-if labels:
-    typer.echo(
-        f"\nTime breakdown for co-occurring labels:"
-    )
-    typer.echo(
-        f"  (shows other labels that appeared"
-        f" alongside {', '.join(labels)})"
-    )
-    co_occurring_label_totals = {}
-    for entry in recent_entries:
-        for label in entry.labels:
-            if label not in labels:
-                if label not in co_occurring_label_totals:
-                    co_occurring_label_totals[label] = (
-                        datetime.timedelta()
-                    )
-                co_occurring_label_totals[label] += (
-                    entry.duration()
-                )
-
-    if co_occurring_label_totals:
-        for label, duration in sorted(
-            co_occurring_label_totals.items(),
-            key=lambda x: x[1], reverse=True
-        ):
-            hours = duration.total_seconds() / 3600
-            pct = (
-                duration.total_seconds()
-                / total_time.total_seconds() * 100
-            )
-            typer.echo(
-                f"  {label}: "
-                f"{format_duration(duration)}"
-                f" ({hours:.1f}h, {pct:.1f}%)"
-            )
-    else:
-        typer.echo(
-            f"  (no other labels co-occurred"
-            f" with {', '.join(labels)})"
-        )
+<<render stats table>>=
+if sys.stdout.isatty():
+    <<render stats table with rich>>
 else:
-    typer.echo(f"\nTime by labels:")
-    label_totals = {}
-    for entry in recent_entries:
-        for label in entry.labels:
-            if label not in label_totals:
-                label_totals[label] = (
-                    datetime.timedelta()
-                )
-            label_totals[label] += entry.duration()
+    <<render stats table as plain columns>>
+@
 
-    for label, duration in sorted(
-        label_totals.items(),
-        key=lambda x: x[1], reverse=True
-    ):
-        hours = duration.total_seconds() / 3600
-        pct = (
-            duration.total_seconds()
-            / total_time.total_seconds() * 100
-        )
-        typer.echo(
-            f"  {label}: "
-            f"{format_duration(duration)}"
-            f" ({hours:.1f}h, {pct:.1f}%)"
-        )
+The two rendering paths share the same rows so they differ only in
+presentation, not in content.  Rich gets automatic column sizing and box
+drawing, while the plain-text path computes widths and prints an aligned
+ASCII table:
+
+<<render stats table with rich>>=
+from rich.console import Console
+from rich import box
+from rich.table import Table
+
+console = Console()
+table = Table(
+    show_header=True,
+    header_style="bold",
+    box=box.SIMPLE,
+    show_edge=False,
+    pad_edge=False,
+)
+table.add_column("Date", style="cyan", no_wrap=True)
+table.add_column("Total", justify="right", no_wrap=True)
+table.add_column("Labels", overflow="fold")
+table.add_column("Time", justify="right", no_wrap=True)
+
+for row in rows:
+    table.add_row(*row)
+
+console.print(table)
+@
+
+<<render stats table as plain columns>>=
+headers = ("Date", "Total", "Labels", "Time")
+date_width = max(len(headers[0]), *(len(row[0]) for row in rows))
+total_width = max(len(headers[1]), *(len(row[1]) for row in rows))
+labels_width = max(len(headers[2]), *(len(row[2]) for row in rows))
+time_width = max(len(headers[3]), *(len(row[3]) for row in rows))
+
+typer.echo(
+    f"{headers[0]:<{date_width}}  "
+    f"{headers[1]:<{total_width}}  "
+    f"{headers[2]:<{labels_width}}  "
+    f"{headers[3]:>{time_width}}"
+)
+typer.echo(
+    f"{'-' * date_width}  "
+    f"{'-' * total_width}  "
+    f"{'-' * labels_width}  "
+    f"{'-' * time_width}"
+)
+for date, total, labels_text, labels_time in rows:
+    typer.echo(
+        f"{date:<{date_width}}  "
+        f"{total:<{total_width}}  "
+        f"{labels_text:<{labels_width}}  "
+        f"{labels_time:>{time_width}}".rstrip()
+    )
 @
 
 \subsection{Export Command}
@@ -3907,6 +4628,9 @@ adding entries for offline work or running commands with automatic tracking:
 <<time entry commands>>=
 <<add command>>
 <<run command>>
+<<show command>>
+<<edit command>>
+<<remove command>>
 @
 
 Analysis commands provide insights into tracked time through statistics
@@ -4005,6 +4729,7 @@ Here we assemble the final test file:
 <<test [[clitrack.py]]>>=
 import datetime
 import json
+import logging
 import os
 import tempfile
 import pytest
@@ -4016,8 +4741,11 @@ sys.path.insert(0, '../src')
 
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
+    TRACKING_HASH_PREFIX_MIN_LENGTH,
     load_tracking_data, load_active_session,
-    filter_entries,
+    filter_entries, filter_entries_for_stats_window,
+    normalize_tracking_entries,
+    merge_duplicate_tracking_entries,
     parse_offset, parse_at_time,
     parse_tmux_exit_status,
     make_tmux_completion_guard,
@@ -4044,101 +4772,173 @@ def test_stats_no_data(temp_tracking_dir):
     assert "No tracking data available" in result.stdout
 
 def test_stats_with_data(temp_tracking_dir):
-    """Test stats command with data"""
-    # Add some data
+    """Default stats show today's grouped label sets."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
-        "--duration", "60"
+        "--duration", "60",
+        "--at", f"{today} 10:00"
     ])
-    
+
     result = runner.invoke(cli, ["stats"])
     assert result.exit_code == 0
-    assert "Statistics for the last 7 days:" in result.stdout
-    assert "DD1310:" in result.stdout
+    assert "Date" in result.stdout
+    assert "Total" in result.stdout
+    assert "Labels" in result.stdout
+    assert "Time" in result.stdout
+    assert today in result.stdout
+    assert "DD1310, grading" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "Statistics for the last" not in result.stdout
 
-def test_stats_filtered_by_labels(temp_tracking_dir):
-    """Test stats command with label filtering"""
-    # Add data for multiple labels
+def test_stats_groups_matching_label_sets(temp_tracking_dir):
+    """Repeated sessions with the same labels collapse together."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "nytid", "devel", "work",
+        "--duration", "30",
+        "--at", f"{today} 09:00"
+    ])
+    runner.invoke(cli, [
+        "add", "work", "nytid", "devel",
+        "--duration", "45",
+        "--at", f"{today} 11:00"
+    ])
+
+    result = runner.invoke(cli, ["stats"])
+    assert result.exit_code == 0
+    assert "devel, nytid, work" in result.stdout
+    assert result.stdout.count("devel, nytid, work") == 1
+    assert "1h 15m 0s" in result.stdout
+
+def test_stats_show_empty_days_as_zero(temp_tracking_dir):
+    """Requested windows include off-days as explicit zeros."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
-        "--duration", "60"
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "-n", "2"])
+    assert result.exit_code == 0
+    yesterday = (
+        datetime.datetime.now().date()
+        - datetime.timedelta(days=1)
+    ).isoformat()
+    assert today in result.stdout
+    assert yesterday in result.stdout
+    assert "(off)" in result.stdout
+    assert "0s" in result.stdout
+
+def test_stats_summary_flag_shows_aggregate_totals(temp_tracking_dir):
+    """--summary restores the overall window totals."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "--summary"])
+    assert result.exit_code == 0
+    assert "Statistics for the last 1 days:" in result.stdout
+    assert "Total time: 1h 0m 0s (1.0 hours)" in result.stdout
+
+def test_stats_summary_uses_calendar_day_window(temp_tracking_dir):
+    """Today's stats include only today's calendar day."""
+    today = datetime.datetime.now().date()
+    yesterday = today - datetime.timedelta(days=1)
+    runner.invoke(cli, [
+        "add", "overnight",
+        "--duration", "90",
+        "--at", f"{yesterday.isoformat()} 23:30"
+    ])
+    runner.invoke(cli, [
+        "add", "today",
+        "--duration", "60",
+        "--at", f"{today.isoformat()} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "--summary"])
+
+    assert result.exit_code == 0
+    assert today.isoformat() in result.stdout
+    assert yesterday.isoformat() not in result.stdout
+    assert "Total time: 2h 0m 0s (2.0 hours)" in result.stdout
+    assert "overnight" in result.stdout
+    assert result.stdout.count("1h 0m 0s") >= 2
+
+def test_stats_days_short_option(temp_tracking_dir):
+    """-n is a shorthand for --days on stats."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 10:00"
+    ])
+
+    result = runner.invoke(cli, ["stats", "-n", "3", "--summary"])
+    assert result.exit_code == 0
+    assert "Statistics for the last 3 days:" in result.stdout
+
+def test_stats_filtered_by_labels(temp_tracking_dir):
+    """Label filters retain grouped daily output."""
+    today = datetime.datetime.now().date().isoformat()
+    runner.invoke(cli, [
+        "add", "DD1310", "grading",
+        "--duration", "60",
+        "--at", f"{today} 09:00"
     ])
     runner.invoke(cli, [
         "add", "DD1321", "lecture",
-        "--duration", "90"
+        "--duration", "90",
+        "--at", f"{today} 11:00"
     ])
     runner.invoke(cli, [
         "add", "DD1310", "lecture",
-        "--duration", "45"
+        "--duration", "45",
+        "--at", f"{today} 14:00"
     ])
-    
+
     # Get stats for DD1310 only
     result = runner.invoke(cli, ["stats", "DD1310"])
     assert result.exit_code == 0
-    assert "for labels: DD1310" in result.stdout
-    assert "DD1310:" in result.stdout
-    
+    assert "DD1310, grading" in result.stdout
+    assert "DD1310, lecture" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "45m 0s" in result.stdout
+    assert "DD1321, lecture" not in result.stdout
+
     # Get stats for lecture only
     result = runner.invoke(cli, ["stats", "lecture"])
     assert result.exit_code == 0
-    assert "for labels: lecture" in result.stdout
-    assert "lecture:" in result.stdout
-    
+    assert "DD1321, lecture" in result.stdout
+    assert "DD1310, lecture" in result.stdout
+    assert "1h 30m 0s" in result.stdout
+    assert "45m 0s" in result.stdout
+
     # Get stats for multiple labels
-    result = runner.invoke(cli, ["stats", "DD1310", "DD1321"])
+    result = runner.invoke(
+        cli, ["stats", "DD1310", "DD1321", "--summary"]
+    )
     assert result.exit_code == 0
     assert "for labels: DD1310, DD1321" in result.stdout
 
-def test_stats_co_occurring_labels(temp_tracking_dir):
-    """Test stats command shows co-occurring labels when filtering"""
-    # Add data with co-occurring labels.
-    # Use --offset so entries don't overlap in
-    # wall-clock time --- overlapping entries are merged
-    # by stats, which would change the expected totals.
-    # devel + nytid (120 min, starting 300 min ago)
+def test_stats_filtered_days_without_matches_show_zero(
+    temp_tracking_dir,
+):
+    """Filtered windows still show empty days explicitly."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
-        "add", "devel", "nytid",
-        "--duration", "120",
-        "--offset", "-300m"
-    ])
-    # devel + canvaslms (90 min, starting 180 min ago)
-    runner.invoke(cli, [
-        "add", "devel", "canvaslms",
-        "--duration", "90",
-        "--offset", "-180m"
-    ])
-    # devel + nytid + testing (60 min, starting 90 min ago)
-    runner.invoke(cli, [
-        "add", "devel", "nytid", "testing",
-        "--duration", "60",
-        "--offset", "-90m"
-    ])
-    # Just nytid (no devel) (30 min, starting 30 min ago)
-    runner.invoke(cli, [
-        "add", "nytid", "docs",
+        "add", "nytid", "work",
         "--duration", "30",
-        "--offset", "-30m"
+        "--at", f"{today} 10:00"
     ])
-    
-    # Get stats for devel - should show co-occurring labels
-    result = runner.invoke(cli, ["stats", "devel"])
+
+    result = runner.invoke(cli, ["stats", "grading", "-n", "2"])
     assert result.exit_code == 0
-    assert "for labels: devel" in result.stdout
-    # Total time should be 120 + 90 + 60 = 270 minutes
-    assert "4h 30m" in result.stdout or "4.5" in result.stdout
-    
-    # Should show co-occurring labels breakdown
-    assert "co-occurring labels" in result.stdout
-    assert "nytid:" in result.stdout  # 120 + 60 = 180 min
-    assert "canvaslms:" in result.stdout  # 90 min
-    assert "testing:" in result.stdout  # 60 min
-    # Should NOT show devel itself in co-occurring
-    
-    # Verify nytid alone doesn't show as much time
-    result2 = runner.invoke(cli, ["stats", "nytid"])
-    assert result2.exit_code == 0
-    # nytid appears in 120 + 60 + 30 = 210 min = 3.5h
-    assert "3h 30m" in result2.stdout or "3.5" in result2.stdout
+    assert result.stdout.count("(off)") == 2
 
 def test_all_tracking_module_functions(temp_tracking_dir):
     """Comprehensive test of all tracking module functions"""
@@ -4529,14 +5329,16 @@ def test_status_shows_all_workers(temp_tracking_dir):
     assert "coding" in result.stdout
 
 def test_stats_with_who_filter(temp_tracking_dir):
-    """Test filtering stats by worker"""
-    # Add entries for different workers
+    """Worker filters apply before daily grouping."""
+    today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
-        "add", "DD1310", "--duration", "60"
+        "add", "DD1310", "--duration", "60",
+        "--at", f"{today} 09:00"
     ])
     runner.invoke(cli, [
         "add", "coding", "--duration", "90",
-        "--who", "Dan-Claude"
+        "--who", "Dan-Claude",
+        "--at", f"{today} 11:00"
     ])
 
     # Stats for Dan-Claude only
@@ -4545,6 +5347,8 @@ def test_stats_with_who_filter(temp_tracking_dir):
     ])
     assert result.exit_code == 0
     assert "coding" in result.stdout
+    assert "1h 30m 0s" in result.stdout
+    assert "DD1310" not in result.stdout
 
     # Stats for default worker only
     result = runner.invoke(
@@ -4552,6 +5356,8 @@ def test_stats_with_who_filter(temp_tracking_dir):
     )
     assert result.exit_code == 0
     assert "DD1310" in result.stdout
+    assert "1h 0m 0s" in result.stdout
+    assert "coding" not in result.stdout
 
 def test_complete_workers(temp_tracking_dir):
     """Test autocompletion returns known workers"""
