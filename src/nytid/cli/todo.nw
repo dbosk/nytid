@@ -207,12 +207,19 @@ DEFAULT_WORK_DAYS = "mon,tue,wed,thu,fri"
 
 
 def get_work_days() -> List[str]:
-    """Get configured work days as list."""
+    """Get configured work days as list.
+
+    Handles both string (``"mon,tue,wed"``) and list
+    (``["mon", "tue", "wed"]``) config formats.
+    """
     try:
-        days_str = config.get(TODO_WORK_DAYS_CONFIG)
+        days_val = config.get(TODO_WORK_DAYS_CONFIG)
     except KeyError:
-        days_str = DEFAULT_WORK_DAYS
-    return [d.strip().lower() for d in days_str.split(",")]
+        days_val = DEFAULT_WORK_DAYS
+    if isinstance(days_val, list):
+        days_val = ",".join(str(d) for d in days_val)
+    return [d.strip().lower()
+            for d in days_val.split(",")]
 @
 
 \section{Data Model}
@@ -2423,10 +2430,8 @@ convention in [[schedule show --user]], where an empty string means
 \label{todo:default-username}
 
 <<constants>>=
-try:
-    default_username = os.environ["USER"]
-except KeyError:
-    default_username = None
+from nytid.cli import get_default_username
+default_username = get_default_username()
 @
 
 Parent-related options control hierarchy placement:
@@ -4513,21 +4518,64 @@ def test_done_pops_stack(temp_todo_dir):
     assert load_active_stack() == [1]
 @
 
-<<stop tracking if active>>=
-try:
-    from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
-        add_completed_entries,
-    )
+Subitems inherit their parent's labels, so a child todo
+typically shares labels like course codes with its parent.
+The tracking session stores each label only once (dict-based),
+so stopping a shared label in one todo silently removes it
+from every other active todo that depends on it.
 
-    worker = item.who or default_username
-    session = load_active_session(worker)
-    todo_label = f"todo:{todo_id}"
-    if todo_label in session.get_active_labels():
+Three code paths need to stop tracking---[[done]]/[[rm]],
+the post-subprocess finalizer, and the [[stop]] command---so
+we factor the logic into a function rather than a reusable
+chunk.  A function makes the dependencies explicit through
+parameters: a missing argument is caught at call time, whereas
+a chunk that implicitly references [[todo_id]] or [[todos]]
+would only fail at runtime if a prerequisite chunk were
+omitted.
+
+The function collects labels that are still needed by other
+todos on the active stack and excludes them from the stop
+list, preventing a child from accidentally removing labels
+shared with its parent.  The caller is responsible for
+managing the stack; the function only reads it.
+
+<<helpers>>=
+def stop_todo_tracking(todo_id, item, todos):
+    """Stop tracking labels for a todo item.
+
+    Protects labels still needed by other active
+    todos on the stack.
+    """
+    try:
+        from nytid.cli.track import (
+            load_active_session,
+            save_active_session,
+            add_completed_entries,
+        )
+
+        worker = item.who or default_username
+        session = load_active_session(worker)
+        todo_label = f"todo:{todo_id}"
+        if todo_label not in \
+                session.get_active_labels():
+            return
+
+        stack = load_active_stack()
+        protected = set()
+        for sid in stack:
+            if sid == todo_id:
+                continue
+            stacked = next(
+                (t for t in todos
+                 if t.id == sid), None,
+            )
+            if stacked:
+                protected.update(stacked.labels)
+
         labels_to_stop = [todo_label] + [
             l for l in item.labels
             if l in session.get_active_labels()
+            and l not in protected
         ]
         entries = session.stop_labels(
             labels_to_stop
@@ -4538,8 +4586,74 @@ try:
         typer.echo(
             f"  Stopped tracking todo:{todo_id}"
         )
-except ImportError:
-    pass
+    except ImportError:
+        pass
+@
+
+All three call sites delegate to [[stop_todo_tracking]]:
+
+<<stop tracking if active>>=
+stop_todo_tracking(todo_id, item, todos)
+@
+
+Let's verify that completing a child todo does not stop labels
+that the still-active parent needs.  The parent has labels
+[["DD1310"]] and [["teaching"]]; the child inherits them.
+After completing the child, only [[todo:2]] should be stopped
+--- [["DD1310"]] and [["teaching"]] must remain active because
+the parent is still on the stack.
+
+<<test functions>>=
+def test_done_preserves_parent_labels(temp_todo_dir):
+    """Done on child must not stop labels shared
+    with still-active parent."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    worker = default_username
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310", "teaching"],
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310", "teaching"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    # Simulate both todos being tracked
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "teaching", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["done"])
+    assert result.exit_code == 0
+    assert "Child" in result.output
+
+    session = load_active_session(worker)
+    active = session.get_active_labels()
+    assert "todo:1" in active
+    assert "DD1310" in active
+    assert "teaching" in active
+    assert "todo:2" not in active
 @
 
 Stopping the specific todo's labels is not enough: labels from
@@ -6345,32 +6459,7 @@ def test_start_headless_reassigns_on_failure(
 @
 
 <<stop tracking after subprocess>>=
-try:
-    from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
-        add_completed_entries,
-    )
-
-    worker = item.who or default_username
-    session = load_active_session(worker)
-    todo_label = f"todo:{todo_id}"
-    if todo_label in session.get_active_labels():
-        labels_to_stop = [todo_label] + [
-            l for l in item.labels
-            if l in session.get_active_labels()
-        ]
-        entries = session.stop_labels(
-            labels_to_stop
-        )
-        if entries:
-            add_completed_entries(entries)
-        save_active_session(session, worker)
-        typer.echo(
-            f"  Stopped tracking todo:{todo_id}"
-        )
-except ImportError:
-    pass
+stop_todo_tracking(todo_id, item, todos)
 @
 
 \subsection{The [[stop]] Command}
@@ -6446,28 +6535,7 @@ else:
 @
 
 <<stop tracking via track module>>=
-try:
-    from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
-        add_completed_entries,
-    )
-
-    worker = item.who or default_username
-    session = load_active_session(worker)
-    todo_label = f"todo:{todo_id}"
-
-    if todo_label in session.get_active_labels():
-        labels_to_stop = [todo_label] + [
-            l for l in item.labels
-            if l in session.get_active_labels()
-        ]
-        entries = session.stop_labels(labels_to_stop)
-        if entries:
-            add_completed_entries(entries)
-        save_active_session(session, worker)
-except ImportError:
-    pass
+stop_todo_tracking(todo_id, item, todos)
 @
 
 We reset the status to [[pending]] rather than leaving it as
@@ -6483,6 +6551,64 @@ if todo_id in stack:
     stack.remove(todo_id)
     save_active_stack(stack)
 typer.echo(f"Stopped: #{todo_id} {item.title}")
+@
+
+Let's verify that the [[stop]] command also protects shared labels.
+The setup mirrors [[test_done_preserves_parent_labels]], but here
+the child is still on the active stack when [[stop]] runs---the
+[[stop]] command pops it afterwards.  The [[sid == todo_id]] guard
+in [[stop_todo_tracking]] ensures the child does not protect its
+own labels.
+
+<<test functions>>=
+def test_stop_preserves_parent_labels(temp_todo_dir):
+    """Stop on child must not stop labels shared
+    with still-active parent."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    worker = default_username
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310", "teaching"],
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310", "teaching"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "teaching", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["stop", "2"])
+    assert result.exit_code == 0
+
+    session = load_active_session(worker)
+    active = session.get_active_labels()
+    assert "todo:1" in active
+    assert "DD1310" in active
+    assert "teaching" in active
+    assert "todo:2" not in active
 @
 
 \section{ICS Export}
