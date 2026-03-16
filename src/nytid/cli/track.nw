@@ -1834,6 +1834,21 @@ prompt_file = None
 prompt_dir = None
 window_name = None
 
+if not block and not (pane or window):
+    typer.echo(
+        "Error: --no-block requires "
+        "--pane or --window",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+if timeout is not None and command is None:
+    typer.echo(
+        "Error: --timeout requires --command",
+        err=True,
+    )
+    raise typer.Exit(1)
+
 if launch_requested:
     try:
         validate_tmux_options(pane, window)
@@ -2029,20 +2044,46 @@ command: Optional[str] = typer.Option(
     help="Program and arguments to run while tracking "
          "(parsed with shlex; no shell syntax)",
 ),
-pane: bool = typer.Option(
-    False, "--pane", "-P",
-    help="Run in a new tmux pane",
-),
-window: bool = typer.Option(
-    False, "--window", "-W",
-    help="Run in a new tmux window",
-),
+pane: bool = PANE_OPTION,
+window: bool = WINDOW_OPTION,
 @
 
 <<start command docstring examples>>=
 nytid track start email -c "mutt"            # Track email while launching mutt
 nytid track start grading -P                  # Open a tracked shell in tmux pane
 nytid track start admin -W                    # Open a tracked shell in tmux window
+@
+
+\subsubsection{Non-Blocking Tmux Launch}
+
+By default, [[start]] blocks until the tmux pane or window exits and
+then stops tracking automatically.  With [[--no-block]], the command
+returns immediately; when the pane exits, a tmux hook calls
+[[nytid track stop]] for the launched labels.  This is useful when a
+long-running tool should remain open while the caller continues with
+other work.
+
+<<start command options>>=
+block: bool = BLOCK_OPTION,
+@
+
+<<start command docstring examples>>=
+nytid track start grading -P --no-block      # Tracked pane, return immediately
+@
+
+\subsubsection{Time-Boxed Tracking}
+
+The [[--timeout]] option kills the subprocess after a specified duration,
+preventing a forgotten session from accumulating hours.  It applies only
+to direct subprocesses launched with [[--command]]---tmux panes are
+interactive and the user can close them at will.
+
+<<start command options>>=
+timeout: Optional[str] = TIMEOUT_OPTION,
+@
+
+<<start command docstring examples>>=
+nytid track start grading -c "vim" --timeout 2h  # Stop after 2 hours
 @
 
 \subsubsection{Calculating Start Time}
@@ -3116,6 +3157,54 @@ that guard writes the status file, runs any follow-up shell command, and
 wakes the parent.  Later signals become harmless no-ops instead of
 double-running cleanup.
 
+The [[--pane]], [[--window]], [[--block]], and [[--timeout]] options
+recur across both [[track start]] and [[todo start]].  We define their
+Typer defaults once so that help text and flag names stay consistent
+without duplication---[[todo]] imports them from here.
+
+<<helper functions>>=
+PANE_OPTION = typer.Option(
+    False, "--pane", "-P",
+    help="Run in a new tmux pane",
+)
+WINDOW_OPTION = typer.Option(
+    False, "--window", "-W",
+    help="Run in a new tmux window",
+)
+BLOCK_OPTION = typer.Option(
+    True, "--block/--no-block",
+    help="Wait for tmux-launched command to exit",
+)
+TIMEOUT_OPTION = typer.Option(
+    None, "--timeout",
+    help="Kill subprocess after duration "
+         "(GNU format: 50m, 1.5h, 30s)",
+)
+@
+
+Timeout durations follow the same format as GNU [[timeout]]: a bare
+number is seconds, or append [[s]], [[m]], [[h]], [[d]] for other units.
+Fractional values such as [[1.5h]] (90~minutes) are accepted.
+
+<<helper functions>>=
+def parse_timeout(duration_str):
+    """Parse a GNU timeout-style duration to seconds.
+
+    Accepts bare numbers (seconds) or suffixed strings:
+    ``s`` (seconds), ``m`` (minutes), ``h`` (hours),
+    ``d`` (days).  Fractional values are allowed,
+    e.g. ``1.5h`` for 90 minutes.
+    """
+    suffixes = {
+        "s": 1, "m": 60,
+        "h": 3600, "d": 86400,
+    }
+    if duration_str[-1] in suffixes:
+        return float(duration_str[:-1]) \
+            * suffixes[duration_str[-1]]
+    return float(duration_str)
+@
+
 <<helper functions>>=
 def validate_tmux_options(
     pane: bool, window: bool
@@ -3488,6 +3577,40 @@ def run_tmux_command(
                 pass
 @
 
+When [[--no-block]] is used, the tmux pane needs to call
+[[nytid track stop]] after the child exits.  We build a shell command
+that invokes [[track stop]] with the correct labels and worker identity.
+The strategy mirrors [[todo]]'s [[build_detached_todo_finalize_command]],
+but is simpler because [[track stop]] already handles all the session
+bookkeeping.
+
+<<helper functions>>=
+def build_detached_track_finalize_command(
+    labels, who
+):
+    """Return shell command to stop tracking
+    when pane exits."""
+    pythonpath = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..", "..", "..",
+        )
+    )
+    label_args = " ".join(
+        shlex.quote(l) for l in labels
+    )
+    cmd = (
+        f"PYTHONPATH={shlex.quote(pythonpath)} "
+        f"{shlex.quote(sys.executable)} "
+        "-c 'from nytid.cli.track import cli;"
+        " cli()' "
+        f"stop {label_args}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
 \subsection{Blocking Command Execution}
 
 When [[start]] launches a command, it must stop the labels afterwards no
@@ -3525,6 +3648,12 @@ if launch_requested:
     launch_start_time = datetime.datetime.now()
     <<announce launch>>
     <<run launched process>>
+    if exit_code is None:
+        typer.echo(
+            "Tracking will stop automatically "
+            "when the pane exits."
+        )
+        raise typer.Exit(0)
     <<stop launched labels>>
     <<report launch result>>
     raise typer.Exit(exit_code)
@@ -3551,30 +3680,31 @@ else:
 <<run launched process>>=
 try:
     if pane or window:
-        exit_code = run_tmux_command(
-            command_args,
-            cwd=proc_cwd,
-            env=proc_env,
-            window=window,
-            window_name=window_name,
-        )
-    else:
-        old_sigint = signal.signal(
-            signal.SIGINT, signal.SIG_IGN
-        )
-        try:
-            result = subprocess.run(
-                command_args, capture_output=False
+        if block:
+            exit_code = run_tmux_command(
+                command_args,
+                cwd=proc_cwd,
+                env=proc_env,
+                window=window,
+                window_name=window_name,
             )
-            exit_code = result.returncode
-        finally:
-            signal.signal(signal.SIGINT, old_sigint)
+        else:
+            <<set up non-blocking tmux launch>>
+    else:
+        <<run direct subprocess>>
 except subprocess.CalledProcessError as exc:
     typer.echo(
-        f"tmux failed with exit code {exc.returncode}",
+        f"tmux failed with exit code "
+        f"{exc.returncode}",
         err=True,
     )
     exit_code = 1
+except subprocess.TimeoutExpired:
+    typer.echo(
+        f"Command timed out after {timeout}",
+        err=True,
+    )
+    exit_code = 124
 except FileNotFoundError:
     typer.echo(
         f"Command not found: {command_args[0]}",
@@ -3585,6 +3715,60 @@ finally:
     cleanup_tracking_shell_command(
         prompt_file, prompt_dir
     )
+@
+
+For the non-blocking case, we create a temporary file for exit status
+and set up a finalize command that calls [[track stop]] when the pane
+exits.  The [[run_tmux_command]] function installs tmux hooks that
+execute the command automatically.
+
+<<set up non-blocking tmux launch>>=
+exit_fd, exit_code_file = tempfile.mkstemp(
+    prefix="nytid-track-",
+    suffix=".status",
+)
+os.close(exit_fd)
+finalize_cmd = \
+    build_detached_track_finalize_command(
+        tracking_labels, who
+    )
+finalize_cmd += (
+    f"; rm -f {shlex.quote(exit_code_file)}"
+)
+run_tmux_command(
+    command_args,
+    cwd=proc_cwd,
+    env=proc_env,
+    window=window,
+    window_name=window_name,
+    block=False,
+    exit_status_file=exit_code_file,
+    on_exit_shell=finalize_cmd,
+)
+exit_code = None
+@
+
+For the direct subprocess branch, we ignore \textsc{sigint} in the
+parent (see the signal handling discussion above) and optionally apply
+a timeout.
+
+<<run direct subprocess>>=
+old_sigint = signal.signal(
+    signal.SIGINT, signal.SIG_IGN
+)
+try:
+    timeout_secs = (
+        parse_timeout(timeout) if timeout
+        else None
+    )
+    result = subprocess.run(
+        command_args,
+        capture_output=False,
+        timeout=timeout_secs,
+    )
+    exit_code = result.returncode
+finally:
+    signal.signal(signal.SIGINT, old_sigint)
 @
 
 <<stop launched labels>>=
@@ -5015,7 +5199,7 @@ from nytid.cli.track import (
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
-    parse_offset, parse_at_time,
+    parse_offset, parse_at_time, parse_timeout,
     parse_tmux_exit_status,
     make_tmux_completion_guard,
     build_tmux_wait_wrapper,
@@ -5453,6 +5637,83 @@ def test_start_without_launch_options_still_only_starts_tracking(
     assert result.exit_code == 0
     mock_run.assert_not_called()
     assert "Started tracking: work" in result.stdout
+@
+
+The [[--no-block]] option only makes sense with a tmux mode.  Without
+[[--pane]] or [[--window]], there is no pane to detach from.
+
+<<test functions>>=
+def test_start_no_block_requires_tmux_mode(
+    temp_tracking_dir,
+):
+    """--no-block without --pane/--window is an error."""
+    result = runner.invoke(
+        cli,
+        ["start", "work", "--no-block"],
+    )
+    assert result.exit_code == 1
+    assert "--no-block requires" in result.stdout
+@
+
+When [[--no-block]] is combined with [[--pane]], the [[run_tmux_command]]
+call should receive [[block=False]] and an [[on_exit_shell]] that
+invokes [[track stop]].
+
+<<test functions>>=
+def test_start_pane_no_block_detached(
+    temp_tracking_dir,
+):
+    """--pane --no-block launches detached tmux."""
+    with patch.dict(
+        os.environ, {"TMUX": "session"},
+        clear=True,
+    ), patch(
+        "nytid.cli.track.run_tmux_command",
+        return_value=None,
+    ) as mock_tmux:
+        result = runner.invoke(
+            cli,
+            [
+                "start", "grading",
+                "--pane", "--no-block",
+            ],
+        )
+    assert result.exit_code == 0
+    assert "stop automatically" in result.stdout
+    mock_tmux.assert_called_once()
+    call_kwargs = mock_tmux.call_args[1]
+    assert call_kwargs["block"] is False
+    assert "track" in call_kwargs["on_exit_shell"]
+    assert "stop" in call_kwargs["on_exit_shell"]
+    assert "grading" in call_kwargs["on_exit_shell"]
+@
+
+The [[--timeout]] option only applies to direct subprocesses, not
+tmux panes.
+
+<<test functions>>=
+def test_start_timeout_requires_command(
+    temp_tracking_dir,
+):
+    """--timeout without --command is an error."""
+    result = runner.invoke(
+        cli,
+        ["start", "work", "--timeout", "5m"],
+    )
+    assert result.exit_code == 1
+    assert "--timeout requires" in result.stdout
+@
+
+Let's verify the timeout parser handles common formats:
+
+<<test functions>>=
+def test_parse_timeout_formats():
+    """parse_timeout accepts common duration formats."""
+    assert parse_timeout("30") == 30.0
+    assert parse_timeout("5m") == 300.0
+    assert parse_timeout("1.5h") == 5400.0
+    assert parse_timeout("2d") == 172800.0
+    assert parse_timeout("90s") == 90.0
 
 
 def test_parse_tmux_exit_status_signal():
