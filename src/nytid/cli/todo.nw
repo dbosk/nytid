@@ -2154,29 +2154,6 @@ from nytid.cli.track import (
 )
 @
 
-Let's verify the timeout parser handles the common formats:
-
-<<test functions>>=
-def test_parse_timeout_seconds():
-    """Bare number treated as seconds."""
-    assert parse_timeout("30") == 30.0
-
-
-def test_parse_timeout_minutes():
-    """Suffix m means minutes."""
-    assert parse_timeout("50m") == 3000.0
-
-
-def test_parse_timeout_hours():
-    """Suffix h means hours."""
-    assert parse_timeout("1.5h") == 5400.0
-
-
-def test_parse_timeout_days():
-    """Suffix d means days."""
-    assert parse_timeout("1d") == 86400.0
-@
-
 \subsection{Testing GitHub Helpers}
 
 We test the helper functions using mocked [[subprocess.run]]
@@ -4528,6 +4505,13 @@ list, preventing a child from accidentally removing labels
 shared with its parent.  The caller is responsible for
 managing the stack; the function only reads it.
 
+The entire load-filter-stop sequence runs inside a single
+[[mutate_worker_tracking_state]] callback so the session
+read and the label stop happen under one lock acquisition.
+Without this, a concurrent process could start new labels
+between our read and our stop, and those labels would be
+silently dropped.
+
 <<helpers>>=
 def stop_todo_tracking(todo_id, item, todos):
     """Stop tracking labels for a todo item.
@@ -4537,40 +4521,54 @@ def stop_todo_tracking(todo_id, item, todos):
     """
     try:
         from nytid.cli.track import (
-            load_active_session,
-            stop_tracking_labels,
+            mutate_worker_tracking_state,
         )
 
         worker = item.who or default_username
-        session = load_active_session(worker)
         todo_label = f"todo:{todo_id}"
-        if todo_label not in \
-                session.get_active_labels():
-            return
+        stopped = []
 
-        stack = load_active_stack()
-        protected = set()
-        for sid in stack:
-            if sid == todo_id:
-                continue
-            stacked = next(
-                (t for t in todos
-                 if t.id == sid), None,
+        def update(session, history_entries):
+            if todo_label not in \
+                    session.get_active_labels():
+                return session, history_entries
+
+            stack = load_active_stack()
+            protected = set()
+            for sid in stack:
+                if sid == todo_id:
+                    continue
+                stacked = next(
+                    (t for t in todos
+                     if t.id == sid), None,
+                )
+                if stacked:
+                    protected.update(
+                        stacked.labels
+                    )
+
+            labels_to_stop = [todo_label] + [
+                l for l in item.labels
+                if l in session.get_active_labels()
+                and l not in protected
+            ]
+            if not labels_to_stop:
+                return session, history_entries
+
+            completed = session.stop_labels(
+                labels_to_stop,
+                datetime.datetime.now(),
+                who=worker,
             )
-            if stacked:
-                protected.update(stacked.labels)
+            stopped.extend(completed)
+            updated = list(history_entries)
+            updated.extend(completed)
+            return session, updated
 
-        labels_to_stop = [todo_label] + [
-            l for l in item.labels
-            if l in session.get_active_labels()
-            and l not in protected
-        ]
-        _, entries = stop_tracking_labels(
-            who=worker,
-            labels=labels_to_stop,
-            quiet_if_missing=True,
+        mutate_worker_tracking_state(
+            update, worker,
         )
-        if not entries:
+        if not stopped:
             return
         typer.echo(
             f"  Stopped tracking todo:{todo_id}"
@@ -4963,6 +4961,13 @@ The behaviour depends on whether a task is currently active:
 If there is nothing to do (no pending tasks match), the command
 exits with code~0 and emits no output. This keeps cron runs quiet in
 the idle case while preserving non-zero exits for actual failures.
+
+The [[block]] option defaults to [[None]] rather than a boolean so
+that [[next_cmd]] can resolve it before delegating to [[start]]: tmux
+launches ([[--pane]]/[[--window]]) default to non-blocking (detached),
+while plain launches default to blocking.  Resolving here avoids
+passing a [[None]] into [[start]], which would otherwise have to
+repeat the same defaulting logic.
 
 <<next command>>=
 @cli.command(name="next")

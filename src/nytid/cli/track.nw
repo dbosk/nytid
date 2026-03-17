@@ -1705,6 +1705,29 @@ def save_active_session(
     with open(session_file, 'w') as f:
         json.dump(session.to_dict(), f, indent=2)
 
+@
+
+Tracking state lives in two files---the per-worker session and the
+shared history log---so any mutation must hold both locks to prevent
+a concurrent process from seeing a half-written state.
+[[mutate_worker_tracking_state]] acquires the session lock first
+(per-worker), then the history lock (global), loads fresh copies of
+both files, and hands them to a \emph{callback}.  The callback
+returns the updated session and history (plus optional extras), and
+the function writes both files before releasing the locks.
+
+The callback pattern keeps the critical section explicit: all reads
+and writes happen inside the lock, so callers cannot accidentally
+read stale data before locking or forget to write afterwards.
+
+Normalization runs twice---once before the callback (so the
+callback sees clean data) and once after (so any entries the
+callback appended are normalized before they hit disk).  The
+double pass is intentional: callbacks may construct entries by hand
+rather than going through [[ActiveSession.stop_labels]], so a
+post-callback pass ensures invariants hold regardless.
+
+<<session management>>=
 def mutate_worker_tracking_state(
     callback,
     who: str = None,
@@ -1749,6 +1772,16 @@ def mutate_worker_tracking_state(
                 fcntl.flock(history_lock_handle, fcntl.LOCK_UN)
                 fcntl.flock(session_lock_handle, fcntl.LOCK_UN)
 
+@
+
+[[start_tracking_labels]] is the public entry point for beginning a
+tracking session.  It wraps [[mutate_worker_tracking_state]] so that
+the caller never touches locks directly.  When [[replace]] is true,
+any labels that are already active are discarded (their incomplete
+entries thrown away) before being restarted---this supports the
+\enquote{restart timer} idiom without requiring an explicit stop first.
+
+<<session management>>=
 def start_tracking_labels(
     labels: List[str],
     *,
@@ -1799,6 +1832,19 @@ def start_tracking_labels(
     )
     return started, already_tracking, discarded
 
+@
+
+[[stop_tracking_labels]] is the symmetric counterpart: it stops labels
+and appends the completed entries to the history log, all under lock.
+Three modes are supported: stop specific [[labels]], stop
+[[all_labels]], or stop the most recent batch (the default).  Passing
+[[labels=[]]] (an empty list) is a deliberate no-op---distinct from
+[[labels=None]], which triggers the batch-stop path.  This distinction
+matters when a caller has filtered a candidate list down to nothing;
+the empty list means \enquote{I chose these specific labels and there
+are zero}, not \enquote{please stop the batch}.
+
+<<session management>>=
 def stop_tracking_labels(
     *,
     who: str = None,
@@ -1818,7 +1864,7 @@ def stop_tracking_labels(
                 end_time=end_time,
                 who=who,
             )
-        elif labels:
+        elif labels is not None:
             completed_entries = session.stop_labels(
                 labels,
                 end_time,
@@ -2751,7 +2797,6 @@ so a subsequent bare [[switch]] correctly restores the idle state.
 
 <<switch to new labels>>=
 session = load_active_session(who)
-previous_switch_other = session.switch_other
 if session.is_active():
     session, completed = stop_tracking_labels(
         who=who,
@@ -2772,6 +2817,7 @@ if session.is_active():
     ]
 else:
     stopped_labels = []
+previous_switch_other = session.switch_other
 if not pop:
     update_switch_other_labels(stopped_labels, who=who)
 elif previous_switch_other is not None:
@@ -2836,6 +2882,12 @@ if session.is_active():
     ]
 else:
     stopped_labels = []
+if session.switch_other is None:
+    typer.echo(
+        "Nothing to switch back to: "
+        "only one label set in play."
+    )
+    raise typer.Exit(0)
 saved_labels = session.switch_other
 if pop:
     next_switch_other = None
@@ -3308,6 +3360,8 @@ Both paths share one atomic completion guard.  The first path to claim
 that guard writes the status file, runs any follow-up shell command, and
 wakes the parent.  Later signals become harmless no-ops instead of
 double-running cleanup.
+
+\subsubsection{Shared Launch Options}
 
 The [[--pane]], [[--window]], [[--block]], and [[--timeout]] options
 recur across both [[track start]] and [[todo start]].  We define their
@@ -3792,14 +3846,14 @@ matter how the child terminates.  That includes normal exit, an error code,
 and signals such as Ctrl+C.
 
 \paragraph{Signal handling.}
-Pressing Ctrl+C in a terminal sends \textsc{sigint} to the entire
+Pressing Ctrl+C in a terminal sends [[SIGINT]] to the entire
 foreground \emph{process group}, which includes both nytid and the
 child.  Without special handling the Python runtime raises
 [[KeyboardInterrupt]] in the parent at the same moment the child
 receives the signal, interrupting the tracking bookkeeping before
 it has a chance to complete.
 
-The correct POSIX approach is to ignore \textsc{sigint} in the
+The correct POSIX approach is to ignore [[SIGINT]] in the
 parent for the duration of the child's execution.
 [[subprocess.run]] applies [[restore_signals=True]] by default,
 which resets any [[SIG_IGN]] signals to [[SIG_DFL]] in the child
@@ -3922,7 +3976,7 @@ run_tmux_command(
 exit_code = None
 @
 
-For the direct subprocess branch, we ignore \textsc{sigint} in the
+For the direct subprocess branch, we ignore [[SIGINT]] in the
 parent (see the signal handling discussion above) and optionally apply
 a timeout.
 
