@@ -4872,15 +4872,21 @@ omitted.
 The function collects labels that are still needed by other
 todos on the active stack and excludes them from the stop
 list, preventing a child from accidentally removing labels
-shared with its parent.  The caller is responsible for
-managing the stack; the function only reads it.
+shared with its parent.  These are the 
+\enquote{protected} labels: labels that belong to the todo being
+stopped, but also to some other todo that remains active.  For example,
+if a parent and child both carry [[DD1310]], completing the child should
+stop [[todo:child]] but leave [[DD1310]] running for the parent.
 
-The entire load-filter-stop sequence runs inside a single
-[[mutate_worker_tracking_state]] callback so the session
-read and the label stop happen under one lock acquisition.
-Without this, a concurrent process could start new labels
-between our read and our stop, and those labels would be
-silently dropped.
+The caller is responsible for managing the active-todo stack; this
+function only reads it to compute that protection set.  Once it has
+decided which labels ought to stop, it delegates the actual tracking
+mutation to the public helper in [[cli.track]].  This is the key
+architectural boundary: [[cli.todo]] owns todo state and stack policy,
+while [[cli.track]] owns all persistence and mutation of tracking data.
+With that split, [[todo start]], [[todo stop]], and [[todo done]] become
+wrappers around track semantics rather than a second implementation of
+them.
 
 <<helpers>>=
 def stop_todo_tracking(todo_id, item, todos):
@@ -4891,59 +4897,41 @@ def stop_todo_tracking(todo_id, item, todos):
     """
     try:
         from nytid.cli.track import (
-            mutate_worker_tracking_state,
+            stop_tracking_labels_if_active,
         )
 
         worker = item.who or default_username
         todo_label = f"todo:{todo_id}"
-        stopped = []
-
-        def update(session, history_entries):
-            if todo_label not in \
-                    session.get_active_labels():
-                return session, history_entries
-
-            stack = normalize_active_stack(
-                todos, load_active_stack_raw()
-            )
-            protected = set()
-            for sid in stack:
-                if sid == todo_id:
-                    continue
-                stacked = next(
-                    (t for t in todos
-                     if t.id == sid), None,
-                )
-                if stacked:
-                    protected.update(
-                        stacked.labels
-                    )
-
-            labels_to_stop = [todo_label] + [
-                l for l in item.labels
-                if l in session.get_active_labels()
-                and l not in protected
-            ]
-            if not labels_to_stop:
-                return session, history_entries
-
-            completed = session.stop_labels(
-                labels_to_stop,
-                datetime.datetime.now(),
-                who=worker,
-            )
-            stopped.extend(completed)
-            updated = list(history_entries)
-            updated.extend(completed)
-            return session, updated
-
-        mutate_worker_tracking_state(
-            update, worker,
+        stack = normalize_active_stack(
+            todos, load_active_stack_raw()
         )
-        if not stopped:
+        protected = set()
+        for sid in stack:
+            if sid == todo_id:
+                continue
+            stacked = next(
+                (t for t in todos if t.id == sid),
+                None,
+            )
+            if stacked:
+                protected.update(stacked.labels)
+
+        labels_to_stop = [todo_label] + [
+            l for l in item.labels
+            if l not in protected
+        ]
+        _, completed_entries, active_labels = (
+            stop_tracking_labels_if_active(
+                who=worker,
+                labels=labels_to_stop,
+                end_time=datetime.datetime.now(),
+            )
+        )
+        if not completed_entries:
             return
         typer.echo(
-            f"  Stopped tracking todo:{todo_id}"
+            "  Stopped tracking: "
+            f"{', '.join(active_labels)}"
         )
     except ImportError:
         pass
@@ -5015,103 +5003,17 @@ def test_done_preserves_parent_labels(temp_todo_dir):
     assert "todo:2" not in active
 @
 
-Stopping the specific todo's labels is not enough: labels from
-previously removed or completed todos may linger in the session
-as \emph{stale labels}.  Every time a new todo is started, these
-stale labels get restarted alongside the real ones, creating
-phantom zero-duration entries in the tracking log.  To prevent
-this, we scan the session for any [[todo:N]] labels where [[N]]
-no longer corresponds to an active (non-done) todo, and stop
-those as well.
-
-We only clean the current worker's session, since [[done]] and
-[[rm]] operate on a single item with a known worker.  The
-[[sync]] command uses a broader variant that sweeps all workers.
+That delegation removes the need for a separate stale-label sweep here.
+If a todo wrapper decides that [[todo:N]] should stop, it should ask the
+track module to stop it explicitly and immediately.  Keeping a hidden
+cleanup pass in [[cli.todo]] would blur the boundary between todo state
+and tracking state again, so the stale-cleanup chunks are intentionally
+empty placeholders.
 
 <<clean stale todo labels>>=
-try:
-    from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
-        add_completed_entries,
-    )
-    import re
-
-    worker = item.who or default_username
-    session = load_active_session(worker)
-    todo_ids = {t.id for t in todos}
-    stale = [
-        l for l in session.get_active_labels()
-        if re.match(r"^todo:(\d+)$", l)
-        and int(l.split(":")[1]) not in todo_ids
-    ]
-    if stale:
-        entries = session.stop_labels(stale)
-        if entries:
-            add_completed_entries(entries)
-        save_active_session(session, worker)
-        typer.echo(
-            f"  Cleaned {len(stale)} stale "
-            f"label(s): {', '.join(stale)}"
-        )
-except ImportError:
-    pass
 @
 
-The [[sync]] command may touch multiple workers' sessions during
-a single run, so we sweep all session files rather than just the
-current worker's.  We reuse the same stale-detection logic:
-
 <<clean stale todo labels from all workers>>=
-try:
-    from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
-        add_completed_entries,
-        get_tracking_dir,
-    )
-    import re
-
-    todo_ids = {t.id for t in todos}
-    tracking_dir = get_tracking_dir()
-    if tracking_dir.exists():
-        for f in sorted(
-            tracking_dir.glob(
-                "current_session*.json"
-            )
-        ):
-            name = f.stem.replace(
-                "current_session_", ""
-            )
-            if name == "current_session":
-                name = default_username
-            session = load_active_session(name)
-            stale = [
-                l
-                for l in (
-                    session.get_active_labels()
-                )
-                if re.match(r"^todo:(\d+)$", l)
-                and int(l.split(":")[1])
-                not in todo_ids
-            ]
-            if stale:
-                entries = session.stop_labels(
-                    stale
-                )
-                if entries:
-                    add_completed_entries(entries)
-                save_active_session(
-                    session, name
-                )
-                typer.echo(
-                    f"  Cleaned {len(stale)} "
-                    f"stale label(s) for "
-                    f"{name}: "
-                    f"{', '.join(stale)}"
-                )
-except ImportError:
-    pass
 @
 
 When a todo linked to a GitHub issue or PR is marked done, we also
@@ -7949,34 +7851,7 @@ if (
         f"  #{item.id} marked done "
         f"(closed on GitHub)"
     )
-    try:
-        from nytid.cli.track import (
-            load_active_session,
-            save_active_session,
-            add_completed_entries,
-        )
-        worker = item.who or default_username
-        session = load_active_session(worker)
-        todo_label = f"todo:{item.id}"
-        if todo_label in (
-            session.get_active_labels()
-        ):
-            labels_to_stop = [todo_label] + [
-                l for l in item.labels
-                if l in (
-                    session.get_active_labels()
-                )
-            ]
-            entries = session.stop_labels(
-                labels_to_stop
-            )
-            if entries:
-                add_completed_entries(entries)
-            save_active_session(
-                session, worker
-            )
-    except ImportError:
-        pass
+    stop_todo_tracking(item.id, item, todos)
 @
 
 Conversely, if our local item is done but GitHub still shows
