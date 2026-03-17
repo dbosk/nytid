@@ -308,6 +308,13 @@ def get_current_session_file(
 
     return session_file
 
+def get_current_session_lock_file(
+    who: str = None
+) -> pathlib.Path:
+    """Get the lock file guarding one worker's active session."""
+    session_file = get_current_session_file(who)
+    return session_file.with_suffix(".lock")
+
 def get_default_weekly_limit() -> float:
     """Get the default weekly hour limit from config"""
     try:
@@ -1697,6 +1704,214 @@ def save_active_session(
     session_file = get_current_session_file(who)
     with open(session_file, 'w') as f:
         json.dump(session.to_dict(), f, indent=2)
+
+@
+
+Tracking state lives in two files---the per-worker session and the
+shared history log---so any mutation must hold both locks to prevent
+a concurrent process from seeing a half-written state.
+[[mutate_worker_tracking_state]] acquires the session lock first
+(per-worker), then the history lock (global), loads fresh copies of
+both files, and hands them to a \emph{callback}.  The callback
+returns the updated session and history (plus optional extras), and
+the function writes both files before releasing the locks.
+
+The callback pattern keeps the critical section explicit: all reads
+and writes happen inside the lock, so callers cannot accidentally
+read stale data before locking or forget to write afterwards.
+
+Normalization runs twice---once before the callback (so the
+callback sees clean data) and once after (so any entries the
+callback appended are normalized before they hit disk).  The
+double pass is intentional: callbacks may construct entries by hand
+rather than going through [[ActiveSession.stop_labels]], so a
+post-callback pass ensures invariants hold regardless.
+
+<<session management>>=
+def mutate_worker_tracking_state(
+    callback,
+    who: str = None,
+):
+    """Mutate one worker's session and history under shared locks."""
+    ensure_tracking_dir()
+    session_lock_file = get_current_session_lock_file(who)
+    with open(session_lock_file, 'w') as session_lock_handle:
+        fcntl.flock(session_lock_handle, fcntl.LOCK_EX)
+        lock_file = get_tracking_lock_file()
+        with open(lock_file, 'w') as history_lock_handle:
+            fcntl.flock(history_lock_handle, fcntl.LOCK_EX)
+            try:
+                session = load_active_session(who)
+                entries = load_tracking_data_raw()
+                normalized_entries, _ = normalize_tracking_entries(entries)
+                callback_result = callback(
+                    session,
+                    normalized_entries,
+                )
+                if isinstance(callback_result, tuple):
+                    updated_session = callback_result[0]
+                    updated_entries = callback_result[1]
+                    extra = callback_result[2:]
+                else:
+                    updated_session = session
+                    updated_entries = normalized_entries
+                    extra = ()
+                final_entries, _ = normalize_tracking_entries(
+                    updated_entries
+                )
+                save_active_session(updated_session, who)
+                save_tracking_data_unlocked(final_entries)
+                if extra:
+                    return (
+                        updated_session,
+                        final_entries,
+                        *extra,
+                    )
+                return updated_session, final_entries
+            finally:
+                fcntl.flock(history_lock_handle, fcntl.LOCK_UN)
+                fcntl.flock(session_lock_handle, fcntl.LOCK_UN)
+
+@
+
+[[start_tracking_labels]] is the public entry point for beginning a
+tracking session.  It wraps [[mutate_worker_tracking_state]] so that
+the caller never touches locks directly.  When [[replace]] is true,
+any labels that are already active are discarded (their incomplete
+entries thrown away) before being restarted---this supports the
+\enquote{restart timer} idiom without requiring an explicit stop first.
+
+<<session management>>=
+def start_tracking_labels(
+    labels: List[str],
+    *,
+    start_time: datetime.datetime,
+    who: str = None,
+    replace: bool = False,
+    description: Optional[str] = None,
+):
+    """Start labels from fresh on-disk state."""
+    normalized_labels = list(labels)
+
+    def update(session, history_entries):
+        discarded = []
+        if replace:
+            to_discard = [
+                label for label in normalized_labels
+                if session.get_label_info(label) is not None
+            ]
+            discarded = session.discard_labels(to_discard)
+
+        started = session.start_labels(normalized_labels, start_time)
+        if description is not None:
+            for label in started:
+                if label not in session.active_labels:
+                    continue
+                label_start_time, _, batch_id = (
+                    session.active_labels[label]
+                )
+                session.active_labels[label] = (
+                    label_start_time,
+                    description,
+                    batch_id,
+                )
+        already_tracking = [
+            label for label in normalized_labels
+            if label not in started
+        ]
+        return (
+            session,
+            history_entries,
+            started,
+            already_tracking,
+            discarded,
+        )
+
+    _, _, started, already_tracking, discarded = (
+        mutate_worker_tracking_state(update, who)
+    )
+    return started, already_tracking, discarded
+
+@
+
+[[stop_tracking_labels]] is the symmetric counterpart: it stops labels
+and appends the completed entries to the history log, all under lock.
+Three modes are supported: stop specific [[labels]], stop
+[[all_labels]], or stop the most recent batch (the default).  Passing
+[[labels=[]]] (an empty list) is a deliberate no-op---distinct from
+[[labels=None]], which triggers the batch-stop path.  This distinction
+matters when a caller has filtered a candidate list down to nothing;
+the empty list means \enquote{I chose these specific labels and there
+are zero}, not \enquote{please stop the batch}.
+
+<<session management>>=
+def stop_tracking_labels(
+    *,
+    who: str = None,
+    labels: Optional[List[str]] = None,
+    all_labels: bool = False,
+    end_time: Optional[datetime.datetime] = None,
+    quiet_if_missing: bool = False,
+):
+    """Stop labels from fresh on-disk state."""
+    if end_time is None:
+        end_time = datetime.datetime.now()
+
+    def update(session, history_entries):
+        if all_labels:
+            completed_entries = session.stop_labels(
+                count=len(session.label_order),
+                end_time=end_time,
+                who=who,
+            )
+        elif labels is not None:
+            completed_entries = session.stop_labels(
+                labels,
+                end_time,
+                who=who,
+            )
+        else:
+            completed_entries = session.stop_labels(
+                end_time=end_time,
+                stop_batch=True,
+                who=who,
+            )
+
+        updated_entries = list(history_entries)
+        updated_entries.extend(completed_entries)
+        return session, updated_entries, completed_entries
+
+    session, _, completed_entries = mutate_worker_tracking_state(
+        update,
+        who,
+    )
+
+    if completed_entries:
+        return session, completed_entries
+    if quiet_if_missing:
+        return session, []
+    if labels:
+        raise ValueError(
+            "None of the specified labels are currently tracking: "
+            f"{', '.join(labels)}"
+        )
+    raise ValueError("No active tracking to stop")
+
+def update_switch_other_labels(
+    labels: Optional[List[str]],
+    *,
+    who: str = None,
+):
+    """Persist the saved switch target without touching active labels."""
+
+    if who is None:
+        who = default_username
+
+    def update(session, history_entries):
+        session.switch_other = labels
+        return session, history_entries
+
+    mutate_worker_tracking_state(update, who)
 @
 
 Now we combine all state management functions:
@@ -1766,8 +1981,11 @@ subprocess launch, and reporting results.
 <<launch subprocess if requested>>
 @
 
-We load the active session first, since we need it both for resume 
-functionality and for starting new labels.
+We load the active session first only for read-only preflight decisions
+such as resume and launch validation.  The actual state mutation happens
+ later through [[start_tracking_labels()]], which reloads the worker's
+ current session under lock before writing anything.  That keeps long-
+ running composed commands from relying on stale in-memory session state.
 
 <<load session and resolve labels>>=
 session = load_active_session(who)
@@ -1794,24 +2012,9 @@ if not labels:
 @
 
 After resolving labels, we start tracking and report what happened.
-Before calling [[start_labels]], we optionally discard any already-active
-matching labels---the discarded labels will then appear in [[started]]
-rather than [[already_tracking]], so the rest of the reporting logic
-needs no special case:
-
-<<replace active labels if requested>>=
-if replace:
-    to_discard = [
-        l for l in tracking_labels
-        if session.get_label_info(l) is not None
-    ]
-    discarded = session.discard_labels(to_discard)
-    if discarded:
-        typer.echo(
-            f"Replaced: "
-            f"{', '.join(sorted(discarded))}"
-        )
-@
+Any [[--replace]] handling is delegated to [[start_tracking_labels()]] so
+the discard and restart happen against fresh on-disk state rather than
+against this earlier snapshot.
 
 When [[start]] launches a command or tmux shell, it may need to derive one
 extra label from the command name, validate tmux usage, and prepare a shell
@@ -1833,6 +2036,24 @@ proc_cwd = os.getcwd()
 prompt_file = None
 prompt_dir = None
 window_name = None
+
+if block is None:
+    block = not (pane or window)
+
+if not block and not (pane or window):
+    typer.echo(
+        "Error: --no-block requires "
+        "--pane or --window",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+if timeout is not None and command is None:
+    typer.echo(
+        "Error: --timeout requires --command",
+        err=True,
+    )
+    raise typer.Exit(1)
 
 if launch_requested:
     try:
@@ -1884,32 +2105,20 @@ string as the batch description.  We attach it to every newly started label in
 that batch so the grouped entry keeps the description regardless of which label
 is encountered first during shutdown.
 
-<<store command description if needed>>=
-if command_text is not None:
-    for label in started:
-        if label not in session.active_labels:
-            continue
-        label_start_time, _, batch_id = (
-            session.active_labels[label]
-        )
-        session.active_labels[label] = (
-            label_start_time,
-            command_text,
-            batch_id,
-        )
-@
-
 <<start tracking and report results>>=
-<<replace active labels if requested>>
-started = session.start_labels(
-    tracking_labels, start_time
+started, already_tracking, discarded = start_tracking_labels(
+    tracking_labels,
+    start_time=start_time,
+    who=who,
+    replace=replace,
+    description=command_text,
 )
-<<store command description if needed>>
-already_tracking = [
-    l for l in tracking_labels if l not in started
-]
 
-save_active_session(session, who)
+if discarded:
+    typer.echo(
+        f"Replaced: "
+        f"{', '.join(sorted(discarded))}"
+    )
 
 if started:
     typer.echo(
@@ -1922,6 +2131,7 @@ if already_tracking:
         f"{', '.join(sorted(already_tracking))}"
     )
 
+session = load_active_session(who)
 all_active = session.get_active_labels()
 typer.echo(f"Active labels: {', '.join(all_active)}")
 if who != default_username:
@@ -2029,20 +2239,46 @@ command: Optional[str] = typer.Option(
     help="Program and arguments to run while tracking "
          "(parsed with shlex; no shell syntax)",
 ),
-pane: bool = typer.Option(
-    False, "--pane", "-P",
-    help="Run in a new tmux pane",
-),
-window: bool = typer.Option(
-    False, "--window", "-W",
-    help="Run in a new tmux window",
-),
+pane: bool = PANE_OPTION,
+window: bool = WINDOW_OPTION,
 @
 
 <<start command docstring examples>>=
 nytid track start email -c "mutt"            # Track email while launching mutt
 nytid track start grading -P                  # Open a tracked shell in tmux pane
 nytid track start admin -W                    # Open a tracked shell in tmux window
+@
+
+\subsubsection{Non-Blocking Tmux Launch}
+
+By default, tmux launches return immediately and keep their labels tied
+to the pane or window.  When the pane exits, a tmux hook stops those
+same labels if they are still active.  [[--block]] instead waits for the
+tmux session to finish and then performs the same label-based stop in the
+foreground process.
+
+<<start command options>>=
+    block: Optional[bool] = BLOCK_OPTION,
+@
+
+<<start command docstring examples>>=
+nytid track start grading -P                 # Tracked pane, return immediately
+nytid track start grading -P --block         # Wait for the pane to finish
+@
+
+\subsubsection{Time-Boxed Tracking}
+
+The [[--timeout]] option kills the subprocess after a specified duration,
+preventing a forgotten session from accumulating hours.  It applies only
+to direct subprocesses launched with [[--command]]---tmux panes are
+interactive and the user can close them at will.
+
+<<start command options>>=
+timeout: Optional[str] = TIMEOUT_OPTION,
+@
+
+<<start command docstring examples>>=
+nytid track start grading -c "vim" --timeout 2h  # Stop after 2 hours
 @
 
 \subsubsection{Calculating Start Time}
@@ -2276,12 +2512,6 @@ def stop(
       nytid track stop --offset -30m
       nytid track stop --at 16:00
     """
-    session = load_active_session(who)
-
-    if not session.is_active():
-        typer.echo("No active tracking session", err=True)
-        raise typer.Exit(1)
-
     # Check for conflicting options
     if offset is not None and at is not None:
         typer.echo(
@@ -2310,40 +2540,16 @@ def stop(
             )
             raise typer.Exit(1)
 
-    # Determine what to stop
-    if all_labels:
-        completed_entries = session.stop_labels(
-            count=len(session.label_order),
-            end_time=end_time, who=who
+    try:
+        session, completed_entries = stop_tracking_labels(
+            who=who,
+            labels=labels,
+            all_labels=all_labels,
+            end_time=end_time,
         )
-    elif labels:
-        completed_entries = session.stop_labels(
-            labels, end_time, who=who
-        )
-    else:
-        completed_entries = session.stop_labels(
-            end_time=end_time, stop_batch=True,
-            who=who
-        )
-
-    if not completed_entries:
-        if labels:
-            typer.echo(
-                "None of the specified labels are "
-                "currently tracking: "
-                f"{', '.join(labels)}", err=True
-            )
-        else:
-            typer.echo(
-                "No active tracking to stop", err=True
-            )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
         raise typer.Exit(1)
-
-    # Save session
-    save_active_session(session, who)
-
-    # Save completed entries
-    add_completed_entries(completed_entries)
 
     # Display what was completed
     for entry in completed_entries:
@@ -2454,9 +2660,10 @@ def test_resume_functionality(temp_tracking_dir):
 
 The [[switch]] command is the user-facing realisation of the
 context-switch design described in
-\cref{sec:design-switch-functionality}.  It wraps the operations
-stop-batch / push-stack / start-new into one atomic step, mirroring
-the way an operating-system context switch saves and restores state.
+\cref{sec:design-switch-functionality}.  It is deliberately built from
+the same start/stop primitives as the explicit commands: switching is
+not a separate tracking mechanism, just a convenient composition of
+[[stop]] and [[start]] plus a remembered toggle target.
 
 We allow an optional [[-a]]/[[--all]] flag so the user can clear
 \emph{all} active labels rather than just the most recent batch when
@@ -2489,7 +2696,6 @@ def switch(
       nytid track switch --pop
       nytid track switch grading --pop
     """
-    session = load_active_session(who)
     <<validate switch time options>>
     <<compute switch time>>
     if labels:
@@ -2590,16 +2796,14 @@ If nothing is active we still record an empty list (unless [[--pop]])
 so a subsequent bare [[switch]] correctly restores the idle state.
 
 <<switch to new labels>>=
+session = load_active_session(who)
 if session.is_active():
-    if all_labels:
-        completed = session.stop_labels(
-            count=len(session.label_order),
-            end_time=switch_time, who=who)
-    else:
-        completed = session.stop_labels(
-            end_time=switch_time,
-            stop_batch=True, who=who)
-    add_completed_entries(completed)
+    session, completed = stop_tracking_labels(
+        who=who,
+        all_labels=all_labels,
+        end_time=switch_time,
+    )
+    session = load_active_session(who)
     for entry in completed:
         typer.echo(
             f"Stopped: "
@@ -2613,10 +2817,16 @@ if session.is_active():
     ]
 else:
     stopped_labels = []
+previous_switch_other = session.switch_other
 if not pop:
-    session.switch_other = stopped_labels
-session.start_labels(labels, switch_time)
-save_active_session(session, who)
+    update_switch_other_labels(stopped_labels, who=who)
+elif previous_switch_other is not None:
+    update_switch_other_labels(previous_switch_other, who=who)
+start_tracking_labels(
+    labels,
+    start_time=switch_time,
+    who=who,
+)
 typer.echo(f"Switched to: {', '.join(labels)}")
 if at is not None or offset is not None:
     typer.echo(
@@ -2639,9 +2849,13 @@ may simply have forgotten they haven't set up a second context yet.
 
 We stop the current labels first (honouring [[-a]]) so the time
 between the forward switch and this reverse switch is recorded
-properly before restoring the saved context.
+properly before restoring the saved context.  This keeps the semantics
+identical to an explicit [[stop]] followed by [[start]]: [[start A]],
+[[switch B]], [[switch]] behaves like [[start A]], [[stop]],
+[[start B]], [[stop]], [[start A]].
 
 <<switch back to saved labels>>=
+session = load_active_session(who)
 if session.switch_other is None:
     typer.echo(
         "Nothing to switch back to: "
@@ -2649,15 +2863,12 @@ if session.switch_other is None:
     )
     raise typer.Exit(0)
 if session.is_active():
-    if all_labels:
-        completed = session.stop_labels(
-            count=len(session.label_order),
-            end_time=switch_time, who=who)
-    else:
-        completed = session.stop_labels(
-            end_time=switch_time,
-            stop_batch=True, who=who)
-    add_completed_entries(completed)
+    session, completed = stop_tracking_labels(
+        who=who,
+        all_labels=all_labels,
+        end_time=switch_time,
+    )
+    session = load_active_session(who)
     for entry in completed:
         typer.echo(
             f"Stopped: "
@@ -2671,13 +2882,24 @@ if session.is_active():
     ]
 else:
     stopped_labels = []
+if session.switch_other is None:
+    typer.echo(
+        "Nothing to switch back to: "
+        "only one label set in play."
+    )
+    raise typer.Exit(0)
 saved_labels = session.switch_other
 if pop:
-    session.switch_other = None
+    next_switch_other = None
 else:
-    session.switch_other = stopped_labels
+    next_switch_other = stopped_labels
+update_switch_other_labels(next_switch_other, who=who)
 if saved_labels:
-    session.start_labels(saved_labels, switch_time)
+    start_tracking_labels(
+        saved_labels,
+        start_time=switch_time,
+        who=who,
+    )
     typer.echo(
         f"Switched back to: "
         f"{', '.join(saved_labels)}"
@@ -2687,7 +2909,6 @@ else:
         "Switched back "
         "(nothing was active before)"
     )
-save_active_session(session, who)
 if at is not None or offset is not None:
     typer.echo(
         f"Switch time: "
@@ -2728,6 +2949,30 @@ def test_switch_back(temp_tracking_dir):
     assert "grading" not in active
     # grading is now the saved set ready for another toggle
     assert session.switch_other is not None
+
+def test_switch_matches_stop_start_timing(temp_tracking_dir):
+    """Switch back starts the restored labels at the switch time."""
+    runner.invoke(cli, ["start", "A", "--at", "2026-03-16 15:00"])
+    runner.invoke(cli, ["switch", "B", "--at", "2026-03-16 15:10"])
+    result = runner.invoke(cli, ["switch", "--at", "2026-03-16 15:15"])
+
+    assert result.exit_code == 0
+
+    entries = sorted(
+        load_tracking_data(),
+        key=lambda entry: entry.start_time,
+    )
+    assert len(entries) == 2
+    assert entries[0].labels == ["A"]
+    assert entries[0].start_time == datetime.datetime(2026, 3, 16, 15, 0)
+    assert entries[0].end_time == datetime.datetime(2026, 3, 16, 15, 10)
+    assert entries[1].labels == ["B"]
+    assert entries[1].start_time == datetime.datetime(2026, 3, 16, 15, 10)
+    assert entries[1].end_time == datetime.datetime(2026, 3, 16, 15, 15)
+
+    session = load_active_session()
+    start_time, _, _ = session.get_label_info("A")
+    assert start_time == datetime.datetime(2026, 3, 16, 15, 15)
 
 def test_switch_toggle(temp_tracking_dir):
     """Test that bare switch toggles between two label sets"""
@@ -3116,6 +3361,56 @@ that guard writes the status file, runs any follow-up shell command, and
 wakes the parent.  Later signals become harmless no-ops instead of
 double-running cleanup.
 
+\subsubsection{Shared Launch Options}
+
+The [[--pane]], [[--window]], [[--block]], and [[--timeout]] options
+recur across both [[track start]] and [[todo start]].  We define their
+Typer defaults once so that help text and flag names stay consistent
+without duplication---[[todo]] imports them from here.
+
+<<helper functions>>=
+PANE_OPTION = typer.Option(
+    False, "--pane", "-P",
+    help="Run in a new tmux pane",
+)
+WINDOW_OPTION = typer.Option(
+    False, "--window", "-W",
+    help="Run in a new tmux window",
+)
+BLOCK_OPTION = typer.Option(
+    None, "--block/--no-block",
+    help="Wait for tmux-launched command to exit",
+)
+TIMEOUT_OPTION = typer.Option(
+    None, "--timeout",
+    help="Kill subprocess after duration "
+         "(GNU format: 50m, 1.5h, 30s)",
+)
+@
+
+Timeout durations follow the same format as GNU [[timeout]]: a bare
+number is seconds, or append [[s]], [[m]], [[h]], [[d]] for other units.
+Fractional values such as [[1.5h]] (90~minutes) are accepted.
+
+<<helper functions>>=
+def parse_timeout(duration_str):
+    """Parse a GNU timeout-style duration to seconds.
+
+    Accepts bare numbers (seconds) or suffixed strings:
+    ``s`` (seconds), ``m`` (minutes), ``h`` (hours),
+    ``d`` (days).  Fractional values are allowed,
+    e.g. ``1.5h`` for 90 minutes.
+    """
+    suffixes = {
+        "s": 1, "m": 60,
+        "h": 3600, "d": 86400,
+    }
+    if duration_str[-1] in suffixes:
+        return float(duration_str[:-1]) \
+            * suffixes[duration_str[-1]]
+    return float(duration_str)
+@
+
 <<helper functions>>=
 def validate_tmux_options(
     pane: bool, window: bool
@@ -3488,6 +3783,62 @@ def run_tmux_command(
                 pass
 @
 
+When [[--no-block]] is used, the tmux pane needs to call
+[[nytid track stop]] after the child exits.  We build a shell command
+that invokes [[track stop]] with the correct labels and worker identity.
+The strategy mirrors [[todo]]'s [[build_detached_todo_finalize_command]],
+but is simpler because [[track stop]] already handles all the session
+bookkeeping.
+
+<<helper functions>>=
+def build_detached_track_finalize_command(
+    labels, who
+):
+    """Return shell command to stop tracking
+    when pane exits."""
+    pythonpath = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..", "..", "..",
+        )
+    )
+    label_args = " ".join(
+        shlex.quote(l) for l in labels
+    )
+    cmd = (
+        f"PYTHONPATH={shlex.quote(pythonpath)} "
+        f"{shlex.quote(sys.executable)} "
+        "-c 'from nytid.cli.track import cli;"
+        " cli()' "
+        f"_stop-detached {label_args}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
+Detached tmux cleanup should be silent when the tracked labels were
+already stopped elsewhere.  A hidden helper command reuses the same
+stop helper with [[quiet_if_missing=True]] so pane exit becomes a
+no-op instead of an error in that case.
+
+<<detached finalize command>>=
+@cli.command(name="_stop-detached", hidden=True)
+def stop_detached(
+    labels: List[str] = typer.Argument(...),
+    who: str = typer.Option(
+        default_username, "--who", "-w",
+        autocompletion=complete_workers,
+    ),
+):
+    """Stop labels quietly when a detached tmux pane exits."""
+    stop_tracking_labels(
+        who=who,
+        labels=labels,
+        quiet_if_missing=True,
+    )
+@
+
 \subsection{Blocking Command Execution}
 
 When [[start]] launches a command, it must stop the labels afterwards no
@@ -3495,14 +3846,14 @@ matter how the child terminates.  That includes normal exit, an error code,
 and signals such as Ctrl+C.
 
 \paragraph{Signal handling.}
-Pressing Ctrl+C in a terminal sends \textsc{sigint} to the entire
+Pressing Ctrl+C in a terminal sends [[SIGINT]] to the entire
 foreground \emph{process group}, which includes both nytid and the
 child.  Without special handling the Python runtime raises
 [[KeyboardInterrupt]] in the parent at the same moment the child
 receives the signal, interrupting the tracking bookkeeping before
 it has a chance to complete.
 
-The correct POSIX approach is to ignore \textsc{sigint} in the
+The correct POSIX approach is to ignore [[SIGINT]] in the
 parent for the duration of the child's execution.
 [[subprocess.run]] applies [[restore_signals=True]] by default,
 which resets any [[SIG_IGN]] signals to [[SIG_DFL]] in the child
@@ -3525,6 +3876,12 @@ if launch_requested:
     launch_start_time = datetime.datetime.now()
     <<announce launch>>
     <<run launched process>>
+    if exit_code is None:
+        typer.echo(
+            "Tracking will stop automatically "
+            "when the pane exits."
+        )
+        raise typer.Exit(0)
     <<stop launched labels>>
     <<report launch result>>
     raise typer.Exit(exit_code)
@@ -3551,30 +3908,31 @@ else:
 <<run launched process>>=
 try:
     if pane or window:
-        exit_code = run_tmux_command(
-            command_args,
-            cwd=proc_cwd,
-            env=proc_env,
-            window=window,
-            window_name=window_name,
-        )
-    else:
-        old_sigint = signal.signal(
-            signal.SIGINT, signal.SIG_IGN
-        )
-        try:
-            result = subprocess.run(
-                command_args, capture_output=False
+        if block:
+            exit_code = run_tmux_command(
+                command_args,
+                cwd=proc_cwd,
+                env=proc_env,
+                window=window,
+                window_name=window_name,
             )
-            exit_code = result.returncode
-        finally:
-            signal.signal(signal.SIGINT, old_sigint)
+        else:
+            <<set up non-blocking tmux launch>>
+    else:
+        <<run direct subprocess>>
 except subprocess.CalledProcessError as exc:
     typer.echo(
-        f"tmux failed with exit code {exc.returncode}",
+        f"tmux failed with exit code "
+        f"{exc.returncode}",
         err=True,
     )
     exit_code = 1
+except subprocess.TimeoutExpired:
+    typer.echo(
+        f"Command timed out after {timeout}",
+        err=True,
+    )
+    exit_code = 124
 except FileNotFoundError:
     typer.echo(
         f"Command not found: {command_args[0]}",
@@ -3587,14 +3945,68 @@ finally:
     )
 @
 
+For the non-blocking case, we create a temporary file for exit status
+and set up a finalize command that calls [[track stop]] when the pane
+exits.  The [[run_tmux_command]] function installs tmux hooks that
+execute the command automatically.
+
+<<set up non-blocking tmux launch>>=
+exit_fd, exit_code_file = tempfile.mkstemp(
+    prefix="nytid-track-",
+    suffix=".status",
+)
+os.close(exit_fd)
+finalize_cmd = \
+    build_detached_track_finalize_command(
+        tracking_labels, who
+    )
+finalize_cmd += (
+    f"; rm -f {shlex.quote(exit_code_file)}"
+)
+run_tmux_command(
+    command_args,
+    cwd=proc_cwd,
+    env=proc_env,
+    window=window,
+    window_name=window_name,
+    block=False,
+    exit_status_file=exit_code_file,
+    on_exit_shell=finalize_cmd,
+)
+exit_code = None
+@
+
+For the direct subprocess branch, we ignore [[SIGINT]] in the
+parent (see the signal handling discussion above) and optionally apply
+a timeout.
+
+<<run direct subprocess>>=
+old_sigint = signal.signal(
+    signal.SIGINT, signal.SIG_IGN
+)
+try:
+    timeout_secs = (
+        parse_timeout(timeout) if timeout
+        else None
+    )
+    result = subprocess.run(
+        command_args,
+        capture_output=False,
+        timeout=timeout_secs,
+    )
+    exit_code = result.returncode
+finally:
+    signal.signal(signal.SIGINT, old_sigint)
+@
+
 <<stop launched labels>>=
 end_time = datetime.datetime.now()
-completed_entries = session.stop_labels(
-    started, end_time, who=who
+session, completed_entries = stop_tracking_labels(
+    who=who,
+    labels=started,
+    end_time=end_time,
+    quiet_if_missing=True,
 )
-
-save_active_session(session, who)
-add_completed_entries(completed_entries)
 @
 
 <<report launch result>>=
@@ -4889,6 +5301,7 @@ and checking the status of active tracking sessions:
 <<start command>>
 <<stop command>>
 <<switch command>>
+<<detached finalize command>>
 <<notes command>>
 @
 
@@ -5015,7 +5428,7 @@ from nytid.cli.track import (
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
-    parse_offset, parse_at_time,
+    parse_offset, parse_at_time, parse_timeout,
     parse_tmux_exit_status,
     make_tmux_completion_guard,
     build_tmux_wait_wrapper,
@@ -5367,7 +5780,7 @@ def test_start_command_without_labels_uses_command_label(
 def test_start_pane_uses_tmux_shell_helper(
     temp_tracking_dir,
 ):
-    """--pane without command opens a tracked shell in tmux."""
+    """--pane without command opens a tracked shell in detached tmux."""
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
             "nytid.cli.track.run_tmux_command",
@@ -5378,16 +5791,18 @@ def test_start_pane_uses_tmux_shell_helper(
                 ["start", "work", "--pane"],
             )
     assert result.exit_code == 0
-    mock_tmux.assert_called_once_with(
-        ["/bin/sh"],
-        cwd=os.getcwd(),
-        env={
-            "TMUX": "session",
-            "PS1": "track:work \\w\\n$ ",
-        },
-        window=False,
-        window_name=None,
-    )
+    mock_tmux.assert_called_once()
+    call_kwargs = mock_tmux.call_args[1]
+    assert mock_tmux.call_args[0] == (["/bin/sh"],)
+    assert call_kwargs["cwd"] == os.getcwd()
+    assert call_kwargs["env"] == {
+        "TMUX": "session",
+        "PS1": "track:work \\w\\n$ ",
+    }
+    assert call_kwargs["window"] is False
+    assert call_kwargs["window_name"] is None
+    assert call_kwargs["block"] is False
+    assert "_stop-detached work" in call_kwargs["on_exit_shell"]
 
 
 def test_start_window_uses_labels_as_window_name(
@@ -5403,14 +5818,15 @@ def test_start_window_uses_labels_as_window_name(
                 cli,
                 ["start", "work", "--window", "-c", "echo test"],
             )
-    assert result.exit_code == 3
-    mock_tmux.assert_called_once_with(
-        ["echo", "test"],
-        cwd=os.getcwd(),
-        env={"TMUX": "session"},
-        window=True,
-        window_name="work echo",
-    )
+    assert result.exit_code == 0
+    mock_tmux.assert_called_once()
+    call_kwargs = mock_tmux.call_args[1]
+    assert mock_tmux.call_args[0] == (["echo", "test"],)
+    assert call_kwargs["cwd"] == os.getcwd()
+    assert call_kwargs["env"] == {"TMUX": "session"}
+    assert call_kwargs["window"] is True
+    assert call_kwargs["window_name"] == "work echo"
+    assert call_kwargs["block"] is False
 
 
 def test_start_pane_requires_tmux(
@@ -5453,6 +5869,125 @@ def test_start_without_launch_options_still_only_starts_tracking(
     assert result.exit_code == 0
     mock_run.assert_not_called()
     assert "Started tracking: work" in result.stdout
+@
+
+The [[--no-block]] option only makes sense with a tmux mode.  Without
+[[--pane]] or [[--window]], there is no pane to detach from.
+
+<<test functions>>=
+def test_start_no_block_requires_tmux_mode(
+    temp_tracking_dir,
+):
+    """--no-block without --pane/--window is an error."""
+    result = runner.invoke(
+        cli,
+        ["start", "work", "--no-block"],
+    )
+    assert result.exit_code == 1
+    assert "--no-block requires" in result.stdout
+@
+
+When [[--no-block]] is combined with [[--pane]], the [[run_tmux_command]]
+call should receive [[block=False]] and an [[on_exit_shell]] that
+invokes [[track stop]].
+
+<<test functions>>=
+def test_start_pane_no_block_detached(
+    temp_tracking_dir,
+):
+    """--pane --no-block launches detached tmux."""
+    with patch.dict(
+        os.environ, {"TMUX": "session"},
+        clear=True,
+    ), patch(
+        "nytid.cli.track.run_tmux_command",
+        return_value=None,
+    ) as mock_tmux:
+        result = runner.invoke(
+            cli,
+            [
+                "start", "grading",
+                "--pane", "--no-block",
+            ],
+        )
+    assert result.exit_code == 0
+    assert "stop automatically" in result.stdout
+    mock_tmux.assert_called_once()
+    call_kwargs = mock_tmux.call_args[1]
+    assert call_kwargs["block"] is False
+    assert "track" in call_kwargs["on_exit_shell"]
+    assert "_stop-detached" in call_kwargs["on_exit_shell"]
+    assert "grading" in call_kwargs["on_exit_shell"]
+@
+
+Closing a tracked tmux pane should stop the launched label names if they
+are active then, even if intervening commands stopped and restarted them.
+That matches the intended semantics that the window remains responsible
+for those labels by name rather than by original batch identity.
+
+<<test functions>>=
+def test_stop_detached_quiet_when_missing(temp_tracking_dir):
+    """Detached cleanup is a silent no-op when labels are inactive."""
+    result = runner.invoke(cli, ["_stop-detached", "A", "B"])
+    assert result.exit_code == 0
+    assert result.stdout == ""
+
+def test_stop_detached_stops_restarted_labels(temp_tracking_dir):
+    """Detached cleanup stops matching labels even after restart and switch."""
+    runner.invoke(cli, ["start", "A", "B", "C"])
+    runner.invoke(cli, ["stop", "--all"])
+    runner.invoke(cli, ["start"])
+    runner.invoke(cli, ["switch", "D", "E", "F"])
+    runner.invoke(cli, ["switch"])
+
+    result = runner.invoke(cli, ["_stop-detached", "A", "B", "C"])
+    assert result.exit_code == 0
+
+    session = load_active_session()
+    active = session.get_active_labels()
+    assert "A" not in active
+    assert "B" not in active
+    assert "C" not in active
+
+def test_stop_detached_only_stops_matching_active_labels(temp_tracking_dir):
+    """Detached cleanup stops only matching labels that are still active."""
+    runner.invoke(cli, ["start", "A", "B", "C"])
+    runner.invoke(cli, ["stop", "A", "C"])
+
+    result = runner.invoke(cli, ["_stop-detached", "A", "B", "C"])
+    assert result.exit_code == 0
+
+    session = load_active_session()
+    active = session.get_active_labels()
+    assert "B" not in active
+@
+
+The [[--timeout]] option only applies to direct subprocesses, not
+tmux panes.
+
+<<test functions>>=
+def test_start_timeout_requires_command(
+    temp_tracking_dir,
+):
+    """--timeout without --command is an error."""
+    result = runner.invoke(
+        cli,
+        ["start", "work", "--timeout", "5m"],
+    )
+    assert result.exit_code == 1
+    assert "--timeout requires" in result.stdout
+@
+
+Let's verify the timeout parser handles common formats:
+
+<<test functions>>=
+def test_parse_timeout_formats():
+    """parse_timeout accepts common duration formats."""
+    assert parse_timeout("30") == 30.0
+    assert parse_timeout("5m") == 300.0
+    assert parse_timeout("1.5h") == 5400.0
+    assert parse_timeout("2d") == 172800.0
+    assert parse_timeout("90s") == 90.0
 
 
 def test_parse_tmux_exit_status_signal():
