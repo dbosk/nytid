@@ -1844,6 +1844,31 @@ matters when a caller has filtered a candidate list down to nothing;
 the empty list means \enquote{I chose these specific labels and there
 are zero}, not \enquote{please stop the batch}.
 
+The todo wrapper needs one more operation: stop a specific label and,
+optionally, a few companion labels, but only if they are currently
+active and not protected by some higher-level policy.  Rather than let
+[[cli.todo]] open-code session mutation, we expose a second public
+helper here.  That keeps all on-disk tracking writes behind the same
+locking API and lets todo orchestration remain a thin wrapper around
+track semantics.
+
+The distinction from [[stop_tracking_labels]] is intentional.
+[[stop_tracking_labels]] models the user-facing [[track stop]] command:
+it treats \enquote{none of those labels are active} as an error unless
+the caller explicitly asks for silence.  The todo wrapper needs a softer
+variant.  Its job is to say \enquote{if [[todo:7]] is active, stop it
+now}; if that label is already
+gone, todo bookkeeping should still succeed.  By exposing that softer
+operation here, we keep the policy difference explicit without forcing
+[[cli.todo]] to reimplement locking, history updates, or session writes.
+
+The helper itself is deliberately narrow.  Callers provide the full set
+of candidate labels, and the helper filters that set against the active
+session under lock before stopping anything.  That makes wrapper code
+robust against small races and repeated cleanup paths: labels that are
+already gone are ignored, while labels that are still active are stopped
+and recorded through the normal tracking-history machinery.
+
 <<session management>>=
 def stop_tracking_labels(
     *,
@@ -1896,6 +1921,43 @@ def stop_tracking_labels(
             f"{', '.join(labels)}"
         )
     raise ValueError("No active tracking to stop")
+
+
+def stop_tracking_labels_if_active(
+    *,
+    who: str = None,
+    labels: List[str],
+    end_time: Optional[datetime.datetime] = None,
+):
+    """Stop the active subset of ``labels`` without erroring if absent."""
+    if end_time is None:
+        end_time = datetime.datetime.now()
+
+    active_labels = []
+
+    def update(session, history_entries):
+        to_stop = [
+            label for label in labels
+            if label in session.get_active_labels()
+        ]
+        if not to_stop:
+            return session, history_entries, []
+
+        completed_entries = session.stop_labels(
+            to_stop,
+            end_time,
+            who=who,
+        )
+        active_labels.extend(to_stop)
+        updated_entries = list(history_entries)
+        updated_entries.extend(completed_entries)
+        return session, updated_entries, completed_entries
+
+    session, _, completed_entries = mutate_worker_tracking_state(
+        update,
+        who,
+    )
+    return session, completed_entries, active_labels
 
 def update_switch_other_labels(
     labels: Optional[List[str]],
@@ -2026,6 +2088,10 @@ appear to belong to that label but the automatic shutdown path would leave the
 old session running.  We therefore require launch-bound labels to be inactive
 unless the user explicitly asks to replace them.
 
+Track and todo should also present launch context the same way.  We therefore
+compute one context string up front and reuse it for both [[PS1]] and tmux
+window names instead of letting each launch mode build its own variant.
+
 <<prepare launch mode>>=
 launch_requested = command is not None or pane or window
 tracking_labels = list(labels)
@@ -2035,6 +2101,7 @@ proc_env = None
 proc_cwd = os.getcwd()
 prompt_file = None
 prompt_dir = None
+launch_context = None
 window_name = None
 
 if block is None:
@@ -2088,16 +2155,23 @@ if launch_requested:
         command_text = command
         tracking_labels.append(command_args[0])
     else:
+        launch_context = build_context_name(
+            "track", tracking_labels
+        )
         command_args, prompt_file, prompt_dir = (
-            build_tracking_shell_command(
-                tracking_labels, proc_env
+            build_prompted_shell_command(
+                launch_context, proc_env,
             )
         )
 
+    launch_context = build_context_name(
+        "track", tracking_labels
+    )
+    if command is not None:
+        apply_context_prompt(launch_context, proc_env)
+
     if window:
-        window_name = join_tracking_labels(
-            tracking_labels
-        )
+        window_name = launch_context
 @
 
 When a launched command is recorded in history, we store the full command
@@ -3424,21 +3498,40 @@ def validate_tmux_options(
         raise ValueError(
             "Error: --pane/--window require an active tmux session"
         )
+@
 
 
-def join_tracking_labels(labels: List[str]) -> str:
-    """Return labels joined for prompts and tmux names."""
-    return " ".join(labels)
+Todo and track both describe shell context as a namespace plus the values
+that identify the current work.  The same rendered string appears in
+[[PS1]] and, for tmux windows, in the window name.  We therefore build
+that context string once and let both commands reuse it.
+
+<<helper functions>>=
+def join_context_values(values: List[str]) -> str:
+    """Return context values joined for prompts and tmux names."""
+    return " ".join(values)
 
 
-def build_tracking_prompt_prefix(
-    labels: List[str],
+def build_context_name(
+    prefix: str,
+    values: List[str],
 ) -> str:
-    """Return the prompt prefix for a tracked shell."""
-    label_text = join_tracking_labels(labels)
-    if label_text:
-        return f"track:{label_text}"
-    return "track"
+    """Return a prefixed context label for prompts and tmux names."""
+    value_text = join_context_values(values)
+    if value_text:
+        return f"{prefix}:{value_text}"
+    return prefix
+
+
+def apply_context_prompt(
+    context_name: str,
+    env: Dict[str, str],
+) -> None:
+    """Store a context marker in [[env]] for child shells."""
+    if "PS1" in env:
+        env["PS1"] = f"{context_name} {env['PS1']}"
+    else:
+        env["PS1"] = f"{context_name} \\w\\n$ "
 @
 
 
@@ -3480,23 +3573,9 @@ def build_prompted_shell_command(
         env["ZDOTDIR"] = prompt_dir
         return [shell], None, prompt_dir
 
-    if "PS1" in env:
-        env["PS1"] = f"{prefix} {env['PS1']}"
-    else:
-        env["PS1"] = f"{prefix} \\w\\n$ "
+    apply_context_prompt(prefix, env)
 
     return [shell], None, None
-
-
-def build_tracking_shell_command(
-    labels: List[str],
-    env: Dict[str, str],
-) -> tuple[List[str], Optional[str], Optional[str]]:
-    """Return a shell command with a prompt showing the labels."""
-    return build_prompted_shell_command(
-        build_tracking_prompt_prefix(labels),
-        env,
-    )
 @
 
 
@@ -3528,12 +3607,6 @@ def cleanup_prompted_shell_command(
             pass
 
 
-def cleanup_tracking_shell_command(
-    prompt_file: Optional[str],
-    prompt_dir: Optional[str],
-) -> None:
-    """Remove temporary prompt artifacts for tracked shells."""
-    cleanup_prompted_shell_command(prompt_file, prompt_dir)
 @
 
 
@@ -3979,7 +4052,7 @@ except FileNotFoundError:
     )
     exit_code = 127
 finally:
-    cleanup_tracking_shell_command(
+    cleanup_prompted_shell_command(
         prompt_file, prompt_dir
     )
 @
@@ -5847,7 +5920,7 @@ def test_start_pane_uses_tmux_shell_helper(
 def test_start_window_uses_labels_as_window_name(
     temp_tracking_dir,
 ):
-    """--window uses the effective labels as the tmux window name."""
+    """--window uses the shared context label in tmux metadata."""
     with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
         with patch(
             "nytid.cli.track.run_tmux_command",
@@ -5862,9 +5935,12 @@ def test_start_window_uses_labels_as_window_name(
     call_kwargs = mock_tmux.call_args[1]
     assert mock_tmux.call_args[0] == (["echo", "test"],)
     assert call_kwargs["cwd"] == os.getcwd()
-    assert call_kwargs["env"] == {"TMUX": "session"}
+    assert call_kwargs["env"] == {
+        "TMUX": "session",
+        "PS1": "track:work echo \\w\\n$ ",
+    }
     assert call_kwargs["window"] is True
-    assert call_kwargs["window_name"] == "work echo"
+    assert call_kwargs["window_name"] == "track:work echo"
     assert call_kwargs["block"] is False
 
 
