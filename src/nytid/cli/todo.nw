@@ -4538,8 +4538,7 @@ def stop_todo_tracking(todo_id, item, todos):
     try:
         from nytid.cli.track import (
             load_active_session,
-            save_active_session,
-            add_completed_entries,
+            stop_tracking_labels,
         )
 
         worker = item.who or default_username
@@ -4566,12 +4565,13 @@ def stop_todo_tracking(todo_id, item, todos):
             if l in session.get_active_labels()
             and l not in protected
         ]
-        entries = session.stop_labels(
-            labels_to_stop
+        _, entries = stop_tracking_labels(
+            who=worker,
+            labels=labels_to_stop,
+            quiet_if_missing=True,
         )
-        if entries:
-            add_completed_entries(entries)
-        save_active_session(session, worker)
+        if not entries:
+            return
         typer.echo(
             f"  Stopped tracking todo:{todo_id}"
         )
@@ -4977,7 +4977,7 @@ def next_cmd(
     ),
     pane: bool = PANE_OPTION,
     window: bool = WINDOW_OPTION,
-    block: bool = BLOCK_OPTION,
+    block: Optional[bool] = BLOCK_OPTION,
     run: Optional[str] = typer.Option(
         None, "--command", "-c",
         help="Override command to run",
@@ -5002,6 +5002,9 @@ def next_cmd(
 
     if target is None:
         raise typer.Exit(0)
+
+    if block is None:
+        block = not (pane or window)
 
     start(
         todo_id=target.id,
@@ -5124,8 +5127,8 @@ spawns a subprocess---the stored [[command]], a [[--command]] override, or
 [[$SHELL]]. This combines the patterns from launch-enabled
 [[track start]] (tracking bookends around a subprocess) and
 [[courses data]] shell (PS1 modification and [[wd]] control).
-When the subprocess exits, tracking stops and the user is prompted
-to mark the todo as done.
+When the subprocess exits, tracking stops and blocking launches ask
+whether the todo should be marked done.
 
 Without a [[wd]], the command behaves as before: it starts tracking
 without spawning anything.
@@ -5400,16 +5403,17 @@ running fully headless.  [[--pane]] keeps the task visible beside the
 current shell, while [[--window]] moves it to another tmux window in the
 same session.  Because both modes rely on tmux owning the terminal, they
 require [[TMUX]] to be set and cannot be combined with [[--headless]].
-By default todo launches still block so the caller can decide whether the
-task is done when the command exits.  [[--no-block]] switches to a fully
-detached tmux workflow: when the pane command exits, tracking stops and
-the todo resets to pending unless it was already marked done from inside
-the pane.
+By default tmux launches detach immediately so the caller can keep using
+other panes while the task remains tracked.  [[--block]] switches back to
+the interactive completion workflow: when the pane command exits,
+tracking stops and the user decides whether the task is done. Detached
+tmux runs still stop tracking automatically and reset the todo to
+pending unless it was already marked done from inside the pane.
 
 <<start command options>>=
 pane: bool = PANE_OPTION,
 window: bool = WINDOW_OPTION,
-block: bool = BLOCK_OPTION,
+block: Optional[bool] = BLOCK_OPTION,
 @
 
 We reject impossible combinations before building the subprocess command.
@@ -5442,6 +5446,8 @@ if (pane or window) and headless:
         err=True,
     )
     raise typer.Exit(1)
+if block is None:
+    block = not (pane or window)
 if block and not (pane or window):
     pass
 if not block and not (pane or window):
@@ -5452,27 +5458,26 @@ if not block and not (pane or window):
     raise typer.Exit(1)
 @
 
-We import and use the track module's session management directly
-rather than shelling out to the CLI. This is more reliable and avoids
-subprocess overhead.
+We import and use the track module's start/stop helpers directly rather
+than shelling out to the CLI. This keeps todo launches aligned with the
+same on-disk locking and persistence semantics as the track commands.
 
 <<start tracking via track module>>=
 try:
     from nytid.cli.track import (
-        load_active_session,
-        save_active_session,
+        start_tracking_labels,
     )
 
     worker = item.who or default_username
-    session = load_active_session(worker)
 
     track_labels = list(item.labels) + [
         f"todo:{todo_id}"
     ]
-    started = session.start_labels(
-        track_labels, datetime.datetime.now()
+    started, _, _ = start_tracking_labels(
+        track_labels,
+        start_time=datetime.datetime.now(),
+        who=worker,
     )
-    save_active_session(session, worker)
 
     if started:
         typer.echo(
@@ -5651,7 +5656,7 @@ of attaching it to the current terminal:
 
 <<test functions>>=
 def test_start_pane_calls_tmux_split(temp_todo_dir):
-    """--pane uses tmux split-window."""
+    """--pane uses tmux split-window in detached mode by default."""
     save_todos(2, [
         TodoItem(
             id=1, title="Review PR",
@@ -5669,22 +5674,24 @@ def test_start_pane_calls_tmux_split(temp_todo_dir):
                 cli, ["start", "1", "--pane"]
             )
     assert result.exit_code == 0
-    mock_run.assert_called_once_with(
-        ["make", "test"],
-        cwd="/tmp/project",
-        env={
-            "PS1": "todo:1 \\w\\n$ ",
-            "TMUX": "session",
-        },
-        window=False,
-        window_name=None,
-    )
+    mock_run.assert_called_once()
+    call_kwargs = mock_run.call_args.kwargs
+    assert mock_run.call_args.args == (["make", "test"],)
+    assert call_kwargs["cwd"] == "/tmp/project"
+    assert call_kwargs["env"] == {
+        "PS1": "todo:1 \\w\\n$ ",
+        "TMUX": "session",
+    }
+    assert call_kwargs["window"] is False
+    assert call_kwargs["window_name"] is None
+    assert call_kwargs["block"] is False
+    assert "_finalize-detached 1 --exit-code-file" in call_kwargs["on_exit_shell"]
 
 
 def test_start_window_calls_tmux_new_window(
     temp_todo_dir,
 ):
-    """--window uses tmux new-window."""
+    """--window uses tmux new-window in detached mode by default."""
     save_todos(2, [
         TodoItem(
             id=1, title="Review PR",
@@ -5702,16 +5709,18 @@ def test_start_window_calls_tmux_new_window(
                 cli, ["start", "1", "--window"]
             )
     assert result.exit_code == 0
-    mock_run.assert_called_once_with(
-        ["python", "-m", "pytest"],
-        cwd="/tmp/project",
-        env={
-            "PS1": "todo:1 \\w\\n$ ",
-            "TMUX": "session",
-        },
-        window=True,
-        window_name="todo:1",
-    )
+    mock_run.assert_called_once()
+    call_kwargs = mock_run.call_args.kwargs
+    assert mock_run.call_args.args == (["python", "-m", "pytest"],)
+    assert call_kwargs["cwd"] == "/tmp/project"
+    assert call_kwargs["env"] == {
+        "PS1": "todo:1 \\w\\n$ ",
+        "TMUX": "session",
+    }
+    assert call_kwargs["window"] is True
+    assert call_kwargs["window_name"] == "todo:1"
+    assert call_kwargs["block"] is False
+    assert "_finalize-detached 1 --exit-code-file" in call_kwargs["on_exit_shell"]
 
 
 def test_start_pane_without_tmux_fails(temp_todo_dir):
@@ -5856,7 +5865,7 @@ def test_start_window_block_runs_exit_handling(
                 return_value=True,
             ) as mock_confirm:
                 result = runner.invoke(
-                    cli, ["start", "1", "--window"]
+                    cli, ["start", "1", "--window", "--block"]
                 )
 
     assert result.exit_code == 0
@@ -5904,7 +5913,7 @@ def test_start_window_block_resets_pending_when_not_done(
                 return_value=False,
             ):
                 result = runner.invoke(
-                    cli, ["start", "1", "--window"]
+                    cli, ["start", "1", "--window", "--block"]
                 )
 
     assert result.exit_code == 0
@@ -6016,7 +6025,7 @@ def test_next_pane_forwards_to_start(temp_todo_dir):
     assert call_kwargs["todo_id"] == 2
     assert call_kwargs["pane"] is True
     assert call_kwargs["window"] is False
-    assert call_kwargs["block"] is True
+    assert call_kwargs["block"] is False
 
 
 def test_next_window_forwards_to_start(temp_todo_dir):
@@ -6042,7 +6051,7 @@ def test_next_window_forwards_to_start(temp_todo_dir):
     assert call_kwargs["todo_id"] == 2
     assert call_kwargs["pane"] is False
     assert call_kwargs["window"] is True
-    assert call_kwargs["block"] is True
+    assert call_kwargs["block"] is False
 
 
 def test_next_no_block_forwards_to_start(
