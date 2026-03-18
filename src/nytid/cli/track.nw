@@ -2079,8 +2079,8 @@ the discard and restart happen against fresh on-disk state rather than
 against this earlier snapshot.
 
 When [[start]] launches a command or tmux shell, it may need to derive one
-extra label from the command name, validate tmux usage, and prepare a shell
-prompt that makes the tracking context visible.
+extra label from the command name, validate tmux usage, and choose between
+the plain tmux shell path and the prompted direct-shell path.
 
 Launch mode also needs a clear ownership rule for labels.  If a label is already
 active and we launch a child process without [[--replace]], the command would
@@ -2089,8 +2089,10 @@ old session running.  We therefore require launch-bound labels to be inactive
 unless the user explicitly asks to replace them.
 
 Track and todo should also present launch context the same way.  We therefore
-compute one context string up front and reuse it for both [[PS1]] and tmux
-window names instead of letting each launch mode build its own variant.
+compute one context string up front and reuse it for tmux window names and
+as a best-effort [[PS1]] seed.  In tmux the user's [[~/.bashrc]] will
+likely overwrite [[PS1]] during normal startup, so the tmux window name is
+the primary context indicator for pane and window launches.
 
 <<prepare launch mode>>=
 launch_requested = command is not None or pane or window
@@ -2130,6 +2132,9 @@ if launch_requested:
         raise typer.Exit(1)
 
     proc_env = os.environ.copy()
+    launch_context = build_context_name(
+        "track", tracking_labels
+    )
 
     conflicting_launch_labels = [
         label for label in labels
@@ -2154,21 +2159,13 @@ if launch_requested:
             raise typer.Exit(1)
         command_text = command
         tracking_labels.append(command_args[0])
-    else:
         launch_context = build_context_name(
             "track", tracking_labels
         )
-        command_args, prompt_file, prompt_dir = (
-            build_prompted_shell_command(
-                launch_context, proc_env,
-            )
-        )
-
-    launch_context = build_context_name(
-        "track", tracking_labels
-    )
-    if command is not None:
         apply_context_prompt(launch_context, proc_env)
+    elif pane or window:
+        apply_context_prompt(launch_context, proc_env)
+        command_args = build_plain_shell_command(proc_env)
 
     if window:
         window_name = launch_context
@@ -2303,9 +2300,10 @@ Rather than keeping a separate subcommand for that workflow, we let
 With [[--command]], the command name becomes an additional implicit label.
 For example, [[nytid track start work --command mutt]] tracks both
 [[work]] and [[mutt]], and stores the full command string as the description
-so the history still records what was launched.  With [[--pane]] or [[--window]] but no
-command, [[start]] opens the user's default shell inside tmux and prefixes the
-prompt with the active labels.
+so the history still records what was launched.  With [[--pane]] or
+[[--window]] but no command, [[start]] opens the user's default shell
+inside tmux through the same plain-shell path as [[todo start]], so
+normal shell startup still runs.
 
 <<start command options>>=
 command: Optional[str] = typer.Option(
@@ -3535,11 +3533,28 @@ def apply_context_prompt(
 @
 
 
-The todo and track commands both need the same shell-startup trick: run
-the user's usual shell init files, then prepend a context marker to the
+Tmux shell launches need a different helper from direct interactive
+subprocesses.  In tmux we want the user's normal shell startup path so
+that [[~/.bashrc]], completion, and other interactive customisations load
+exactly as they do in an ordinary window.  Todo and track therefore
+share one helper that simply resolves the default shell command.
+
+<<helper functions>>=
+def build_plain_shell_command(
+    env: Dict[str, str],
+) -> List[str]:
+    """Return the plain shell command for interactive tmux launches."""
+    shell = env.get("SHELL") or os.environ.get(
+        "SHELL", "/bin/sh"
+    )
+    return [shell]
+@
+
+
+Direct interactive subprocesses still need one extra trick: run the
+user's usual shell init files, then prepend a context marker to the
 prompt without losing tab completion or other interactive setup.  We
-therefore factor the shell-specific startup logic into a shared helper
-that accepts only a prompt prefix.
+therefore keep a separate helper for the non-tmux case.
 
 <<helper functions>>=
 def build_prompted_shell_command(
@@ -4438,9 +4453,9 @@ requested (or fewer if the history is shorter).
 
 When the user wants to repair history, though, a bare timestamp line is
 not enough: they need a stable way to name one specific entry.  The
-optional [[--id]] flag prepends a short, unique prefix of each entry's
-[[content_hash()]], giving us Git-style identification without storing a
-separate persistent identifier.
+optional [[--id]] flag (which is actually default now) prepends a short, unique 
+prefix of each entry's [[content_hash()]], giving us Git-style identification 
+without storing a separate persistent identifier.
 
 <<ls command>>=
 @cli.command(name="ls")
@@ -4454,8 +4469,8 @@ def ls_entries(
         10, "--number", "-n",
         help="Number of entries to show"),
     show_id: bool = typer.Option(
-        False, "--id",
-        help="Show unique content-hash prefixes for entries"),
+        True, "--id/--no-id",
+        help="Remove column with content-hash prefixes for entries"),
     who: Optional[str] = typer.Option(
         None, "--who", "-w",
         help="Filter by worker "
@@ -5889,11 +5904,15 @@ def test_start_command_without_labels_uses_command_label(
     assert "tracking with labels: echo" in result.stdout
 
 
-def test_start_pane_uses_tmux_shell_helper(
+def test_start_pane_uses_plain_tmux_shell(
     temp_tracking_dir,
 ):
-    """--pane without command opens a tracked shell in detached tmux."""
-    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+    """--pane without command uses the shared plain tmux shell."""
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "SHELL": "/bin/bash"},
+        clear=True,
+    ):
         with patch(
             "nytid.cli.track.run_tmux_command",
             return_value=0,
@@ -5904,10 +5923,11 @@ def test_start_pane_uses_tmux_shell_helper(
             )
     assert result.exit_code == 0
     mock_tmux.assert_called_once()
-    call_kwargs = mock_tmux.call_args[1]
-    assert mock_tmux.call_args[0] == (["/bin/sh"],)
+    call_kwargs = mock_tmux.call_args.kwargs
+    assert mock_tmux.call_args.args == (["/bin/bash"],)
     assert call_kwargs["cwd"] == os.getcwd()
     assert call_kwargs["env"] == {
+        "SHELL": "/bin/bash",
         "TMUX": "session",
         "PS1": "track:work \\w\\n$ ",
     }
@@ -5915,6 +5935,38 @@ def test_start_pane_uses_tmux_shell_helper(
     assert call_kwargs["window_name"] is None
     assert call_kwargs["block"] is False
     assert "_stop-detached work" in call_kwargs["on_exit_shell"]
+
+
+def test_start_window_uses_plain_tmux_shell(
+    temp_tracking_dir,
+):
+    """--window without command keeps the shared plain shell path."""
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "SHELL": "/bin/bash"},
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.track.run_tmux_command",
+            return_value=0,
+        ) as mock_tmux:
+            result = runner.invoke(
+                cli,
+                ["start", "work", "--window"],
+            )
+    assert result.exit_code == 0
+    mock_tmux.assert_called_once()
+    call_kwargs = mock_tmux.call_args.kwargs
+    assert mock_tmux.call_args.args == (["/bin/bash"],)
+    assert call_kwargs["cwd"] == os.getcwd()
+    assert call_kwargs["env"] == {
+        "SHELL": "/bin/bash",
+        "TMUX": "session",
+        "PS1": "track:work \\w\\n$ ",
+    }
+    assert call_kwargs["window"] is True
+    assert call_kwargs["window_name"] == "track:work"
+    assert call_kwargs["block"] is False
 
 
 def test_start_window_uses_labels_as_window_name(
