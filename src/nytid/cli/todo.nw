@@ -2596,6 +2596,47 @@ def complete_todo_state(todo_id):
     return resolved_id, item, next_id, todos, stack
 @
 
+When all children of a parent become done, the parent is auto-completed.
+This runs as a separate locked mutation so that tracking labels can be
+stopped between the child completion and the parent status change.
+
+<<helpers>>=
+def auto_complete_parent(item, todos):
+    """Auto-complete the parent if all siblings are done.
+
+    Runs a second locked mutation so tracking labels
+    are stopped before the parent status changes.
+    """
+    if item.parent_id is None:
+        return
+    if not check_parent_completion(todos, item.parent_id):
+        return
+    parent_item = next(
+        (t for t in todos if t.id == item.parent_id),
+        None,
+    )
+    if parent_item is None or parent_item.status == "done":
+        return
+
+    stop_todo_tracking(parent_item.id, parent_item, todos)
+
+    def mark_parent(next_id, todos, stack):
+        parent = next(
+            (t for t in todos
+             if t.id == item.parent_id),
+            None,
+        )
+        if parent and parent.status != "done":
+            parent.status = "done"
+            typer.echo(
+                f"  Parent #{parent.id} "
+                f"auto-completed: {parent.title}"
+            )
+        return next_id, todos, stack
+
+    mutate_todo_state(mark_parent)
+@
+
 Listing issues and PRs returns summaries for bulk import. We
 include [[createdAt]] because the age-based priority heuristic
 in the [[import]] command needs timestamps to rank items:
@@ -5033,9 +5074,7 @@ def done(
 
     <<stop tracking if active>>
     <<close github issue>>
-    <<check parent auto-completion>>
-
-    save_todos(next_id, todos)
+    auto_complete_parent(item, todos)
 @
 
 Let's verify that [[done]] without an argument pops the stack
@@ -5159,17 +5198,13 @@ All three call sites delegate to [[stop_todo_tracking]]:
 stop_todo_tracking(todo_id, item, todos)
 @
 
-Let's verify that completing a child todo does not stop labels
-that the still-active parent needs.  The parent has labels
-[["DD1310"]] and [["teaching"]]; the child inherits them.
-After completing the child, only [[todo:2]] should be stopped
---- [["DD1310"]] and [["teaching"]] must remain active because
-the parent is still on the stack.
+Let's verify the auto-completion case.  When the parent has only one
+child, completing that child should first stop the child's tracking
+labels, then auto-complete the parent and stop the parent's labels too.
 
 <<test functions>>=
 def test_done_preserves_parent_labels(temp_todo_dir):
-    """Done on child must not stop labels shared
-    with still-active parent."""
+    """Done on only child stops child and parent labels."""
     from nytid.cli.track import (
         load_active_session,
         save_active_session,
@@ -5196,6 +5231,70 @@ def test_done_preserves_parent_labels(temp_todo_dir):
     save_active_stack([1, 2])
 
     # Simulate both todos being tracked
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "teaching", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["done"])
+    assert result.exit_code == 0
+    assert "Child" in result.output
+
+    session = load_active_session(worker)
+    active = session.get_active_labels()
+    assert "todo:1" not in active
+    assert "DD1310" not in active
+    assert "teaching" not in active
+    assert "todo:2" not in active
+@
+
+The sibling case still needs the old protection behavior.  If another
+child remains pending, the parent is not auto-completed, so labels shared
+between the completed child and the parent must remain active.
+
+<<test functions>>=
+def test_done_preserves_parent_labels_with_pending_sibling(
+    temp_todo_dir,
+):
+    """Done on child preserves labels shared with active parent."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    worker = default_username
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310", "teaching"],
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310", "teaching"],
+        ),
+        TodoItem(
+            id=3, title="Sibling task",
+            created="2026-02-20T10:00:00",
+            status="pending",
+            parent_id=1,
+            labels=["DD1310", "teaching"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
     session = ActiveSession()
     session.start_labels(
         ["DD1310", "teaching", "todo:1"],
@@ -5251,21 +5350,6 @@ if item.github:
             f"GitHub {item_type}: {e}",
             err=True,
         )
-@
-
-<<check parent auto-completion>>=
-if item.parent_id is not None:
-    if check_parent_completion(todos, item.parent_id):
-        parent_item = next(
-            (t for t in todos if t.id == item.parent_id),
-            None,
-        )
-        if parent_item and parent_item.status != "done":
-            parent_item.status = "done"
-            typer.echo(
-                f"  Parent #{parent_item.id} "
-                f"auto-completed: {parent_item.title}"
-            )
 @
 
 Let's verify that completing a GitHub-linked todo also closes the
@@ -6864,11 +6948,12 @@ elif typer.confirm(
     f"Mark todo #{todo_id} as done?"
 ):
     item.status = "done"
-    <<check parent auto-completion>>
 else:
     item.status = "pending"
 
 save_todos(next_id, todos)
+if item.status == "done":
+    auto_complete_parent(item, todos)
 @
 
 The exit code and captured output form a diagnostic record---the
