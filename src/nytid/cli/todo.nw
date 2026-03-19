@@ -2983,6 +2983,27 @@ description: Annotated[Optional[str],
                        description_opt] = "",
 @
 
+Most of the time we infer priority interactively by comparing the new
+item with its siblings. Sometimes, however, the caller already knows the
+numeric value or simply wants to add the item after the current lowest-
+priority sibling. The [[--prio]] option handles the former case, while
+[[--append]] keeps the latter non-interactive:
+
+<<argument and option definitions>>=
+prio_opt = typer.Option(
+    "--prio",
+    help="Set explicit priority")
+append_opt = typer.Option(
+    "--append",
+    help="Append after lowest-priority sibling")
+@
+
+<<add command options>>=
+explicit_priority: Annotated[Optional[float],
+                             prio_opt] = None,
+append: Annotated[bool, append_opt] = False,
+@
+
 Like the UNIX [[at]] command, we can capture the current working
 directory and environment at creation time. The [[--here]] flag is a
 convenient shorthand that captures both [[os.getcwd()]] and
@@ -3090,11 +3111,13 @@ who: Annotated[Optional[str],
                who_opt] = default_username,
 @
 
-Now the implementation. We first resolve the parent ID, then run the
-binary search among siblings, and finally save.
+Now the implementation. We first reject contradictory flags, then
+resolve the parent ID, determine the priority, and finally save.
 
 <<add command implementation>>=
 next_id, todos = load_todos()
+
+<<validate add options>>
 
 if edit_mode:
     <<add via editor>>
@@ -3102,8 +3125,25 @@ else:
     <<add via cli flags>>
 @
 
-The CLI-flag path is the original flow: resolve parent, run binary
-search, create a single item.
+Some combinations would give contradictory instructions. In
+particular, [[--prio]] says 
+\enquote{use exactly this numeric value} while
+[[--append]] says 
+\enquote{derive a value by placing the item after its
+siblings}. Rather than silently picking one interpretation, we reject
+the combination and ask the user to choose:
+
+<<validate add options>>=
+if explicit_priority is not None and append:
+    typer.echo(
+        "Error: --prio and --append cannot be used together",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+The CLI-flag path is the original flow: resolve parent, determine the
+priority, create a single item.
 
 <<add via cli flags>>=
 if not title:
@@ -3113,9 +3153,10 @@ if not title:
         err=True,
     )
     raise typer.Exit(1)
+priority_title = title
 <<resolve parent id>>
 <<inherit from parent>>
-<<run binary search for priority>>
+<<resolve priority for new todo>>
 <<create and save new todo>>
 @
 
@@ -3157,20 +3198,51 @@ if resolved_parent is not None:
         inherited_deadline = parent_item.deadline
 @
 
-<<run binary search for priority>>=
+Priority selection has three modes. [[--prio]] bypasses all inference.
+[[--append]] keeps the operation non-interactive by placing the item at
+the bottom of the current sibling list. Otherwise we fall back to the
+interactive binary search, which remains the default because it
+preserves the existing 
+\enquote{compare against nearby tasks} workflow:
+
+<<resolve priority for new todo>>=
 # Build a temporary item to find siblings
 temp = TodoItem(
-    id=0, title=title, parent_id=resolved_parent
+    id=0,
+    title=priority_title,
+    parent_id=resolved_parent,
 )
 siblings = get_active_siblings(todos, temp)
 parent_ctx = (
     parent_item if resolved_parent is not None
     else None
 )
-priority = binary_search_priority(
-    siblings, title,
-    parent=parent_ctx, todos=todos,
-)
+if explicit_priority is not None:
+    priority = explicit_priority
+elif append:
+    sorted_items = sorted(
+        siblings,
+        key=effective_priority,
+        reverse=True,
+    )
+    if sorted_items:
+        priority = assign_priority_at_position(
+            sorted_items,
+            len(sorted_items),
+        )
+    elif parent_ctx is not None:
+        high, low = compute_child_priority_range(
+            todos, parent_ctx
+        )
+        priority = (high + low) / 2.0
+    else:
+        priority = 1.0
+else:
+    priority = binary_search_priority(
+        siblings,
+        priority_title,
+        parent=parent_ctx, todos=todos,
+    )
 @
 
 When [[--here]] is used, we capture the current working directory and
@@ -3257,9 +3329,10 @@ if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
-<<run binary search for priority>>
+<<resolve priority for new todo>>
 <<create parent from parsed>>
 <<create children from parsed>>
 save_todos(next_id, todos)
@@ -8593,6 +8666,109 @@ def test_add_and_ls(temp_todo_dir):
     result = runner.invoke(cli, ["ls"])
     assert result.exit_code == 0
     assert "Test task" in result.stdout
+
+
+def test_add_with_explicit_priority(temp_todo_dir):
+    """--prio stores the provided priority unchanged."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Explicit prio",
+            "--prio", "7.25",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].priority == 7.25
+
+
+def test_add_append_uses_bottom_priority(temp_todo_dir):
+    """--append adds after the lowest-priority sibling."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Higher",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Lower",
+            priority=3.0,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Appended",
+            "--append",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    appended = next(t for t in todos if t.id == 3)
+    assert appended.priority == 2.0
+
+
+def test_add_append_under_parent(temp_todo_dir):
+    """--append works for a parent's active children too."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child high",
+            parent_id=1,
+            priority=4.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Child low",
+            parent_id=1,
+            priority=3.0,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Child appended",
+            "--parent", "1",
+            "--append",
+        ],
+    )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    appended = next(t for t in todos if t.id == 4)
+    assert appended.parent_id == 1
+    assert appended.priority == 2.0
+
+
+def test_add_rejects_prio_with_append(temp_todo_dir):
+    """--prio and --append are mutually exclusive."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Conflicting",
+            "--prio", "5",
+            "--append",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert (
+        "--prio and --append cannot be used together"
+        in result.output
+    )
 
 
 def test_done_command(temp_todo_dir):
