@@ -1028,6 +1028,21 @@ Because flat storage simplifies JSON serialization, avoids recursive
 data structures, and lets commands like [[todo ls --flat]] work
 without flattening logic.
 
+Priority comparison uses siblings---items sharing the same parent.
+When multiple workers share a parent (say a course-level epic), each
+worker's priorities are independent: it makes no sense to ask
+\enquote{is your grading task more urgent than my lecture-prep task?}
+The optional [[who]] parameter on [[get_active_siblings]] restricts
+the comparison set to a single worker so that binary-search
+prioritisation stays meaningful.
+
+The active stack is global (all workers share one
+[[active_stack.json]]), but stack-based commands like [[stop]] and
+[[done]] should operate on the current worker's topmost item, not
+another worker's. [[filter_ids_by_worker]] narrows a list of todo IDs
+to those belonging to a given worker, treating [[who=None]] as
+[[default_username]] for backward compatibility with older items.
+
 <<sub-item helpers>>=
 def get_children(
     todos: List[TodoItem], parent_id: int
@@ -1052,16 +1067,47 @@ def get_siblings(
 
 
 def get_active_siblings(
-    todos: List[TodoItem], item: TodoItem
+    todos: List[TodoItem],
+    item: TodoItem,
+    who: Optional[str] = None,
 ) -> List[TodoItem]:
     """Get pending/in-progress siblings, sorted by
-    effective priority (highest first)."""
+    effective priority (highest first).
+
+    When ``who`` is given, only siblings assigned to
+    that worker are returned.
+    """
     siblings = get_siblings(todos, item)
     active = [
-        s for s in siblings if s.status != "done"
+        s
+        for s in siblings
+        if s.status != "done"
+        and (
+            who is None
+            or (s.who or default_username) == who
+        )
     ]
     active.sort(key=effective_priority, reverse=True)
     return active
+
+
+def filter_ids_by_worker(
+    todos: List[TodoItem],
+    ids: List[int],
+    who: str,
+) -> List[int]:
+    """Keep only todo IDs belonging to ``who``.
+
+    Treats items with ``who=None`` as belonging to
+    [[default_username]].
+    """
+    by_id = {t.id: t for t in todos}
+    return [
+        i
+        for i in ids
+        if i in by_id
+        and (by_id[i].who or default_username) == who
+    ]
 
 
 def check_parent_completion(
@@ -2445,17 +2491,33 @@ rendering the current hierarchy.  Third, state-changing wrappers for the
 common transitions activate, stop, and complete, so command bodies can
 state their intent directly.
 
+When no explicit ID is given, stack-based commands resolve to the top of
+the active stack.  Because the stack is global (shared across workers),
+[[resolve_todo_id]] accepts an optional [[who]] together with the full
+[[todos]] list and uses [[filter_ids_by_worker]] to narrow the stack to
+items belonging to that worker.  This prevents one worker's [[todo stop]]
+from accidentally targeting another worker's active item.
+
 <<helpers>>=
-def resolve_todo_id(todo_id, action):
+def resolve_todo_id(
+    todo_id, action, who=None, todos=None
+):
     """Return an explicit todo ID or the active stack top.
 
-    If ``todo_id`` is ``None``, use the top of the active stack.
-    Exits with an actionable error if no active todo exists.
+    If ``todo_id`` is ``None``, use the top of the active
+    stack.  When ``who`` and ``todos`` are given, only
+    consider stack entries belonging to that worker.
+    Exits with an actionable error if no active todo
+    exists.
     """
     if todo_id is not None:
         return todo_id
 
     stack = load_active_stack()
+    if who is not None and todos is not None:
+        stack = filter_ids_by_worker(
+            todos, stack, who
+        )
     if not stack:
         typer.echo(
             "No active todo. "
@@ -2535,11 +2597,14 @@ state that follows from it. This keeps the command bodies declarative:
 [[start]] activates, [[stop]] pauses, and [[done]] completes.
 
 <<helpers>>=
-def activate_todo_state(todo_id):
+def activate_todo_state(todo_id, who=None):
     """Push [[todo_id]] onto the authoritative active stack."""
 
     def update(next_id, todos, stack):
-        resolved_id = resolve_todo_id(todo_id, "start")
+        resolved_id = resolve_todo_id(
+            todo_id, "start",
+            who=who, todos=todos,
+        )
         item = next(
             (t for t in todos if t.id == resolved_id),
             None,
@@ -2558,18 +2623,23 @@ def activate_todo_state(todo_id):
     return resolved_id, item, next_id, todos, stack
 
 
-def stop_todo_state(todo_id):
+def stop_todo_state(todo_id, who=None):
     """Remove a todo from the authoritative active stack."""
 
     def update(next_id, todos, stack):
         if todo_id is None:
-            if not stack:
+            worker_stack = stack
+            if who is not None:
+                worker_stack = filter_ids_by_worker(
+                    todos, stack, who
+                )
+            if not worker_stack:
                 typer.echo(
                     "No active todo. Specify an ID to stop.",
                     err=True,
                 )
                 raise typer.Exit(1)
-            resolved_id = stack[-1]
+            resolved_id = worker_stack[-1]
         else:
             resolved_id = todo_id
         item = next(
@@ -2589,11 +2659,14 @@ def stop_todo_state(todo_id):
     return resolved_id, item, next_id, todos, stack
 
 
-def complete_todo_state(todo_id):
+def complete_todo_state(todo_id, who=None):
     """Mark a todo done and remove it from the active stack."""
 
     def update(next_id, todos, stack):
-        resolved_id = resolve_todo_id(todo_id, "mark done")
+        resolved_id = resolve_todo_id(
+            todo_id, "mark done",
+            who=who, todos=todos,
+        )
         item = next(
             (t for t in todos if t.id == resolved_id),
             None,
@@ -3207,7 +3280,9 @@ Priority selection has three modes. [[--prio]] bypasses all inference.
 the bottom of the current sibling list. Otherwise we fall back to the
 interactive binary search, which remains the default because it
 preserves the existing 
-\enquote{compare against nearby tasks} workflow.
+\enquote{compare against nearby tasks} workflow.  In all three modes
+the sibling set is scoped to the target worker ([[--who]]) so that
+priorities stay meaningful within one person's task list.
 
 The append path works from stored base priorities, not
 [[effective_priority]].  Deadline boost is intentionally temporary; if we
@@ -3231,7 +3306,7 @@ temp = TodoItem(
     title=priority_title,
     parent_id=resolved_parent,
 )
-siblings = get_active_siblings(todos, temp)
+siblings = get_active_siblings(todos, temp, who=who)
 parent_ctx = (
     parent_item if resolved_parent is not None
     else None
@@ -4333,7 +4408,10 @@ def view(
     """
     _, todos = load_todos()
 
-    todo_id = resolve_todo_id(todo_id, "view")
+    todo_id = resolve_todo_id(
+        todo_id, "view",
+        who=default_username, todos=todos,
+    )
 
     item = next(
         (t for t in todos if t.id == todo_id), None
@@ -4587,7 +4665,10 @@ def edit(
     (top of the active stack).
     """
     next_id, todos = load_todos()
-    todo_id = resolve_todo_id(todo_id, "edit")
+    todo_id = resolve_todo_id(
+        todo_id, "edit",
+        who=default_username, todos=todos,
+    )
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
@@ -5037,7 +5118,9 @@ def test_edit_without_id_requires_active_todo(
 
 When priorities shift, a todo may need repositioning among its
 siblings. This reruns the same binary search algorithm used during
-[[add]], but for an existing item.
+[[add]], but for an existing item.  The comparison set is limited to
+siblings belonging to the same worker, because cross-worker priority
+comparisons are not meaningful.
 
 Like the other single-item commands, an explicit ID overrides the
 active stack, while omitting the ID means \enquote{reprioritize the task
@@ -5057,7 +5140,10 @@ def reprioritize(
     Alias: reprio
     """
     next_id, todos = load_todos()
-    todo_id = resolve_todo_id(todo_id, "reprioritize")
+    todo_id = resolve_todo_id(
+        todo_id, "reprioritize",
+        who=default_username, todos=todos,
+    )
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
@@ -5068,7 +5154,10 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
-    siblings = get_active_siblings(todos, item)
+    siblings = get_active_siblings(
+        todos, item,
+        who=item.who or default_username,
+    )
     new_priority = binary_search_priority(
         siblings, item.title
     )
@@ -5146,6 +5235,69 @@ def test_reprioritize_without_id_requires_active_todo(
     )
 @
 
+When a parent has children assigned to different workers, reprioritising
+should only compare against siblings from the same worker.  Otherwise the
+binary search would ask the user to compare unrelated tasks.
+
+<<test functions>>=
+def test_reprioritize_ignores_other_workers_siblings(
+    temp_todo_dir,
+):
+    """Reprioritize only compares same-worker siblings."""
+    from nytid.cli.todo import default_username
+
+    save_todos(5, [
+        TodoItem(
+            id=1, title="Epic",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="My task",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            who=default_username,
+        ),
+        TodoItem(
+            id=3, title="Other's task",
+            priority=3.0,
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            who="other-worker",
+        ),
+        TodoItem(
+            id=4, title="Another mine",
+            priority=7.0,
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            who=default_username,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    captured_siblings = {}
+
+    def mock_binary_search(siblings, title, **kw):
+        captured_siblings["items"] = [
+            s.title for s in siblings
+        ]
+        return 4.5
+
+    with patch(
+        "nytid.cli.todo.binary_search_priority",
+        side_effect=mock_binary_search,
+    ):
+        result = runner.invoke(
+            cli, ["reprioritize", "2"]
+        )
+
+    assert result.exit_code == 0
+    sibs = captured_siblings["items"]
+    assert "Another mine" in sibs
+    assert "Other's task" not in sibs
+@
+
 \subsection{The [[done]] Command}
 
 Marking a todo as done also stops any active tracking for that item.
@@ -5169,7 +5321,9 @@ def done(
     If no ID given, completes the most recently
     started task (top of the active stack).
     """
-    todo_id, item, next_id, todos, stack = complete_todo_state(todo_id)
+    todo_id, item, next_id, todos, stack = complete_todo_state(
+        todo_id, who=default_username
+    )
     typer.echo(f"Done: #{todo_id} {item.title}")
 
     <<stop tracking if active>>
@@ -5209,6 +5363,41 @@ def test_done_pops_stack(temp_todo_dir):
     assert load_active_stack() == [1]
 @
 
+When two workers share the global active stack, [[done]] without an
+explicit ID must complete the current worker's topmost item, not
+another worker's item that happens to sit higher on the stack.
+
+<<test functions>>=
+def test_done_resolves_own_worker_stack_top(
+    temp_todo_dir,
+):
+    """Done without ID targets the current worker's
+    topmost item, skipping other workers' entries."""
+    from nytid.cli.todo import default_username
+
+    save_todos(3, [
+        TodoItem(
+            id=1, title="My task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who=default_username,
+        ),
+        TodoItem(
+            id=2, title="Other's task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="other-worker",
+        ),
+    ])
+    # Other worker's item is on top of the stack
+    save_active_stack([1, 2])
+
+    result = runner.invoke(cli, ["done"])
+    assert result.exit_code == 0
+    assert "My task" in result.output
+    assert "Other's task" not in result.output
+@
+
 Subitems inherit their parent's labels, so a child todo
 typically shares labels like course codes with its parent.
 The tracking session stores each label only once (dict-based),
@@ -5232,6 +5421,13 @@ shared with its parent.  These are the
 stopped, but also to some other todo that remains active.  For example,
 if a parent and child both carry [[DD1310]], completing the child should
 stop [[todo:child]] but leave [[DD1310]] running for the parent.
+
+Protection only considers items belonging to the \emph{same} worker.
+Each worker has an independent tracking session, so another worker's
+active todo cannot keep your labels alive---and should not prevent them
+from being stopped.  Without this restriction, a parent task owned by
+worker~A would shield labels from being stopped for worker~B, leaving
+B's tracking session with dangling open entries.
 
 The caller is responsible for managing the active-todo stack; this
 function only reads it to compute that protection set.  Once it has
@@ -5268,7 +5464,9 @@ def stop_todo_tracking(todo_id, item, todos):
                 (t for t in todos if t.id == sid),
                 None,
             )
-            if stacked:
+            if stacked and (
+                stacked.who or default_username
+            ) == worker:
                 protected.update(stacked.labels)
 
         labels_to_stop = [todo_label] + [
@@ -5418,6 +5616,65 @@ def test_done_preserves_parent_labels_with_pending_sibling(
     assert "todo:2" not in active
 @
 
+Cross-worker label protection must \emph{not} apply.  Each worker's
+tracking session is independent: if worker~A's parent is on the stack,
+completing worker~B's child must still stop B's labels---A's session is
+irrelevant to~B.
+
+<<test functions>>=
+def test_done_cross_worker_labels_not_protected(
+    temp_todo_dir,
+):
+    """Labels from another worker's task must not
+    shield the current worker's labels from stopping."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    other_worker = "other-worker"
+    worker = default_username
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent (other worker)",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310", "teaching"],
+            who=other_worker,
+        ),
+        TodoItem(
+            id=2, title="Child (me)",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310", "teaching"],
+            who=worker,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "teaching", "todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["done"])
+    assert result.exit_code == 0
+    assert "Child" in result.output
+
+    session = load_active_session(worker)
+    active = session.get_active_labels()
+    # Our labels must be stopped---the other worker's
+    # parent must not protect them.
+    assert "DD1310" not in active
+    assert "teaching" not in active
+    assert "todo:2" not in active
+@
+
 That delegation removes the need for a separate stale-label sweep here.
 If a todo wrapper decides that [[todo:N]] should stop, it should ask the
 track module to stop it explicitly and immediately.  Keeping a hidden
@@ -5519,7 +5776,10 @@ def rm(
     (top of the active stack).
     """
     next_id, todos = load_todos()
-    todo_id = resolve_todo_id(todo_id, "remove")
+    todo_id = resolve_todo_id(
+        todo_id, "remove",
+        who=default_username, todos=todos,
+    )
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
@@ -5935,7 +6195,9 @@ def start(
     If the todo has a working directory, spawns a
     shell or command in that directory with tracking.
     """
-    todo_id, item, next_id, todos, stack = activate_todo_state(todo_id)
+    todo_id, item, next_id, todos, stack = activate_todo_state(
+        todo_id, who=default_username
+    )
 
     <<start tracking via track module>>
 
@@ -7243,7 +7505,9 @@ def stop(
 
     If no ID given, stops the currently tracked todo.
     """
-    todo_id, item, next_id, todos, stack = stop_todo_state(todo_id)
+    todo_id, item, next_id, todos, stack = stop_todo_state(
+        todo_id, who=default_username
+    )
     <<stop tracking via track module>>
     typer.echo(f"Stopped: #{todo_id} {item.title}")
 @
@@ -7744,7 +8008,9 @@ for gh_item in new_items:
             title=gh_item["title"],
             parent_id=resolved_parent,
         )
-        active = get_active_siblings(todos, temp)
+        active = get_active_siblings(
+            todos, temp, who=who
+        )
         priority = binary_search_priority(
             active, gh_item["title"],
             parent=parent_item,
@@ -8402,7 +8668,10 @@ def note(
 ):
     """Add a note to a todo item."""
     next_id, todos = load_todos()
-    todo_id = resolve_todo_id(todo_id, "add a note")
+    todo_id = resolve_todo_id(
+        todo_id, "add a note",
+        who=default_username, todos=todos,
+    )
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
