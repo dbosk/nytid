@@ -3944,18 +3944,49 @@ def build_tmux_hook_command(
 
 When tmux splits a pane, the new pane inherits pane-scoped
 options---including our exit hooks.  Without a guard, closing
-\emph{any} pane in the window would stop tracking, even if the
-original tracked pane is still alive.  We wrap the hook command in
-[[if-shell -F]] so that it only fires when the dying pane's
-[[pane_id]] matches the one we recorded.
+\emph{any} descendant pane would stop tracking, even if the
+original tracked pane is still alive.
 
-The guard uses tmux's [[#{==:a,b}]] format comparison, which
-returns~[[1]] when the two arguments match.  In the Python source
-the braces are doubled ([[#{{==:...}}]]) to survive f-string
-interpolation; after interpolation the result for pane [[%42]]
-would be:
+The same inheritance bug affects [[new-window]]: creating a window
+with \texttt{\^{}b c} while focused on the tracked pane causes the
+new pane to inherit the exit hooks.  When that new window closes,
+tmux has already selected a new active window (typically the tracked
+one).  A format-string guard like [[#{==:#{pane_id},%42}]] fails
+here because [[#{pane_id}]] resolves to the \emph{currently active}
+pane---not the pane that triggered the event---so the guard
+passes and tracking stops.
+
+Instead of comparing pane IDs, we ask the semantically correct
+question: is the tracked pane still alive?  We use
+[[tmux display-message -t]] targeting the tracked pane; the command
+fails (non-zero exit) when the pane no longer exists.  With the
+leading~[[!]], the hook body only fires when the tracked pane is
+dead.
+
+This approach is correct across all exit paths:
+\begin{description}
+\item[Normal exit]  The wrapper script
+  ([[build_tmux_wait_wrapper]]) runs the [[on_exit_shell]]
+  \emph{before} the pane exits, so the wrapper handles cleanup.
+  When the pane subsequently dies and the hook fires, the tracked
+  pane is dead, so the guard lets the hook run---but
+  [[_stop-detached]] uses [[quiet_if_missing]], making the
+  duplicate invocation harmless.
+\item[Abnormal exit]  When the pane is killed (e.g.\@ via
+  [[kill-pane]]), the wrapper never executes its cleanup.  The
+  [[pane-exited]]/[[pane-died]] hooks fire, the tracked pane is
+  dead, and the guard lets the hook stop tracking.
+\item[Spurious firing]  When a \emph{different} pane exits (via
+  inheritance from [[split-window]] or the [[new-window]] bug),
+  the tracked pane is still alive, so
+  [[tmux display-message -t]] succeeds and the guard suppresses
+  the hook.
+\end{description}
+
+For pane [[%42]] the resulting hook is:
 \begin{quote}
-\small [[if-shell -F '#{==:#{pane_id},%42}' { run-shell '...' }]]
+\small [[if-shell '! tmux display-message -p -t %42 ""
+  2>/dev/null' { run-shell '...' }]]
 \end{quote}
 
 <<helper functions>>=
@@ -3965,14 +3996,17 @@ def install_tmux_exit_hooks(
 ) -> None:
     """Install pane exit hooks for a newly created pane.
 
-    The hook is wrapped in an ``if-shell -F`` guard so that
-    hooks inherited by split panes are no-ops.
+    The hook is wrapped in an ``if-shell`` guard that checks
+    whether the tracked pane still exists, so that hooks
+    inherited by split panes or (due to a tmux bug) by
+    new-window panes are no-ops.
     """
     if not hook_command:
         return
     guarded_command = (
-        "if-shell -F "
-        f"'#{{==:#{{pane_id}},{pane_id}}}' "
+        "if-shell "
+        f"'! tmux display-message -p -t {pane_id}"
+        f' "" 2>/dev/null\' '
         f"{{ {hook_command} }}"
     )
     for hook_name in ("pane-exited", "pane-died"):
@@ -4478,8 +4512,8 @@ hook that simply removes the state file.
 
 The hook runs as a second [[pane-exited]] handler.  Tmux 3.2+
 allows multiple hooks on the same event by appending with
-[[set-hook -a]].  The guard pattern is the same pane-ID comparison
-used by all other hooks.
+[[set-hook -a]].  The guard uses the same pane-existence check
+as the main exit hooks (see above).
 
 <<helper functions>>=
 def install_tmux_suspend_cleanup_hook(
@@ -4490,8 +4524,9 @@ def install_tmux_suspend_cleanup_hook(
     state_file = suspend_state_path(pane_id, who)
     cleanup_cmd = f"rm -f {shlex.quote(str(state_file))}"
     guarded = (
-        "if-shell -F "
-        f"'#{{==:#{{pane_id}},{pane_id}}}' "
+        "if-shell "
+        f"'! tmux display-message -p -t {pane_id}"
+        f' "" 2>/dev/null\' '
         f"{{ run-shell {shlex.quote(cleanup_cmd)} }}"
     )
     for hook_name in ("pane-exited", "pane-died"):
@@ -7215,8 +7250,9 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
     assert "tmux wait-for -S done-chan" in hook
 
 def test_install_tmux_exit_hooks_guards_pane_id():
-    """Hooks include if-shell guard to prevent
-    inherited hooks from firing on wrong pane."""
+    """Hooks use pane-existence guard to prevent
+    inherited hooks from firing while tracked pane
+    is alive."""
     with patch("subprocess.run") as mock_run:
         hook_cmd = "run-shell 'echo done'"
         install_tmux_exit_hooks("%42", hook_cmd)
@@ -7224,7 +7260,8 @@ def test_install_tmux_exit_hooks_guards_pane_id():
         for call in mock_run.call_args_list:
             cmd = call[0][0]
             hook_value = cmd[-1]
-            assert "if-shell -F" in hook_value
+            assert "if-shell" in hook_value
+            assert "display-message" in hook_value
             assert "%42" in hook_value
             assert hook_cmd in hook_value
 
