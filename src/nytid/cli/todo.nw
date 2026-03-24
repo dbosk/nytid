@@ -40,6 +40,14 @@ siblings, and can be started/stopped independently via the track
 system. When all children of a parent are done, the parent is
 automatically marked done.
 
+Starting a child automatically activates the entire ancestor chain:
+if you [[todo start 7]] and item~7 is a sub-item of~5, which in turn
+is a sub-item of~3, both~3 and~5 are pushed onto the active stack and
+their labels begin tracking.  Conversely, stopping a parent
+automatically stops all active descendants.  Completing a parent with
+active children requires [[--force]], which recursively marks all
+descendants as done.
+
 \subsection{Track Integration}
 
 Rather than building a separate time-tracking mechanism, [[todo start]]
@@ -2762,6 +2770,192 @@ def auto_complete_parent(item, todos):
     mutate_todo_state(mark_parent)
 @
 
+\subsubsection{Auto-activating Ancestors}
+
+The converse of auto-completing a parent is auto-activating one.  When a
+user starts a child directly ([[todo start 7]] where~7 is a sub-item of
+parent~5), the parent should already be on the active stack---otherwise
+the hierarchy reported by [[todo status]] would be incomplete, and
+tracking would miss the parent's labels entirely.
+
+Rather than requiring the user to manually start every ancestor first, we
+walk up the [[parent_id]] chain and activate any ancestor that is not
+already on the stack.  We collect ancestors from the child upward, then
+reverse the list so that the outermost ancestor is pushed first, giving
+the stack the correct root-to-leaf order.
+
+Each activated ancestor also gets its labels tracked.  Without this, the
+parent would appear in the hierarchy but accumulate no time---defeating
+the purpose of nested tracking.  We reuse the same
+[[start_tracking_labels]] path that [[<<start tracking via track module>>]]
+uses for the explicitly started item.
+
+<<helpers>>=
+def ensure_ancestors_active(item, todos, stack):
+    """Activate and track all ancestors of ``item``.
+
+    Walks up the parent chain and, for each ancestor
+    not already on the active stack, pushes it onto
+    the stack and starts tracking its labels.
+
+    Returns the list of ancestor items that were
+    newly activated (outermost first).
+    """
+    by_id = {t.id: t for t in todos}
+    missing = []
+    current = item
+    while current.parent_id is not None:
+        parent = by_id.get(current.parent_id)
+        if parent is None:
+            break
+        if parent.id not in stack:
+            missing.append(parent)
+        current = parent
+
+    if not missing:
+        return []
+
+    missing.reverse()
+
+    def push_ancestors(next_id, todos, stack):
+        for ancestor in missing:
+            if ancestor.id not in stack:
+                idx = stack.index(item.id) \
+                    if item.id in stack else len(stack)
+                stack.insert(idx, ancestor.id)
+        return next_id, todos, stack
+
+    mutate_todo_state(push_ancestors)
+
+    try:
+        from nytid.cli.track import (
+            start_tracking_labels,
+        )
+        worker = item.who or default_username
+        for ancestor in missing:
+            labels = list(ancestor.labels) + [
+                f"todo:{ancestor.id}"
+            ]
+            started, _, _ = start_tracking_labels(
+                labels,
+                start_time=datetime.datetime.now(),
+                who=worker,
+            )
+            typer.echo(
+                f"  Auto-started parent: "
+                f"#{ancestor.id} {ancestor.title}"
+            )
+            if started:
+                typer.echo(
+                    f"  Tracking: "
+                    f"{', '.join(sorted(started))}"
+                )
+    except ImportError:
+        pass
+
+    return missing
+@
+
+Let's verify that starting a child auto-activates its parent:
+
+<<test functions>>=
+def test_start_child_auto_activates_parent(
+    temp_todo_dir,
+):
+    """Starting a child pushes its parent onto the stack
+    and starts tracking the parent's labels."""
+    from nytid.cli.track import (
+        load_active_session,
+        default_username,
+    )
+
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            labels=["DD1310"],
+        ),
+    ])
+
+    result = runner.invoke(cli, ["start", "2"])
+    assert result.exit_code == 0
+    assert "Auto-started parent" in result.output
+    assert "#1 Parent" in result.output
+
+    stack = load_active_stack()
+    assert stack == [1, 2]
+
+    session = load_active_session(default_username)
+    active = session.get_active_labels()
+    assert "todo:1" in active
+    assert "todo:2" in active
+    assert "DD1310" in active
+
+
+def test_start_grandchild_auto_activates_chain(
+    temp_todo_dir,
+):
+    """Starting a grandchild activates parent and grandparent."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Grandparent",
+            created="2026-02-20T10:00:00",
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=2, title="Parent",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=3, title="Grandchild",
+            created="2026-02-20T10:00:00",
+            parent_id=2,
+            labels=["DD1310"],
+        ),
+    ])
+
+    result = runner.invoke(cli, ["start", "3"])
+    assert result.exit_code == 0
+
+    stack = load_active_stack()
+    assert stack == [1, 2, 3]
+
+
+def test_start_child_skips_already_active_parent(
+    temp_todo_dir,
+):
+    """If the parent is already on the stack, don't
+    duplicate it."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+        ),
+    ])
+    save_active_stack([1])
+
+    result = runner.invoke(cli, ["start", "2"])
+    assert result.exit_code == 0
+    assert "Auto-started parent" not in result.output
+
+    stack = load_active_stack()
+    assert stack == [1, 2]
+@
+
 Listing issues and PRs returns summaries for bulk import. We
 include [[createdAt]] because the age-based priority heuristic
 in the [[import]] command needs timestamps to rank items:
@@ -5439,17 +5633,36 @@ most recently started task.  This enables a natural nested workflow:
 [[todo done]] (pops~5).  When an explicit ID is given, that ID is
 removed from wherever it appears in the stack.
 
+If the item has active descendants (children or deeper) on the stack,
+[[done]] refuses by default---completing a parent while children are
+still being worked on is almost always a mistake.  The [[--force]]
+flag overrides this guard: it recursively marks all active descendants
+as done, stops their tracking, and then completes the parent.
+
+<<argument and option definitions>>=
+force_opt = typer.Option(
+    "--force", "-f",
+    help="Force-complete even if children are "
+         "still active (marks them done too)")
+@
+
 <<done command>>=
 @cli.command()
 def done(
     todo_id: Annotated[Optional[int],
                        todo_id_arg] = None,
+    force: Annotated[bool, force_opt] = False,
 ):
     """Mark a todo item as done.
 
     If no ID given, completes the most recently
     started task (top of the active stack).
+
+    Refuses if the item has active children unless
+    --force is used, which also marks all descendants
+    as done.
     """
+    <<guard active descendants>>
     todo_id, item, next_id, todos, stack = complete_todo_state(
         todo_id, who=default_username
     )
@@ -5525,6 +5738,99 @@ def test_done_resolves_own_worker_stack_top(
     assert result.exit_code == 0
     assert "My task" in result.output
     assert "Other's task" not in result.output
+@
+
+The [[--force]] guard prevents accidental completion of a parent whose
+children are still active.  Without [[--force]], the user gets a clear
+error listing the blocking children.  With [[--force]], all descendants
+are completed recursively before the parent.
+
+<<test functions>>=
+def test_done_refuses_parent_with_active_children(
+    temp_todo_dir,
+):
+    """Done on a parent with active children errors
+    without --force."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    result = runner.invoke(cli, ["done", "1"])
+    assert result.exit_code == 1
+    assert "active descendants" in result.output
+
+
+def test_done_force_completes_descendants(
+    temp_todo_dir,
+):
+    """Done --force marks all active descendants done."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+        ),
+        TodoItem(
+            id=3, title="Grandchild",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=2,
+        ),
+    ])
+    save_active_stack([1, 2, 3])
+
+    result = runner.invoke(
+        cli, ["done", "1", "--force"]
+    )
+    assert result.exit_code == 0
+    assert "Force-completed" in result.output
+
+    _, todos = load_todos()
+    for t in todos:
+        assert t.status == "done"
+    assert load_active_stack() == []
+
+
+def test_done_without_force_on_leaf_works(
+    temp_todo_dir,
+):
+    """Done without --force on a leaf item (no active
+    children) works normally."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Child (leaf)",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    result = runner.invoke(cli, ["done", "2"])
+    assert result.exit_code == 0
+    assert "Child (leaf)" in result.output
 @
 
 Subitems inherit their parent's labels, so a child todo
@@ -5802,6 +6108,312 @@ def test_done_cross_worker_labels_not_protected(
     assert "DD1310" not in active
     assert "teaching" not in active
     assert "todo:2" not in active
+@
+
+\subsubsection{Auto-stopping Descendants}
+
+When a parent is stopped, any active descendants should be stopped as
+well.  A child left running while its parent is off the stack would be an
+orphan---[[todo status]] would show a broken hierarchy, and the child's
+labels would be tracked without the parent's context.
+
+The inverse of [[ensure_ancestors_active]]: we walk \emph{down} the tree,
+depth-first, collecting every active descendant.  Depth-first order means
+a grandchild appears before its parent, matching the natural LIFO unwind.
+
+Both stopping and force-completing need the same traversal, so we start
+with a pure-read helper that returns the list of active descendant IDs
+without mutating anything.
+
+<<helpers>>=
+def get_active_descendant_ids(todo_id, todos):
+    """Return IDs of all descendants on the active stack.
+
+    Pure read---no mutations.  Depth-first order
+    (deepest descendants first).
+    """
+    stack = load_active_stack()
+    found = []
+
+    def collect(parent_id):
+        children = get_children(todos, parent_id)
+        for child in children:
+            collect(child.id)
+            if child.id in stack:
+                found.append(child.id)
+
+    collect(todo_id)
+    return found
+@
+
+[[stop_active_descendants]] builds on that traversal: for each active
+descendant it stops tracking, then removes all of them from the stack
+in a single mutation.
+
+<<helpers>>=
+def stop_active_descendants(todo_id, todos):
+    """Stop tracking and deactivate all descendants.
+
+    Recursively walks children of ``todo_id``,
+    stopping tracking and removing each active
+    descendant from the stack.  Returns the list of
+    IDs that were deactivated.
+    """
+    stopped_ids = get_active_descendant_ids(
+        todo_id, todos
+    )
+
+    if not stopped_ids:
+        return []
+
+    by_id = {t.id: t for t in todos}
+    for cid in stopped_ids:
+        child_item = by_id.get(cid)
+        if child_item is not None:
+            stop_todo_tracking(cid, child_item, todos)
+            typer.echo(
+                f"  Auto-stopped child: "
+                f"#{cid} {child_item.title}"
+            )
+
+    def remove_from_stack(next_id, todos, stack):
+        stack = [
+            sid for sid in stack
+            if sid not in stopped_ids
+        ]
+        return next_id, todos, stack
+
+    mutate_todo_state(remove_from_stack)
+    return stopped_ids
+@
+
+The [[done]] command also needs the traversal, but its response differs:
+rather than stopping tracking, it marks each descendant as done.
+[[force_complete_descendants]] handles the [[--force]] path.
+
+<<helpers>>=
+def force_complete_descendants(
+    todo_id, todos
+):
+    """Mark all active descendants as done.
+
+    For each active descendant (depth-first): stop
+    tracking, mark done, and remove from the stack.
+    """
+    desc_ids = get_active_descendant_ids(
+        todo_id, todos
+    )
+    if not desc_ids:
+        return
+
+    by_id = {t.id: t for t in todos}
+    for cid in desc_ids:
+        child_item = by_id.get(cid)
+        if child_item is not None:
+            stop_todo_tracking(
+                cid, child_item, todos
+            )
+
+    def mark_done(next_id, todos, stack):
+        for cid in desc_ids:
+            child = next(
+                (t for t in todos if t.id == cid),
+                None,
+            )
+            if child and child.status != "done":
+                child.status = "done"
+                typer.echo(
+                    f"  Force-completed: "
+                    f"#{child.id} {child.title}"
+                )
+        stack = [
+            sid for sid in stack
+            if sid not in desc_ids
+        ]
+        return next_id, todos, stack
+
+    mutate_todo_state(mark_done)
+@
+
+The guard chunk checks for active descendants before completing.  Without
+[[--force]], it lists the offending children and exits.  With [[--force]],
+it completes them all recursively before proceeding with the parent.
+
+The guard must resolve the target ID first so it knows which item to
+check.  We use [[resolve_todo_id]] for that, which reads the active
+stack but does not mutate it.
+
+<<guard active descendants>>=
+_, preflight_todos = load_todos()
+resolved_id = resolve_todo_id(
+    todo_id, "mark done",
+    who=default_username,
+    todos=preflight_todos,
+)
+desc_ids = get_active_descendant_ids(
+    resolved_id, preflight_todos
+)
+if desc_ids and not force:
+    by_id = {t.id: t for t in preflight_todos}
+    typer.echo(
+        f"Error: todo #{resolved_id} has active "
+        f"descendants:",
+        err=True,
+    )
+    for cid in desc_ids:
+        child = by_id.get(cid)
+        if child:
+            typer.echo(
+                f"  #{child.id} {child.title}",
+                err=True,
+            )
+    typer.echo(
+        "Use --force to mark all descendants "
+        "as done.",
+        err=True,
+    )
+    raise typer.Exit(1)
+if desc_ids and force:
+    force_complete_descendants(
+        resolved_id, preflight_todos
+    )
+@
+
+Let's verify that stopping a parent auto-stops its active child:
+
+<<test functions>>=
+def test_stop_parent_auto_stops_child(temp_todo_dir):
+    """Stopping a parent also stops its active child."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    worker = default_username
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=2, title="Child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["stop", "1"])
+    assert result.exit_code == 0
+    assert "Auto-stopped child" in result.output
+
+    stack = load_active_stack()
+    assert 1 not in stack
+    assert 2 not in stack
+
+    session = load_active_session(worker)
+    active = session.get_active_labels()
+    assert "todo:1" not in active
+    assert "todo:2" not in active
+
+
+def test_stop_grandparent_auto_stops_chain(
+    temp_todo_dir,
+):
+    """Stopping a grandparent stops child and grandchild."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    worker = default_username
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Grandparent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=2, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310"],
+        ),
+        TodoItem(
+            id=3, title="Child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=2,
+            labels=["DD1310"],
+        ),
+    ])
+    save_active_stack([1, 2, 3])
+
+    session = ActiveSession()
+    session.start_labels(
+        ["DD1310", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    session.start_labels(
+        ["todo:3"],
+        datetime.datetime(2026, 2, 20, 10, 10),
+    )
+    save_active_session(session, worker)
+
+    result = runner.invoke(cli, ["stop", "1"])
+    assert result.exit_code == 0
+
+    stack = load_active_stack()
+    assert stack == []
+
+
+def test_stop_parent_ignores_inactive_children(
+    temp_todo_dir,
+):
+    """Stopping a parent doesn't affect children not on
+    the stack."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Inactive child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+        ),
+    ])
+    save_active_stack([1])
+
+    result = runner.invoke(cli, ["stop", "1"])
+    assert result.exit_code == 0
+    assert "Auto-stopped child" not in result.output
 @
 
 That delegation removes the need for a separate stale-label sweep here.
@@ -6328,6 +6940,7 @@ def start(
         todo_id, who=default_username
     )
 
+    <<auto-activate ancestors>>
     <<start tracking via track module>>
 
     typer.echo(
@@ -6636,6 +7249,15 @@ if not block and not (pane or window):
 We import and use the track module's start/stop helpers directly rather
 than shelling out to the CLI. This keeps todo launches aligned with the
 same on-disk locking and persistence semantics as the track commands.
+
+Before we start tracking the explicitly requested todo, we ensure that
+all its ancestors are already active and tracked.  This way, starting
+a sub-item \enquote{just works} without requiring the user to manually
+start each ancestor first.
+
+<<auto-activate ancestors>>=
+ensure_ancestors_active(item, todos, stack)
+@
 
 <<start tracking via track module>>=
 try:
@@ -7633,16 +8255,27 @@ def stop(
     """Stop tracking time for a todo item.
 
     If no ID given, stops the currently tracked todo.
+    Also stops any active descendants.
     """
     todo_id, item, next_id, todos, stack = stop_todo_state(
         todo_id, who=default_username
     )
     <<stop tracking via track module>>
+    <<auto-stop descendants>>
     typer.echo(f"Stopped: #{todo_id} {item.title}")
 @
 
 <<stop tracking via track module>>=
 stop_todo_tracking(todo_id, item, todos)
+@
+
+After the stopped item's own tracking is handled, we stop any active
+descendants.  This must run after [[stop_todo_tracking]] so that the
+parent's labels are already resolved before we start unwinding children,
+which may share some of those labels.
+
+<<auto-stop descendants>>=
+stop_active_descendants(todo_id, todos)
 @
 
 Let's verify that the [[stop]] command also protects shared labels.
