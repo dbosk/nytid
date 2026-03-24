@@ -203,6 +203,7 @@ cli = typer.Typer(
 @
 
 \section{Configuration Management}
+\label{track:configuration}
 
 The track system uses nytid's configuration system (via typerconf) to store user
 preferences and data locations, making it configurable and consistent with other
@@ -217,6 +218,16 @@ The track system supports the following configuration options:
   in statistics. Defaults to 40.0 hours if not configured.
 \item[[[track.daily_limit]]] Default daily hour limit for warnings
   in statistics. Defaults to 8.0 hours if not configured.
+\item[[[track.auto-suspend.default]]] Whether to automatically
+  suspend tracking when a tmux pane loses focus and resume when it
+  regains focus.  Defaults to \enquote{true}.  Can be overridden
+  per launch with [[--auto-suspend]]/[[--no-auto-suspend]].
+  Requires tmux [[focus-events]] to be on.
+\item[[[track.auto-suspend.<worker>]]] Per-worker override for
+  auto-suspend.  Set to \enquote{false} for automated workers like
+  \enquote{dan-claude} that do not interactively focus tmux
+  windows.  Example:
+  [[nytid config track.auto-suspend.dan-claude -s false]].
 \end{description}
 
 To customize the track system, use the standard nytid config commands:
@@ -230,6 +241,9 @@ nytid config track.weekly_limit -s 35.0
 
 # Set daily hour limit warnings
 nytid config track.daily_limit -s 7.5
+
+# Disable auto-suspend for an automated worker
+nytid config track.auto-suspend.dan-claude -s false
 
 # View current track configuration
 nytid config track.data_dir
@@ -249,6 +263,7 @@ backends (local filesystem, AFS, etc.).
 TRACKING_DIR_CONFIG = "track.data_dir"
 DEFAULT_WEEKLY_LIMIT_CONFIG = "track.weekly_limit"
 DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
+AUTO_SUSPEND_CONFIG = "track.auto-suspend"
 
 def get_tracking_storage() -> storage.StorageRoot:
     """
@@ -328,6 +343,39 @@ def get_default_daily_limit() -> float:
         return float(config.get(DEFAULT_DAILY_LIMIT_CONFIG))
     except (KeyError, ValueError):
         return DEFAULT_DAILY_LIMIT_HOURS
+
+
+def should_auto_suspend(
+    who: str,
+    flag: Optional[bool],
+) -> bool:
+    """Resolve whether auto-suspend is enabled.
+
+    Checks, in order: CLI flag, per-worker config,
+    global config, hard-coded default (``True``).
+    """
+    if flag is not None:
+        return flag
+    worker_key = (
+        f"{AUTO_SUSPEND_CONFIG}"
+        f".{sanitize_who(who)}"
+    )
+    try:
+        value = config.get(worker_key)
+        return str(value).lower() in (
+            "true", "1", "yes",
+        )
+    except KeyError:
+        pass
+    try:
+        value = config.get(
+            f"{AUTO_SUSPEND_CONFIG}.default"
+        )
+        return str(value).lower() in (
+            "true", "1", "yes",
+        )
+    except KeyError:
+        return True
 @
 
 \section{Default Worker Identity}
@@ -2134,6 +2182,12 @@ if launch_requested:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1)
 
+    use_auto_suspend = should_auto_suspend(
+        who, auto_suspend,
+    )
+    if use_auto_suspend and (pane or window):
+        warn_if_focus_events_off()
+
     <<resolve working directory>>
     proc_cwd = wd_path if wd_path else proc_cwd
     proc_env = os.environ.copy()
@@ -2362,6 +2416,29 @@ foreground process.
 <<start command docstring examples>>=
 nytid track start grading -P                 # Tracked pane, return immediately
 nytid track start grading -P --block         # Wait for the pane to finish
+@
+
+\subsubsection{Auto-Suspend on Focus Change}
+
+When a tmux pane loses focus (the user switches to another pane or
+window), tracking continues even though the user is no longer working
+in that context.  [[--auto-suspend]] installs [[pane-focus-out]] and
+[[pane-focus-in]] hooks so that tracking pauses and resumes with the
+pane's focus.  This produces many small completed entries rather than
+one long one, but each entry accurately reflects \emph{attended} time.
+
+The default is resolved through the config hierarchy documented in
+\cref{track:configuration}: CLI flag overrides per-worker config,
+which overrides global config, which defaults to true.
+
+<<start command options>>=
+    auto_suspend: Annotated[
+        Optional[bool], auto_suspend_opt
+    ] = None,
+@
+
+<<start command docstring examples>>=
+nytid track start grading -P --no-auto-suspend  # No focus tracking
 @
 
 \subsubsection{Time-Boxed Tracking}
@@ -3534,6 +3611,15 @@ here_opt = typer.Option(
     help="Capture current directory "
          "and environment",
 )
+auto_suspend_opt = typer.Option(
+    "--auto-suspend/--no-auto-suspend",
+    help="Suspend tracking when the tmux pane "
+         "loses focus, resume on focus-in.  "
+         "Defaults to config key "
+         "track.auto-suspend.<worker>, "
+         "then track.auto-suspend.default, "
+         "then true.",
+)
 @
 
 Several options ([[--timeout]], [[--duration]], [[--estimate]]) accept
@@ -3858,18 +3944,49 @@ def build_tmux_hook_command(
 
 When tmux splits a pane, the new pane inherits pane-scoped
 options---including our exit hooks.  Without a guard, closing
-\emph{any} pane in the window would stop tracking, even if the
-original tracked pane is still alive.  We wrap the hook command in
-[[if-shell -F]] so that it only fires when the dying pane's
-[[pane_id]] matches the one we recorded.
+\emph{any} descendant pane would stop tracking, even if the
+original tracked pane is still alive.
 
-The guard uses tmux's [[#{==:a,b}]] format comparison, which
-returns~[[1]] when the two arguments match.  In the Python source
-the braces are doubled ([[#{{==:...}}]]) to survive f-string
-interpolation; after interpolation the result for pane [[%42]]
-would be:
+The same inheritance bug affects [[new-window]]: creating a window
+with \texttt{\^{}b c} while focused on the tracked pane causes the
+new pane to inherit the exit hooks.  When that new window closes,
+tmux has already selected a new active window (typically the tracked
+one).  A format-string guard like [[#{==:#{pane_id},%42}]] fails
+here because [[#{pane_id}]] resolves to the \emph{currently active}
+pane---not the pane that triggered the event---so the guard
+passes and tracking stops.
+
+Instead of comparing pane IDs, we ask the semantically correct
+question: is the tracked pane still alive?  We use
+[[tmux display-message -t]] targeting the tracked pane; the command
+fails (non-zero exit) when the pane no longer exists.  With the
+leading~[[!]], the hook body only fires when the tracked pane is
+dead.
+
+This approach is correct across all exit paths:
+\begin{description}
+\item[Normal exit]  The wrapper script
+  ([[build_tmux_wait_wrapper]]) runs the [[on_exit_shell]]
+  \emph{before} the pane exits, so the wrapper handles cleanup.
+  When the pane subsequently dies and the hook fires, the tracked
+  pane is dead, so the guard lets the hook run---but
+  [[_stop-detached]] uses [[quiet_if_missing]], making the
+  duplicate invocation harmless.
+\item[Abnormal exit]  When the pane is killed (e.g.\@ via
+  [[kill-pane]]), the wrapper never executes its cleanup.  The
+  [[pane-exited]]/[[pane-died]] hooks fire, the tracked pane is
+  dead, and the guard lets the hook stop tracking.
+\item[Spurious firing]  When a \emph{different} pane exits (via
+  inheritance from [[split-window]] or the [[new-window]] bug),
+  the tracked pane is still alive, so
+  [[tmux display-message -t]] succeeds and the guard suppresses
+  the hook.
+\end{description}
+
+For pane [[%42]] the resulting hook is:
 \begin{quote}
-\small [[if-shell -F '#{==:#{pane_id},%42}' { run-shell '...' }]]
+\small [[if-shell '! tmux display-message -p -t %42 ""
+  2>/dev/null' { run-shell '...' }]]
 \end{quote}
 
 <<helper functions>>=
@@ -3879,14 +3996,17 @@ def install_tmux_exit_hooks(
 ) -> None:
     """Install pane exit hooks for a newly created pane.
 
-    The hook is wrapped in an ``if-shell -F`` guard so that
-    hooks inherited by split panes are no-ops.
+    The hook is wrapped in an ``if-shell`` guard that checks
+    whether the tracked pane still exists, so that hooks
+    inherited by split panes or (due to a tmux bug) by
+    new-window panes are no-ops.
     """
     if not hook_command:
         return
     guarded_command = (
-        "if-shell -F "
-        f"'#{{==:#{{pane_id}},{pane_id}}}' "
+        "if-shell "
+        f"'! tmux display-message -p -t {pane_id}"
+        f' "" 2>/dev/null\' '
         f"{{ {hook_command} }}"
     )
     for hook_name in ("pane-exited", "pane-died"):
@@ -3943,8 +4063,15 @@ def run_tmux_command(
     block: bool = True,
     exit_status_file: Optional[str] = None,
     on_exit_shell: Optional[str] = None,
+    focus_labels: Optional[List[str]] = None,
+    focus_who: Optional[str] = None,
 ) -> Optional[int]:
-    """Run a command in tmux and optionally wait for exit."""
+    """Run a command in tmux and optionally wait for exit.
+
+    When ``focus_labels`` is set, pane-focus-out/-in hooks
+    are installed so tracking suspends and resumes with
+    the pane's focus.
+    """
     ready_channel = make_tmux_channel("ready")
     wait_channel = None
     status_file = exit_status_file
@@ -4016,6 +4143,13 @@ def run_tmux_command(
         )
         pane_id = result.stdout.strip()
         install_tmux_exit_hooks(pane_id, hook_command)
+        if focus_labels and focus_who:
+            install_tmux_focus_hooks(
+                pane_id, focus_labels, focus_who,
+            )
+            install_tmux_suspend_cleanup_hook(
+                pane_id, focus_who,
+            )
         subprocess.run(
             ["tmux", "wait-for", "-S", ready_channel],
             check=True,
@@ -4053,32 +4187,377 @@ def run_tmux_command(
 @
 
 When [[--no-block]] is used, the tmux pane needs to call
-[[nytid track stop]] after the child exits.  We build a shell command
-that invokes [[track stop]] with the correct labels and worker identity.
-The strategy mirrors [[todo]]'s [[build_detached_todo_finalize_command]],
-but is simpler because [[track stop]] already handles all the session
-bookkeeping.
+[[nytid track stop]] after the child exits.  The
+[[build_detached_track_finalize_command]] helper (defined in
+\cref{track:auto-suspend}) constructs the appropriate shell command.
+
+<<argument and option definitions>>=
+detached_labels_arg = typer.Argument(...)
+@
+
+\subsection{Auto-Suspend on Focus Change}
+\label{track:auto-suspend}
+
+When a tmux pane running a tracked shell loses focus, the user has
+switched their attention elsewhere.  Continuing to accumulate time
+against those labels is inaccurate.  Auto-suspend solves this by
+hooking into tmux's [[pane-focus-out]] and [[pane-focus-in]] events.
+
+On focus-out, we snapshot which of the pane's labels are still active
+(the user may have stopped some manually), stop those labels, and
+record the snapshot in a per-pane state file.  On focus-in, we read
+that state file, restart the saved labels, and delete the file.
+If the state file is missing on focus-in (because the pane was
+stopped entirely while unfocused), the resume is a silent no-op.
+
+Each focus-out/focus-in cycle produces completed [[TrackingEntry]]
+records---many small entries rather than one long one.  This is the
+correct representation: the entries reflect attended time.
+
+\subsubsection{Suspend State Files}
+
+Each tracked pane that uses auto-suspend stores a JSON file
+identifying the labels that were suspended.  The filename encodes
+the tmux pane ID (with the leading [[%]] replaced by [[pane_]])
+and the worker identity so that parallel workers in different panes
+do not collide.
 
 <<helper functions>>=
-def build_detached_track_finalize_command(
-    labels, who
+def suspend_state_path(
+    pane_id: str, who: str
+) -> pathlib.Path:
+    """Return the path to a pane's suspend state file.
+
+    The file records which labels were suspended
+    when the pane lost focus.
+    """
+    safe_pane = pane_id.replace("%", "pane_")
+    return (
+        get_tracking_dir()
+        / f"suspend_{safe_pane}_{sanitize_who(who)}.json"
+    )
+@
+
+Writing the state file must be atomic: a half-written file would
+confuse the resume path.  We write to a temporary file in the same
+directory and rename, which is atomic on POSIX filesystems.
+
+<<helper functions>>=
+def write_suspend_state(
+    path: pathlib.Path, labels: List[str]
+) -> None:
+    """Atomically write suspended labels to a state file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(labels))
+    tmp.rename(path)
+@
+
+Reading the state file returns [[None]] when the file is missing or
+corrupt.  This lets the resume path treat absence as a no-op rather
+than raising, which is the normal case when a pane exits while
+unfocused (the cleanup hook already removed the file).
+
+<<helper functions>>=
+def read_suspend_state(
+    path: pathlib.Path,
+) -> Optional[List[str]]:
+    """Read suspended labels, or ``None`` if missing."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+@
+
+Deletion is idempotent: the file may already have been removed by
+the cleanup hook or by a concurrent resume in another pane.
+
+<<helper functions>>=
+def delete_suspend_state(
+    path: pathlib.Path,
+) -> None:
+    """Remove a suspend state file if it exists."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+@
+
+\subsubsection{Suspend and Resume Helpers}
+
+The suspend helper stops only the labels that are currently active
+in the worker's session---any label already stopped (by the user
+or another process) is silently skipped.  It writes the actually
+stopped labels to the state file, so the state file records the
+truth rather than the caller's optimistic assumption.
+
+<<helper functions>>=
+def suspend_tracking_labels(
+    who: str,
+    labels: List[str],
+    pane_id: str,
+) -> None:
+    """Suspend tracking for a pane that lost focus.
+
+    Stops whichever of ``labels`` are still active and
+    writes them to the pane's suspend state file.
+    """
+    session = load_active_session(who)
+    active = set(session.get_active_labels())
+    to_suspend = [
+        lbl for lbl in labels if lbl in active
+    ]
+    if not to_suspend:
+        return
+
+    stop_tracking_labels(
+        who=who,
+        labels=to_suspend,
+        quiet_if_missing=True,
+    )
+    state_path = suspend_state_path(pane_id, who)
+    write_suspend_state(state_path, to_suspend)
+@
+
+We delete the state file \emph{before} restarting labels so that a
+crash between the two steps never causes a double-resume---losing
+an unfocused session is preferable to silently double-booking time.
+If the file is absent (pane exited while unfocused, or user manually
+stopped everything), the resume is a no-op.
+
+<<helper functions>>=
+def resume_tracking_labels(
+    who: str,
+    pane_id: str,
+) -> None:
+    """Resume tracking for a pane that regained focus.
+
+    Reads the suspend state file and restarts the
+    labels recorded there.  Deletes the file afterwards.
+    """
+    state_path = suspend_state_path(pane_id, who)
+    labels = read_suspend_state(state_path)
+    if not labels:
+        return
+
+    delete_suspend_state(state_path)
+    start_tracking_labels(
+        who=who,
+        labels=labels,
+        start_time=datetime.datetime.now(),
+    )
+@
+
+\subsubsection{Hidden Detached Commands}
+
+The focus hooks run inside tmux's [[run-shell]], which launches a
+fresh Python process.  We provide two hidden CLI commands for this
+purpose, following the same pattern as [[_stop-detached]].
+
+<<argument and option definitions>>=
+pane_id_opt = typer.Option(
+    "--pane-id",
+    help="Tmux pane ID (internal use)",
+)
+@
+
+<<detached suspend command>>=
+@cli.command(
+    name="_suspend-detached", hidden=True
+)
+def suspend_detached(
+    labels: Annotated[
+        List[str], detached_labels_arg
+    ],
+    pane_id: Annotated[str, pane_id_opt],
+    who: Annotated[str, who_opt] = default_username,
 ):
-    """Return shell command to stop tracking
-    when pane exits."""
+    """Suspend labels when a tracked pane loses focus."""
+    suspend_tracking_labels(
+        who=who, labels=labels, pane_id=pane_id,
+    )
+@
+
+<<detached resume command>>=
+@cli.command(
+    name="_resume-detached", hidden=True
+)
+def resume_detached(
+    pane_id: Annotated[str, pane_id_opt],
+    who: Annotated[str, who_opt] = default_username,
+):
+    """Resume labels when a tracked pane regains focus."""
+    resume_tracking_labels(who=who, pane_id=pane_id)
+@
+
+\subsubsection{Shell Command Builders}
+
+Building the shell commands that tmux hooks will execute follows
+the same pattern as [[build_detached_track_finalize_command]]:
+set [[PYTHONPATH]], invoke the hidden CLI command, and pass the
+labels and worker identity.
+
+<<helper functions>>=
+def build_detached_nytid_prefix() -> str:
+    """Return the PYTHONPATH and Python prefix for detached commands."""
     pythonpath = os.path.abspath(
         os.path.join(
             os.path.dirname(__file__),
             "..", "..", "..",
         )
     )
-    label_args = " ".join(
-        shlex.quote(l) for l in labels
-    )
-    cmd = (
+    return (
         f"PYTHONPATH={shlex.quote(pythonpath)} "
         f"{shlex.quote(sys.executable)} "
         "-c 'from nytid.cli.track import cli;"
-        " cli()' "
+        " cli()'"
+    )
+@
+
+The suspend command needs the labels (to know which ones to check)
+and the pane ID (for the state file name).
+
+<<helper functions>>=
+def build_detached_suspend_command(
+    labels: List[str],
+    who: str,
+    pane_id: str,
+) -> str:
+    """Return shell command to suspend tracking on focus-out."""
+    prefix = build_detached_nytid_prefix()
+    label_args = " ".join(
+        shlex.quote(lbl) for lbl in labels
+    )
+    cmd = (
+        f"{prefix} "
+        f"_suspend-detached {label_args}"
+        f" --pane-id {shlex.quote(pane_id)}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
+The resume command is simpler---it needs only the pane ID because
+labels are read from the state file written during suspend.
+
+<<helper functions>>=
+def build_detached_resume_command(
+    who: str,
+    pane_id: str,
+) -> str:
+    """Return shell command to resume tracking on focus-in."""
+    prefix = build_detached_nytid_prefix()
+    cmd = (
+        f"{prefix} "
+        f"_resume-detached"
+        f" --pane-id {shlex.quote(pane_id)}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
+\subsubsection{Installing Focus Hooks}
+
+Unlike the exit hooks, which use a pane-existence check (see
+[[install_tmux_exit_hooks]]), focus hooks use tmux's format-string
+pane-ID comparison ([[#{==:#{pane_id},...}]]).  The distinction
+matters: exit hooks fire \emph{after} a pane dies, so we must ask
+whether the tracked pane still exists; focus hooks fire while the
+tracked pane is alive, so [[#{pane_id}]] correctly resolves to the
+pane that gained or lost focus and we can compare it directly.
+
+<<helper functions>>=
+def install_tmux_focus_hooks(
+    pane_id: str,
+    labels: List[str],
+    who: str,
+) -> None:
+    """Install pane-focus-out and pane-focus-in hooks.
+
+    The hooks use a format-string pane-ID guard (not the
+    pane-existence check used by exit hooks) because
+    focus events fire while the tracked pane is alive.
+    """
+    suspend_cmd = build_detached_suspend_command(
+        labels, who, pane_id,
+    )
+    resume_cmd = build_detached_resume_command(
+        who, pane_id,
+    )
+    for hook_name, shell_cmd in (
+        ("pane-focus-out", suspend_cmd),
+        ("pane-focus-in", resume_cmd),
+    ):
+        guarded = (
+            "if-shell -F "
+            f"'#{{==:#{{pane_id}},{pane_id}}}' "
+            f"{{ run-shell {shlex.quote(shell_cmd)} }}"
+        )
+        subprocess.run(
+            [
+                "tmux", "set-hook", "-p",
+                "-t", pane_id,
+                hook_name, guarded,
+            ],
+            check=True,
+        )
+@
+
+\subsubsection{Cleaning Up Suspend State on Pane Exit}
+
+When a pane exits while unfocused, the focus-out hook has already
+written a suspend state file that no focus-in will ever read.  Rather
+than complicating [[_stop-detached]] with an optional [[--pane-id]]
+argument (which would require the pane ID to be known before the
+on-exit shell command is built), we install a lightweight cleanup
+hook that simply removes the state file.
+
+The hook runs as a second [[pane-exited]] handler.  Tmux 3.2+
+allows multiple hooks on the same event by appending with
+[[set-hook -a]].  The guard uses the same pane-existence check
+as the main exit hooks (see above).
+
+<<helper functions>>=
+def install_tmux_suspend_cleanup_hook(
+    pane_id: str,
+    who: str,
+) -> None:
+    """Install a pane-exit hook that deletes the suspend state file."""
+    state_file = suspend_state_path(pane_id, who)
+    cleanup_cmd = f"rm -f {shlex.quote(str(state_file))}"
+    guarded = (
+        "if-shell "
+        f"'! tmux display-message -p -t {pane_id}"
+        f' "" 2>/dev/null\' '
+        f"{{ run-shell {shlex.quote(cleanup_cmd)} }}"
+    )
+    for hook_name in ("pane-exited", "pane-died"):
+        subprocess.run(
+            [
+                "tmux", "set-hook", "-ap",
+                "-t", pane_id,
+                hook_name, guarded,
+            ],
+            check=True,
+        )
+@
+
+The finalize command builder does not need a [[pane_id]] parameter
+anymore---cleanup is handled by the hook above.
+
+<<helper functions>>=
+def build_detached_track_finalize_command(
+    labels: List[str], who: str,
+) -> str:
+    """Return shell command to stop tracking when pane exits."""
+    prefix = build_detached_nytid_prefix()
+    label_args = " ".join(
+        shlex.quote(lbl) for lbl in labels
+    )
+    cmd = (
+        f"{prefix} "
         f"_stop-detached {label_args}"
     )
     if who != default_username:
@@ -4086,14 +4565,8 @@ def build_detached_track_finalize_command(
     return cmd
 @
 
-Detached tmux cleanup should be silent when the tracked labels were
-already stopped elsewhere.  A hidden helper command reuses the same
-stop helper with [[quiet_if_missing=True]] so pane exit becomes a
-no-op instead of an error in that case.
-
-<<argument and option definitions>>=
-detached_labels_arg = typer.Argument(...)
-@
+The [[_stop-detached]] hidden command remains unchanged---suspend
+state cleanup is handled by the dedicated hook installed above.
 
 <<detached finalize command>>=
 @cli.command(name="_stop-detached", hidden=True)
@@ -4107,6 +4580,256 @@ def stop_detached(
         labels=labels,
         quiet_if_missing=True,
     )
+@
+
+\subsubsection{Focus-Events Validation}
+
+The [[pane-focus-out]]/[[pane-focus-in]] hooks require tmux's
+[[focus-events]] option to be on.  Without it, the hooks never fire
+and auto-suspend silently does nothing.  We warn the user at launch
+time when the option is off.
+
+<<helper functions>>=
+def warn_if_focus_events_off() -> None:
+    """Emit a warning if tmux focus-events is off."""
+    try:
+        result = subprocess.run(
+            ["tmux", "show-option", "-gv",
+             "focus-events"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if result.stdout.strip().lower() != "on":
+            typer.echo(
+                "Warning: tmux focus-events is off; "
+                "auto-suspend hooks will not fire.  "
+                "Run: tmux set -g focus-events on",
+                err=True,
+            )
+    except (subprocess.CalledProcessError, OSError):
+        pass
+@
+
+Let's verify the auto-suspend infrastructure with unit tests.
+These test the pure-Python helpers without requiring tmux.
+
+\paragraph{Config resolution.}
+The [[should_auto_suspend]] resolver must follow the documented
+priority: CLI flag beats per-worker config beats global config
+beats the hard-coded default.
+
+<<test functions>>=
+def test_should_auto_suspend_cli_flag_wins(
+    temp_tracking_dir,
+):
+    """CLI flag overrides all config."""
+    assert should_auto_suspend("me", True) is True
+    assert should_auto_suspend("me", False) is False
+
+def test_should_auto_suspend_per_worker_config(
+    temp_tracking_dir,
+):
+    """Per-worker config overrides global."""
+    import typerconf as config
+    config.set(
+        f"{AUTO_SUSPEND_CONFIG}.default", "true"
+    )
+    config.set(
+        f"{AUTO_SUSPEND_CONFIG}.alice", "false"
+    )
+    assert should_auto_suspend("alice", None) is False
+    # Other worker falls through to global
+    assert should_auto_suspend("bob", None) is True
+
+def test_should_auto_suspend_global_config(
+    temp_tracking_dir,
+):
+    """Global config overrides hard-coded default."""
+    import typerconf as config
+    config.set(
+        f"{AUTO_SUSPEND_CONFIG}.default", "false"
+    )
+    assert should_auto_suspend("me", None) is False
+
+def test_should_auto_suspend_hardcoded_default(
+    temp_tracking_dir,
+):
+    """Hard-coded default is True when no config is set.
+
+    Earlier tests may have set config keys that persist
+    in the same process (typerconf has no delete method),
+    so we mock [[config.get]] to always raise [[KeyError]]
+    for auto-suspend keys.
+    """
+    import typerconf as _cfg
+    _orig_get = _cfg.get
+    def _no_auto_suspend(key, *args, **kwargs):
+        if key.startswith(AUTO_SUSPEND_CONFIG):
+            raise KeyError(key)
+        return _orig_get(key, *args, **kwargs)
+    with patch(
+        "nytid.cli.track.config.get",
+        side_effect=_no_auto_suspend,
+    ):
+        assert should_auto_suspend("me", None) is True
+@
+
+\paragraph{State file helpers.}
+These tests verify atomic write, read, and delete of the
+suspend state file.
+
+<<test functions>>=
+def test_suspend_state_roundtrip(
+    temp_tracking_dir,
+):
+    """Write, read, delete cycle works."""
+    path = suspend_state_path("%42", "me")
+    assert path.name.startswith("suspend_pane_42")
+
+    write_suspend_state(path, ["work", "email"])
+    labels = read_suspend_state(path)
+    assert labels == ["work", "email"]
+
+    delete_suspend_state(path)
+    assert read_suspend_state(path) is None
+
+def test_read_suspend_state_missing():
+    """Missing file returns None."""
+    import pathlib
+    missing = pathlib.Path("/tmp/nonexistent_nytid.json")
+    assert read_suspend_state(missing) is None
+
+def test_delete_suspend_state_missing():
+    """Deleting a missing file is a no-op."""
+    import pathlib
+    missing = pathlib.Path("/tmp/nonexistent_nytid.json")
+    delete_suspend_state(missing)  # should not raise
+@
+
+\paragraph{Suspend and resume cycle.}
+We test that suspending an active session writes the correct
+state file and stops the labels, and that resuming restarts them.
+
+<<test functions>>=
+def test_suspend_resume_cycle(temp_tracking_dir):
+    """Suspend stops active labels, resume restarts them."""
+    runner.invoke(cli, [
+        "start", "work", "email",
+    ])
+
+    pane_id = "%99"
+    suspend_tracking_labels(
+        who=default_username,
+        labels=["work", "email"],
+        pane_id=pane_id,
+    )
+
+    # Labels should be stopped
+    session = load_active_session(default_username)
+    assert session.get_active_labels() == []
+
+    # State file should exist
+    state_path = suspend_state_path(
+        pane_id, default_username,
+    )
+    labels = read_suspend_state(state_path)
+    assert sorted(labels) == ["email", "work"]
+
+    # Resume should restart them
+    resume_tracking_labels(
+        who=default_username,
+        pane_id=pane_id,
+    )
+    session = load_active_session(default_username)
+    assert sorted(session.get_active_labels()) == [
+        "email", "work",
+    ]
+    # State file should be cleaned up
+    assert read_suspend_state(state_path) is None
+
+    # Clean up
+    runner.invoke(cli, ["stop"])
+
+def test_suspend_skips_already_stopped(
+    temp_tracking_dir,
+):
+    """Suspend only stops labels that are still active."""
+    runner.invoke(cli, [
+        "start", "work", "email",
+    ])
+    # Manually stop email
+    runner.invoke(cli, [
+        "stop", "email",
+    ])
+
+    pane_id = "%77"
+    suspend_tracking_labels(
+        who=default_username,
+        labels=["work", "email"],
+        pane_id=pane_id,
+    )
+
+    state_path = suspend_state_path(
+        pane_id, default_username,
+    )
+    labels = read_suspend_state(state_path)
+    assert labels == ["work"]
+
+    # Clean up
+    resume_tracking_labels(
+        who=default_username, pane_id=pane_id,
+    )
+    runner.invoke(cli, ["stop"])
+
+def test_resume_noop_without_state_file(
+    temp_tracking_dir,
+):
+    """Resume is a no-op if the state file is missing."""
+    pane_id = "%88"
+    # Should not raise
+    resume_tracking_labels(
+        who=default_username,
+        pane_id=pane_id,
+    )
+@
+
+\paragraph{Shell command builders.}
+We test that the generated shell commands contain the expected
+arguments without actually running them.
+
+<<test functions>>=
+def test_build_detached_suspend_command():
+    """Suspend command includes labels and pane-id."""
+    cmd = build_detached_suspend_command(
+        ["work", "email"], "me", "%42",
+    )
+    assert "_suspend-detached" in cmd
+    assert "work" in cmd
+    assert "email" in cmd
+    assert "--pane-id" in cmd
+    assert "%42" in cmd
+
+def test_build_detached_resume_command():
+    """Resume command includes pane-id."""
+    cmd = build_detached_resume_command("me", "%42")
+    assert "_resume-detached" in cmd
+    assert "--pane-id" in cmd
+    assert "%42" in cmd
+
+def test_build_detached_resume_command_other_worker():
+    """Resume command includes --who for non-default worker."""
+    cmd = build_detached_resume_command(
+        "dan-claude", "%42",
+    )
+    assert "--who" in cmd
+    assert "dan-claude" in cmd
+
+def test_build_detached_nytid_prefix():
+    """Prefix includes PYTHONPATH and python executable."""
+    prefix = build_detached_nytid_prefix()
+    assert "PYTHONPATH=" in prefix
+    assert "nytid.cli.track" in prefix
 @
 
 \subsection{Blocking Command Execution}
@@ -4176,6 +4899,12 @@ else:
 @
 
 <<run launched process>>=
+focus_labels_for_tmux = (
+    tracking_labels if use_auto_suspend else None
+)
+focus_who_for_tmux = (
+    who if use_auto_suspend else None
+)
 try:
     if pane or window:
         if block:
@@ -4185,6 +4914,8 @@ try:
                 env=proc_env,
                 window=window,
                 window_name=window_name,
+                focus_labels=focus_labels_for_tmux,
+                focus_who=focus_who_for_tmux,
             )
         else:
             <<set up non-blocking tmux launch>>
@@ -4242,6 +4973,8 @@ run_tmux_command(
     block=False,
     exit_status_file=exit_code_file,
     on_exit_shell=finalize_cmd,
+    focus_labels=focus_labels_for_tmux,
+    focus_who=focus_who_for_tmux,
 )
 exit_code = None
 @
@@ -5715,6 +6448,8 @@ and checking the status of active tracking sessions:
 <<stop command>>
 <<switch command>>
 <<detached finalize command>>
+<<detached suspend command>>
+<<detached resume command>>
 <<notes command>>
 @
 
@@ -5837,6 +6572,7 @@ sys.path.insert(0, '../src')
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
+    AUTO_SUSPEND_CONFIG,
     load_tracking_data, load_active_session,
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
@@ -5849,6 +6585,16 @@ from nytid.cli.track import (
     build_tmux_hook_command,
     install_tmux_exit_hooks,
     sanitize_who, complete_workers,
+    should_auto_suspend,
+    suspend_state_path,
+    write_suspend_state,
+    read_suspend_state,
+    delete_suspend_state,
+    suspend_tracking_labels,
+    resume_tracking_labels,
+    build_detached_nytid_prefix,
+    build_detached_suspend_command,
+    build_detached_resume_command,
     default_username
 )
 
@@ -6508,8 +7254,9 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
     assert "tmux wait-for -S done-chan" in hook
 
 def test_install_tmux_exit_hooks_guards_pane_id():
-    """Hooks include if-shell guard to prevent
-    inherited hooks from firing on wrong pane."""
+    """Hooks use pane-existence guard to prevent
+    inherited hooks from firing while tracked pane
+    is alive."""
     with patch("subprocess.run") as mock_run:
         hook_cmd = "run-shell 'echo done'"
         install_tmux_exit_hooks("%42", hook_cmd)
@@ -6517,7 +7264,8 @@ def test_install_tmux_exit_hooks_guards_pane_id():
         for call in mock_run.call_args_list:
             cmd = call[0][0]
             hook_value = cmd[-1]
-            assert "if-shell -F" in hook_value
+            assert "if-shell" in hook_value
+            assert "display-message" in hook_value
             assert "%42" in hook_value
             assert hook_cmd in hook_value
 
