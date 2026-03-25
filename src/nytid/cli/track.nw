@@ -2255,6 +2255,7 @@ if started:
         f"Started tracking: "
         f"{', '.join(sorted(started))}"
     )
+    <<register started labels with pane>>
 if already_tracking:
     typer.echo(
         f"Already tracking: "
@@ -2267,6 +2268,23 @@ typer.echo(f"Active labels: {', '.join(all_active)}")
 if who != default_username:
     typer.echo(f"Worker: {who}")
 <<report custom start time if used>>
+@
+
+If we are running inside a tmux pane that already has auto-suspend
+(indicated by an existing pane labels file), we register the newly
+started labels so that future focus-out events suspend them too.
+The check for [[read_pane_labels]] returning non-[[None]] ensures we
+only touch panes that were launched with [[--pane]]/[[--window]] and
+auto-suspend enabled---a plain [[track start]] in an untracked pane
+creates no file.
+
+<<register started labels with pane>>=
+pane_id = os.environ.get("TMUX_PANE")
+if pane_id:
+    if read_pane_labels(pane_id, who) is not None:
+        add_pane_labels(
+            pane_id, who, list(started),
+        )
 @
 
 \subsubsection{Time Offset Support}
@@ -2781,6 +2799,24 @@ def stop(
         typer.echo(
             f"Stop time: "
             f"{end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    <<unregister stopped labels from pane>>
+@
+
+When labels are stopped, we remove them from the pane's active labels
+file so that the next focus-out event does not try to suspend labels
+that are no longer running.
+
+<<unregister stopped labels from pane>>=
+stopped_labels = []
+for entry in completed_entries:
+    stopped_labels.extend(entry.labels)
+pane_id = os.environ.get("TMUX_PANE")
+if pane_id and stopped_labels:
+    if read_pane_labels(pane_id, who) is not None:
+        remove_pane_labels(
+            pane_id, who, stopped_labels,
         )
 @
 
@@ -4144,8 +4180,11 @@ def run_tmux_command(
         pane_id = result.stdout.strip()
         install_tmux_exit_hooks(pane_id, hook_command)
         if focus_labels and focus_who:
+            write_pane_labels(
+                pane_id, focus_who, focus_labels,
+            )
             install_tmux_focus_hooks(
-                pane_id, focus_labels, focus_who,
+                pane_id, focus_who,
             )
             install_tmux_suspend_cleanup_hook(
                 pane_id, focus_who,
@@ -4283,6 +4322,137 @@ def delete_suspend_state(
         pass
 @
 
+\subsubsection{Per-Pane Active Labels}
+
+The suspend state file records which labels were suspended during a
+single focus-out event, but it does not track which labels
+\emph{belong} to a pane.  When focus hooks are installed, the label
+list is embedded directly in the hook command---so labels started
+later in the same pane are invisible to auto-suspend.
+
+To fix this, we maintain a per-pane \emph{active labels file} that
+the suspend hook reads dynamically.  Both [[track start]] and
+[[track stop]] update this file when they detect they are running
+inside a tracked pane (via the [[TMUX_PANE]] environment variable).
+The file exists only for panes launched with auto-suspend; a plain
+[[track start]] in an untracked pane creates no file.
+
+The naming convention mirrors [[suspend_state_path]]: the tmux pane
+ID's leading [[%]] becomes [[pane_]], and the worker identity is
+appended.
+
+<<helper functions>>=
+def pane_labels_path(
+    pane_id: str, who: str
+) -> pathlib.Path:
+    """Return path to a pane's active labels file.
+
+    The file records which labels should be
+    suspended when the pane loses focus.
+    """
+    safe_pane = pane_id.replace("%", "pane_")
+    return (
+        get_tracking_dir()
+        / f"pane_labels_{safe_pane}"
+        f"_{sanitize_who(who)}.json"
+    )
+@
+
+Reading returns [[None]] when the file is absent, which lets callers
+distinguish \enquote{no file} (pane is not tracked) from
+\enquote{empty list} (all labels removed).
+
+<<helper functions>>=
+def read_pane_labels(
+    pane_id: str, who: str,
+) -> Optional[List[str]]:
+    """Read pane labels, or ``None`` if not tracked."""
+    path = pane_labels_path(pane_id, who)
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+@
+
+Writing uses the same atomic tmp-then-rename strategy as the suspend
+state helpers.
+
+<<helper functions>>=
+def write_pane_labels(
+    pane_id: str, who: str,
+    labels: List[str],
+) -> None:
+    """Atomically write the pane's active labels."""
+    path = pane_labels_path(pane_id, who)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(labels))
+    tmp.rename(path)
+@
+
+When [[track start]] adds labels to an already-tracked pane, the new
+labels must merge into the existing set.  Order is preserved so that
+the suspend hook processes labels in the same sequence they were
+started---keeping the suspend state file predictable across cycles.
+Duplicates are skipped because a user may restart a label that is
+already registered.
+
+<<helper functions>>=
+def add_pane_labels(
+    pane_id: str, who: str,
+    labels: List[str],
+) -> None:
+    """Add labels to the pane's active set."""
+    existing = read_pane_labels(pane_id, who) or []
+    seen = set(existing)
+    merged = list(existing)
+    for lbl in labels:
+        if lbl not in seen:
+            merged.append(lbl)
+            seen.add(lbl)
+    write_pane_labels(pane_id, who, merged)
+@
+
+When [[track stop]] removes labels from a tracked pane, the file
+must shrink accordingly so the next focus-out does not try to suspend
+already-stopped labels.  Deleting the file when empty (rather than
+writing~[[]]) ensures the pane reverts to the \enquote{untracked}
+state---matching the invariant that file existence means
+\enquote{auto-suspend is active.}
+
+<<helper functions>>=
+def remove_pane_labels(
+    pane_id: str, who: str,
+    labels: List[str],
+) -> None:
+    """Remove labels from the pane's active set."""
+    existing = read_pane_labels(pane_id, who)
+    if existing is None:
+        return
+    to_remove = set(labels)
+    remaining = [
+        lbl for lbl in existing
+        if lbl not in to_remove
+    ]
+    if remaining:
+        write_pane_labels(pane_id, who, remaining)
+    else:
+        delete_pane_labels(pane_id, who)
+@
+
+Deletion is idempotent, matching [[delete_suspend_state]].
+
+<<helper functions>>=
+def delete_pane_labels(
+    pane_id: str, who: str,
+) -> None:
+    """Remove a pane's active labels file."""
+    try:
+        pane_labels_path(pane_id, who).unlink()
+    except OSError:
+        pass
+@
+
 \subsubsection{Suspend and Resume Helpers}
 
 The suspend helper stops only the labels that are currently active
@@ -4366,13 +4536,13 @@ pane_id_opt = typer.Option(
     name="_suspend-detached", hidden=True
 )
 def suspend_detached(
-    labels: Annotated[
-        List[str], detached_labels_arg
-    ],
     pane_id: Annotated[str, pane_id_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Suspend labels when a tracked pane loses focus."""
+    labels = read_pane_labels(pane_id, who)
+    if not labels:
+        return
     suspend_tracking_labels(
         who=who, labels=labels, pane_id=pane_id,
     )
@@ -4414,23 +4584,20 @@ def build_detached_nytid_prefix() -> str:
     )
 @
 
-The suspend command needs the labels (to know which ones to check)
-and the pane ID (for the state file name).
+The suspend command no longer receives labels as arguments---it reads
+them from the pane's active labels file (see above).  It only needs
+the pane ID (to locate the file) and the worker identity.
 
 <<helper functions>>=
 def build_detached_suspend_command(
-    labels: List[str],
     who: str,
     pane_id: str,
 ) -> str:
     """Return shell command to suspend tracking on focus-out."""
     prefix = build_detached_nytid_prefix()
-    label_args = " ".join(
-        shlex.quote(lbl) for lbl in labels
-    )
     cmd = (
         f"{prefix} "
-        f"_suspend-detached {label_args}"
+        f"_suspend-detached"
         f" --pane-id {shlex.quote(pane_id)}"
     )
     if who != default_username:
@@ -4471,7 +4638,6 @@ pane that gained or lost focus and we can compare it directly.
 <<helper functions>>=
 def install_tmux_focus_hooks(
     pane_id: str,
-    labels: List[str],
     who: str,
 ) -> None:
     """Install pane-focus-out and pane-focus-in hooks.
@@ -4481,7 +4647,7 @@ def install_tmux_focus_hooks(
     focus events fire while the tracked pane is alive.
     """
     suspend_cmd = build_detached_suspend_command(
-        labels, who, pane_id,
+        who, pane_id,
     )
     resume_cmd = build_detached_resume_command(
         who, pane_id,
@@ -4512,7 +4678,8 @@ written a suspend state file that no focus-in will ever read.  Rather
 than complicating [[_stop-detached]] with an optional [[--pane-id]]
 argument (which would require the pane ID to be known before the
 on-exit shell command is built), we install a lightweight cleanup
-hook that simply removes the state file.
+hook that removes both the suspend state file and the pane labels
+file.
 
 The hook runs as a second [[pane-exited]] handler.  Tmux 3.2+
 allows multiple hooks on the same event by appending with
@@ -4524,9 +4691,13 @@ def install_tmux_suspend_cleanup_hook(
     pane_id: str,
     who: str,
 ) -> None:
-    """Install a pane-exit hook that deletes the suspend state file."""
+    """Install a pane-exit hook that deletes suspend and pane-labels files."""
     state_file = suspend_state_path(pane_id, who)
-    cleanup_cmd = f"rm -f {shlex.quote(str(state_file))}"
+    labels_file = pane_labels_path(pane_id, who)
+    cleanup_cmd = (
+        f"rm -f {shlex.quote(str(state_file))}"
+        f" {shlex.quote(str(labels_file))}"
+    )
     guarded = (
         "if-shell "
         f"'! tmux display-message -p -t {pane_id}"
@@ -4707,6 +4878,92 @@ def test_delete_suspend_state_missing():
     delete_suspend_state(missing)  # should not raise
 @
 
+\paragraph{Pane labels file helpers.}
+These mirror the suspend state tests but exercise the per-pane
+active labels file used by the dynamic auto-suspend system.
+
+<<test functions>>=
+def test_pane_labels_roundtrip(temp_tracking_dir):
+    """Write, read, delete cycle for pane labels."""
+    pane_id, who = "%42", "me"
+    path = pane_labels_path(pane_id, who)
+    assert "pane_labels_pane_42" in path.name
+
+    write_pane_labels(pane_id, who, ["work", "email"])
+    assert read_pane_labels(pane_id, who) == [
+        "work", "email",
+    ]
+
+    delete_pane_labels(pane_id, who)
+    assert read_pane_labels(pane_id, who) is None
+
+def test_read_pane_labels_missing():
+    """Missing file returns None, not empty list."""
+    assert read_pane_labels("%99", "nobody") is None
+
+def test_add_pane_labels_merges(temp_tracking_dir):
+    """Adding labels merges without duplicates."""
+    pane_id, who = "%42", "me"
+    write_pane_labels(pane_id, who, ["a", "b"])
+    add_pane_labels(pane_id, who, ["b", "c"])
+    assert read_pane_labels(pane_id, who) == [
+        "a", "b", "c",
+    ]
+
+def test_remove_pane_labels(temp_tracking_dir):
+    """Removing labels preserves order of remainder."""
+    pane_id, who = "%42", "me"
+    write_pane_labels(
+        pane_id, who, ["a", "b", "c"],
+    )
+    remove_pane_labels(pane_id, who, ["b"])
+    assert read_pane_labels(pane_id, who) == [
+        "a", "c",
+    ]
+
+def test_remove_pane_labels_deletes_when_empty(
+    temp_tracking_dir,
+):
+    """Removing all labels deletes the file."""
+    pane_id, who = "%42", "me"
+    write_pane_labels(pane_id, who, ["a"])
+    remove_pane_labels(pane_id, who, ["a"])
+    assert read_pane_labels(pane_id, who) is None
+@
+
+\paragraph{Suspend reads from pane labels file.}
+After the refactoring, [[_suspend-detached]] reads which labels to
+suspend from the pane labels file rather than receiving them as
+command-line arguments.  We verify this by writing a pane labels
+file, starting those labels, then invoking the hidden command.
+
+<<test functions>>=
+def test_suspend_detached_reads_pane_labels(
+    temp_tracking_dir,
+):
+    """Suspend reads labels from pane labels file."""
+    pane_id, who = "%55", default_username
+    runner.invoke(cli, ["start", "work", "email"])
+
+    write_pane_labels(pane_id, who, ["work", "email"])
+    runner.invoke(cli, [
+        "_suspend-detached",
+        "--pane-id", pane_id,
+    ])
+
+    session = load_active_session(who)
+    assert session.get_active_labels() == []
+
+    state = read_suspend_state(
+        suspend_state_path(pane_id, who),
+    )
+    assert sorted(state) == ["email", "work"]
+
+    # Clean up
+    resume_tracking_labels(who=who, pane_id=pane_id)
+    runner.invoke(cli, ["stop", "--all"])
+@
+
 \paragraph{Suspend and resume cycle.}
 We test that suspending an active session writes the correct
 state file and stops the labels, and that resuming restarts them.
@@ -4800,13 +5057,9 @@ arguments without actually running them.
 
 <<test functions>>=
 def test_build_detached_suspend_command():
-    """Suspend command includes labels and pane-id."""
-    cmd = build_detached_suspend_command(
-        ["work", "email"], "me", "%42",
-    )
+    """Suspend command includes pane-id but not labels."""
+    cmd = build_detached_suspend_command("me", "%42")
     assert "_suspend-detached" in cmd
-    assert "work" in cmd
-    assert "email" in cmd
     assert "--pane-id" in cmd
     assert "%42" in cmd
 
@@ -6590,6 +6843,12 @@ from nytid.cli.track import (
     write_suspend_state,
     read_suspend_state,
     delete_suspend_state,
+    pane_labels_path,
+    read_pane_labels,
+    write_pane_labels,
+    add_pane_labels,
+    remove_pane_labels,
+    delete_pane_labels,
     suspend_tracking_labels,
     resume_tracking_labels,
     build_detached_nytid_prefix,
