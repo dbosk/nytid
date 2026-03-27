@@ -4716,7 +4716,10 @@ def resume_tracking_labels(
 @
 
 Window suspend/resume mirrors the pane helpers but keys state by
-[[window_id]] and uses the tracked window's labels file.
+[[window_id]] and uses the tracked window's labels file.  The same
+delete-before-restart ordering applies: deleting the state file first
+ensures a crash never causes a double-resume (see the pane resume
+helper above for the full rationale).
 
 <<helper functions>>=
 def suspend_window_tracking_labels(
@@ -4761,18 +4764,10 @@ def resume_window_tracking_labels(
     )
 @
 
-To implement \enquote{selected in any attached client} semantics we ask tmux for
-the tracked window's [[window_active_clients]] count.  A positive count
-means at least one client currently has the window selected, regardless
-of whether that client is the original terminal.
-
-For nested [[track]] commands inside a tracked tmux window, we must not
-trust inherited environment variables such as [[TMUX_WINDOW_ID]].  A new
-tmux window created with [[^b c]] would inherit the shell environment
-from the old one, falsely claiming to belong to the tracked window.
-Instead we derive the current [[window_id]] from the live [[TMUX_PANE]]
-every time and only join window-scoped bookkeeping when that live window
-already has nytid's tracked-window state file.
+To implement \enquote{selected in any attached client} semantics we ask
+tmux for the tracked window's [[window_active_clients]] count.  A
+positive count means at least one client currently has the window
+selected, regardless of whether that client is the original terminal.
 
 <<helper functions>>=
 def tmux_window_has_active_client(
@@ -4799,8 +4794,16 @@ def tmux_window_has_active_client(
         return int(result.stdout.strip() or "0") > 0
     except ValueError:
         return False
+@
 
+For nested [[track]] commands inside a tracked tmux window, we must not
+trust inherited environment variables such as [[TMUX_WINDOW_ID]].  A new
+tmux window created with [[^b c]] would inherit the shell environment
+from the old one, falsely claiming to belong to the tracked window.
+Instead we derive the current [[window_id]] from the live [[TMUX_PANE]]
+every time.
 
+<<helper functions>>=
 def get_tmux_window_id_for_pane(
     pane_id: str,
 ) -> Optional[str]:
@@ -4825,16 +4828,26 @@ def get_tmux_window_id_for_pane(
     if not window_id:
         return None
     return window_id
+@
 
+Before querying tmux for the current window, we check whether any
+tracked-window state files exist at all.  This avoids a subprocess call
+to tmux in the common case where window tracking is not in use.
 
+<<helper functions>>=
 def has_tracked_window_state(
     who: str,
 ) -> bool:
     """Return whether this worker currently has tracked windows."""
     pattern = f"window_labels_*_{sanitize_who(who)}.json"
     return any(get_tracking_dir().glob(pattern))
+@
 
+Enumerating tracked windows and workers is needed by the session-scoped
+dispatcher command, which must scan all tracked windows across all
+workers to decide which to suspend or resume.
 
+<<helper functions>>=
 def list_tracked_window_ids(
     who: str,
 ) -> List[str]:
@@ -4850,8 +4863,13 @@ def list_tracked_window_ids(
         encoded = name[len(prefix):-len(suffix)]
         window_ids.append("@" + encoded)
     return window_ids
+@
 
+Worker discovery scans the tracking directory rather than maintaining a
+separate registry, keeping the state self-describing and avoiding stale
+entries.
 
+<<helper functions>>=
 def list_workers_with_tracked_windows() -> List[str]:
     """Return workers that currently have tracked tmux windows."""
     prefix = "window_labels_window_"
@@ -4867,8 +4885,14 @@ def list_workers_with_tracked_windows() -> List[str]:
         _, worker = stem.split("_", 1)
         workers.add(worker)
     return sorted(workers)
+@
 
+The dispatcher must restrict its actions to windows that belong to the
+triggering tmux session, since multiple sessions may coexist on the same
+server.  We query tmux for the window's current session rather than
+caching it, because windows can be moved between sessions.
 
+<<helper functions>>=
 def window_belongs_to_session(
     window_id: str,
     session_id: str,
@@ -4891,8 +4915,14 @@ def window_belongs_to_session(
     except (subprocess.CalledProcessError, OSError):
         return False
     return result.stdout.strip() == session_id
+@
 
+The main entry point for nested commands combines the guards above: it
+resolves the live window from [[TMUX_PANE]], checks for existing
+tracked-window state, and only returns a [[window_id]] when the window
+is already tracked by nytid.
 
+<<helper functions>>=
 def get_current_tracked_window_id(
     who: str,
 ) -> Optional[str]:
@@ -5132,6 +5162,11 @@ dispatcher scans nytid's tracked-window state, then consults tmux's live
 [[window_active_clients]] count to decide which windows should be
 suspended or resumed.
 
+Because multiple nytid launches may target the same tmux session, we
+must avoid appending duplicate hook entries.  The
+[[install_tmux_hook_once]] helper queries existing hooks first and skips
+the append when the exact command string is already registered.
+
 <<helper functions>>=
 def install_tmux_hook_once(
     target: str,
@@ -5140,7 +5175,7 @@ def install_tmux_hook_once(
 ) -> None:
     """Append a tmux hook command once without clobbering others."""
     show_result = subprocess.run(
-        ["tmux", "show-hooks", "-t", target, hook_name],
+        ["tmux", "show-hooks", "-t", target],
         capture_output=True,
         text=True,
         check=False,
@@ -5157,7 +5192,10 @@ def install_tmux_hook_once(
         ],
         check=True,
     )
+@
 
+With the idempotent installer in hand, we register session-scoped hooks
+for all events that can change which window is selected.
 
 <<helper functions>>=
 def install_tmux_window_sync_hooks(
@@ -5573,6 +5611,7 @@ def test_install_tmux_window_sync_hooks_register_session_hooks():
                for mock_call in hook_calls)
     hook_names = [mock_call.args[1] for mock_call in hook_calls]
     assert "session-window-changed" in hook_names
+    assert "client-session-changed" in hook_names
     assert "client-attached" in hook_names
     assert "client-detached" in hook_names
     assert all("_sync-window-tracking-detached" in mock_call.args[2]
@@ -5591,7 +5630,7 @@ def test_install_tmux_hook_once_preserves_existing_hook():
         )
 
     assert mock_run.call_args_list[0].args[0] == [
-        "tmux", "show-hooks", "-t", "$1", "session-window-changed",
+        "tmux", "show-hooks", "-t", "$1",
     ]
     assert mock_run.call_args_list[1].args[0] == [
         "tmux", "set-hook", "-a", "-t", "$1",
@@ -8162,7 +8201,7 @@ def test_start_window_uses_plain_tmux_shell(
         ) as mock_tmux:
             result = runner.invoke(
                 cli,
-                ["start", "work", "--window"],
+                ["start", "work", "--window", "--auto-suspend"],
             )
     assert result.exit_code == 0
     mock_tmux.assert_called_once()
@@ -8191,7 +8230,8 @@ def test_start_window_uses_labels_as_window_name(
         ) as mock_tmux:
             result = runner.invoke(
                 cli,
-                ["start", "work", "--window", "-c", "echo test"],
+                ["start", "work", "--window", "--auto-suspend",
+                 "-c", "echo test"],
             )
     assert result.exit_code == 0
     mock_tmux.assert_called_once()
