@@ -4620,9 +4620,14 @@ def delete_window_labels(
 
 \subsubsection{Per-Window Suspend State}
 
-Window auto-suspend also needs its own suspend-state file so switching
-away from a tracked window records which labels were paused and can
-restart them when any client selects the window again.
+Window auto-suspend also needs its own suspend-state file, but its role
+differs slightly from the pane case.  A pane owns its labels
+exclusively, so pane suspend state can record exactly what was stopped.
+Tracked tmux windows may share labels, however, and the dispatcher may
+revisit an already-inactive window several times.  We therefore store the
+window's full label set as the set to restore when the window becomes
+selected again.  This avoids order-dependent loss of shared labels and
+preserves labels that were added later inside the tracked window.
 
 <<helper functions>>=
 def window_suspend_state_path(
@@ -4641,7 +4646,7 @@ def window_suspend_state_path(
 def write_window_suspend_state(
     path: pathlib.Path, labels: List[str]
 ) -> None:
-    """Atomically write suspended labels for a tracked window."""
+    """Atomically write the labels to restore for a tracked window."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(labels))
@@ -4652,7 +4657,7 @@ def write_window_suspend_state(
 def read_window_suspend_state(
     path: pathlib.Path,
 ) -> Optional[List[str]]:
-    """Read suspended window labels, or ``None`` if missing."""
+    """Read window labels to restore, or ``None`` if missing."""
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -4735,34 +4740,43 @@ def resume_tracking_labels(
     )
 @
 
-Window suspend/resume mirrors the pane helpers but keys state by
-[[window_id]] and uses the tracked window's labels file.  The same
-delete-before-restart ordering applies: deleting the state file first
-ensures a crash never causes a double-resume (see the pane resume
-helper above for the full rationale).
+The implementation takes a [[protected_labels]] set---labels that some
+selected tracked window still needs---and only stops labels outside that
+set.  The state file is written unconditionally with the window's full
+label set, even when nothing was actually stopped, so that a later
+resume can reassert all labels regardless of the order in which windows
+were visited.  The same delete-before-restart ordering still applies
+(see the pane resume helper above for the crash-safety rationale).
 
 <<helper functions>>=
 def suspend_window_tracking_labels(
     who: str,
     labels: List[str],
     window_id: str,
+    protected_labels: Optional[List[str]] = None,
 ) -> None:
-    """Suspend tracking for a tmux window that lost selection."""
+    """Suspend tracking for a tmux window that lost selection.
+
+    Stops only labels not still required by a selected tracked
+    window, but records the window's full label set for later
+    resume.
+    """
+    protected = set(protected_labels or [])
     session = load_active_session(who)
     active = set(session.get_active_labels())
     to_suspend = [
-        lbl for lbl in labels if lbl in active
+        lbl for lbl in labels
+        if lbl in active and lbl not in protected
     ]
-    if not to_suspend:
-        return
 
-    stop_tracking_labels(
-        who=who,
-        labels=to_suspend,
-        quiet_if_missing=True,
-    )
+    if to_suspend:
+        stop_tracking_labels(
+            who=who,
+            labels=to_suspend,
+            quiet_if_missing=True,
+        )
     state_path = window_suspend_state_path(window_id, who)
-    write_window_suspend_state(state_path, to_suspend)
+    write_window_suspend_state(state_path, list(labels))
 @
 
 <<helper functions>>=
@@ -4968,6 +4982,16 @@ purpose: a pane-scoped suspend/resume pair, plus a window-sync command
 that reevaluates all tracked windows in a session.  They follow the
 same pattern as [[_stop-detached]].
 
+Window sync must use a two-phase snapshot.  If we suspend one inactive
+window before learning which other tracked windows are still selected,
+shared labels become order-dependent: the first inactive window can stop
+a label that the selected window still needs, and later passes over an
+already-inactive window can forget labels that were not stopped on that
+particular pass.  We therefore snapshot the tracked windows first,
+derive the union of labels contributed by currently selected windows,
+and only then suspend or resume individual windows against that stable
+protection set.
+
 <<argument and option definitions>>=
 pane_id_opt = typer.Option(
     "--pane-id",
@@ -5009,13 +5033,27 @@ def sync_window_tracking_detached(
 ):
     """Synchronize tracked window state for one tmux session."""
     for who in list_workers_with_tracked_windows():
+        tracked_windows = []
+        active_labels = []
+        active_seen = set()
         for window_id in list_tracked_window_ids(who):
             if not window_belongs_to_session(window_id, session_id):
                 continue
             labels = read_window_labels(window_id, who)
             if not labels:
                 continue
-            if tmux_window_has_active_client(window_id):
+            is_active = tmux_window_has_active_client(window_id)
+            tracked_windows.append(
+                (window_id, labels, is_active)
+            )
+            if is_active:
+                for label in labels:
+                    if label not in active_seen:
+                        active_labels.append(label)
+                        active_seen.add(label)
+
+        for window_id, labels, is_active in tracked_windows:
+            if is_active:
                 resume_window_tracking_labels(
                     who=who, window_id=window_id,
                 )
@@ -5024,6 +5062,7 @@ def sync_window_tracking_detached(
                     who=who,
                     labels=labels,
                     window_id=window_id,
+                    protected_labels=active_labels,
                 )
 @
 
@@ -5586,6 +5625,36 @@ def test_suspend_resume_window_cycle(temp_tracking_dir):
     assert read_window_suspend_state(state_path) is None
 
     runner.invoke(cli, ["stop"])
+@
+
+The suspend state file must record the window's full label set, not
+just the labels that were actually stopped.  This ensures that a later
+resume can reassert shared labels that were protected during this pass.
+<<test functions>>=
+def test_suspend_window_preserves_full_restore_set(
+    temp_tracking_dir,
+):
+    """Window suspend stores the full window label set for later resume."""
+    window_id = "@99"
+    runner.invoke(cli, ["start", "devel", "nytid"])
+
+    suspend_window_tracking_labels(
+        who=default_username,
+        labels=["devel", "nytid", "opencode"],
+        window_id=window_id,
+        protected_labels=["devel"],
+    )
+
+    session = load_active_session(default_username)
+    assert session.get_active_labels() == ["devel"]
+    state_path = window_suspend_state_path(
+        window_id, default_username,
+    )
+    assert read_window_suspend_state(state_path) == [
+        "devel", "nytid", "opencode",
+    ]
+
+    runner.invoke(cli, ["stop"])
 
 def test_suspend_window_detached_respects_active_clients(
     temp_tracking_dir,
@@ -5700,6 +5769,113 @@ def test_sync_window_tracking_detached_suspends_inactive_window(
     assert read_window_suspend_state(
         window_suspend_state_path(window_id, who)
     ) == ["work"]
+@
+
+When two tracked windows share a label and only one is selected, the
+sync dispatcher must not stop the shared label while suspending the
+inactive window.
+<<test functions>>=
+def test_sync_window_tracking_detached_preserves_shared_labels(
+    temp_tracking_dir,
+):
+    """Window sync keeps labels still required by the active window."""
+    session_id = "$1"
+    who = default_username
+    runner.invoke(cli, [
+        "start", "devel", "kthutils", "nytid",
+    ])
+    write_window_labels("@1", who, ["devel", "kthutils"])
+    write_window_labels("@2", who, ["devel", "nytid"])
+
+    with patch(
+        "nytid.cli.track.list_tracked_window_ids",
+        return_value=["@1", "@2"],
+    ), patch(
+        "nytid.cli.track.window_belongs_to_session",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.tmux_window_has_active_client",
+        side_effect=lambda window_id: window_id == "@2",
+    ):
+        runner.invoke(cli, [
+            "_sync-window-tracking-detached",
+            "--session-id", session_id,
+        ])
+
+    assert load_active_session(who).get_active_labels() == [
+        "devel", "nytid",
+    ]
+    assert read_window_suspend_state(
+        window_suspend_state_path("@1", who)
+    ) == ["devel", "kthutils"]
+
+    runner.invoke(cli, ["stop"])
+@
+
+The full restore set stored during suspend must survive across
+dispatcher passes so that switching back to a previously inactive
+window restores all its labels, including those added after the initial
+suspend.
+<<test functions>>=
+def test_sync_window_tracking_detached_restores_labels_added_in_window(
+    temp_tracking_dir,
+):
+    """Window sync remembers labels added later inside a tracked window."""
+    session_id = "$1"
+    who = default_username
+    runner.invoke(cli, [
+        "start", "devel", "kthutils", "nytid", "opencode",
+    ])
+    write_window_labels("@1", who, ["devel", "kthutils"])
+    write_window_labels(
+        "@2", who, ["devel", "nytid", "opencode"]
+    )
+
+    with patch(
+        "nytid.cli.track.list_tracked_window_ids",
+        return_value=["@1", "@2"],
+    ), patch(
+        "nytid.cli.track.window_belongs_to_session",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.tmux_window_has_active_client",
+        side_effect=lambda window_id: window_id == "@1",
+    ):
+        runner.invoke(cli, [
+            "_sync-window-tracking-detached",
+            "--session-id", session_id,
+        ])
+
+    assert load_active_session(who).get_active_labels() == [
+        "devel", "kthutils",
+    ]
+    assert read_window_suspend_state(
+        window_suspend_state_path("@2", who)
+    ) == ["devel", "nytid", "opencode"]
+
+    with patch(
+        "nytid.cli.track.list_tracked_window_ids",
+        return_value=["@1", "@2"],
+    ), patch(
+        "nytid.cli.track.window_belongs_to_session",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.tmux_window_has_active_client",
+        side_effect=lambda window_id: window_id == "@2",
+    ):
+        runner.invoke(cli, [
+            "_sync-window-tracking-detached",
+            "--session-id", session_id,
+        ])
+
+    assert load_active_session(who).get_active_labels() == [
+        "devel", "nytid", "opencode",
+    ]
+    assert read_window_suspend_state(
+        window_suspend_state_path("@1", who)
+    ) == ["devel", "kthutils"]
+
+    runner.invoke(cli, ["stop"])
 
 def test_sync_window_tracking_detached_ignores_other_sessions(
     temp_tracking_dir,
