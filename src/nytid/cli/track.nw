@@ -2189,7 +2189,7 @@ if launch_requested:
     use_auto_suspend = should_auto_suspend(
         who, auto_suspend,
     )
-    if use_auto_suspend and (pane or window):
+    if use_auto_suspend and pane:
         warn_if_focus_events_off()
 
     <<resolve working directory>>
@@ -4214,12 +4214,9 @@ def run_tmux_command(
                 write_window_labels(
                     window_id, focus_who, focus_labels,
                 )
-                install_tmux_window_sync_hooks(
-                    session_id, focus_who,
-                )
+                install_tmux_window_sync_hooks(session_id)
                 install_tmux_window_cleanup_hook(
                     pane_id,
-                    session_id,
                     window_id,
                     focus_who,
                 )
@@ -4855,6 +4852,23 @@ def list_tracked_window_ids(
     return window_ids
 
 
+def list_workers_with_tracked_windows() -> List[str]:
+    """Return workers that currently have tracked tmux windows."""
+    prefix = "window_labels_"
+    suffix = ".json"
+    workers = set()
+    for path in get_tracking_dir().glob("window_labels_*.json"):
+        name = path.name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        stem = name[len(prefix):-len(suffix)]
+        if "_" not in stem:
+            continue
+        worker = stem.rsplit("_", 1)[1]
+        workers.add(worker)
+    return sorted(workers)
+
+
 def window_belongs_to_session(
     window_id: str,
     session_id: str,
@@ -4899,7 +4913,7 @@ def get_current_tracked_window_id(
 \subsubsection{Hidden Detached Commands}
 
 The focus hooks run inside tmux's [[run-shell]], which launches a
-fresh Python process.  We provide four hidden CLI commands for this
+fresh Python process.  We provide three hidden CLI commands for this
 purpose: a pane-scoped suspend/resume pair, plus a window-sync command
 that reevaluates all tracked windows in a session.  They follow the
 same pattern as [[_stop-detached]].
@@ -4942,25 +4956,25 @@ def suspend_detached(
 )
 def sync_window_tracking_detached(
     session_id: Annotated[str, session_id_opt],
-    who: Annotated[str, who_opt] = default_username,
 ):
     """Synchronize tracked window state for one tmux session."""
-    for window_id in list_tracked_window_ids(who):
-        if not window_belongs_to_session(window_id, session_id):
-            continue
-        labels = read_window_labels(window_id, who)
-        if not labels:
-            continue
-        if tmux_window_has_active_client(window_id):
-            resume_window_tracking_labels(
-                who=who, window_id=window_id,
-            )
-        else:
-            suspend_window_tracking_labels(
-                who=who,
-                labels=labels,
-                window_id=window_id,
-            )
+    for who in list_workers_with_tracked_windows():
+        for window_id in list_tracked_window_ids(who):
+            if not window_belongs_to_session(window_id, session_id):
+                continue
+            labels = read_window_labels(window_id, who)
+            if not labels:
+                continue
+            if tmux_window_has_active_client(window_id):
+                resume_window_tracking_labels(
+                    who=who, window_id=window_id,
+                )
+            else:
+                suspend_window_tracking_labels(
+                    who=who,
+                    labels=labels,
+                    window_id=window_id,
+                )
 @
 
 <<detached resume command>>=
@@ -5022,14 +5036,15 @@ def build_detached_suspend_command(
 @
 
 Window auto-suspend uses one hidden dispatcher command keyed by
-[[session_id]] rather than one hidden command per [[window_id]].  It
+[[session_id]] rather than one hidden command per [[window_id]].  The
+dispatcher scans tracked windows for all workers, so one worker's tmux
+launch cannot overwrite another worker's hooks in the same session.  It
 queries tmux at hook time so detach/reattach and multiple attached
 clients are handled from current tmux state without accumulating stale
 per-window hook entries.
 
 <<helper functions>>=
 def build_detached_window_sync_command(
-    who: str,
     session_id: str,
 ) -> str:
     """Return shell command to synchronize tracked windows in a session."""
@@ -5039,8 +5054,6 @@ def build_detached_window_sync_command(
         f"_sync-window-tracking-detached"
         f" --session-id {shlex.quote(session_id)}"
     )
-    if who != default_username:
-        cmd += f" --who {shlex.quote(who)}"
     return cmd
 @
 
@@ -5121,12 +5134,9 @@ which windows should be suspended or resumed.
 <<helper functions>>=
 def install_tmux_window_sync_hooks(
     session_id: str,
-    who: str,
 ) -> None:
     """Install stable session hooks that dispatch window sync."""
-    sync_cmd = build_detached_window_sync_command(
-        who, session_id,
-    )
+    sync_cmd = build_detached_window_sync_command(session_id)
     hook_specs = (
         "session-window-changed",
         "client-session-changed",
@@ -5192,14 +5202,13 @@ def install_tmux_suspend_cleanup_hook(
 Window cleanup removes both the tracked window files and any leftover
 suspend-state when the pane that created the tracked shell exits.  The
 guard still protects against inherited cleanup hooks in descendant panes
-or windows.  The session dispatcher hooks remain installed, but they are
-stable and are overwritten rather than appended, so they do not
-accumulate stale per-window entries.
+or windows.  Unlike the session dispatcher hooks, this cleanup hook must
+be pane-scoped so it disappears together with the pane that created the
+tracked shell.
 
 <<helper functions>>=
 def install_tmux_window_cleanup_hook(
     pane_id: str,
-    session_id: str,
     window_id: str,
     who: str,
 ) -> None:
@@ -5220,7 +5229,7 @@ def install_tmux_window_cleanup_hook(
         subprocess.run(
             [
                 "tmux", "set-hook", "-ap",
-                "-t", session_id,
+                "-t", pane_id,
                 hook_name,
                 guarded,
             ],
@@ -5531,7 +5540,7 @@ def test_suspend_window_detached_respects_active_clients(
 def test_install_tmux_window_sync_hooks_register_session_hooks():
     """Window sync hooks are installed on the tmux session."""
     with patch("nytid.cli.track.subprocess.run") as mock_run:
-        install_tmux_window_sync_hooks("$1", "me")
+        install_tmux_window_sync_hooks("$1")
 
     hook_calls = [
         mock_call.args[0] for mock_call in mock_run.call_args_list
@@ -5865,10 +5874,18 @@ def test_build_detached_resume_command_other_worker():
 
 def test_build_detached_window_sync_command():
     """Window sync command includes session-id."""
-    cmd = build_detached_window_sync_command("me", "$1")
+    cmd = build_detached_window_sync_command("$1")
     assert "_sync-window-tracking-detached" in cmd
     assert "--session-id" in cmd
     assert "$1" in cmd
+
+def test_list_workers_with_tracked_windows(temp_tracking_dir):
+    """Window worker discovery inspects tracked window state files."""
+    write_window_labels("@1", "Dan-Claude", ["seminar"])
+    write_window_labels("@2", default_username, ["notes"])
+    assert list_workers_with_tracked_windows() == [
+        "dan-claude", sanitize_who(default_username),
+    ]
 
 def test_build_detached_nytid_prefix():
     """Prefix includes PYTHONPATH and python executable."""
@@ -7663,6 +7680,7 @@ from nytid.cli.track import (
     resume_window_tracking_labels,
     tmux_window_has_active_client,
     list_tracked_window_ids,
+    list_workers_with_tracked_windows,
     window_belongs_to_session,
     get_tmux_window_id_for_pane,
     has_tracked_window_state,
