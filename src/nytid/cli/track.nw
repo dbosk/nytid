@@ -4854,7 +4854,7 @@ def list_tracked_window_ids(
 
 def list_workers_with_tracked_windows() -> List[str]:
     """Return workers that currently have tracked tmux windows."""
-    prefix = "window_labels_"
+    prefix = "window_labels_window_"
     suffix = ".json"
     workers = set()
     for path in get_tracking_dir().glob("window_labels_*.json"):
@@ -4864,7 +4864,7 @@ def list_workers_with_tracked_windows() -> List[str]:
         stem = name[len(prefix):-len(suffix)]
         if "_" not in stem:
             continue
-        worker = stem.rsplit("_", 1)[1]
+        _, worker = stem.split("_", 1)
         workers.add(worker)
     return sorted(workers)
 
@@ -5126,10 +5126,38 @@ def install_tmux_focus_hooks(
 
 Window launches cannot use [[pane-focus-out]] because terminal blur to a
 browser would incorrectly suspend tracking.  Instead we install one
-stable session-scoped dispatcher hook per worker/session pair.  On each
-relevant tmux event, that dispatcher scans nytid's tracked-window state,
-then consults tmux's live [[window_active_clients]] count to decide
-which windows should be suspended or resumed.
+stable session-scoped dispatcher hook that coexists with any existing
+tmux hooks for the same event.  On each relevant tmux event, that
+dispatcher scans nytid's tracked-window state, then consults tmux's live
+[[window_active_clients]] count to decide which windows should be
+suspended or resumed.
+
+<<helper functions>>=
+def install_tmux_hook_once(
+    target: str,
+    hook_name: str,
+    command: str,
+) -> None:
+    """Append a tmux hook command once without clobbering others."""
+    show_result = subprocess.run(
+        ["tmux", "show-hooks", "-t", target, hook_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    existing = show_result.stdout
+    if command in existing:
+        return
+    subprocess.run(
+        [
+            "tmux", "set-hook", "-a",
+            "-t", target,
+            hook_name,
+            command,
+        ],
+        check=True,
+    )
+
 
 <<helper functions>>=
 def install_tmux_window_sync_hooks(
@@ -5137,6 +5165,7 @@ def install_tmux_window_sync_hooks(
 ) -> None:
     """Install stable session hooks that dispatch window sync."""
     sync_cmd = build_detached_window_sync_command(session_id)
+    hook_command = f"run-shell {shlex.quote(sync_cmd)}"
     hook_specs = (
         "session-window-changed",
         "client-session-changed",
@@ -5144,14 +5173,10 @@ def install_tmux_window_sync_hooks(
         "client-detached",
     )
     for hook_name in hook_specs:
-        subprocess.run(
-            [
-                "tmux", "set-hook",
-                "-t", session_id,
-                hook_name,
-                f"run-shell {shlex.quote(sync_cmd)}",
-            ],
-            check=True,
+        install_tmux_hook_once(
+            session_id,
+            hook_name,
+            hook_command,
         )
 @
 
@@ -5539,23 +5564,53 @@ def test_suspend_window_detached_respects_active_clients(
 
 def test_install_tmux_window_sync_hooks_register_session_hooks():
     """Window sync hooks are installed on the tmux session."""
-    with patch("nytid.cli.track.subprocess.run") as mock_run:
+    with patch("nytid.cli.track.install_tmux_hook_once") as mock_install:
         install_tmux_window_sync_hooks("$1")
 
-    hook_calls = [
-        mock_call.args[0] for mock_call in mock_run.call_args_list
-    ]
+    hook_calls = mock_install.call_args_list
     assert hook_calls
-    assert all(cmd[0:3] == [
-        "tmux", "set-hook", "-t"
-    ] for cmd in hook_calls)
-    assert all(cmd[3] == "$1" for cmd in hook_calls)
-    hook_names = [cmd[4] for cmd in hook_calls]
+    assert all(mock_call.args[0] == "$1"
+               for mock_call in hook_calls)
+    hook_names = [mock_call.args[1] for mock_call in hook_calls]
     assert "session-window-changed" in hook_names
     assert "client-attached" in hook_names
     assert "client-detached" in hook_names
-    assert all("_sync-window-tracking-detached" in cmd[5]
-               for cmd in hook_calls)
+    assert all("_sync-window-tracking-detached" in mock_call.args[2]
+               for mock_call in hook_calls)
+
+def test_install_tmux_hook_once_preserves_existing_hook():
+    """Hook installer appends nytid without overwriting existing hooks."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run:
+        mock_run.return_value.stdout = (
+            "session-window-changed[0] run-shell 'existing'\n"
+        )
+        install_tmux_hook_once(
+            "$1",
+            "session-window-changed",
+            "run-shell 'nytid-sync'",
+        )
+
+    assert mock_run.call_args_list[0].args[0] == [
+        "tmux", "show-hooks", "-t", "$1", "session-window-changed",
+    ]
+    assert mock_run.call_args_list[1].args[0] == [
+        "tmux", "set-hook", "-a", "-t", "$1",
+        "session-window-changed", "run-shell 'nytid-sync'",
+    ]
+
+def test_install_tmux_hook_once_skips_duplicate_command():
+    """Hook installer avoids appending duplicate nytid hook commands."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run:
+        mock_run.return_value.stdout = (
+            "session-window-changed[1] run-shell 'nytid-sync'\n"
+        )
+        install_tmux_hook_once(
+            "$1",
+            "session-window-changed",
+            "run-shell 'nytid-sync'",
+        )
+
+    assert mock_run.call_count == 1
 
 def test_sync_window_tracking_detached_suspends_inactive_window(
     temp_tracking_dir,
@@ -7685,6 +7740,7 @@ from nytid.cli.track import (
     get_tmux_window_id_for_pane,
     has_tracked_window_state,
     get_current_tracked_window_id,
+    install_tmux_hook_once,
     build_detached_nytid_prefix,
     build_detached_suspend_command,
     build_detached_resume_command,
