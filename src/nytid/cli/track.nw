@@ -1759,18 +1759,25 @@ def save_active_session(
 
 @
 
-Tracking state lives in two files---the per-worker session and the
-shared history log---so any mutation must hold both locks to prevent
-a concurrent process from seeing a half-written state.
+Tracking state lives in two primary files---the per-worker session and
+the shared history log---so any mutation must hold both locks to prevent
+a concurrent process from seeing a half-written state.  Some operations
+also need to update tmux pane/window context files in lock-step with
+those primary files; otherwise hooks can observe contradictory state.
 [[mutate_worker_tracking_state]] acquires the session lock first
-(per-worker), then the history lock (global), loads fresh copies of
-both files, and hands them to a \emph{callback}.  The callback
-returns the updated session and history (plus optional extras), and
-the function writes both files before releasing the locks.
+(per-worker), then the history lock (global), loads fresh copies of the
+primary files, and hands them to a \emph{callback}.  The callback
+returns the updated session and history (plus optional extras), and the
+function writes both files before running an optional [[post_update]]
+hook that can update dependent state while the same locks are still
+held.
 
-The callback pattern keeps the critical section explicit: all reads
-and writes happen inside the lock, so callers cannot accidentally
-read stale data before locking or forget to write afterwards.
+The two-phase callback pattern keeps the critical section explicit: all
+reads and writes happen inside the lock, so callers cannot accidentally
+read stale data before locking or forget to write afterwards.  The main
+callback computes the new session/history contents, while
+[[post_update]] handles side files whose correctness depends on seeing
+the freshly persisted primary state.
 
 Normalization runs twice---once before the callback (so the
 callback sees clean data) and once after (so any entries the
@@ -1785,7 +1792,12 @@ def mutate_worker_tracking_state(
     who: str = None,
     post_update=None,
 ):
-    """Mutate one worker's session and history under shared locks."""
+    """Mutate one worker's session and history under shared locks.
+
+    ``post_update`` runs after the primary files are written but before
+    the locks are released, so dependent state such as tmux context
+    files can stay in sync with the persisted session/history state.
+    """
     ensure_tracking_dir()
     session_lock_file = get_current_session_lock_file(who)
     with open(session_lock_file, 'w') as session_lock_handle:
@@ -1957,6 +1969,8 @@ def stop_tracking_labels(
     """Stop labels from fresh on-disk state."""
     if end_time is None:
         end_time = datetime.datetime.now()
+    if labels == []:
+        return load_active_session(who), []
     resolved_who = (
         who if who is not None
         else default_username
@@ -5369,11 +5383,14 @@ def build_detached_track_finalize_command(
 @
 
 The [[_stop-detached]] hidden command must also unregister labels from any
-tracked tmux context.  Since [[_stop-detached]] runs inside the tmux pane,
-[[$TMUX_PANE]] is available and the unregister logic can locate the correct
-pane and window labels files.  Without this cleanup, labels from finished
-detached commands accumulate in the pane labels file and interfere with
-auto-suspend.
+tracked tmux context.  It delegates that cleanup to
+[[stop_tracking_labels()]] with tmux context updates left enabled, so the
+same start/stop helper owns both the active-session mutation and the pane or
+window bookkeeping.  Since [[_stop-detached]] runs inside the tmux pane,
+[[$TMUX_PANE]] is available and the delegated unregister logic can locate the
+correct pane and window labels files.  Without this cleanup, labels from
+finished detached commands accumulate in the pane labels file and interfere
+with auto-suspend.
 
 <<detached finalize command>>=
 @cli.command(name="_stop-detached", hidden=True)
@@ -5386,6 +5403,7 @@ def stop_detached(
         who=who,
         labels=labels,
         quiet_if_missing=True,
+        update_tmux_context=True,
     )
 @
 
