@@ -1841,6 +1841,7 @@ def start_tracking_labels(
     who: str = None,
     replace: bool = False,
     description: Optional[str] = None,
+    update_tmux_context: bool = True,
 ):
     """Start labels from fresh on-disk state."""
     normalized_labels = list(labels)
@@ -1882,6 +1883,14 @@ def start_tracking_labels(
     _, _, started, already_tracking, discarded = (
         mutate_worker_tracking_state(update, who)
     )
+    if update_tmux_context and started:
+        resolved_who = (
+            who if who is not None
+            else default_username
+        )
+        register_tmux_context_labels(
+            started, resolved_who,
+        )
     return started, already_tracking, discarded
 
 @
@@ -1929,6 +1938,7 @@ def stop_tracking_labels(
     all_labels: bool = False,
     end_time: Optional[datetime.datetime] = None,
     quiet_if_missing: bool = False,
+    update_tmux_context: bool = True,
 ):
     """Stop labels from fresh on-disk state."""
     if end_time is None:
@@ -1963,6 +1973,20 @@ def stop_tracking_labels(
         who,
     )
 
+    if update_tmux_context and completed_entries:
+        stopped_labels = [
+            label
+            for entry in completed_entries
+            for label in entry.labels
+        ]
+        resolved_who = (
+            who if who is not None
+            else default_username
+        )
+        unregister_tmux_context_labels(
+            stopped_labels, resolved_who,
+        )
+
     if completed_entries:
         return session, completed_entries
     if quiet_if_missing:
@@ -1980,6 +2004,7 @@ def stop_tracking_labels_if_active(
     who: str = None,
     labels: List[str],
     end_time: Optional[datetime.datetime] = None,
+    update_tmux_context: bool = True,
 ):
     """Stop the active subset of ``labels`` without erroring if absent."""
     if end_time is None:
@@ -2009,6 +2034,19 @@ def stop_tracking_labels_if_active(
         update,
         who,
     )
+    if update_tmux_context and completed_entries:
+        stopped_labels = [
+            label
+            for entry in completed_entries
+            for label in entry.labels
+        ]
+        resolved_who = (
+            who if who is not None
+            else default_username
+        )
+        unregister_tmux_context_labels(
+            stopped_labels, resolved_who,
+        )
     return session, completed_entries, active_labels
 
 def update_switch_other_labels(
@@ -2259,7 +2297,6 @@ if started:
         f"Started tracking: "
         f"{', '.join(sorted(started))}"
     )
-    <<register started labels with tracked tmux context>>
 if already_tracking:
     typer.echo(
         f"Already tracking: "
@@ -2272,28 +2309,6 @@ typer.echo(f"Active labels: {', '.join(all_active)}")
 if who != default_username:
     typer.echo(f"Worker: {who}")
 <<report custom start time if used>>
-@
-
-If we are running inside a tracked tmux context, newly started labels
-must join that context's auto-suspend set.  Pane launches use the pane
-labels file; window launches use the window labels file.  The checks for
-[[read_pane_labels()]] and [[read_window_labels()]] returning non-[[None]]
-ensure we only touch contexts that were launched with auto-suspend
-enabled---a plain [[track start]] in an untracked pane or window creates
-no file.
-
-<<register started labels with tracked tmux context>>=
-pane_id = os.environ.get("TMUX_PANE")
-if pane_id:
-    if read_pane_labels(pane_id, who) is not None:
-        add_pane_labels(
-            pane_id, who, list(started),
-        )
-window_id = get_current_tracked_window_id(who)
-if window_id:
-    add_window_labels(
-        window_id, who, list(started),
-    )
 @
 
 \subsubsection{Time Offset Support}
@@ -2819,36 +2834,6 @@ def stop(
             f"{end_time.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-    <<unregister stopped labels from tracked tmux context>>
-@
-
-When labels are stopped, we remove them from any tracked tmux context so
-that the next auto-suspend event does not try to suspend labels that are
-no longer running.  Pane launches update the pane labels file; window
-launches update only the current window's labels file.
-
-That asymmetry is intentional.  Pane tracking models one focused shell,
-so a stopped label should disappear from that pane's declaration.  Window
-tracking is per-window rather than globally per label: stopping [[devel]]
-while working in window~A removes [[devel]] from window~A's file so a
-later return to window~A will not restart it, but another tracked
-window~B may still declare [[devel]] independently.
-
-<<unregister stopped labels from tracked tmux context>>=
-stopped_labels = []
-for entry in completed_entries:
-    stopped_labels.extend(entry.labels)
-pane_id = os.environ.get("TMUX_PANE")
-if pane_id and stopped_labels:
-    if read_pane_labels(pane_id, who) is not None:
-        remove_pane_labels(
-            pane_id, who, stopped_labels,
-        )
-window_id = get_current_tracked_window_id(who)
-if window_id and stopped_labels:
-    remove_window_labels(
-        window_id, who, stopped_labels,
-    )
 @
 
 \subsubsection{Testing Stop Command}
@@ -4520,6 +4505,50 @@ def delete_pane_labels(
         pass
 @
 
+Pane and window label files are updated together whenever interactive tracking
+starts or stops labels.  Centralising that policy in helper functions keeps
+call sites from forgetting the tmux bookkeeping.  The pane side remains guarded
+by [[read_pane_labels()]] returning non-[[None]]: only panes launched with
+auto-suspend should gain a pane labels file.  Window tracking is intentionally
+asymmetric.  Removing [[devel]] from window~A should stop that window from
+reviving it later, but another tracked window~B may still declare [[devel]]
+independently.
+
+<<helper functions>>=
+def register_tmux_context_labels(
+    labels: List[str], who: str,
+) -> None:
+    """Add labels to the current pane/window tracking context."""
+    pane_id = os.environ.get("TMUX_PANE")
+    if pane_id:
+        if read_pane_labels(pane_id, who) is not None:
+            add_pane_labels(
+                pane_id, who, list(labels),
+            )
+    window_id = get_current_tracked_window_id(who)
+    if window_id:
+        add_window_labels(
+            window_id, who, list(labels),
+        )
+
+
+def unregister_tmux_context_labels(
+    labels: List[str], who: str,
+) -> None:
+    """Remove labels from the current pane/window tracking context."""
+    pane_id = os.environ.get("TMUX_PANE")
+    if pane_id:
+        if read_pane_labels(pane_id, who) is not None:
+            remove_pane_labels(
+                pane_id, who, list(labels),
+            )
+    window_id = get_current_tracked_window_id(who)
+    if window_id:
+        remove_window_labels(
+            window_id, who, list(labels),
+        )
+@
+
 \subsubsection{Per-Window Active Labels}
 \label{track:window-auto-suspend}
 
@@ -4656,6 +4685,7 @@ def suspend_tracking_labels(
         who=who,
         labels=to_suspend,
         quiet_if_missing=True,
+        update_tmux_context=False,
     )
     state_path = suspend_state_path(pane_id, who)
     write_suspend_state(state_path, to_suspend)
@@ -4687,6 +4717,7 @@ def resume_tracking_labels(
         who=who,
         labels=labels,
         start_time=datetime.datetime.now(),
+        update_tmux_context=False,
     )
 @
 
@@ -4988,6 +5019,7 @@ if to_stop:
         who=who,
         labels=to_stop,
         quiet_if_missing=True,
+        update_tmux_context=False,
     )
 
 to_start = [
@@ -4999,6 +5031,7 @@ if to_start:
         who=who,
         labels=to_start,
         start_time=datetime.datetime.now(),
+        update_tmux_context=False,
     )
 @
 
@@ -5332,7 +5365,6 @@ def stop_detached(
         labels=labels,
         quiet_if_missing=True,
     )
-    <<unregister stopped labels from tracked tmux context>>
 @
 
 \subsubsection{Focus-Events Validation}
@@ -6357,16 +6389,9 @@ window or pane declarations behind.
 
 <<unregister launched labels from tracked tmux context>>=
 launched_labels = list(started)
-pane_id = os.environ.get("TMUX_PANE")
-if pane_id and launched_labels:
-    if read_pane_labels(pane_id, who) is not None:
-        remove_pane_labels(
-            pane_id, who, launched_labels,
-        )
-window_id = get_current_tracked_window_id(who)
-if window_id and launched_labels:
-    remove_window_labels(
-        window_id, who, launched_labels,
+if launched_labels:
+    unregister_tmux_context_labels(
+        launched_labels, who,
     )
 @
 
@@ -7954,6 +7979,8 @@ from nytid.cli.track import (
     add_pane_labels,
     remove_pane_labels,
     delete_pane_labels,
+    register_tmux_context_labels,
+    unregister_tmux_context_labels,
     window_labels_path,
     read_window_labels,
     write_window_labels,
