@@ -6187,6 +6187,14 @@ tracked tmux context.  The pane itself survives after a [[-c]] command
 exits, so without explicit cleanup the pane labels file would accumulate
 stale entries that confuse auto-suspend.
 
+Normal command exit has one subtle race with auto-suspend: by the time the
+child process exits, switching away from the pane or window may already have
+stopped those labels.  In that case [[stop_tracking_labels()]] quite rightly
+returns no completed entries, but the tmux context still needs to forget that
+the command ever owned those labels.  We therefore unregister the labels that
+this launch started, rather than inferring cleanup from what happened to still
+be active at process exit.
+
 <<launch subprocess if requested>>=
 if launch_requested:
     launch_start_time = datetime.datetime.now()
@@ -6199,7 +6207,7 @@ if launch_requested:
         )
         raise typer.Exit(0)
     <<stop launched labels>>
-    <<unregister stopped labels from tracked tmux context>>
+    <<unregister launched labels from tracked tmux context>>
     <<report launch result>>
     raise typer.Exit(exit_code)
 @
@@ -6340,6 +6348,26 @@ session, completed_entries = stop_tracking_labels(
     end_time=end_time,
     quiet_if_missing=True,
 )
+@
+
+The launch cleanup path must unregister the labels this command started even
+when they were already auto-suspended before the subprocess exited.  Using the
+freshly computed [[completed_entries]] would miss that case and leave stale
+window or pane declarations behind.
+
+<<unregister launched labels from tracked tmux context>>=
+stopped_labels = list(started)
+pane_id = os.environ.get("TMUX_PANE")
+if pane_id and stopped_labels:
+    if read_pane_labels(pane_id, who) is not None:
+        remove_pane_labels(
+            pane_id, who, stopped_labels,
+        )
+window_id = get_current_tracked_window_id(who)
+if window_id and stopped_labels:
+    remove_window_labels(
+        window_id, who, stopped_labels,
+    )
 @
 
 <<report launch result>>=
@@ -8312,6 +8340,67 @@ def test_start_command_uses_command_basename_as_label(temp_tracking_dir):
     assert "neomutt" in last_entry.labels
     assert "/usr/local/bin/neomutt" not in last_entry.labels
     assert last_entry.description == "/usr/local/bin/neomutt -f inbox"
+
+
+def test_start_command_exit_cleans_stale_window_labels(
+    temp_tracking_dir,
+):
+    """Command exit removes launch labels even after window auto-suspend."""
+    who = default_username
+    runner.invoke(cli, ["start", "work"])
+    write_window_labels("@42", who, ["work"])
+
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX_PANE": "%7",
+            "TMUX_WINDOW_ID": "@999",
+        },
+        clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value="@42",
+    ), patch(
+        "nytid.cli.track.subprocess.run",
+    ) as mock_run:
+        mock_run.return_value.returncode = 0
+        result = runner.invoke(cli, [
+            "start", "--command", "opencode",
+        ])
+
+    assert result.exit_code == 0
+    assert read_window_labels("@42", who) == ["work"]
+    assert "opencode" not in load_active_session(who).get_active_labels()
+
+    runner.invoke(cli, ["stop"])
+
+
+def test_start_command_exit_cleans_stale_pane_labels(
+    temp_tracking_dir,
+):
+    """Command exit removes launch labels even after pane auto-suspend."""
+    who = default_username
+    pane_id = "%7"
+    runner.invoke(cli, ["start", "work"])
+    write_pane_labels(pane_id, who, ["work"])
+
+    with patch.dict(
+        os.environ,
+        {"TMUX_PANE": pane_id},
+        clear=True,
+    ), patch(
+        "nytid.cli.track.subprocess.run",
+    ) as mock_run:
+        mock_run.return_value.returncode = 0
+        result = runner.invoke(cli, [
+            "start", "--command", "opencode",
+        ])
+
+    assert result.exit_code == 0
+    assert read_pane_labels(pane_id, who) == ["work"]
+    assert "opencode" not in load_active_session(who).get_active_labels()
+
+    runner.invoke(cli, ["stop"])
 
 
 def test_start_pane_uses_plain_tmux_shell(
