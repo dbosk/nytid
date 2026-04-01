@@ -234,6 +234,9 @@ The track system supports the following configuration options:
   \enquote{dan-claude} that do not interactively focus tmux
   windows.  Example:
   [[nytid config track.auto-suspend.dan-claude -s false]].
+\item[[[track.debug]]] Enable deferred window-event debug logging and
+  notifications.  Defaults to \enquote{false}.  Truthy values are
+  \enquote{true}, \enquote{1}, and \enquote{yes}.
 \end{description}
 
 To customize the track system, use the standard nytid config commands:
@@ -251,10 +254,14 @@ nytid config track.daily_limit -s 7.5
 # Disable auto-suspend for an automated worker
 nytid config track.auto-suspend.dan-claude -s false
 
+# Enable deferred window-event debugging
+nytid config track.debug -s true
+
 # View current track configuration
 nytid config track.data_dir
 nytid config track.weekly_limit  
 nytid config track.daily_limit
+nytid config track.debug
 \end{minted}
 
 The configuration system ensures that track settings are persistent and can be
@@ -264,13 +271,15 @@ We use nytid's StorageRoot system for managing tracking data files, which provid
 a consistent interface with other nytid components and supports different storage
 backends (local filesystem, AFS, etc.).
 
-<<configuration management>>=
-# Configuration keys for track system
-TRACKING_DIR_CONFIG = "track.data_dir"
-DEFAULT_WEEKLY_LIMIT_CONFIG = "track.weekly_limit"
-DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
-AUTO_SUSPEND_CONFIG = "track.auto-suspend"
+The storage-root helper is the only code that cares about where track
+data lives, so we introduce [[TRACKING_DIR_CONFIG]] here rather than in
+one distant global block.
 
+<<constants>>=
+TRACKING_DIR_CONFIG = "track.data_dir"
+@
+
+<<configuration management>>=
 def get_tracking_storage() -> storage.StorageRoot:
     """
     Get the StorageRoot for tracking data.
@@ -375,22 +384,49 @@ def get_current_session_lock_file(
     """Get the lock file guarding one worker's active session."""
     session_file = get_current_session_file(who)
     return session_file.with_suffix(".lock")
+@
 
+The weekly limit helper only needs one key, so we keep that key next to
+the helper that reads it.
+
+<<constants>>=
+DEFAULT_WEEKLY_LIMIT_CONFIG = "track.weekly_limit"
+@
+
+<<configuration management>>=
 def get_default_weekly_limit() -> float:
     """Get the default weekly hour limit from config"""
     try:
         return float(config.get(DEFAULT_WEEKLY_LIMIT_CONFIG))
     except (KeyError, ValueError):
         return DEFAULT_WEEKLY_LIMIT_HOURS
+@
 
+Likewise, the daily-limit key belongs with the daily-limit helper.
+
+<<constants>>=
+DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
+@
+
+<<configuration management>>=
 def get_default_daily_limit() -> float:
     """Get the default daily hour limit from config"""
     try:
         return float(config.get(DEFAULT_DAILY_LIMIT_CONFIG))
     except (KeyError, ValueError):
         return DEFAULT_DAILY_LIMIT_HOURS
+@
+
+Auto-suspend has both runtime logic and tests that refer to the same
+key family, so we define [[AUTO_SUSPEND_CONFIG]] here where that policy
+is resolved.
+
+<<constants>>=
+AUTO_SUSPEND_CONFIG = "track.auto-suspend"
+@
 
 
+<<configuration management>>=
 def should_auto_suspend(
     who: str,
     flag: Optional[bool],
@@ -4855,7 +4891,7 @@ When debugging unexpected history splits, we need to see both sides of
 the deferred \emph{window-event} buffer: what each hook appended and
 what transition that buffer eventually executed.  We therefore add an
 environment-gated trace for this buffer only.  When
-[[NYTID_TRACK_DEBUG]] is truthy, nytid appends one line per buffer
+[[track.debug]] is truthy, nytid appends one line per buffer
 append or buffer-triggered execution to a debug log in the tracking
 directory and also emits best-effort desktop notifications via
 [[notify-send]].  Append events notify individually, but one executed
@@ -4869,9 +4905,17 @@ because tmux hook subprocesses only inherit whatever graphical session
 environment the server can see.  The file log is therefore the primary
 record, while notifications are a convenience for live observation.
 
-An environment variable keeps the instrumentation local to one shell or
-tmux hook.  That makes it easy to turn on while reproducing the bug and
-impossible to forget in persistent configuration.
+Because the setting lives in nytid's configuration store rather than one
+shell environment, tmux hooks see the same debug flag as interactive
+commands.  That makes the instrumentation reliable across both the live
+CLI and detached hook processes.
+
+The debug flag is only used by the deferred-buffer diagnostics, so we
+introduce [[TRACK_DEBUG_CONFIG]] immediately before that helper.
+
+<<constants>>=
+TRACK_DEBUG_CONFIG = "track.debug"
+@
 
 <<helper functions>>=
 def window_event_buffer_path(
@@ -4887,12 +4931,13 @@ def window_event_buffer_path(
     )
 
 def track_debug_enabled() -> bool:
-    """Return whether [[NYTID_TRACK_DEBUG]] enables hook tracing."""
-    value = os.environ.get("NYTID_TRACK_DEBUG")
-    if value is None:
+    """Return whether [[track.debug]] enables hook tracing."""
+    try:
+        value = config.get(TRACK_DEBUG_CONFIG)
+    except KeyError:
         return False
-    return value.strip().lower() not in {
-        "", "0", "false", "no", "off",
+    return str(value).strip().lower() in {
+        "true", "1", "yes",
     }
 
 def window_event_debug_log_path() -> pathlib.Path:
@@ -6539,45 +6584,46 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
     ).read_text() == ""
 
 def test_window_event_debug_disabled_by_default(temp_tracking_dir):
-    """Without the env var, window-event tracing stays silent."""
-    with patch.dict(
-        os.environ,
-        {"NYTID_TRACK_DEBUG": ""},
-        clear=False,
-    ):
+    """Without [[track.debug]], window-event tracing stays silent."""
+    import typerconf as config
+    config.set(TRACK_DEBUG_CONFIG, None)
+    try:
         append_and_check_window_event(
             "me", TEST_SERVER_KEY, TEST_SESSION_ID,
             "stop work",
         )
+    finally:
+        config.set(TRACK_DEBUG_CONFIG, None)
 
     assert not window_event_debug_log_path().exists()
 
 def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
     """Debug mode logs append and execute steps for the event buffer."""
     who = "me"
-    with patch.dict(
-        os.environ,
-        {"NYTID_TRACK_DEBUG": "1"},
-        clear=False,
-    ), patch(
-        "nytid.cli.track.subprocess.run"
-    ) as mock_run, patch(
-        "nytid.cli.track.stop_tracking_labels"
-    ), patch(
-        "nytid.cli.track.start_tracking_labels"
-    ):
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
-        )
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
-        )
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked",
-        )
+    import typerconf as config
+    config.set(TRACK_DEBUG_CONFIG, "1")
+    try:
+        with patch(
+            "nytid.cli.track.subprocess.run"
+        ) as mock_run, patch(
+            "nytid.cli.track.stop_tracking_labels"
+        ), patch(
+            "nytid.cli.track.start_tracking_labels"
+        ):
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "stop work",
+            )
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "start admin",
+            )
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "window-switch tracked",
+            )
+    finally:
+        config.set(TRACK_DEBUG_CONFIG, None)
 
     log_text = window_event_debug_log_path().read_text()
     assert "action=append" in log_text
@@ -6600,18 +6646,19 @@ def test_window_event_debug_ignores_missing_notify_send(
     temp_tracking_dir,
 ):
     """Debug mode tolerates hosts without [[notify-send]]."""
-    with patch.dict(
-        os.environ,
-        {"NYTID_TRACK_DEBUG": "1"},
-        clear=False,
-    ), patch(
-        "nytid.cli.track.subprocess.run",
-        side_effect=FileNotFoundError,
-    ):
-        append_and_check_window_event(
-            "me", TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
-        )
+    import typerconf as config
+    config.set(TRACK_DEBUG_CONFIG, "1")
+    try:
+        with patch(
+            "nytid.cli.track.subprocess.run",
+            side_effect=FileNotFoundError,
+        ):
+            append_and_check_window_event(
+                "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+                "stop work",
+            )
+    finally:
+        config.set(TRACK_DEBUG_CONFIG, None)
 
     assert window_event_debug_log_path().exists()
 
@@ -6620,25 +6667,26 @@ def test_window_event_debug_notifies_stop_only_execution(
 ):
     """Tracked-to-untracked execution sends one summary notification."""
     who = "me"
-    with patch.dict(
-        os.environ,
-        {"NYTID_TRACK_DEBUG": "1"},
-        clear=False,
-    ), patch(
-        "nytid.cli.track.subprocess.run"
-    ) as mock_run, patch(
-        "nytid.cli.track.stop_tracking_labels"
-    ), patch(
-        "nytid.cli.track.start_tracking_labels"
-    ):
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
-        )
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch untracked",
-        )
+    import typerconf as config
+    config.set(TRACK_DEBUG_CONFIG, "1")
+    try:
+        with patch(
+            "nytid.cli.track.subprocess.run"
+        ) as mock_run, patch(
+            "nytid.cli.track.stop_tracking_labels"
+        ), patch(
+            "nytid.cli.track.start_tracking_labels"
+        ):
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "stop work",
+            )
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "window-switch untracked",
+            )
+    finally:
+        config.set(TRACK_DEBUG_CONFIG, None)
 
     notify_calls = [
         call for call in mock_run.call_args_list
@@ -6655,25 +6703,26 @@ def test_window_event_debug_notifies_start_only_execution(
 ):
     """Untracked-to-tracked execution sends one summary notification."""
     who = "me"
-    with patch.dict(
-        os.environ,
-        {"NYTID_TRACK_DEBUG": "1"},
-        clear=False,
-    ), patch(
-        "nytid.cli.track.subprocess.run"
-    ) as mock_run, patch(
-        "nytid.cli.track.stop_tracking_labels"
-    ), patch(
-        "nytid.cli.track.start_tracking_labels"
-    ):
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
-        )
-        append_and_check_window_event(
-            who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked",
-        )
+    import typerconf as config
+    config.set(TRACK_DEBUG_CONFIG, "1")
+    try:
+        with patch(
+            "nytid.cli.track.subprocess.run"
+        ) as mock_run, patch(
+            "nytid.cli.track.stop_tracking_labels"
+        ), patch(
+            "nytid.cli.track.start_tracking_labels"
+        ):
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "start admin",
+            )
+            append_and_check_window_event(
+                who, TEST_SERVER_KEY, TEST_SESSION_ID,
+                "window-switch tracked",
+            )
+    finally:
+        config.set(TRACK_DEBUG_CONFIG, None)
 
     notify_calls = [
         call for call in mock_run.call_args_list
@@ -8904,6 +8953,7 @@ from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
     AUTO_SUSPEND_CONFIG,
+    TRACK_DEBUG_CONFIG,
     load_tracking_data, load_active_session,
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
