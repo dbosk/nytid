@@ -148,6 +148,7 @@ import os
 import pathlib
 import shlex
 import signal
+import socket
 import sys
 import subprocess
 import tempfile
@@ -308,6 +309,42 @@ def sanitize_who(who: str) -> str:
     return "".join(
         c if c.isalnum() or c == "-" else "_"
         for c in who.lower()
+    )
+
+def sanitize_tmux_id(value: str) -> str:
+    """Sanitize a tmux identifier for use in filenames."""
+    return "".join(
+        c if c.isalnum() or c == "-" else "_"
+        for c in value
+    )
+
+def build_tmux_server_key(
+    hostname: str,
+    socket_path: str,
+) -> str:
+    """Return a stable key for one tmux server."""
+    digest = hashlib.sha256(
+        f"{hostname}\0{socket_path}".encode()
+    ).hexdigest()
+    return digest[:16]
+
+def parse_tmux_socket_path(
+    tmux_env: Optional[str],
+) -> Optional[str]:
+    """Extract the tmux socket path from ``$TMUX`` if present."""
+    if not tmux_env:
+        return None
+    return tmux_env.split(",", 1)[0] or None
+
+def get_current_tmux_server_key() -> Optional[str]:
+    """Return the current tmux server key from the environment."""
+    socket_path = parse_tmux_socket_path(
+        os.environ.get("TMUX")
+    )
+    if not socket_path:
+        return None
+    return build_tmux_server_key(
+        socket.gethostname(), socket_path,
     )
 
 def get_current_session_file(
@@ -4176,6 +4213,7 @@ def run_tmux_command(
     session_id = None
     remove_status_file = False
     completion_guard = None
+    tmux_server_key = None
 
     if block and status_file is None:
         fd, status_file = tempfile.mkstemp(
@@ -4233,6 +4271,13 @@ def run_tmux_command(
         )
 
     try:
+        socket_path = parse_tmux_socket_path(
+            env.get("TMUX")
+        )
+        if socket_path:
+            tmux_server_key = build_tmux_server_key(
+                socket.gethostname(), socket_path,
+            )
         result = subprocess.run(
             tmux_args,
             check=True,
@@ -4248,27 +4293,45 @@ def run_tmux_command(
             session_id = pane_info[2]
         install_tmux_exit_hooks(pane_id, hook_command)
         if focus_labels and focus_who:
+            if not tmux_server_key:
+                raise RuntimeError(
+                    "tmux server key missing for auto-suspend launch"
+                )
             if focus_window and window_id and session_id:
                 write_window_labels(
-                    window_id, focus_who, focus_labels,
+                    window_id,
+                    focus_who,
+                    tmux_server_key,
+                    focus_labels,
                 )
                 install_tmux_window_sync_hooks(
-                    session_id, pane_id, focus_who,
+                    session_id,
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
                 )
                 install_tmux_window_cleanup_hook(
                     pane_id,
                     window_id,
                     focus_who,
+                    tmux_server_key,
                 )
             else:
                 write_pane_labels(
-                    pane_id, focus_who, focus_labels,
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
+                    focus_labels,
                 )
                 install_tmux_focus_hooks(
-                    pane_id, focus_who,
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
                 )
                 install_tmux_suspend_cleanup_hook(
-                    pane_id, focus_who,
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
                 )
         subprocess.run(
             ["tmux", "wait-for", "-S", ready_channel],
@@ -4348,14 +4411,16 @@ tracking (see \cref{track:window-auto-suspend}).
 \subsubsection{Suspend State Files}
 
 Each tracked pane that uses auto-suspend stores a JSON file
-identifying the labels that were suspended.  The filename encodes
-the tmux pane ID (with the leading [[%]] replaced by [[pane_]])
-and the worker identity so that parallel workers in different panes
-do not collide.
+identifying the labels that were suspended.  The filename encodes the
+tmux server key, the tmux pane ID (with the leading [[%]] replaced by
+[[pane_]]), and the worker identity so that parallel workers or
+independent tmux servers sharing the same filesystem do not collide.
 
 <<helper functions>>=
 def suspend_state_path(
-    pane_id: str, who: str
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> pathlib.Path:
     """Return the path to a pane's suspend state file.
 
@@ -4365,7 +4430,8 @@ def suspend_state_path(
     safe_pane = pane_id.replace("%", "pane_")
     return (
         get_tracking_dir()
-        / f"suspend_{safe_pane}_{sanitize_who(who)}.json"
+        / f"suspend_{sanitize_tmux_id(tmux_server_key)}"
+        f"_{safe_pane}_{sanitize_who(who)}.json"
     )
 @
 
@@ -4429,13 +4495,15 @@ inside a tracked pane (via the [[TMUX_PANE]] environment variable).
 The file exists only for panes launched with auto-suspend; a plain
 [[track start]] in an untracked pane creates no file.
 
-The naming convention mirrors [[suspend_state_path]]: the tmux pane
-ID's leading [[%]] becomes [[pane_]], and the worker identity is
-appended.
+The naming convention mirrors [[suspend_state_path]]: the tmux server
+key is prefixed, the tmux pane ID's leading [[%]] becomes [[pane_]],
+and the worker identity is appended.
 
 <<helper functions>>=
 def pane_labels_path(
-    pane_id: str, who: str
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> pathlib.Path:
     """Return path to a pane's active labels file.
 
@@ -4445,7 +4513,7 @@ def pane_labels_path(
     safe_pane = pane_id.replace("%", "pane_")
     return (
         get_tracking_dir()
-        / f"pane_labels_{safe_pane}"
+        / f"pane_labels_{sanitize_tmux_id(tmux_server_key)}_{safe_pane}"
         f"_{sanitize_who(who)}.json"
     )
 @
@@ -4456,10 +4524,14 @@ distinguish \enquote{no file} (pane is not tracked) from
 
 <<helper functions>>=
 def read_pane_labels(
-    pane_id: str, who: str,
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> Optional[List[str]]:
     """Read pane labels, or ``None`` if not tracked."""
-    path = pane_labels_path(pane_id, who)
+    path = pane_labels_path(
+        pane_id, who, tmux_server_key,
+    )
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -4471,11 +4543,15 @@ state helpers.
 
 <<helper functions>>=
 def write_pane_labels(
-    pane_id: str, who: str,
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Atomically write the pane's active labels."""
-    path = pane_labels_path(pane_id, who)
+    path = pane_labels_path(
+        pane_id, who, tmux_server_key,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(labels))
@@ -4491,18 +4567,24 @@ already registered.
 
 <<helper functions>>=
 def add_pane_labels(
-    pane_id: str, who: str,
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Add labels to the pane's active set."""
-    existing = read_pane_labels(pane_id, who) or []
+    existing = read_pane_labels(
+        pane_id, who, tmux_server_key,
+    ) or []
     seen = set(existing)
     merged = list(existing)
     for lbl in labels:
         if lbl not in seen:
             merged.append(lbl)
             seen.add(lbl)
-    write_pane_labels(pane_id, who, merged)
+    write_pane_labels(
+        pane_id, who, tmux_server_key, merged,
+    )
 @
 
 When [[track stop]] removes labels from a tracked pane, the file
@@ -4514,11 +4596,15 @@ state---matching the invariant that file existence means
 
 <<helper functions>>=
 def remove_pane_labels(
-    pane_id: str, who: str,
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Remove labels from the pane's active set."""
-    existing = read_pane_labels(pane_id, who)
+    existing = read_pane_labels(
+        pane_id, who, tmux_server_key,
+    )
     if existing is None:
         return
     to_remove = set(labels)
@@ -4527,20 +4613,28 @@ def remove_pane_labels(
         if lbl not in to_remove
     ]
     if remaining:
-        write_pane_labels(pane_id, who, remaining)
+        write_pane_labels(
+            pane_id, who, tmux_server_key, remaining,
+        )
     else:
-        delete_pane_labels(pane_id, who)
+        delete_pane_labels(
+            pane_id, who, tmux_server_key,
+        )
 @
 
 Deletion is idempotent, matching [[delete_suspend_state]].
 
 <<helper functions>>=
 def delete_pane_labels(
-    pane_id: str, who: str,
+    pane_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> None:
     """Remove a pane's active labels file."""
     try:
-        pane_labels_path(pane_id, who).unlink()
+        pane_labels_path(
+            pane_id, who, tmux_server_key,
+        ).unlink()
     except OSError:
         pass
 @
@@ -4559,16 +4653,25 @@ def register_tmux_context_labels(
     labels: List[str], who: str,
 ) -> None:
     """Add labels to the current pane/window tracking context."""
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return
     pane_id = os.environ.get("TMUX_PANE")
     if pane_id:
-        if read_pane_labels(pane_id, who) is not None:
+        if read_pane_labels(
+            pane_id, who, tmux_server_key,
+        ) is not None:
             add_pane_labels(
-                pane_id, who, list(labels),
+                pane_id, who, tmux_server_key,
+                list(labels),
             )
-    window_id = get_current_tracked_window_id(who)
+    window_id = get_current_tracked_window_id(
+        who, tmux_server_key,
+    )
     if window_id:
         add_window_labels(
-            window_id, who, list(labels),
+            window_id, who, tmux_server_key,
+            list(labels),
         )
 
 
@@ -4576,16 +4679,25 @@ def unregister_tmux_context_labels(
     labels: List[str], who: str,
 ) -> None:
     """Remove labels from the current pane/window tracking context."""
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return
     pane_id = os.environ.get("TMUX_PANE")
     if pane_id:
-        if read_pane_labels(pane_id, who) is not None:
+        if read_pane_labels(
+            pane_id, who, tmux_server_key,
+        ) is not None:
             remove_pane_labels(
-                pane_id, who, list(labels),
+                pane_id, who, tmux_server_key,
+                list(labels),
             )
-    window_id = get_current_tracked_window_id(who)
+    window_id = get_current_tracked_window_id(
+        who, tmux_server_key,
+    )
     if window_id:
         remove_window_labels(
-            window_id, who, list(labels),
+            window_id, who, tmux_server_key,
+            list(labels),
         )
 @
 
@@ -4595,17 +4707,22 @@ def unregister_tmux_context_labels(
 Window auto-suspend has different semantics from pane auto-suspend.
 Instead of following terminal focus, it follows whether the tracked tmux
 window is selected by any attached client.  To support that, we keep a
-window-scoped labels file analogous to the pane labels file.
+window-scoped labels file analogous to the pane labels file.  As with
+pane state, the filename includes the tmux server key so two different
+tmux servers sharing a filesystem do not reuse the same window-state
+path for identical [[@...]] identifiers.
 
 <<helper functions>>=
 def window_labels_path(
-    window_id: str, who: str
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> pathlib.Path:
     """Return path to a tracked window's labels file."""
     safe_window = window_id.replace("@", "window_")
     return (
         get_tracking_dir()
-        / f"window_labels_{safe_window}"
+        / f"window_labels_{sanitize_tmux_id(tmux_server_key)}_{safe_window}"
         f"_{sanitize_who(who)}.json"
     )
 @
@@ -4616,10 +4733,14 @@ tracked file exists but currently has no labels.
 
 <<helper functions>>=
 def read_window_labels(
-    window_id: str, who: str,
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> Optional[List[str]]:
     """Read tracked window labels, or ``None`` if absent."""
-    path = window_labels_path(window_id, who)
+    path = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -4630,11 +4751,15 @@ Writing again uses an atomic temporary file in the same directory.
 
 <<helper functions>>=
 def write_window_labels(
-    window_id: str, who: str,
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Atomically write a tracked window's labels."""
-    path = window_labels_path(window_id, who)
+    path = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(labels))
@@ -4646,18 +4771,24 @@ duplicates.
 
 <<helper functions>>=
 def add_window_labels(
-    window_id: str, who: str,
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Add labels to a tracked window's active set."""
-    existing = read_window_labels(window_id, who) or []
+    existing = read_window_labels(
+        window_id, who, tmux_server_key,
+    ) or []
     seen = set(existing)
     merged = list(existing)
     for lbl in labels:
         if lbl not in seen:
             merged.append(lbl)
             seen.add(lbl)
-    write_window_labels(window_id, who, merged)
+    write_window_labels(
+        window_id, who, tmux_server_key, merged,
+    )
 @
 
 Removing labels shrinks the file or deletes it entirely when the last
@@ -4665,11 +4796,15 @@ tracked label disappears.
 
 <<helper functions>>=
 def remove_window_labels(
-    window_id: str, who: str,
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
     labels: List[str],
 ) -> None:
     """Remove labels from a tracked window's active set."""
-    existing = read_window_labels(window_id, who)
+    existing = read_window_labels(
+        window_id, who, tmux_server_key,
+    )
     if existing is None:
         return
     to_remove = set(labels)
@@ -4678,18 +4813,26 @@ def remove_window_labels(
         if lbl not in to_remove
     ]
     if remaining:
-        write_window_labels(window_id, who, remaining)
+        write_window_labels(
+            window_id, who, tmux_server_key, remaining,
+        )
     else:
-        delete_window_labels(window_id, who)
+        delete_window_labels(
+            window_id, who, tmux_server_key,
+        )
 @
 
 <<helper functions>>=
 def delete_window_labels(
-    window_id: str, who: str,
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
 ) -> None:
     """Remove a tracked window's labels file."""
     try:
-        window_labels_path(window_id, who).unlink()
+        window_labels_path(
+            window_id, who, tmux_server_key,
+        ).unlink()
     except OSError:
         pass
 @
@@ -4698,16 +4841,23 @@ def delete_window_labels(
 \label{track:event-buffer}
 
 The event buffer file lives in the tracking directory and is shared
-across all panes for a given worker.  Using one file per worker (rather
-than per session or per pane) is correct because a worker can only be
-actively tracking in one tmux context at a time.
+across all tracked windows for one worker \\emph{within one tmux
+session}.  The filename therefore includes the tmux server key and the
+tmux session ID.  Windows inside the same session must share one event
+stream so that switching among them works, while different sessions or
+different tmux servers must remain isolated.
 
 <<helper functions>>=
-def window_event_buffer_path(who: str) -> pathlib.Path:
+def window_event_buffer_path(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+) -> pathlib.Path:
     """Return the path to the deferred window event buffer."""
     return (
         get_tracking_dir()
-        / f"window_events_{sanitize_who(who)}.txt"
+        / f"window_events_{sanitize_tmux_id(tmux_server_key)}"
+        f"_{sanitize_tmux_id(session_id)}_{sanitize_who(who)}.txt"
     )
 @
 
@@ -4724,6 +4874,8 @@ execute stop then start, and truncate the file.
 <<helper functions>>=
 def append_and_check_window_event(
     who: str,
+    tmux_server_key: str,
+    session_id: str,
     event_line: str,
 ) -> None:
     """Append an event line and execute if the trigger condition is met.
@@ -4735,7 +4887,9 @@ def append_and_check_window_event(
     file lock.
     """
     ensure_tracking_dir()
-    path = window_event_buffer_path(who)
+    path = window_event_buffer_path(
+        who, tmux_server_key, session_id,
+    )
     fd = os.open(
         str(path),
         os.O_RDWR | os.O_CREAT,
@@ -4822,6 +4976,7 @@ def suspend_tracking_labels(
     who: str,
     labels: List[str],
     pane_id: str,
+    tmux_server_key: str,
 ) -> None:
     """Suspend tracking for a pane that lost focus.
 
@@ -4842,7 +4997,9 @@ def suspend_tracking_labels(
         quiet_if_missing=True,
         update_tmux_context=False,
     )
-    state_path = suspend_state_path(pane_id, who)
+    state_path = suspend_state_path(
+        pane_id, who, tmux_server_key,
+    )
     write_suspend_state(state_path, to_suspend)
 @
 
@@ -4856,13 +5013,16 @@ stopped everything), the resume is a no-op.
 def resume_tracking_labels(
     who: str,
     pane_id: str,
+    tmux_server_key: str,
 ) -> None:
     """Resume tracking for a pane that regained focus.
 
     Reads the suspend state file and restarts the
     labels recorded there.  Deletes the file afterwards.
     """
-    state_path = suspend_state_path(pane_id, who)
+    state_path = suspend_state_path(
+        pane_id, who, tmux_server_key,
+    )
     labels = read_suspend_state(state_path)
     if not labels:
         return
@@ -4881,7 +5041,8 @@ trust inherited environment variables such as [[TMUX_WINDOW_ID]].  A new
 tmux window created with [[^b c]] would inherit the shell environment
 from the old one, falsely claiming to belong to the tracked window.
 Instead we derive the current [[window_id]] from the live [[TMUX_PANE]]
-every time.
+every time, then constrain any state lookup to the current tmux server
+namespace.
 
 <<helper functions>>=
 def get_tmux_window_id_for_pane(
@@ -4911,37 +5072,47 @@ def get_tmux_window_id_for_pane(
 @
 
 Before querying tmux for the current window, we check whether any
-tracked-window state files exist at all.  This avoids a subprocess call
-to tmux in the common case where window tracking is not in use.
+tracked-window state files exist in the current tmux server namespace at
+all.  This avoids a subprocess call to tmux in the common case where
+window tracking is not in use.
 
 <<helper functions>>=
 def has_tracked_window_state(
     who: str,
+    tmux_server_key: str,
 ) -> bool:
     """Return whether this worker currently has tracked windows."""
-    pattern = f"window_labels_*_{sanitize_who(who)}.json"
+    pattern = (
+        f"window_labels_{sanitize_tmux_id(tmux_server_key)}_*"
+        f"_{sanitize_who(who)}.json"
+    )
     return any(get_tracking_dir().glob(pattern))
 @
 
 The main entry point for nested commands combines the guards above: it
 resolves the live window from [[TMUX_PANE]], checks for existing
-tracked-window state, and only returns a [[window_id]] when the window
-is already tracked by nytid.
+tracked-window state in the current tmux server, and only returns a
+[[window_id]] when the window is already tracked by nytid.
 
 <<helper functions>>=
 def get_current_tracked_window_id(
     who: str,
+    tmux_server_key: str,
 ) -> Optional[str]:
     """Return the live tmux window id if it is already tracked."""
     pane_id = os.environ.get("TMUX_PANE")
     if not pane_id:
         return None
-    if not has_tracked_window_state(who):
+    if not has_tracked_window_state(
+        who, tmux_server_key,
+    ):
         return None
     window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return None
-    if read_window_labels(window_id, who) is None:
+    if read_window_labels(
+        window_id, who, tmux_server_key,
+    ) is None:
         return None
     return window_id
 @
@@ -4964,6 +5135,16 @@ pane_id_opt = typer.Option(
     "--pane-id",
     help="Tmux pane ID (internal use)",
 )
+
+tmux_server_key_opt = typer.Option(
+    "--server-key",
+    help="Tmux server key (internal use)",
+)
+
+session_id_opt = typer.Option(
+    "--session-id",
+    help="Tmux session ID (internal use)",
+)
 @
 
 <<detached suspend command>>=
@@ -4972,14 +5153,20 @@ pane_id_opt = typer.Option(
 )
 def suspend_detached(
     pane_id: Annotated[str, pane_id_opt],
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Suspend labels when a tracked pane loses focus."""
-    labels = read_pane_labels(pane_id, who)
+    labels = read_pane_labels(
+        pane_id, who, tmux_server_key,
+    )
     if not labels:
         return
     suspend_tracking_labels(
-        who=who, labels=labels, pane_id=pane_id,
+        who=who,
+        labels=labels,
+        pane_id=pane_id,
+        tmux_server_key=tmux_server_key,
     )
 @
 
@@ -4989,17 +5176,24 @@ def suspend_detached(
 )
 def window_focus_out_detached(
     pane_id: Annotated[str, pane_id_opt],
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
+    session_id: Annotated[str, session_id_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Record a deferred stop candidate for the pane's window."""
     window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return
-    labels = read_window_labels(window_id, who)
+    labels = read_window_labels(
+        window_id, who, tmux_server_key,
+    )
     if not labels:
         return
     append_and_check_window_event(
-        who, "stop " + " ".join(labels),
+        who,
+        tmux_server_key,
+        session_id,
+        "stop " + " ".join(labels),
     )
 @
 
@@ -5013,33 +5207,47 @@ switch occurred.
 )
 def window_focus_in_detached(
     pane_id: Annotated[str, pane_id_opt],
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
+    session_id: Annotated[str, session_id_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Record a deferred start candidate for the pane's window."""
     window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return
-    labels = read_window_labels(window_id, who)
+    labels = read_window_labels(
+        window_id, who, tmux_server_key,
+    )
     if not labels:
         return
     append_and_check_window_event(
-        who, "start " + " ".join(labels),
+        who,
+        tmux_server_key,
+        session_id,
+        "start " + " ".join(labels),
     )
 @
 
 The session hook contributes the trigger marker.  It does not need a
 pane or window identifier because the deferred buffer already stores the
-candidate labels from the focus hooks.
+candidate labels from the focus hooks, but it does still need the tmux
+server key and [[session_id]] so it appends to the correct per-session
+buffer.
 
 <<detached window switch command>>=
 @cli.command(
     name="_window-switch-detached", hidden=True
 )
 def window_switch_detached(
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
+    session_id: Annotated[str, session_id_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Record a deferred window-switch event."""
-    append_and_check_window_event(who, "window-switch")
+    append_and_check_window_event(
+        who, tmux_server_key, session_id,
+        "window-switch",
+    )
 @
 
 <<detached resume command>>=
@@ -5048,10 +5256,15 @@ def window_switch_detached(
 )
 def resume_detached(
     pane_id: Annotated[str, pane_id_opt],
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
     who: Annotated[str, who_opt] = default_username,
 ):
     """Resume labels when a tracked pane regains focus."""
-    resume_tracking_labels(who=who, pane_id=pane_id)
+    resume_tracking_labels(
+        who=who,
+        pane_id=pane_id,
+        tmux_server_key=tmux_server_key,
+    )
 @
 
 \subsubsection{Shell Command Builders}
@@ -5059,8 +5272,8 @@ def resume_detached(
 Building the shell commands that tmux hooks execute follows the
 same pattern as [[build_detached_track_finalize_command]]: set
 [[PYTHONPATH]], invoke the hidden CLI command, and pass the relevant
-tmux identifier ([[pane_id]] or [[session_id]]) plus worker identity
-when needed.
+tmux identifiers ([[pane_id]], [[session_id]], or tmux server key)
+plus worker identity when needed.
 
 <<helper functions>>=
 def build_detached_nytid_prefix() -> str:
@@ -5087,6 +5300,7 @@ needs the pane ID (to locate the file) and the worker identity.
 def build_detached_suspend_command(
     who: str,
     pane_id: str,
+    tmux_server_key: str,
 ) -> str:
     """Return shell command to suspend tracking on focus-out."""
     prefix = build_detached_nytid_prefix()
@@ -5094,6 +5308,7 @@ def build_detached_suspend_command(
         f"{prefix} "
         f"_suspend-detached"
         f" --pane-id {shlex.quote(pane_id)}"
+        f" --server-key {shlex.quote(tmux_server_key)}"
     )
     if who != default_username:
         cmd += f" --who {shlex.quote(who)}"
@@ -5109,6 +5324,8 @@ event line.
 def build_detached_window_focus_out_command(
     who: str,
     pane_id: str,
+    tmux_server_key: str,
+    session_id: str,
 ) -> str:
     """Return shell command to record window focus-out."""
     prefix = build_detached_nytid_prefix()
@@ -5116,6 +5333,8 @@ def build_detached_window_focus_out_command(
         f"{prefix} "
         f"_window-focus-out-detached"
         f" --pane-id {shlex.quote(pane_id)}"
+        f" --server-key {shlex.quote(tmux_server_key)}"
+        f" --session-id {shlex.quote(session_id)}"
     )
     if who != default_username:
         cmd += f" --who {shlex.quote(who)}"
@@ -5126,6 +5345,8 @@ def build_detached_window_focus_out_command(
 def build_detached_window_focus_in_command(
     who: str,
     pane_id: str,
+    tmux_server_key: str,
+    session_id: str,
 ) -> str:
     """Return shell command to record window focus-in."""
     prefix = build_detached_nytid_prefix()
@@ -5133,6 +5354,8 @@ def build_detached_window_focus_in_command(
         f"{prefix} "
         f"_window-focus-in-detached"
         f" --pane-id {shlex.quote(pane_id)}"
+        f" --server-key {shlex.quote(tmux_server_key)}"
+        f" --session-id {shlex.quote(session_id)}"
     )
     if who != default_username:
         cmd += f" --who {shlex.quote(who)}"
@@ -5142,12 +5365,16 @@ def build_detached_window_focus_in_command(
 <<helper functions>>=
 def build_detached_window_switch_command(
     who: str,
+    tmux_server_key: str,
+    session_id: str,
 ) -> str:
     """Return shell command to record a window-switch event."""
     prefix = build_detached_nytid_prefix()
     cmd = (
         f"{prefix} "
         f"_window-switch-detached"
+        f" --server-key {shlex.quote(tmux_server_key)}"
+        f" --session-id {shlex.quote(session_id)}"
     )
     if who != default_username:
         cmd += f" --who {shlex.quote(who)}"
@@ -5162,6 +5389,7 @@ identity when it differs from the default.
 def build_detached_resume_command(
     who: str,
     pane_id: str,
+    tmux_server_key: str,
 ) -> str:
     """Return shell command to resume tracking on focus-in."""
     prefix = build_detached_nytid_prefix()
@@ -5169,6 +5397,7 @@ def build_detached_resume_command(
         f"{prefix} "
         f"_resume-detached"
         f" --pane-id {shlex.quote(pane_id)}"
+        f" --server-key {shlex.quote(tmux_server_key)}"
     )
     if who != default_username:
         cmd += f" --who {shlex.quote(who)}"
@@ -5189,6 +5418,7 @@ pane that gained or lost focus and we can compare it directly.
 def install_tmux_focus_hooks(
     pane_id: str,
     who: str,
+    tmux_server_key: str,
 ) -> None:
     """Install pane-focus-out and pane-focus-in hooks.
 
@@ -5197,10 +5427,10 @@ def install_tmux_focus_hooks(
     focus events fire while the tracked pane is alive.
     """
     suspend_cmd = build_detached_suspend_command(
-        who, pane_id,
+        who, pane_id, tmux_server_key,
     )
     resume_cmd = build_detached_resume_command(
-        who, pane_id,
+        who, pane_id, tmux_server_key,
     )
     for hook_name, shell_cmd in (
         ("pane-focus-out", suspend_cmd),
@@ -5328,13 +5558,14 @@ def install_tmux_window_sync_hooks(
     session_id: str,
     pane_id: str,
     who: str,
+    tmux_server_key: str,
 ) -> None:
     """Install deferred event buffer hooks for window tracking."""
     focus_out_cmd = build_detached_window_focus_out_command(
-        who, pane_id,
+        who, pane_id, tmux_server_key, session_id,
     )
     focus_in_cmd = build_detached_window_focus_in_command(
-        who, pane_id,
+        who, pane_id, tmux_server_key, session_id,
     )
     for hook_name, shell_cmd in (
         ("pane-focus-out", focus_out_cmd),
@@ -5353,7 +5584,9 @@ def install_tmux_window_sync_hooks(
             ],
             check=True,
         )
-    switch_cmd = build_detached_window_switch_command(who)
+    switch_cmd = build_detached_window_switch_command(
+        who, tmux_server_key, session_id,
+    )
     switch_hook = f"run-shell {shlex.quote(switch_cmd)}"
     install_tmux_hook_once(
         session_id,
@@ -5381,10 +5614,15 @@ as the main exit hooks (see above).
 def install_tmux_suspend_cleanup_hook(
     pane_id: str,
     who: str,
+    tmux_server_key: str,
 ) -> None:
     """Install a pane-exit hook that deletes suspend and pane-labels files."""
-    state_file = suspend_state_path(pane_id, who)
-    labels_file = pane_labels_path(pane_id, who)
+    state_file = suspend_state_path(
+        pane_id, who, tmux_server_key,
+    )
+    labels_file = pane_labels_path(
+        pane_id, who, tmux_server_key,
+    )
     cleanup_cmd = (
         f"rm -f {shlex.quote(str(state_file))}"
         f" {shlex.quote(str(labels_file))}"
@@ -5424,9 +5662,12 @@ def install_tmux_window_cleanup_hook(
     pane_id: str,
     window_id: str,
     who: str,
+    tmux_server_key: str,
 ) -> None:
     """Install cleanup hook for tracked window labels file."""
-    labels_file = window_labels_path(window_id, who)
+    labels_file = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
     cleanup_cmd = (
         f"rm -f {shlex.quote(str(labels_file))}"
     )
@@ -5599,8 +5840,10 @@ def test_suspend_state_roundtrip(
     temp_tracking_dir,
 ):
     """Write, read, delete cycle works."""
-    path = suspend_state_path("%42", "me")
-    assert path.name.startswith("suspend_pane_42")
+    path = suspend_state_path("%42", "me", TEST_SERVER_KEY)
+    assert path.name.startswith(
+        f"suspend_{TEST_SERVER_KEY}_pane_42"
+    )
 
     write_suspend_state(path, ["work", "email"])
     labels = read_suspend_state(path)
@@ -5630,27 +5873,44 @@ active labels file used by the dynamic auto-suspend system.
 def test_pane_labels_roundtrip(temp_tracking_dir):
     """Write, read, delete cycle for pane labels."""
     pane_id, who = "%42", "me"
-    path = pane_labels_path(pane_id, who)
-    assert "pane_labels_pane_42" in path.name
+    path = pane_labels_path(pane_id, who, TEST_SERVER_KEY)
+    assert f"pane_labels_{TEST_SERVER_KEY}_pane_42" in path.name
 
-    write_pane_labels(pane_id, who, ["work", "email"])
-    assert read_pane_labels(pane_id, who) == [
+    write_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+        ["work", "email"],
+    )
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) == [
         "work", "email",
     ]
 
-    delete_pane_labels(pane_id, who)
-    assert read_pane_labels(pane_id, who) is None
+    delete_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    )
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) is None
 
 def test_read_pane_labels_missing():
     """Missing file returns None, not empty list."""
-    assert read_pane_labels("%99", "nobody") is None
+    assert read_pane_labels(
+        "%99", "nobody", TEST_SERVER_KEY,
+    ) is None
 
 def test_add_pane_labels_merges(temp_tracking_dir):
     """Adding labels merges without duplicates."""
     pane_id, who = "%42", "me"
-    write_pane_labels(pane_id, who, ["a", "b"])
-    add_pane_labels(pane_id, who, ["b", "c"])
-    assert read_pane_labels(pane_id, who) == [
+    write_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["a", "b"],
+    )
+    add_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["b", "c"],
+    )
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) == [
         "a", "b", "c",
     ]
 
@@ -5658,10 +5918,15 @@ def test_remove_pane_labels(temp_tracking_dir):
     """Removing labels preserves order of remainder."""
     pane_id, who = "%42", "me"
     write_pane_labels(
-        pane_id, who, ["a", "b", "c"],
+        pane_id, who, TEST_SERVER_KEY,
+        ["a", "b", "c"],
     )
-    remove_pane_labels(pane_id, who, ["b"])
-    assert read_pane_labels(pane_id, who) == [
+    remove_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["b"],
+    )
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) == [
         "a", "c",
     ]
 
@@ -5670,16 +5935,28 @@ def test_remove_pane_labels_deletes_when_empty(
 ):
     """Removing all labels deletes the file."""
     pane_id, who = "%42", "me"
-    write_pane_labels(pane_id, who, ["a"])
-    remove_pane_labels(pane_id, who, ["a"])
-    assert read_pane_labels(pane_id, who) is None
+    write_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["a"],
+    )
+    remove_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["a"],
+    )
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) is None
 
 def test_add_window_labels_merges(temp_tracking_dir):
     """Adding window labels merges without duplicates."""
     window_id, who = "@42", "me"
-    write_window_labels(window_id, who, ["a", "b"])
-    add_window_labels(window_id, who, ["b", "c"])
-    assert read_window_labels(window_id, who) == [
+    write_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["a", "b"],
+    )
+    add_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["b", "c"],
+    )
+    assert read_window_labels(
+        window_id, who, TEST_SERVER_KEY,
+    ) == [
         "a", "b", "c",
     ]
 
@@ -5688,16 +5965,24 @@ def test_remove_window_labels_deletes_when_empty(
 ):
     """Removing all window labels deletes the file."""
     window_id, who = "@42", "me"
-    write_window_labels(window_id, who, ["a"])
-    remove_window_labels(window_id, who, ["a"])
-    assert read_window_labels(window_id, who) is None
+    write_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["a"],
+    )
+    remove_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["a"],
+    )
+    assert read_window_labels(
+        window_id, who, TEST_SERVER_KEY,
+    ) is None
 
 def test_install_tmux_window_sync_hooks_register_session_hooks():
     """Window hooks install pane sensors plus one session switch hook."""
     with patch("nytid.cli.track.subprocess.run") as mock_run, patch(
         "nytid.cli.track.install_tmux_hook_once"
     ) as mock_install:
-        install_tmux_window_sync_hooks("$1", "%7", "me")
+        install_tmux_window_sync_hooks(
+            TEST_SESSION_ID, "%7", "me", TEST_SERVER_KEY,
+        )
 
     assert len(mock_run.call_args_list) == 2
     first = mock_run.call_args_list[0].args[0]
@@ -5714,7 +5999,7 @@ def test_install_tmux_window_sync_hooks_register_session_hooks():
     assert "_window-focus-in-detached" in second[6]
 
     mock_install.assert_called_once()
-    assert mock_install.call_args.args[0] == "$1"
+    assert mock_install.call_args.args[0] == TEST_SESSION_ID
     assert mock_install.call_args.args[1] == "session-window-changed"
     assert "_window-switch-detached" in mock_install.call_args.args[2]
 
@@ -5758,12 +6043,20 @@ def test_event_buffer_alt_tab_no_execute(temp_tracking_dir):
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
-        append_and_check_window_event(who, "stop work")
-        append_and_check_window_event(who, "start work")
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start work",
+        )
 
     assert mock_stop.call_count == 0
     assert mock_start.call_count == 0
-    assert window_event_buffer_path(who).read_text() == (
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == (
         "stop work\nstart work\n"
     )
 @
@@ -5779,9 +6072,18 @@ def test_event_buffer_window_switch_triggers(
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
-        append_and_check_window_event(who, "stop work")
-        append_and_check_window_event(who, "start admin")
-        append_and_check_window_event(who, "window-switch")
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch",
+        )
 
     mock_stop.assert_called_once_with(
         who=who,
@@ -5793,7 +6095,9 @@ def test_event_buffer_window_switch_triggers(
     assert mock_start.call_args.kwargs["who"] == who
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
     assert mock_start.call_args.kwargs["update_tmux_context"] is False
-    assert window_event_buffer_path(who).read_text() == ""
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
 @
 
 Stale Alt-Tab pairs must remain harmless until a real window switch
@@ -5807,14 +6111,28 @@ def test_event_buffer_stale_pairs_ignored(
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
-        append_and_check_window_event(who, "stop work")
-        append_and_check_window_event(who, "start work")
-        append_and_check_window_event(who, "stop work")
-        append_and_check_window_event(who, "start work")
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start work",
+        )
 
     assert mock_stop.call_count == 0
     assert mock_start.call_count == 0
-    assert window_event_buffer_path(who).read_text() == (
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == (
         "stop work\nstart work\nstop work\nstart work\n"
     )
 @
@@ -5842,9 +6160,18 @@ def test_event_buffer_shared_labels_stop_before_start(
         "nytid.cli.track.start_tracking_labels",
         side_effect=record_start,
     ):
-        append_and_check_window_event(who, "stop work grading")
-        append_and_check_window_event(who, "start work admin")
-        append_and_check_window_event(who, "window-switch")
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work grading",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start work admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch",
+        )
 
     assert calls == [
         ("stop", ["work", "grading"]),
@@ -5873,7 +6200,10 @@ def test_event_buffer_locking(
 
     def worker(event_line):
         barrier.wait()
-        append_and_check_window_event(who, event_line)
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            event_line,
+        )
 
     with patch(
         "nytid.cli.track.stop_tracking_labels",
@@ -5897,7 +6227,38 @@ def test_event_buffer_locking(
         ("start", ["admin"]),
         ("stop", ["work"]),
     ]
-    assert window_event_buffer_path(who).read_text() == ""
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_event_buffer_isolated_by_session(temp_tracking_dir):
+    """Different tmux sessions for one worker use different buffers."""
+    who = "me"
+    other_session = "$2"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, other_session,
+            "start admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, other_session,
+            "window-switch",
+        )
+
+    assert mock_stop.call_count == 0
+    assert mock_start.call_count == 0
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == "stop work\n"
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, other_session,
+    ).read_text() == "start admin\nwindow-switch\n"
 
 def test_manual_stop_prevents_window_resume(
     temp_tracking_dir,
@@ -5905,17 +6266,26 @@ def test_manual_stop_prevents_window_resume(
     """Stopping a label removes it from this window's file only."""
     who = default_username
     runner.invoke(cli, ["start", "work", "email"])
-    write_window_labels("@1", who, ["work", "email"])
+    write_window_labels(
+        "@1", who, TEST_SERVER_KEY,
+        ["work", "email"],
+    )
 
     with patch.dict(
-        os.environ, {"TMUX_PANE": "%7"},
+        os.environ,
+        {
+            "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
     ), patch(
         "nytid.cli.track.get_tmux_window_id_for_pane",
         return_value="@1",
     ):
         runner.invoke(cli, ["stop", "email"])
 
-    assert read_window_labels("@1", who) == ["work"]
+    assert read_window_labels(
+        "@1", who, TEST_SERVER_KEY,
+    ) == ["work"]
 
     with patch(
         "nytid.cli.track.get_tmux_window_id_for_pane",
@@ -5924,13 +6294,19 @@ def test_manual_stop_prevents_window_resume(
         runner.invoke(cli, [
             "_window-focus-out-detached",
             "--pane-id", "%7",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
         ])
         runner.invoke(cli, [
             "_window-focus-in-detached",
             "--pane-id", "%7",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
         ])
         runner.invoke(cli, [
             "_window-switch-detached",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
         ])
 
     active = load_active_session(who).get_active_labels()
@@ -5968,7 +6344,9 @@ def test_get_current_tracked_window_id_ignores_untracked_window(
             "nytid.cli.track.get_tmux_window_id_for_pane",
             return_value="@42",
         ):
-            assert get_current_tracked_window_id("me") is None
+            assert get_current_tracked_window_id(
+                "me", TEST_SERVER_KEY,
+            ) is None
 
 def test_get_current_tracked_window_id_skips_tmux_lookup_without_state(
     temp_tracking_dir,
@@ -5978,14 +6356,19 @@ def test_get_current_tracked_window_id_skips_tmux_lookup_without_state(
         with patch(
             "nytid.cli.track.get_tmux_window_id_for_pane",
         ) as mock_lookup:
-            assert get_current_tracked_window_id("me") is None
+            assert get_current_tracked_window_id(
+                "me", TEST_SERVER_KEY,
+            ) is None
     mock_lookup.assert_not_called()
 
 def test_get_current_tracked_window_id_uses_live_window_lookup(
     temp_tracking_dir,
 ):
     """Tracked window lookup is based on current pane, not inherited env."""
-    write_window_labels("@42", "me", ["seminar"])
+    write_window_labels(
+        "@42", "me", TEST_SERVER_KEY,
+        ["seminar"],
+    )
     with patch.dict(
         os.environ,
         {
@@ -5998,18 +6381,24 @@ def test_get_current_tracked_window_id_uses_live_window_lookup(
             "nytid.cli.track.get_tmux_window_id_for_pane",
             return_value="@42",
         ):
-            assert get_current_tracked_window_id("me") == "@42"
+            assert get_current_tracked_window_id(
+                "me", TEST_SERVER_KEY,
+            ) == "@42"
 
 def test_nested_start_updates_live_tracked_window_only(
     temp_tracking_dir,
 ):
     """Nested starts use live tmux window state rather than env inheritance."""
     who = default_username
-    write_window_labels("@42", who, ["seminar"])
+    write_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+        ["seminar"],
+    )
     with patch.dict(
         os.environ,
         {
             "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
             "TMUX_WINDOW_ID": "@999",
         },
         clear=True,
@@ -6020,10 +6409,14 @@ def test_nested_start_updates_live_tracked_window_only(
         ):
             runner.invoke(cli, ["start", "notes"])
 
-    assert read_window_labels("@42", who) == [
+    assert read_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+    ) == [
         "seminar", "notes",
     ]
-    assert read_window_labels("@999", who) is None
+    assert read_window_labels(
+        "@999", who, TEST_SERVER_KEY,
+    ) is None
     runner.invoke(cli, ["stop", "notes"])
 
 def test_nested_stop_updates_live_tracked_window_only(
@@ -6032,11 +6425,15 @@ def test_nested_stop_updates_live_tracked_window_only(
     """Nested stops remove labels from the live tracked window only."""
     who = default_username
     runner.invoke(cli, ["start", "notes"])
-    write_window_labels("@42", who, ["seminar", "notes"])
+    write_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+        ["seminar", "notes"],
+    )
     with patch.dict(
         os.environ,
         {
             "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
             "TMUX_WINDOW_ID": "@999",
         },
         clear=True,
@@ -6047,7 +6444,9 @@ def test_nested_stop_updates_live_tracked_window_only(
         ):
             runner.invoke(cli, ["stop", "notes"])
 
-    assert read_window_labels("@42", who) == ["seminar"]
+    assert read_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+    ) == ["seminar"]
 @
 
 \paragraph{Suspend reads from pane labels file.}
@@ -6064,22 +6463,32 @@ def test_suspend_detached_reads_pane_labels(
     pane_id, who = "%55", default_username
     runner.invoke(cli, ["start", "work", "email"])
 
-    write_pane_labels(pane_id, who, ["work", "email"])
+    write_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+        ["work", "email"],
+    )
     runner.invoke(cli, [
         "_suspend-detached",
         "--pane-id", pane_id,
+        "--server-key", TEST_SERVER_KEY,
     ])
 
     session = load_active_session(who)
     assert session.get_active_labels() == []
 
     state = read_suspend_state(
-        suspend_state_path(pane_id, who),
+        suspend_state_path(
+            pane_id, who, TEST_SERVER_KEY,
+        ),
     )
     assert sorted(state) == ["email", "work"]
 
     # Clean up
-    resume_tracking_labels(who=who, pane_id=pane_id)
+    resume_tracking_labels(
+        who=who,
+        pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
+    )
     runner.invoke(cli, ["stop", "--all"])
 @
 
@@ -6099,6 +6508,7 @@ def test_suspend_resume_cycle(temp_tracking_dir):
         who=default_username,
         labels=["work", "email"],
         pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
     )
 
     # Labels should be stopped
@@ -6107,7 +6517,7 @@ def test_suspend_resume_cycle(temp_tracking_dir):
 
     # State file should exist
     state_path = suspend_state_path(
-        pane_id, default_username,
+        pane_id, default_username, TEST_SERVER_KEY,
     )
     labels = read_suspend_state(state_path)
     assert sorted(labels) == ["email", "work"]
@@ -6116,6 +6526,7 @@ def test_suspend_resume_cycle(temp_tracking_dir):
     resume_tracking_labels(
         who=default_username,
         pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
     )
     session = load_active_session(default_username)
     assert sorted(session.get_active_labels()) == [
@@ -6144,17 +6555,20 @@ def test_suspend_skips_already_stopped(
         who=default_username,
         labels=["work", "email"],
         pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
     )
 
     state_path = suspend_state_path(
-        pane_id, default_username,
+        pane_id, default_username, TEST_SERVER_KEY,
     )
     labels = read_suspend_state(state_path)
     assert labels == ["work"]
 
     # Clean up
     resume_tracking_labels(
-        who=default_username, pane_id=pane_id,
+        who=default_username,
+        pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
     )
     runner.invoke(cli, ["stop"])
 
@@ -6167,6 +6581,7 @@ def test_resume_noop_without_state_file(
     resume_tracking_labels(
         who=default_username,
         pane_id=pane_id,
+        tmux_server_key=TEST_SERVER_KEY,
     )
 @
 
@@ -6177,51 +6592,91 @@ arguments without actually running them.
 <<test functions>>=
 def test_build_detached_suspend_command():
     """Suspend command includes pane-id but not labels."""
-    cmd = build_detached_suspend_command("me", "%42")
+    cmd = build_detached_suspend_command(
+        "me", "%42", TEST_SERVER_KEY,
+    )
     assert "_suspend-detached" in cmd
     assert "--pane-id" in cmd
+    assert "--server-key" in cmd
     assert "%42" in cmd
 
 def test_build_detached_resume_command():
     """Resume command includes pane-id."""
-    cmd = build_detached_resume_command("me", "%42")
+    cmd = build_detached_resume_command(
+        "me", "%42", TEST_SERVER_KEY,
+    )
     assert "_resume-detached" in cmd
     assert "--pane-id" in cmd
+    assert "--server-key" in cmd
     assert "%42" in cmd
 
 def test_build_detached_resume_command_other_worker():
     """Resume command includes --who for non-default worker."""
     cmd = build_detached_resume_command(
-        "dan-claude", "%42",
+        "dan-claude", "%42", TEST_SERVER_KEY,
     )
     assert "--who" in cmd
     assert "dan-claude" in cmd
 
 def test_build_detached_window_focus_out_command():
     """Window focus-out command includes pane-id."""
-    cmd = build_detached_window_focus_out_command("me", "%42")
+    cmd = build_detached_window_focus_out_command(
+        "me", "%42", TEST_SERVER_KEY, TEST_SESSION_ID,
+    )
     assert "_window-focus-out-detached" in cmd
     assert "--pane-id" in cmd
+    assert "--server-key" in cmd
+    assert "--session-id" in cmd
     assert "%42" in cmd
 
 def test_build_detached_window_focus_in_command():
     """Window focus-in command includes pane-id."""
-    cmd = build_detached_window_focus_in_command("me", "%42")
+    cmd = build_detached_window_focus_in_command(
+        "me", "%42", TEST_SERVER_KEY, TEST_SESSION_ID,
+    )
     assert "_window-focus-in-detached" in cmd
     assert "--pane-id" in cmd
+    assert "--server-key" in cmd
+    assert "--session-id" in cmd
     assert "%42" in cmd
 
 def test_build_detached_window_switch_command():
     """Window-switch command does not need a pane-id."""
-    cmd = build_detached_window_switch_command("me")
+    cmd = build_detached_window_switch_command(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+    )
     assert "_window-switch-detached" in cmd
     assert "--pane-id" not in cmd
+    assert "--server-key" in cmd
+    assert "--session-id" in cmd
 
 def test_build_detached_nytid_prefix():
     """Prefix includes PYTHONPATH and python executable."""
     prefix = build_detached_nytid_prefix()
     assert "PYTHONPATH=" in prefix
     assert "nytid.cli.track" in prefix
+
+def test_build_tmux_server_key_changes_with_host_or_socket():
+    """Server key distinguishes host/socket combinations."""
+    assert build_tmux_server_key("a", "/tmp/x") != \
+        build_tmux_server_key("b", "/tmp/x")
+    assert build_tmux_server_key("a", "/tmp/x") != \
+        build_tmux_server_key("a", "/tmp/y")
+
+def test_parse_tmux_socket_path_reads_first_field():
+    """$TMUX parsing returns the socket path prefix."""
+    assert parse_tmux_socket_path("/tmp/tmux.sock,123,0") == \
+        "/tmp/tmux.sock"
+    assert parse_tmux_socket_path(None) is None
+
+def test_get_current_tmux_server_key_from_env():
+    """Current server key is derived from hostname and $TMUX."""
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,123,0"}, clear=True,
+    ), patch("nytid.cli.track.socket.gethostname", return_value="host"):
+        assert get_current_tmux_server_key() == build_tmux_server_key(
+            "host", "/tmp/tmux.sock",
+        )
 @
 
 \subsection{Blocking Command Execution}
@@ -7988,6 +8443,7 @@ import datetime
 import json
 import logging
 import os
+import socket
 import tempfile
 import pytest
 from typer.testing import CliRunner
@@ -8011,6 +8467,9 @@ from nytid.cli.track import (
     build_tmux_wait_wrapper,
     build_tmux_hook_command,
     install_tmux_exit_hooks,
+    build_tmux_server_key,
+    parse_tmux_socket_path,
+    get_current_tmux_server_key,
     sanitize_who, complete_workers,
     should_auto_suspend,
     suspend_state_path,
@@ -8051,6 +8510,10 @@ from nytid.cli.track import (
 )
 
 runner = CliRunner()
+TEST_SERVER_KEY = build_tmux_server_key(
+    socket.gethostname(), "/tmp/tmux.sock",
+)
+TEST_SESSION_ID = "$1"
 
 # All test functions defined throughout the document
 <<test functions>>
@@ -8419,12 +8882,15 @@ def test_start_command_exit_cleans_stale_window_labels(
     """Command exit removes launch labels even after window auto-suspend."""
     who = default_username
     runner.invoke(cli, ["start", "work"])
-    write_window_labels("@42", who, ["work"])
+    write_window_labels(
+        "@42", who, TEST_SERVER_KEY, ["work"],
+    )
 
     with patch.dict(
         os.environ,
         {
             "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
             "TMUX_WINDOW_ID": "@999",
         },
         clear=True,
@@ -8440,7 +8906,9 @@ def test_start_command_exit_cleans_stale_window_labels(
         ])
 
     assert result.exit_code == 0
-    assert read_window_labels("@42", who) == ["work"]
+    assert read_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+    ) == ["work"]
     assert "opencode" not in load_active_session(who).get_active_labels()
 
     runner.invoke(cli, ["stop"])
@@ -8453,11 +8921,16 @@ def test_start_command_exit_cleans_stale_pane_labels(
     who = default_username
     pane_id = "%7"
     runner.invoke(cli, ["start", "work"])
-    write_pane_labels(pane_id, who, ["work"])
+    write_pane_labels(
+        pane_id, who, TEST_SERVER_KEY, ["work"],
+    )
 
     with patch.dict(
         os.environ,
-        {"TMUX_PANE": pane_id},
+        {
+            "TMUX_PANE": pane_id,
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
         clear=True,
     ), patch(
         "nytid.cli.track.subprocess.run",
@@ -8468,7 +8941,9 @@ def test_start_command_exit_cleans_stale_pane_labels(
         ])
 
     assert result.exit_code == 0
-    assert read_pane_labels(pane_id, who) == ["work"]
+    assert read_pane_labels(
+        pane_id, who, TEST_SERVER_KEY,
+    ) == ["work"]
     assert "opencode" not in load_active_session(who).get_active_labels()
 
     runner.invoke(cli, ["stop"])
@@ -8710,17 +9185,22 @@ def test_stop_detached_unregisters_pane_labels(
     pane_id = "%99"
     runner.invoke(cli, ["start", "A", "B"])
     write_pane_labels(
-        pane_id, default_username, ["A", "B"],
+        pane_id, default_username, TEST_SERVER_KEY,
+        ["A", "B"],
     )
     with patch.dict(
-        os.environ, {"TMUX_PANE": pane_id},
+        os.environ,
+        {
+            "TMUX_PANE": pane_id,
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
     ):
         result = runner.invoke(
             cli, ["_stop-detached", "A", "B"],
         )
     assert result.exit_code == 0
     remaining = read_pane_labels(
-        pane_id, default_username,
+        pane_id, default_username, TEST_SERVER_KEY,
     )
     assert remaining is None or "A" not in remaining
     assert remaining is None or "B" not in remaining
@@ -8732,10 +9212,15 @@ def test_stop_detached_unregisters_window_labels(
     window_id = "@42"
     runner.invoke(cli, ["start", "X"])
     write_window_labels(
-        window_id, default_username, ["X"],
+        window_id, default_username, TEST_SERVER_KEY,
+        ["X"],
     )
     with patch.dict(
-        os.environ, {"TMUX_PANE": "%99"},
+        os.environ,
+        {
+            "TMUX_PANE": "%99",
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
     ), patch(
         "nytid.cli.track.get_current_tracked_window_id",
         return_value=window_id,
@@ -8745,7 +9230,7 @@ def test_stop_detached_unregisters_window_labels(
         )
     assert result.exit_code == 0
     remaining = read_window_labels(
-        window_id, default_username,
+        window_id, default_username, TEST_SERVER_KEY,
     )
     assert remaining is None or "X" not in remaining
 @
