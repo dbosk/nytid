@@ -4851,6 +4851,25 @@ tmux session ID.  Windows inside the same session must share one event
 stream so that switching among them works, while different sessions or
 different tmux servers must remain isolated.
 
+When debugging unexpected history splits, we need to see both sides of
+the deferred \emph{window-event} buffer: what each hook appended and
+what transition that buffer eventually executed.  We therefore add an
+environment-gated trace for this buffer only.  When
+[[NYTID_TRACK_DEBUG]] is truthy, nytid appends one line per buffer
+append or buffer-triggered execution to a debug log in the tracking
+directory and also emits a best-effort desktop notification via
+[[notify-send]].  The notification path must not affect tracking
+behaviour, so missing [[notify-send]] is silently ignored.
+
+Desktop notifications are inherently less reliable than the file log,
+because tmux hook subprocesses only inherit whatever graphical session
+environment the server can see.  The file log is therefore the primary
+record, while notifications are a convenience for live observation.
+
+An environment variable keeps the instrumentation local to one shell or
+tmux hook.  That makes it easy to turn on while reproducing the bug and
+impossible to forget in persistent configuration.
+
 <<helper functions>>=
 def window_event_buffer_path(
     who: str,
@@ -4863,6 +4882,61 @@ def window_event_buffer_path(
         / f"window_events_{sanitize_tmux_id(tmux_server_key)}"
         f"_{sanitize_tmux_id(session_id)}_{sanitize_who(who)}.txt"
     )
+
+def track_debug_enabled() -> bool:
+    """Return whether [[NYTID_TRACK_DEBUG]] enables hook tracing."""
+    value = os.environ.get("NYTID_TRACK_DEBUG")
+    if value is None:
+        return False
+    return value.strip().lower() not in {
+        "", "0", "false", "no", "off",
+    }
+
+def window_event_debug_log_path() -> pathlib.Path:
+    """Return the debug log path for deferred window events."""
+    return get_tracking_dir() / "window_event_debug.log"
+
+def emit_window_event_debug(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+    action: str,
+    event_line: str,
+    buffer_text: str = "",
+) -> None:
+    """Emit env-gated diagnostics for the deferred window buffer."""
+    if not track_debug_enabled():
+        return
+
+    ensure_tracking_dir()
+    timestamp = datetime.datetime.now().isoformat(sep=" ")
+    buffer_snapshot = buffer_text.replace("\n", " | ").strip()
+    log_line = (
+        f"{timestamp} pid={os.getpid()} who={who} "
+        f"server={tmux_server_key} session={session_id} "
+        f"action={action} event={event_line!r} "
+        f"buffer={buffer_snapshot!r}\n"
+    )
+    with open(window_event_debug_log_path(), "a") as handle:
+        handle.write(log_line)
+
+    body = (
+        f"action: {action}\n"
+        f"event: {event_line}\n"
+        f"who: {who}\n"
+        f"session: {session_id}\n"
+        f"buffer: {buffer_snapshot or '(empty)'}"
+    )
+    try:
+        subprocess.run(
+            ["notify-send", "nytid track debug", body],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+    except FileNotFoundError:
+        pass
 @
 
 The core function appends one event line, then checks the trigger
@@ -4914,6 +4988,7 @@ Appending seeks to the end so that existing content is preserved:
 <<append event line>>=
 os.lseek(fd, 0, os.SEEK_END)
 os.write(fd, (event_line + "\n").encode())
+os.fsync(fd)
 @
 
 After appending, we re-read the entire file and parse it:
@@ -4922,6 +4997,14 @@ After appending, we re-read the entire file and parse it:
 os.lseek(fd, 0, os.SEEK_SET)
 content = os.read(fd, 1_000_000).decode()
 lines = content.splitlines()
+emit_window_event_debug(
+    who,
+    tmux_server_key,
+    session_id,
+    "append",
+    event_line,
+    content,
+)
 
 stop_count = 0
 start_count = 0
@@ -4974,11 +5057,31 @@ because the tmux context files (window labels) are already correct---we
 are just updating the tracking session state to match.
 
 <<execute deferred window switch>>=
+emit_window_event_debug(
+    who,
+    tmux_server_key,
+    session_id,
+    "execute-switch",
+    (
+        "window-switch tracked"
+        if switch_target_tracked
+        else "window-switch untracked"
+    ),
+    content,
+)
 <<execute deferred window stop>>
 <<execute deferred window start>>
 @
 
 <<execute deferred window stop>>=
+emit_window_event_debug(
+    who,
+    tmux_server_key,
+    session_id,
+    "execute-stop",
+    "stop " + " ".join(last_stop_labels),
+    content,
+)
 stop_tracking_labels(
     who=who,
     labels=last_stop_labels,
@@ -4988,6 +5091,14 @@ stop_tracking_labels(
 @
 
 <<execute deferred window start>>=
+emit_window_event_debug(
+    who,
+    tmux_server_key,
+    session_id,
+    "execute-start",
+    "start " + " ".join(last_start_labels),
+    content,
+)
 start_tracking_labels(
     who=who,
     labels=last_start_labels,
@@ -6390,6 +6501,75 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
+
+def test_window_event_debug_disabled_by_default(temp_tracking_dir):
+    """Without the env var, window-event tracing stays silent."""
+    append_and_check_window_event(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+        "stop work",
+    )
+
+    assert not window_event_debug_log_path().exists()
+
+def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
+    """Debug mode logs append and execute steps for the event buffer."""
+    who = "me"
+    with patch.dict(
+        os.environ,
+        {"NYTID_TRACK_DEBUG": "1"},
+        clear=False,
+    ), patch(
+        "nytid.cli.track.subprocess.run"
+    ) as mock_run, patch(
+        "nytid.cli.track.stop_tracking_labels"
+    ), patch(
+        "nytid.cli.track.start_tracking_labels"
+    ):
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked",
+        )
+
+    log_text = window_event_debug_log_path().read_text()
+    assert "action=append" in log_text
+    assert "event='stop work'" in log_text
+    assert "event='start admin'" in log_text
+    assert "event='window-switch tracked'" in log_text
+    assert "action=execute-switch" in log_text
+    assert "action=execute-stop" in log_text
+    assert "action=execute-start" in log_text
+    notify_calls = [
+        call for call in mock_run.call_args_list
+        if call.args[0][0] == "notify-send"
+    ]
+    assert len(notify_calls) == 6
+
+def test_window_event_debug_ignores_missing_notify_send(
+    temp_tracking_dir,
+):
+    """Debug mode tolerates hosts without [[notify-send]]."""
+    with patch.dict(
+        os.environ,
+        {"NYTID_TRACK_DEBUG": "1"},
+        clear=False,
+    ), patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=FileNotFoundError,
+    ):
+        append_and_check_window_event(
+            "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+
+    assert window_event_debug_log_path().exists()
 
 def test_manual_stop_prevents_window_resume(
     temp_tracking_dir,
@@ -8647,6 +8827,7 @@ from nytid.cli.track import (
     suspend_tracking_labels,
     resume_tracking_labels,
     window_event_buffer_path,
+    window_event_debug_log_path,
     append_and_check_window_event,
     get_tmux_window_id_for_pane,
     get_tmux_selected_window_id,
