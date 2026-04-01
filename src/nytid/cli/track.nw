@@ -4251,7 +4251,9 @@ def run_tmux_command(
                 write_window_labels(
                     window_id, focus_who, focus_labels,
                 )
-                install_tmux_window_sync_hooks(session_id)
+                install_tmux_window_sync_hooks(
+                    session_id, pane_id, focus_who,
+                )
                 install_tmux_window_cleanup_hook(
                     pane_id,
                     window_id,
@@ -4691,6 +4693,121 @@ def delete_window_labels(
         pass
 @
 
+\subsubsection{Deferred Window Event Buffer}
+\label{track:event-buffer}
+
+The event buffer file lives in the tracking directory and is shared
+across all panes for a given worker.  Using one file per worker (rather
+than per session or per pane) is correct because a worker can only be
+actively tracking in one tmux context at a time.
+
+<<helper functions>>=
+def window_event_buffer_path(who: str) -> pathlib.Path:
+    """Return the path to the deferred window event buffer."""
+    return (
+        get_tracking_dir()
+        / f"window_events_{sanitize_who(who)}.txt"
+    )
+@
+
+The core function appends one event line, then checks the trigger
+condition under the same lock.  All three hooks call this function;
+the only difference is the line they append.
+
+The trigger condition requires that [[stop]] and [[start]] entries
+appear in equal numbers (complete pairs) and that at least one
+[[window-switch]] entry is present.  When triggered, we extract labels
+from the \emph{last} [[stop]] line and the \emph{last} [[start]] line,
+execute stop then start, and truncate the file.
+
+<<helper functions>>=
+def append_and_check_window_event(
+    who: str,
+    event_line: str,
+) -> None:
+    """Append an event line and execute if the trigger condition is met.
+
+    The trigger fires when the file contains equal numbers of ``stop``
+    and ``start`` entries plus at least one ``window-switch``.  On
+    trigger, the *last* stop and start are executed (stop first) and
+    the file is truncated.  All operations happen under an exclusive
+    file lock.
+    """
+    ensure_tracking_dir()
+    path = window_event_buffer_path(who)
+    fd = os.open(
+        str(path),
+        os.O_RDWR | os.O_CREAT,
+        0o644,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        <<append event line>>
+        <<check trigger condition>>
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+@
+
+Appending seeks to the end so that existing content is preserved:
+
+<<append event line>>=
+os.lseek(fd, 0, os.SEEK_END)
+os.write(fd, (event_line + "\n").encode())
+@
+
+After appending, we re-read the entire file and parse it:
+
+<<check trigger condition>>=
+os.lseek(fd, 0, os.SEEK_SET)
+content = os.read(fd, 1_000_000).decode()
+lines = content.splitlines()
+
+stop_count = 0
+start_count = 0
+has_switch = False
+last_stop_labels = []
+last_start_labels = []
+
+for line in lines:
+    if line.startswith("stop "):
+        stop_count += 1
+        last_stop_labels = line[len("stop "):].split()
+    elif line.startswith("start "):
+        start_count += 1
+        last_start_labels = line[len("start "):].split()
+    elif line == "window-switch":
+        has_switch = True
+
+if (
+    stop_count == start_count
+    and stop_count > 0
+    and has_switch
+):
+    <<execute deferred window switch>>
+    os.ftruncate(fd, 0)
+@
+
+The execution step stops the old window's labels, then starts the new
+window's labels.  Both operations pass [[update_tmux_context=False]]
+because the tmux context files (window labels) are already correct---we
+are just updating the tracking session state to match.
+
+<<execute deferred window switch>>=
+stop_tracking_labels(
+    who=who,
+    labels=last_stop_labels,
+    quiet_if_missing=True,
+    update_tmux_context=False,
+)
+start_tracking_labels(
+    who=who,
+    labels=last_start_labels,
+    start_time=datetime.datetime.now(),
+    update_tmux_context=False,
+)
+@
+
 \subsubsection{Suspend and Resume Helpers}
 
 The suspend helper stops only the labels that are currently active
@@ -4758,38 +4875,6 @@ def resume_tracking_labels(
     )
 @
 
-To implement \enquote{selected in any attached client} semantics we ask
-tmux for the tracked window's [[window_active_clients]] count.  A
-positive count means at least one client currently has the window
-selected, regardless of whether that client is the original terminal.
-
-<<helper functions>>=
-def tmux_window_has_active_client(
-    window_id: str,
-) -> bool:
-    """Return whether any attached client currently selects ``window_id``."""
-    try:
-        result = subprocess.run(
-            [
-                "tmux",
-                "display-message",
-                "-p",
-                "-t",
-                window_id,
-                "#{window_active_clients}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    try:
-        return int(result.stdout.strip() or "0") > 0
-    except ValueError:
-        return False
-@
-
 For nested [[track]] commands inside a tracked tmux window, we must not
 trust inherited environment variables such as [[TMUX_WINDOW_ID]].  A new
 tmux window created with [[^b c]] would inherit the shell environment
@@ -4837,80 +4922,6 @@ def has_tracked_window_state(
     return any(get_tracking_dir().glob(pattern))
 @
 
-Enumerating tracked windows and workers is needed by the session-scoped
-dispatcher command, which must scan all tracked windows across all
-workers to decide which to suspend or resume.
-
-<<helper functions>>=
-def list_tracked_window_ids(
-    who: str,
-) -> List[str]:
-    """Return tracked tmux window ids for ``who`` from state files."""
-    pattern = f"window_labels_*_{sanitize_who(who)}.json"
-    prefix = "window_labels_window_"
-    suffix = f"_{sanitize_who(who)}.json"
-    window_ids = []
-    for path in sorted(get_tracking_dir().glob(pattern)):
-        name = path.name
-        if not name.startswith(prefix) or not name.endswith(suffix):
-            continue
-        encoded = name[len(prefix):-len(suffix)]
-        window_ids.append("@" + encoded)
-    return window_ids
-@
-
-Worker discovery scans the tracking directory rather than maintaining a
-separate registry, keeping the state self-describing and avoiding stale
-entries.
-
-<<helper functions>>=
-def list_workers_with_tracked_windows() -> List[str]:
-    """Return workers that currently have tracked tmux windows."""
-    prefix = "window_labels_window_"
-    suffix = ".json"
-    workers = set()
-    for path in get_tracking_dir().glob("window_labels_*.json"):
-        name = path.name
-        if not name.startswith(prefix) or not name.endswith(suffix):
-            continue
-        stem = name[len(prefix):-len(suffix)]
-        if "_" not in stem:
-            continue
-        _, worker = stem.split("_", 1)
-        workers.add(worker)
-    return sorted(workers)
-@
-
-The dispatcher must restrict its actions to windows that belong to the
-triggering tmux session, since multiple sessions may coexist on the same
-server.  We query tmux for the window's current session rather than
-caching it, because windows can be moved between sessions.
-
-<<helper functions>>=
-def window_belongs_to_session(
-    window_id: str,
-    session_id: str,
-) -> bool:
-    """Return whether ``window_id`` currently belongs to ``session_id``."""
-    try:
-        result = subprocess.run(
-            [
-                "tmux",
-                "display-message",
-                "-p",
-                "-t",
-                window_id,
-                "#{session_id}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    return result.stdout.strip() == session_id
-@
-
 The main entry point for nested commands combines the guards above: it
 resolves the live window from [[TMUX_PANE]], checks for existing
 tracked-window state, and only returns a [[window_id]] when the window
@@ -4937,41 +4948,20 @@ def get_current_tracked_window_id(
 \subsubsection{Hidden Detached Commands}
 
 The focus hooks run inside tmux's [[run-shell]], which launches a
-fresh Python process.  We provide three hidden CLI commands for this
-purpose: a pane-scoped suspend/resume pair, plus a window-sync command
-that reevaluates all tracked windows in a session.  They follow the
-same pattern as [[_stop-detached]].
+fresh Python process.  We therefore provide hidden CLI commands that
+can be called safely from hooks.  Pane tracking still uses the direct
+[[_suspend-detached]]/[[_resume-detached]] pair, while window tracking
+uses three event-sensor commands that append to the deferred buffer.
 
-Window sync uses a declarative approach: it reads every tracked
-window's labels file, computes which labels \emph{should} be active
-(the union of labels from currently selected windows) and which are
-\emph{managed} (the union of labels from all tracked windows in the
-session), then converges the running state by stopping managed labels
-that should not be active and starting labels that should be active
-but are not yet running.  Because the window labels file is the sole
-source of truth---no intermediate suspend-state files are
-involved---there is no stale state that can cause labels to leak
-between windows.
-
-The source of truth is deliberately scoped per window, however, not per
-label across the whole session.  If the user manually stops [[devel]]
-while inside tracked window~A, [[track stop]] removes [[devel]] from
-window~A's file.  Sync will therefore not resurrect [[devel]] when
-window~A becomes selected again.  If tracked window~B still declares
-[[devel]], that declaration remains valid for window~B.
+This separation matters because terminal blur alone does not prove that
+the user changed tmux windows.  The focus hooks merely record candidate
+[[stop]] and [[start]] events; only after [[session-window-changed]]
+adds [[window-switch]] does the shared buffer execute the last pair.
 
 <<argument and option definitions>>=
 pane_id_opt = typer.Option(
     "--pane-id",
     help="Tmux pane ID (internal use)",
-)
-window_id_opt = typer.Option(
-    "--window-id",
-    help="Tmux window ID (internal use)",
-)
-session_id_opt = typer.Option(
-    "--session-id",
-    help="Tmux session ID (internal use)",
 )
 @
 
@@ -4992,84 +4982,63 @@ def suspend_detached(
     )
 @
 
-<<detached window sync command>>=
+<<detached window focus-out command>>=
 @cli.command(
-    name="_sync-window-tracking-detached", hidden=True
+    name="_window-focus-out-detached", hidden=True
 )
-def sync_window_tracking_detached(
-    session_id: Annotated[str, session_id_opt],
+def window_focus_out_detached(
+    pane_id: Annotated[str, pane_id_opt],
+    who: Annotated[str, who_opt] = default_username,
 ):
-    """Synchronize tracked window state for a tmux session.
-
-    Converges running labels toward the declared window
-    labels: stops managed labels that should not be active,
-    starts labels that should be active but are not running.
-    """
-    for who in list_workers_with_tracked_windows():
-        <<snapshot tracked windows for session>>
-        if not managed_labels:
-            continue
-        <<converge running labels toward declared state>>
-@
-
-The snapshot phase iterates every tracked window in the session and
-partitions labels into two sets.  [[managed_labels]] is the union of
-labels from \emph{all} tracked windows---these are the labels the sync
-is responsible for.  [[should_be_active]] is the subset contributed by
-windows that currently have an attached client selecting them.  Labels
-outside [[managed_labels]] (started manually or by pane tracking) are
-left untouched.
-
-<<snapshot tracked windows for session>>=
-should_be_active = set()
-managed_labels = set()
-for window_id in list_tracked_window_ids(who):
-    if not window_belongs_to_session(
-        window_id, session_id,
-    ):
-        continue
+    """Record a deferred stop candidate for the pane's window."""
+    window_id = get_tmux_window_id_for_pane(pane_id)
+    if not window_id:
+        return
     labels = read_window_labels(window_id, who)
     if not labels:
-        continue
-    managed_labels.update(labels)
-    if tmux_window_has_active_client(window_id):
-        should_be_active.update(labels)
+        return
+    append_and_check_window_event(
+        who, "stop " + " ".join(labels),
+    )
 @
 
-Convergence compares the declared state against the running state and
-issues the minimal set of stop and start operations.  A label shared
-by two windows where only one is selected stays in
-[[should_be_active]] and is never stopped---no explicit protection
-set is needed because the set algebra handles it naturally.
+The focus-in command is symmetric: it records the labels that should
+become active if the buffered events later prove that a real window
+switch occurred.
 
-<<converge running labels toward declared state>>=
-session = load_active_session(who)
-currently_running = set(session.get_active_labels())
-
-to_stop = [
-    lbl for lbl in managed_labels
-    if lbl in currently_running
-    and lbl not in should_be_active
-]
-if to_stop:
-    stop_tracking_labels(
-        who=who,
-        labels=to_stop,
-        quiet_if_missing=True,
-        update_tmux_context=False,
+<<detached window focus-in command>>=
+@cli.command(
+    name="_window-focus-in-detached", hidden=True
+)
+def window_focus_in_detached(
+    pane_id: Annotated[str, pane_id_opt],
+    who: Annotated[str, who_opt] = default_username,
+):
+    """Record a deferred start candidate for the pane's window."""
+    window_id = get_tmux_window_id_for_pane(pane_id)
+    if not window_id:
+        return
+    labels = read_window_labels(window_id, who)
+    if not labels:
+        return
+    append_and_check_window_event(
+        who, "start " + " ".join(labels),
     )
+@
 
-to_start = [
-    lbl for lbl in should_be_active
-    if lbl not in currently_running
-]
-if to_start:
-    start_tracking_labels(
-        who=who,
-        labels=to_start,
-        start_time=datetime.datetime.now(),
-        update_tmux_context=False,
-    )
+The session hook contributes the trigger marker.  It does not need a
+pane or window identifier because the deferred buffer already stores the
+candidate labels from the focus hooks.
+
+<<detached window switch command>>=
+@cli.command(
+    name="_window-switch-detached", hidden=True
+)
+def window_switch_detached(
+    who: Annotated[str, who_opt] = default_username,
+):
+    """Record a deferred window-switch event."""
+    append_and_check_window_event(who, "window-switch")
 @
 
 <<detached resume command>>=
@@ -5130,25 +5099,57 @@ def build_detached_suspend_command(
     return cmd
 @
 
-Window auto-suspend uses one hidden dispatcher command keyed by
-[[session_id]] rather than one hidden command per [[window_id]].  The
-dispatcher scans tracked windows for all workers, so one worker's tmux
-launch cannot overwrite another worker's hooks in the same session.  It
-queries tmux at hook time so detach/reattach and multiple attached
-clients are handled from current tmux state without accumulating stale
-per-window hook entries.
+Window auto-suspend uses the same detached-command pattern, but the
+commands now report events instead of synchronizing the whole session.
+Each builder only passes the identifiers needed to reconstruct its own
+event line.
 
 <<helper functions>>=
-def build_detached_window_sync_command(
-    session_id: str,
+def build_detached_window_focus_out_command(
+    who: str,
+    pane_id: str,
 ) -> str:
-    """Return shell command to synchronize tracked windows in a session."""
+    """Return shell command to record window focus-out."""
     prefix = build_detached_nytid_prefix()
     cmd = (
         f"{prefix} "
-        f"_sync-window-tracking-detached"
-        f" --session-id {shlex.quote(session_id)}"
+        f"_window-focus-out-detached"
+        f" --pane-id {shlex.quote(pane_id)}"
     )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
+<<helper functions>>=
+def build_detached_window_focus_in_command(
+    who: str,
+    pane_id: str,
+) -> str:
+    """Return shell command to record window focus-in."""
+    prefix = build_detached_nytid_prefix()
+    cmd = (
+        f"{prefix} "
+        f"_window-focus-in-detached"
+        f" --pane-id {shlex.quote(pane_id)}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
+<<helper functions>>=
+def build_detached_window_switch_command(
+    who: str,
+) -> str:
+    """Return shell command to record a window-switch event."""
+    prefix = build_detached_nytid_prefix()
+    cmd = (
+        f"{prefix} "
+        f"_window-switch-detached"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
     return cmd
 @
 
@@ -5219,13 +5220,65 @@ def install_tmux_focus_hooks(
         )
 @
 
-Window launches cannot use [[pane-focus-out]] because terminal blur to a
-browser would incorrectly suspend tracking.  Instead we install one
-stable session-scoped dispatcher hook that coexists with any existing
-tmux hooks for the same event.  On each relevant tmux event, that
-dispatcher scans nytid's tracked-window state, then consults tmux's live
-[[window_active_clients]] count to decide which windows should be
-suspended or resumed.
+Window launches \emph{do} use [[pane-focus-out]] and [[pane-focus-in]],
+but not to directly stop or start labels.  The problem with directly
+stopping on [[pane-focus-out]] is that the event fires whenever the
+terminal emulator loses focus---for example when the user Alt-Tabs to a
+browser or PDF reader.  For workflows where consulting a browser is
+routine, this is too aggressive: the user is still working on the task,
+just not inside the terminal.
+
+An earlier design avoided pane-focus hooks entirely for [[--window]]
+mode, relying on session-scoped hooks ([[session-window-changed]],
+[[client-session-changed]], etc.)\ that queried
+[[window_active_clients]] at hook time.  That approach suffered from the
+same terminal-blur problem: one or more of the session-scoped hooks
+fired when the terminal lost focus, causing the
+[[window_active_clients]] count to drop to zero and incorrectly
+suspending the session.
+
+The current design solves this with a \emph{deferred event buffer}.
+All three relevant tmux events---[[pane-focus-out]],
+[[pane-focus-in]], and [[session-window-changed]]---write to the same
+shared file under a file lock.  Each event appends a single line:
+\begin{description}
+\item[[[pane-focus-out]]] appends [[stop label1 label2 ...]],
+    recording the labels from the departing window.
+\item[[[pane-focus-in]]] appends [[start label1 label2 ...]],
+    recording the labels from the arriving window.
+\item[[[session-window-changed]]] appends [[window-switch]],
+    confirming that an actual tmux window switch occurred.
+\end{description}
+
+After every append, the hook checks a \emph{trigger condition}: if the
+file contains an equal number of [[stop]] and [[start]] lines (complete
+pairs) and at least one [[window-switch]] line, then a real window
+switch has occurred and all necessary information is present.  The hook
+executes the \emph{last} [[stop]] line (stopping those labels), then
+the \emph{last} [[start]] line (starting those labels), and finally
+truncates the file.
+
+The equal-pairs requirement is what filters out terminal blur.  An
+Alt-Tab cycle produces one [[stop]]/[[start]] pair but no
+[[window-switch]], so the trigger condition is never met and tracking
+continues undisturbed.  A real window switch produces the same
+[[stop]]/[[start]] pair \emph{plus} a [[window-switch]] entry, causing
+the last hook to fire (whichever arrives last) to execute the switch.
+
+Because all three hooks check the trigger condition, the mechanism is
+order-independent.  Whether tmux fires [[pane-focus-out]] before or
+after [[session-window-changed]] does not matter: the last of the three
+to append its line finds the complete set and triggers execution.
+
+File locking ([[fcntl.flock]]) prevents races between the hooks, which
+tmux may invoke as overlapping [[run-shell]] subprocesses.  The lock is
+held for the duration of the append-check-execute cycle, ensuring
+atomic transitions.
+
+Start is idempotent: calling [[start_tracking_labels]] for labels that
+are already active is a no-op.  This means the brief window where both
+the old and new labels may be active (if [[pane-focus-in]] fires before
+[[session-window-changed]] executes the stop) is harmless.
 
 Because multiple nytid launches may target the same tmux session, we
 must avoid appending duplicate hook entries.  The
@@ -5263,28 +5316,49 @@ def install_tmux_hook_once(
     )
 @
 
-With the idempotent installer in hand, we register session-scoped hooks
-for all events that can change which window is selected.
+With the idempotent installer in hand, we register the three hooks that
+implement the deferred event buffer.  The [[pane-focus-out]] and
+[[pane-focus-in]] hooks are pane-scoped (using the same pane-ID guard as
+[[install_tmux_focus_hooks]]), while [[session-window-changed]] is
+session-scoped (using [[install_tmux_hook_once]] to avoid duplicates).
 
 <<helper functions>>=
 def install_tmux_window_sync_hooks(
     session_id: str,
+    pane_id: str,
+    who: str,
 ) -> None:
-    """Install stable session hooks that dispatch window sync."""
-    sync_cmd = build_detached_window_sync_command(session_id)
-    hook_command = f"run-shell {shlex.quote(sync_cmd)}"
-    hook_specs = (
-        "session-window-changed",
-        "client-session-changed",
-        "client-attached",
-        "client-detached",
+    """Install deferred event buffer hooks for window tracking."""
+    focus_out_cmd = build_detached_window_focus_out_command(
+        who, pane_id,
     )
-    for hook_name in hook_specs:
-        install_tmux_hook_once(
-            session_id,
-            hook_name,
-            hook_command,
+    focus_in_cmd = build_detached_window_focus_in_command(
+        who, pane_id,
+    )
+    for hook_name, shell_cmd in (
+        ("pane-focus-out", focus_out_cmd),
+        ("pane-focus-in", focus_in_cmd),
+    ):
+        guarded = (
+            "if-shell -F "
+            f"'#{{==:#{{pane_id}},{pane_id}}}' "
+            f"{{ run-shell {shlex.quote(shell_cmd)} }}"
         )
+        subprocess.run(
+            [
+                "tmux", "set-hook", "-p",
+                "-t", pane_id,
+                hook_name, guarded,
+            ],
+            check=True,
+        )
+    switch_cmd = build_detached_window_switch_command(who)
+    switch_hook = f"run-shell {shlex.quote(switch_cmd)}"
+    install_tmux_hook_once(
+        session_id,
+        "session-window-changed",
+        switch_hook,
+    )
 @
 
 \subsubsection{Cleaning Up Suspend State on Pane Exit}
@@ -5345,8 +5419,10 @@ def install_tmux_window_cleanup_hook(
 ) -> None:
     """Install cleanup hook for tracked window labels file."""
     labels_file = window_labels_path(window_id, who)
+    event_file = window_event_buffer_path(who)
     cleanup_cmd = (
         f"rm -f {shlex.quote(str(labels_file))}"
+        f" {shlex.quote(str(event_file))}"
     )
     guarded = (
         "if-shell "
@@ -5607,52 +5683,31 @@ def test_remove_window_labels_deletes_when_empty(
     remove_window_labels(window_id, who, ["a"])
     assert read_window_labels(window_id, who) is None
 
-def test_sync_window_keeps_active_window_labels(
-    temp_tracking_dir,
-):
-    """Window sync leaves labels running when the window is active."""
-    session_id = "$1"
-    window_id = "@77"
-    who = default_username
-    runner.invoke(cli, ["start", "work"])
-    write_window_labels(window_id, who, ["work"])
-
-    with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=[window_id],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        return_value=True,
-    ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-
-    session = load_active_session(who)
-    assert session.get_active_labels() == ["work"]
-
-    runner.invoke(cli, ["stop"])
-
 def test_install_tmux_window_sync_hooks_register_session_hooks():
-    """Window sync hooks are installed on the tmux session."""
-    with patch("nytid.cli.track.install_tmux_hook_once") as mock_install:
-        install_tmux_window_sync_hooks("$1")
+    """Window hooks install pane sensors plus one session switch hook."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run, patch(
+        "nytid.cli.track.install_tmux_hook_once"
+    ) as mock_install:
+        install_tmux_window_sync_hooks("$1", "%7", "me")
 
-    hook_calls = mock_install.call_args_list
-    assert hook_calls
-    assert all(mock_call.args[0] == "$1"
-               for mock_call in hook_calls)
-    hook_names = [mock_call.args[1] for mock_call in hook_calls]
-    assert "session-window-changed" in hook_names
-    assert "client-session-changed" in hook_names
-    assert "client-attached" in hook_names
-    assert "client-detached" in hook_names
-    assert all("_sync-window-tracking-detached" in mock_call.args[2]
-               for mock_call in hook_calls)
+    assert len(mock_run.call_args_list) == 2
+    first = mock_run.call_args_list[0].args[0]
+    second = mock_run.call_args_list[1].args[0]
+    assert first[:6] == [
+        "tmux", "set-hook", "-p", "-t", "%7",
+        "pane-focus-out",
+    ]
+    assert second[:6] == [
+        "tmux", "set-hook", "-p", "-t", "%7",
+        "pane-focus-in",
+    ]
+    assert "_window-focus-out-detached" in first[6]
+    assert "_window-focus-in-detached" in second[6]
+
+    mock_install.assert_called_once()
+    assert mock_install.call_args.args[0] == "$1"
+    assert mock_install.call_args.args[1] == "session-window-changed"
+    assert "_window-switch-detached" in mock_install.call_args.args[2]
 
 def test_install_tmux_hook_once_preserves_existing_hook():
     """Hook installer appends nytid without overwriting existing hooks."""
@@ -5688,230 +5743,157 @@ def test_install_tmux_hook_once_skips_duplicate_command():
 
     assert mock_run.call_count == 1
 
-def test_sync_window_tracking_detached_suspends_inactive_window(
-    temp_tracking_dir,
-):
-    """Window sync suspends windows with no active clients."""
-    session_id = "$1"
-    window_id = "@77"
-    who = default_username
-    runner.invoke(cli, ["start", "work"])
-    write_window_labels(window_id, who, ["work"])
+def test_event_buffer_alt_tab_no_execute(temp_tracking_dir):
+    """Balanced stop/start without switch stays buffered."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(who, "stop work")
+        append_and_check_window_event(who, "start work")
 
-    with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=[window_id],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        return_value=False,
-    ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-
-    assert load_active_session(who).get_active_labels() == []
+    assert mock_stop.call_count == 0
+    assert mock_start.call_count == 0
+    assert window_event_buffer_path(who).read_text() == (
+        "stop work\nstart work\n"
+    )
 @
 
-When two tracked windows share a label and only one is selected, the
-sync dispatcher must not stop the shared label while suspending the
-inactive window.
+The buffer should only execute after it has both a complete stop/start
+pair and a [[window-switch]] marker.
 <<test functions>>=
-def test_sync_window_tracking_detached_preserves_shared_labels(
+def test_event_buffer_window_switch_triggers(
     temp_tracking_dir,
 ):
-    """Window sync keeps labels still required by the active window."""
-    session_id = "$1"
-    who = default_username
-    runner.invoke(cli, [
-        "start", "devel", "kthutils", "nytid",
-    ])
-    write_window_labels("@1", who, ["devel", "kthutils"])
-    write_window_labels("@2", who, ["devel", "nytid"])
+    """Switch marker executes the last stop/start pair and clears state."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(who, "stop work")
+        append_and_check_window_event(who, "start admin")
+        append_and_check_window_event(who, "window-switch")
 
-    with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=["@1", "@2"],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        side_effect=lambda window_id: window_id == "@2",
-    ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-
-    assert load_active_session(who).get_active_labels() == [
-        "devel", "nytid",
-    ]
-
-    runner.invoke(cli, ["stop"])
+    mock_stop.assert_called_once_with(
+        who=who,
+        labels=["work"],
+        quiet_if_missing=True,
+        update_tmux_context=False,
+    )
+    assert mock_start.call_count == 1
+    assert mock_start.call_args.kwargs["who"] == who
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["update_tmux_context"] is False
+    assert window_event_buffer_path(who).read_text() == ""
 @
 
-Switching to a previously inactive window must start all its declared
-labels, including labels added dynamically after the window was created.
+Stale Alt-Tab pairs must remain harmless until a real window switch
+arrives.
 <<test functions>>=
-def test_sync_window_switching_restores_declared_labels(
+def test_event_buffer_stale_pairs_ignored(
     temp_tracking_dir,
 ):
-    """Switching active window starts the new window's declared labels."""
-    session_id = "$1"
-    who = default_username
-    runner.invoke(cli, [
-        "start", "devel", "kthutils", "nytid", "opencode",
-    ])
-    write_window_labels("@1", who, ["devel", "kthutils"])
-    write_window_labels(
-        "@2", who, ["devel", "nytid", "opencode"]
+    """Repeated Alt-Tab cycles do not execute without switch."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(who, "stop work")
+        append_and_check_window_event(who, "start work")
+        append_and_check_window_event(who, "stop work")
+        append_and_check_window_event(who, "start work")
+
+    assert mock_stop.call_count == 0
+    assert mock_start.call_count == 0
+    assert window_event_buffer_path(who).read_text() == (
+        "stop work\nstart work\nstop work\nstart work\n"
     )
+@
+
+The last stop/start entries define the actual switch, and stop must run
+before start so that shared labels can be restarted cleanly.
+<<test functions>>=
+def test_event_buffer_shared_labels_stop_before_start(
+    temp_tracking_dir,
+):
+    """Shared labels are stopped before the replacement set starts."""
+    who = "me"
+    calls = []
+
+    def record_stop(**kwargs):
+        calls.append(("stop", kwargs["labels"]))
+
+    def record_start(**kwargs):
+        calls.append(("start", kwargs["labels"]))
 
     with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=["@1", "@2"],
+        "nytid.cli.track.stop_tracking_labels",
+        side_effect=record_stop,
     ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        side_effect=lambda wid: wid == "@1",
+        "nytid.cli.track.start_tracking_labels",
+        side_effect=record_start,
     ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
+        append_and_check_window_event(who, "stop work grading")
+        append_and_check_window_event(who, "start work admin")
+        append_and_check_window_event(who, "window-switch")
 
-    assert load_active_session(who).get_active_labels() == [
-        "devel", "kthutils",
+    assert calls == [
+        ("stop", ["work", "grading"]),
+        ("start", ["work", "admin"]),
     ]
+@
 
-    with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=["@1", "@2"],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        side_effect=lambda wid: wid == "@2",
-    ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-
-    assert sorted(
-        load_active_session(who).get_active_labels()
-    ) == ["devel", "nytid", "opencode"]
-
-    runner.invoke(cli, ["stop"])
-
-def test_sync_window_tracking_detached_ignores_other_sessions(
+Concurrent writers should still serialize through the file lock and
+produce one clean execution.
+<<test functions>>=
+def test_event_buffer_locking(
     temp_tracking_dir,
 ):
-    """Window sync only touches tracked windows in the target session."""
-    session_id = "$1"
-    window_id = "@77"
-    who = default_username
-    runner.invoke(cli, ["start", "work"])
-    write_window_labels(window_id, who, ["work"])
+    """Simultaneous appends serialize through the file lock."""
+    import threading
+
+    who = "me"
+    barrier = threading.Barrier(4)
+    calls = []
+
+    def record_stop(**kwargs):
+        calls.append(("stop", kwargs["labels"]))
+
+    def record_start(**kwargs):
+        calls.append(("start", kwargs["labels"]))
+
+    def worker(event_line):
+        barrier.wait()
+        append_and_check_window_event(who, event_line)
 
     with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=[window_id],
+        "nytid.cli.track.stop_tracking_labels",
+        side_effect=record_stop,
     ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=False,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        return_value=False,
+        "nytid.cli.track.start_tracking_labels",
+        side_effect=record_start,
     ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
+        threads = [
+            threading.Thread(target=worker, args=("stop work",)),
+            threading.Thread(target=worker, args=("start admin",)),
+            threading.Thread(target=worker, args=("window-switch",)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
 
-    assert load_active_session(who).get_active_labels() == ["work"]
-
-def test_sync_window_leaves_unmanaged_labels_alone(
-    temp_tracking_dir,
-):
-    """Labels not declared in any window file are untouched by sync."""
-    session_id = "$1"
-    who = default_username
-    runner.invoke(cli, ["start", "manual", "window-work"])
-    write_window_labels("@1", who, ["window-work"])
-
-    with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=["@1"],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        return_value=False,
-    ):
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-
-    active = load_active_session(who).get_active_labels()
-    assert "manual" in active
-    assert "window-work" not in active
-
-    runner.invoke(cli, ["stop"])
-
-def test_sync_window_idempotent(temp_tracking_dir):
-    """Running sync twice produces the same state."""
-    session_id = "$1"
-    who = default_username
-    runner.invoke(cli, ["start", "work"])
-    write_window_labels("@1", who, ["work"])
-
-    patches = (
-        patch(
-            "nytid.cli.track.list_tracked_window_ids",
-            return_value=["@1"],
-        ),
-        patch(
-            "nytid.cli.track.window_belongs_to_session",
-            return_value=True,
-        ),
-        patch(
-            "nytid.cli.track.tmux_window_has_active_client",
-            return_value=False,
-        ),
-    )
-    with patches[0], patches[1], patches[2]:
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-    assert load_active_session(
-        who
-    ).get_active_labels() == []
-
-    with patches[0], patches[1], patches[2]:
-        runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
-        ])
-    assert load_active_session(
-        who
-    ).get_active_labels() == []
+    assert sorted(calls) == [
+        ("start", ["admin"]),
+        ("stop", ["work"]),
+    ]
+    assert window_event_buffer_path(who).read_text() == ""
 
 def test_manual_stop_prevents_window_resume(
     temp_tracking_dir,
 ):
     """Stopping a label removes it from this window's file only."""
-    session_id = "$1"
     who = default_username
     runner.invoke(cli, ["start", "work", "email"])
     write_window_labels("@1", who, ["work", "email"])
@@ -5927,18 +5909,19 @@ def test_manual_stop_prevents_window_resume(
     assert read_window_labels("@1", who) == ["work"]
 
     with patch(
-        "nytid.cli.track.list_tracked_window_ids",
-        return_value=["@1"],
-    ), patch(
-        "nytid.cli.track.window_belongs_to_session",
-        return_value=True,
-    ), patch(
-        "nytid.cli.track.tmux_window_has_active_client",
-        return_value=True,
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value="@1",
     ):
         runner.invoke(cli, [
-            "_sync-window-tracking-detached",
-            "--session-id", session_id,
+            "_window-focus-out-detached",
+            "--pane-id", "%7",
+        ])
+        runner.invoke(cli, [
+            "_window-focus-in-detached",
+            "--pane-id", "%7",
+        ])
+        runner.invoke(cli, [
+            "_window-switch-detached",
         ])
 
     active = load_active_session(who).get_active_labels()
@@ -6205,20 +6188,25 @@ def test_build_detached_resume_command_other_worker():
     assert "--who" in cmd
     assert "dan-claude" in cmd
 
-def test_build_detached_window_sync_command():
-    """Window sync command includes session-id."""
-    cmd = build_detached_window_sync_command("$1")
-    assert "_sync-window-tracking-detached" in cmd
-    assert "--session-id" in cmd
-    assert "$1" in cmd
+def test_build_detached_window_focus_out_command():
+    """Window focus-out command includes pane-id."""
+    cmd = build_detached_window_focus_out_command("me", "%42")
+    assert "_window-focus-out-detached" in cmd
+    assert "--pane-id" in cmd
+    assert "%42" in cmd
 
-def test_list_workers_with_tracked_windows(temp_tracking_dir):
-    """Window worker discovery inspects tracked window state files."""
-    write_window_labels("@1", "Dan-Claude", ["seminar"])
-    write_window_labels("@2", default_username, ["notes"])
-    assert list_workers_with_tracked_windows() == [
-        "dan-claude", sanitize_who(default_username),
-    ]
+def test_build_detached_window_focus_in_command():
+    """Window focus-in command includes pane-id."""
+    cmd = build_detached_window_focus_in_command("me", "%42")
+    assert "_window-focus-in-detached" in cmd
+    assert "--pane-id" in cmd
+    assert "%42" in cmd
+
+def test_build_detached_window_switch_command():
+    """Window-switch command does not need a pane-id."""
+    cmd = build_detached_window_switch_command("me")
+    assert "_window-switch-detached" in cmd
+    assert "--pane-id" not in cmd
 
 def test_build_detached_nytid_prefix():
     """Prefix includes PYTHONPATH and python executable."""
@@ -7877,7 +7865,9 @@ and checking the status of active tracking sessions:
 <<detached finalize command>>
 <<detached suspend command>>
 <<detached resume command>>
-<<detached window sync command>>
+<<detached window focus-out command>>
+<<detached window focus-in command>>
+<<detached window switch command>>
 <<notes command>>
 @
 
@@ -8034,10 +8024,8 @@ from nytid.cli.track import (
     delete_window_labels,
     suspend_tracking_labels,
     resume_tracking_labels,
-    tmux_window_has_active_client,
-    list_tracked_window_ids,
-    list_workers_with_tracked_windows,
-    window_belongs_to_session,
+    window_event_buffer_path,
+    append_and_check_window_event,
     get_tmux_window_id_for_pane,
     has_tracked_window_state,
     get_current_tracked_window_id,
@@ -8045,7 +8033,9 @@ from nytid.cli.track import (
     build_detached_nytid_prefix,
     build_detached_suspend_command,
     build_detached_resume_command,
-    build_detached_window_sync_command,
+    build_detached_window_focus_out_command,
+    build_detached_window_focus_in_command,
+    build_detached_window_switch_command,
     install_tmux_window_sync_hooks,
     install_tmux_window_cleanup_hook,
     default_username
