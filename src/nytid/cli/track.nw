@@ -5085,6 +5085,7 @@ emit_window_event_debug(
 stop_count = 0
 start_count = 0
 switch_target_tracked = None
+switch_source_tracked = None
 suppress_execution_notifications = False
 last_stop_labels = []
 last_start_labels = []
@@ -5102,10 +5103,11 @@ for line in lines:
     elif line == "start":
         start_count += 1
         last_start_labels = []
-    elif line == "window-switch tracked":
-        switch_target_tracked = True
-    elif line == "window-switch untracked":
-        switch_target_tracked = False
+    elif line.startswith("window-switch "):
+        parts = line.split()
+        switch_target_tracked = parts[1] == "tracked"
+        if len(parts) > 2:
+            switch_source_tracked = parts[2] == "from-tracked"
 
 if (
     switch_target_tracked is True
@@ -5123,6 +5125,7 @@ elif (
 elif (
     switch_target_tracked is True
     and start_count == stop_count + 1
+    and switch_source_tracked is not True
 ):
     <<execute deferred window start>>
     os.ftruncate(fd, 0)
@@ -5132,6 +5135,12 @@ The execution step stops the old window's labels, then starts the new
 window's labels.  Both operations pass [[update_tmux_context=False]]
 because the tmux context files (window labels) are already correct---we
 are just updating the tracking session state to match.
+
+For debugging, the execution notifications also report whether the source
+window was known to be tracked.  That makes the previously ambiguous
+start-only case visible in the log: a [[from-tracked]] marker means the
+buffer must wait for the pending [[stop]] line, while [[from-untracked]]
+or an older marker without source information may execute immediately.
 
 <<execute deferred window switch>>=
 suppress_execution_notifications = True
@@ -5149,6 +5158,7 @@ emit_window_event_debug(
     notification_body=(
         f"action: execute-switch\n"
         f"target: {'tracked' if switch_target_tracked else 'untracked'}\n"
+        f"source: {switch_source_tracked}\n"
         f"stop: {' '.join(last_stop_labels) or '(none)'}\n"
         f"start: {' '.join(last_start_labels) or '(none)'}\n"
         f"who: {who}\n"
@@ -5171,6 +5181,7 @@ emit_window_event_debug(
     notification_body=(
         f"action: execute-stop\n"
         f"target: {'tracked' if switch_target_tracked else 'untracked'}\n"
+        f"source: {switch_source_tracked}\n"
         f"stop: {' '.join(last_stop_labels) or '(none)'}\n"
         f"start: (none)\n"
         f"who: {who}\n"
@@ -5197,6 +5208,7 @@ emit_window_event_debug(
     notification_body=(
         f"action: execute-start\n"
         f"target: {'tracked' if switch_target_tracked else 'untracked'}\n"
+        f"source: {switch_source_tracked}\n"
         f"stop: (none)\n"
         f"start: {' '.join(last_start_labels) or '(none)'}\n"
         f"who: {who}\n"
@@ -5509,9 +5521,43 @@ def get_tmux_selected_window_id(
     return window_id
 @
 
-The switch command uses [[get_tmux_selected_window_id]] to determine
-whether the newly selected window is tracked, then appends the
-appropriate marker to the event buffer.
+The same tmux hook can also ask for the previously selected window via
+the special target [[session_id:!]].  We need that source window because
+[[window-switch tracked]] alone is ambiguous: it may mean either
+untracked-to-tracked (safe to start immediately) or tracked-to-tracked
+with the [[stop]] event still in flight.  Recording the source tracking
+status removes that ambiguity without forcing the focus hooks into a
+single ordering.
+
+<<helper functions>>=
+def get_tmux_last_window_id(
+    session_id: str,
+) -> Optional[str]:
+    """Return the previously selected tmux window for ``session_id``."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                f"{session_id}:!",
+                "#{window_id}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    window_id = result.stdout.strip()
+    return window_id if window_id else None
+@
+
+The switch command now records both ends of the switch.  That lets the
+buffer defer the tracked-to-tracked case until the matching [[stop]]
+arrives, while preserving the simpler start-only behaviour for
+untracked-to-tracked switches.
 
 <<detached window switch command>>=
 @cli.command(
@@ -5524,10 +5570,17 @@ def window_switch_detached(
 ):
     """Record a deferred window-switch event."""
     selected_window_id = get_tmux_selected_window_id(session_id)
+    last_window_id = get_tmux_last_window_id(session_id)
     selected_is_tracked = (
         selected_window_id is not None
         and read_window_labels(
             selected_window_id, who, tmux_server_key,
+        ) is not None
+    )
+    source_is_tracked = (
+        last_window_id is not None
+        and read_window_labels(
+            last_window_id, who, tmux_server_key,
         ) is not None
     )
     append_and_check_window_event(
@@ -5536,6 +5589,11 @@ def window_switch_detached(
             "window-switch tracked"
             if selected_is_tracked
             else "window-switch untracked"
+        )
+        + (
+            " from-tracked"
+            if source_is_tracked
+            else " from-untracked"
         ),
     )
 @
@@ -5779,9 +5837,12 @@ shared file under a file lock.  Each event appends a single line:
 \item[[[pane-focus-in]]] appends [[start label1 label2 ...]],
     recording the labels from the arriving window.
 \item[[[session-window-changed]]] appends either
-    [[window-switch tracked]] or [[window-switch untracked]],
-    confirming that an actual tmux window switch occurred and whether
-    the destination window is tracked.
+    [[window-switch tracked from-tracked]],
+    [[window-switch tracked from-untracked]],
+    [[window-switch untracked from-tracked]], or
+    [[window-switch untracked from-untracked]], confirming both whether
+    an actual tmux window switch occurred and whether the source and
+    destination windows are tracked.
 \end{description}
 
 After every append, the hook checks a \emph{trigger condition}.  A real
@@ -5799,10 +5860,21 @@ the destination is tracked, allowing the buffer to execute the full
 stop/start pair or the single-sided stop/start case that arises when
 only one side of the switch is tracked.
 
+The source annotation is what makes the start-only case safe.  Without
+it, [[window-switch tracked]] plus one [[start]] line looks complete even
+when tmux merely delivered [[pane-focus-in]] before the tracked source
+window's [[pane-focus-out]].  By distinguishing [[from-tracked]] from
+[[from-untracked]], the buffer waits for the pending [[stop]] in the
+former case and still executes immediately in the latter.
+
 Because all three hooks check the trigger condition, the mechanism is
-order-independent.  Whether tmux fires [[pane-focus-out]] before or
-after [[session-window-changed]] does not matter: the last of the three
-to append its line finds the complete set and triggers execution.
+now order-independent in the only sense that matters: whichever hook
+appends the last
+\emph{required} fact triggers execution.  A tracked-to-tracked switch
+therefore waits for [[stop]], [[start]], and the enriched
+[[window-switch ...]] marker in any order, while the one-sided tracked
+or untracked cases still complete as soon as their shorter fact set is
+present.
 
 File locking ([[fcntl.flock]]) prevents races between the hooks, which
 tmux may invoke as overlapping [[run-shell]] subprocesses.  The lock is
@@ -6385,7 +6457,7 @@ def test_event_buffer_window_switch_triggers(
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked",
+            "window-switch tracked from-tracked",
         )
 
     mock_stop.assert_called_once_with(
@@ -6473,7 +6545,7 @@ def test_event_buffer_shared_labels_stop_before_start(
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked",
+            "window-switch tracked from-tracked",
         )
 
     assert calls == [
@@ -6520,7 +6592,7 @@ def test_event_buffer_locking(
             threading.Thread(target=worker, args=("start admin",)),
             threading.Thread(
                 target=worker,
-                args=("window-switch tracked",),
+                args=("window-switch tracked from-tracked",),
             ),
         ]
         for thread in threads:
@@ -6554,7 +6626,7 @@ def test_event_buffer_isolated_by_session(temp_tracking_dir):
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, other_session,
-            "window-switch tracked",
+            "window-switch tracked from-untracked",
         )
 
     assert mock_stop.call_count == 0
@@ -6582,7 +6654,7 @@ def test_event_buffer_tracked_to_untracked_switch_stops_only(
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch untracked",
+            "window-switch untracked from-tracked",
         )
 
     mock_stop.assert_called_once_with(
@@ -6610,7 +6682,7 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked",
+            "window-switch tracked from-untracked",
         )
 
     assert mock_stop.call_count == 0
@@ -6618,6 +6690,100 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
     assert mock_start.call_args.kwargs["who"] == who
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
     assert mock_start.call_args.kwargs["update_tmux_context"] is False
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_event_buffer_late_focus_out_still_triggers_switch(
+    temp_tracking_dir,
+):
+    """Ordering in, switch, out still executes a tracked switch once."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-tracked",
+        )
+        assert mock_stop.call_count == 0
+        assert mock_start.call_count == 0
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+
+    mock_stop.assert_called_once_with(
+        who=who,
+        labels=["work"],
+        quiet_if_missing=True,
+        update_tmux_context=False,
+    )
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_event_buffer_late_focus_out_ordering_6(
+    temp_tracking_dir,
+):
+    """Ordering switch, in, out also waits for the final tracked stop."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-tracked",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start admin",
+        )
+        assert mock_stop.call_count == 0
+        assert mock_start.call_count == 0
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "stop work",
+        )
+
+    mock_stop.assert_called_once_with(
+        who=who,
+        labels=["work"],
+        quiet_if_missing=True,
+        update_tmux_context=False,
+    )
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_event_buffer_backward_compatible_old_switch_marker(
+    temp_tracking_dir,
+):
+    """Old switch markers still allow the historical start-only path."""
+    who = "me"
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "start admin",
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked",
+        )
+
+    assert mock_stop.call_count == 0
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
@@ -6659,7 +6825,7 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch tracked",
+                "window-switch tracked from-tracked",
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -6678,6 +6844,7 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
     ]
     assert len(notify_calls) == 4
     assert "target: tracked" in notify_calls[-1].args[0][2]
+    assert "source: True" in notify_calls[-1].args[0][2]
     assert "stop: work" in notify_calls[-1].args[0][2]
     assert "start: admin" in notify_calls[-1].args[0][2]
 
@@ -6722,7 +6889,7 @@ def test_window_event_debug_notifies_stop_only_execution(
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch untracked",
+                "window-switch untracked from-tracked",
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -6734,6 +6901,7 @@ def test_window_event_debug_notifies_stop_only_execution(
     assert len(notify_calls) == 3
     assert "action: execute-stop" in notify_calls[-1].args[0][2]
     assert "target: untracked" in notify_calls[-1].args[0][2]
+    assert "source: True" in notify_calls[-1].args[0][2]
     assert "stop: work" in notify_calls[-1].args[0][2]
     assert "start: (none)" in notify_calls[-1].args[0][2]
 
@@ -6758,7 +6926,7 @@ def test_window_event_debug_notifies_start_only_execution(
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch tracked",
+                "window-switch tracked from-untracked",
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -6770,6 +6938,7 @@ def test_window_event_debug_notifies_start_only_execution(
     assert len(notify_calls) == 3
     assert "action: execute-start" in notify_calls[-1].args[0][2]
     assert "target: tracked" in notify_calls[-1].args[0][2]
+    assert "source: False" in notify_calls[-1].args[0][2]
     assert "stop: (none)" in notify_calls[-1].args[0][2]
     assert "start: admin" in notify_calls[-1].args[0][2]
 
@@ -6861,6 +7030,26 @@ def test_get_tmux_selected_window_id_reads_live_tmux_state():
             "-p",
             "-t",
             "$1",
+            "#{window_id}",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+def test_get_tmux_last_window_id_reads_live_tmux_state():
+    """Last window id is resolved from tmux's previous-window target."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run:
+        mock_run.return_value.stdout = "@41\n"
+        assert get_tmux_last_window_id("$1") == "@41"
+
+    mock_run.assert_called_once_with(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            "$1:!",
             "#{window_id}",
         ],
         capture_output=True,
@@ -9057,6 +9246,7 @@ from nytid.cli.track import (
     append_and_check_window_event,
     get_tmux_window_id_for_pane,
     get_tmux_selected_window_id,
+    get_tmux_last_window_id,
     has_tracked_window_state,
     get_current_tracked_window_id,
     install_tmux_hook_once,
