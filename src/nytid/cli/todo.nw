@@ -6194,6 +6194,51 @@ def stop_active_descendants(todo_id, todos):
     return stopped_ids
 @
 
+Callers rarely want just one piece of that protocol.  The common
+high-level operation is 
+\enquote{stop this todo the same way [[todo stop]] would}:
+remove the target from the stack, stop its own
+tracking labels, then unwind any active descendants beneath it.
+
+We package that policy into [[stop_todo_hierarchy]] so manual
+[[todo stop]], blocked subprocess cleanup, and detached tmux finalization
+all share one implementation.  The helper stops at the hierarchy
+boundary; callers remain free to apply their own post-stop status policy
+such as prompting for completion or resetting unfinished work to
+[[pending]].
+
+<<helpers>>=
+def stop_todo_hierarchy(todo_id, who=None):
+    """Stop a todo and all active descendants.
+
+    Reuses the same hierarchy-unwinding order as
+    ``todo stop`` and returns the refreshed todo
+    state after descendants have been deactivated.
+    """
+    resolved_id, item, _, todos, _ = stop_todo_state(
+        todo_id, who=who
+    )
+    stop_todo_tracking(resolved_id, item, todos)
+    stopped_ids = stop_active_descendants(
+        resolved_id, todos
+    )
+    next_id, todos, stack = load_todo_state()
+    by_id = {t.id: t for t in todos}
+    descendants = [
+        by_id[cid]
+        for cid in stopped_ids
+        if cid in by_id
+    ]
+    return (
+        resolved_id,
+        by_id.get(resolved_id),
+        next_id,
+        todos,
+        stack,
+        descendants,
+    )
+@
+
 The [[done]] command also needs the traversal, but its response differs:
 rather than stopping tracking, it marks each descendant as done.
 [[force_complete_descendants]] handles the [[--force]] path.
@@ -6964,7 +7009,8 @@ def start(
 Detached tmux cleanup happens after the pane process exits, so it cannot
 reuse the in-memory todo item from the original [[start]] call.  We
 therefore provide a hidden helper command that reloads the todo,
-stops tracking, and applies the same post-run policy in a fresh process.
+stops it through the same hierarchy-unwinding helper as manual
+[[todo stop]], and applies the post-run policy in a fresh process.
 
 That helper must be robust against exactly the kinds of changes that may
 happen during a long-running task.  The working directory might have been
@@ -6983,15 +7029,15 @@ def finalize_detached_todo(
         exit_code = read_detached_exit_code(
             exit_code_file
         )
-    next_id, todos, stack = apply_todo_mutation(
-        lambda next_id, todos, stack: (
-            next_id,
-            todos,
-            [sid for sid in stack if sid != todo_id],
-        )
-    )
-    item = next(
-        (t for t in todos if t.id == todo_id), None
+    (
+        todo_id,
+        item,
+        next_id,
+        todos,
+        stack,
+        descendants,
+    ) = stop_todo_hierarchy(
+        todo_id
     )
     if item is None:
         return
@@ -7004,10 +7050,11 @@ def finalize_detached_todo(
         },
     )()
 
-    <<stop tracking after subprocess>>
-
     if item.status != "done":
         item.status = "pending"
+    for child in descendants:
+        if child.status != "done":
+            child.status = "pending"
 
     save_todos(next_id, todos)
 
@@ -7828,6 +7875,53 @@ def test_start_window_block_resets_pending_when_not_done(
     assert load_active_stack() == []
 
 
+def test_start_window_block_resets_descendants_pending(
+    temp_todo_dir,
+):
+    """Blocked tmux exit also resets active descendants."""
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+            command="python -m pytest",
+            status="in-progress",
+            labels=["review"],
+        ),
+        TodoItem(
+            id=2,
+            title="Child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            status="in-progress",
+            labels=["review"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.todo.run_todo_tmux_command",
+            return_value=0,
+        ):
+            with patch(
+                "nytid.cli.todo.typer.confirm",
+                return_value=False,
+            ):
+                result = runner.invoke(
+                    cli, ["start", "1", "--window", "--block"]
+                )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    child = next(t for t in todos if t.id == 2)
+    assert parent.status == "pending"
+    assert child.status == "pending"
+    assert load_active_stack() == []
+
+
 def test_finalize_detached_todo_resets_pending(
     temp_todo_dir,
 ):
@@ -7873,6 +7967,69 @@ def test_finalize_detached_todo_reads_status_file(
         os.unlink(status_path)
     _, todos = load_todos()
     assert todos[0].status == "pending"
+
+
+def test_finalize_detached_todo_resets_descendants_pending(
+    temp_todo_dir,
+):
+    """Detached finalize also resets active descendants."""
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["review"],
+        ),
+        TodoItem(
+            id=2,
+            title="Child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            status="in-progress",
+            labels=["review"],
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    finalize_detached_todo(1, 0)
+
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    child = next(t for t in todos if t.id == 2)
+    assert parent.status == "pending"
+    assert child.status == "pending"
+    assert load_active_stack() == []
+
+
+def test_finalize_detached_todo_keeps_done_descendant(
+    temp_todo_dir,
+):
+    """Detached finalize leaves already-done descendants alone."""
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2,
+            title="Child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            status="done",
+        ),
+    ])
+    save_active_stack([1])
+
+    finalize_detached_todo(1, 0)
+
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    child = next(t for t in todos if t.id == 2)
+    assert parent.status == "pending"
+    assert child.status == "done"
 
 
 def test_read_detached_exit_code_parses_signal(
@@ -8122,11 +8279,12 @@ typer.echo(
 )
 @
 
-After the subprocess exits, we reload todos (the file may have
-changed during the session), stop tracking, and prompt the user
-about completion status.  In headless mode we skip the prompt: if
-the subprocess already marked the todo done (via [[todo done]]),
-we respect that; otherwise we reset to pending for retry.
+After the subprocess exits, we stop the todo through the same shared
+hierarchy helper used by manual [[todo stop]] and detached tmux cleanup,
+then prompt the user about completion status.  In headless mode we skip
+the prompt: if the subprocess already marked the todo done (via
+[[todo done]]), we respect that; otherwise we reset the todo and any
+auto-stopped descendants to pending for retry.
 
 When headless mode captured output (via [[subprocess.PIPE]]),
 we post it as a note before updating the status.  This ensures
@@ -8134,22 +8292,18 @@ the teacher can review what the agent did, even if the task
 failed or was reset.
 
 <<handle subprocess exit>>=
-# Reload in case file changed during session, while also removing the
-# finished todo from the authoritative stack in the same mutation.
-next_id, todos, stack = apply_todo_mutation(
-    lambda next_id, todos, stack: (
-        next_id,
-        todos,
-        [sid for sid in stack if sid != todo_id],
-    )
-)
-item = next(
-    (t for t in todos if t.id == todo_id), None
+(
+    todo_id,
+    item,
+    next_id,
+    todos,
+    stack,
+    descendants,
+) = stop_todo_hierarchy(
+    todo_id
 )
 if item is None:
     return
-
-<<stop tracking after subprocess>>
 <<post headless output as note>>
 
 if item.status == "done":
@@ -8162,6 +8316,10 @@ elif typer.confirm(
     item.status = "done"
 else:
     item.status = "pending"
+
+for child in descendants:
+    if child.status != "done":
+        child.status = "pending"
 
 save_todos(next_id, todos)
 if item.status == "done":
@@ -8295,14 +8453,15 @@ def test_start_headless_reassigns_on_failure(
     assert item.status == "pending"
 @
 
-<<stop tracking after subprocess>>=
-stop_todo_tracking(todo_id, item, todos)
-@
-
 \subsection{The [[stop]] Command}
 
 Stopping can target a specific todo by ID, or if no ID is given, find
 whichever todo is currently being tracked and stop it.
+
+Manual stopping uses the same hierarchy helper as subprocess and tmux
+exit handling.  That keeps the high-level rule uniform across all three
+paths: stopping a parent also unwinds any active descendants before the
+caller decides what status changes, if any, should follow.
 
 <<stop command>>=
 @cli.command()
@@ -8315,25 +8474,17 @@ def stop(
     If no ID given, stops the currently tracked todo.
     Also stops any active descendants.
     """
-    todo_id, item, next_id, todos, stack = stop_todo_state(
+    (
+        todo_id,
+        item,
+        next_id,
+        todos,
+        stack,
+        descendants,
+    ) = stop_todo_hierarchy(
         todo_id, who=default_username
     )
-    <<stop tracking via track module>>
-    <<auto-stop descendants>>
     typer.echo(f"Stopped: #{todo_id} {item.title}")
-@
-
-<<stop tracking via track module>>=
-stop_todo_tracking(todo_id, item, todos)
-@
-
-After the stopped item's own tracking is handled, we stop any active
-descendants.  This must run after [[stop_todo_tracking]] so that the
-parent's labels are already resolved before we start unwinding children,
-which may share some of those labels.
-
-<<auto-stop descendants>>=
-stop_active_descendants(todo_id, todos)
 @
 
 Let's verify that the [[stop]] command also protects shared labels.
