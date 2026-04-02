@@ -309,6 +309,11 @@ def get_tracking_lock_file() -> pathlib.Path:
     """Get the path to the tracking history lock file."""
     return get_tracking_dir() / "tracking_data.lock"
 
+
+def get_tmux_context_lock_file() -> pathlib.Path:
+    """Return the lock file guarding tmux context state."""
+    return get_tracking_dir() / "tmux_context.lock"
+
 def sanitize_who(who: str) -> str:
     """Sanitize a worker name for use in filenames.
 
@@ -1840,15 +1845,18 @@ def save_active_session(
 Tracking state lives in two primary files---the per-worker session and
 the shared history log---so any mutation must hold both locks to prevent
 a concurrent process from seeing a half-written state.  Some operations
-also need to update tmux pane/window context files in lock-step with
-those primary files; otherwise hooks can observe contradictory state.
+also need to update tmux pane/window context files in the same critical
+section; otherwise hooks can observe contradictory state.  We therefore
+take a third lock for tmux-context files whenever a mutation also needs
+to touch pane/window metadata.
 [[mutate_worker_tracking_state]] acquires the session lock first
 (per-worker), then the history lock (global), loads fresh copies of the
 primary files, and hands them to a \emph{callback}.  The callback
 returns the updated session and history (plus optional extras), and the
 function writes both files before running an optional [[post_update]]
-hook that can update dependent state while the same locks are still
-held.
+hook that can update dependent state while those same locks are still
+held.  Hook-side readers take the tmux-context lock too, so they cannot
+observe the pre-update and post-update views interleaved.
 
 The two-phase callback pattern keeps the critical section explicit: all
 reads and writes happen inside the lock, so callers cannot accidentally
@@ -1883,42 +1891,46 @@ def mutate_worker_tracking_state(
         lock_file = get_tracking_lock_file()
         with open(lock_file, 'w') as history_lock_handle:
             fcntl.flock(history_lock_handle, fcntl.LOCK_EX)
-            try:
-                session = load_active_session(who)
-                entries = load_tracking_data_raw()
-                normalized_entries, _ = normalize_tracking_entries(entries)
-                callback_result = callback(
-                    session,
-                    normalized_entries,
-                )
-                if isinstance(callback_result, tuple):
-                    updated_session = callback_result[0]
-                    updated_entries = callback_result[1]
-                    extra = callback_result[2:]
-                else:
-                    updated_session = session
-                    updated_entries = normalized_entries
-                    extra = ()
-                final_entries, _ = normalize_tracking_entries(
-                    updated_entries
-                )
-                save_active_session(updated_session, who)
-                save_tracking_data_unlocked(final_entries)
-                if post_update is not None:
-                    post_update(
-                        updated_session,
-                        final_entries,
+            tmux_context_lock_file = get_tmux_context_lock_file()
+            with open(tmux_context_lock_file, 'w') as tmux_lock_handle:
+                fcntl.flock(tmux_lock_handle, fcntl.LOCK_EX)
+                try:
+                    session = load_active_session(who)
+                    entries = load_tracking_data_raw()
+                    normalized_entries, _ = normalize_tracking_entries(entries)
+                    callback_result = callback(
+                        session,
+                        normalized_entries,
                     )
-                if extra:
-                    return (
-                        updated_session,
-                        final_entries,
-                        *extra,
+                    if isinstance(callback_result, tuple):
+                        updated_session = callback_result[0]
+                        updated_entries = callback_result[1]
+                        extra = callback_result[2:]
+                    else:
+                        updated_session = session
+                        updated_entries = normalized_entries
+                        extra = ()
+                    final_entries, _ = normalize_tracking_entries(
+                        updated_entries
                     )
-                return updated_session, final_entries
-            finally:
-                fcntl.flock(history_lock_handle, fcntl.LOCK_UN)
-                fcntl.flock(session_lock_handle, fcntl.LOCK_UN)
+                    save_active_session(updated_session, who)
+                    save_tracking_data_unlocked(final_entries)
+                    if post_update is not None:
+                        post_update(
+                            updated_session,
+                            final_entries,
+                        )
+                    if extra:
+                        return (
+                            updated_session,
+                            final_entries,
+                            *extra,
+                        )
+                    return updated_session, final_entries
+                finally:
+                    fcntl.flock(tmux_lock_handle, fcntl.LOCK_UN)
+                    fcntl.flock(history_lock_handle, fcntl.LOCK_UN)
+                    fcntl.flock(session_lock_handle, fcntl.LOCK_UN)
 
 @
 
@@ -1984,7 +1996,7 @@ def start_tracking_labels(
 
     def sync_tmux_context(session, history_entries):
         if update_tmux_context and started_labels:
-            register_tmux_context_labels(
+            _register_tmux_context_labels_unlocked(
                 started_labels, resolved_who,
             )
 
@@ -2086,7 +2098,7 @@ def stop_tracking_labels(
 
     def sync_tmux_context(session, history_entries):
         if update_tmux_context and stopped_labels:
-            unregister_tmux_context_labels(
+            _unregister_tmux_context_labels_unlocked(
                 stopped_labels, resolved_who,
             )
 
@@ -2151,7 +2163,7 @@ def stop_tracking_labels_if_active(
 
     def sync_tmux_context(session, history_entries):
         if update_tmux_context and stopped_labels:
-            unregister_tmux_context_labels(
+            _unregister_tmux_context_labels_unlocked(
                 stopped_labels, resolved_who,
             )
 
@@ -4688,11 +4700,19 @@ asymmetric.  Removing [[devel]] from window~A should stop that window from
 reviving it later, but another tracked window~B may still declare [[devel]]
 independently.
 
+The internal helpers below assume the tmux-context lock is already held.
+That lets [[mutate_worker_tracking_state]] call them from its [[post_update]]
+hook without deadlocking on a second attempt to take the same lock, while the
+public wrappers still provide the lock for ordinary callers.
+
 <<helper functions>>=
-def register_tmux_context_labels(
+def _register_tmux_context_labels_unlocked(
     labels: List[str], who: str,
 ) -> None:
-    """Add labels to the current pane/window tracking context."""
+    """Add labels to the current tmux context.
+
+    Requires the tmux-context lock to already be held.
+    """
     tmux_server_key = get_current_tmux_server_key()
     if tmux_server_key is None:
         return
@@ -4713,6 +4733,17 @@ def register_tmux_context_labels(
             window_id, who, tmux_server_key,
             list(labels),
         )
+
+
+def register_tmux_context_labels(
+    labels: List[str], who: str,
+) -> None:
+    """Add labels to the current pane/window tracking context."""
+    with_tmux_context_lock(
+        lambda: _register_tmux_context_labels_unlocked(
+            labels, who,
+        )
+    )
 @
 
 The inverse operation mirrors [[register_tmux_context_labels]] but
@@ -4720,10 +4751,13 @@ calls the removal helpers instead, so that [[track stop]] can clean up
 both pane and window state in one call.
 
 <<helper functions>>=
-def unregister_tmux_context_labels(
+def _unregister_tmux_context_labels_unlocked(
     labels: List[str], who: str,
 ) -> None:
-    """Remove labels from the current pane/window tracking context."""
+    """Remove labels from the current tmux context.
+
+    Requires the tmux-context lock to already be held.
+    """
     tmux_server_key = get_current_tmux_server_key()
     if tmux_server_key is None:
         return
@@ -4744,6 +4778,17 @@ def unregister_tmux_context_labels(
             window_id, who, tmux_server_key,
             list(labels),
         )
+
+
+def unregister_tmux_context_labels(
+    labels: List[str], who: str,
+) -> None:
+    """Remove labels from the current pane/window tracking context."""
+    with_tmux_context_lock(
+        lambda: _unregister_tmux_context_labels_unlocked(
+            labels, who,
+        )
+    )
 @
 
 \subsubsection{Per-Window Active Labels}
@@ -4915,6 +4960,24 @@ shell environment, tmux hooks see the same debug flag as interactive
 commands.  That makes the instrumentation reliable across both the live
 CLI and detached hook processes.
 
+Tmux hook subprocesses also read pane/window context files without going
+through the main tracking-state mutation helper.  We therefore guard
+those files with their own lock so hook readers and command-side writers
+see one coherent view.
+
+<<helper functions>>=
+def with_tmux_context_lock(callback):
+    """Run ``callback`` while holding the tmux context lock."""
+    ensure_tracking_dir()
+    lock_file = get_tmux_context_lock_file()
+    with open(lock_file, "w") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            return callback()
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+@
+
 The debug flag is only used by the deferred-buffer diagnostics, so we
 introduce [[TRACK_DEBUG_CONFIG]] immediately before that helper.
 
@@ -4959,6 +5022,65 @@ providing a chronological record that survives across buffer truncations.
 def window_event_debug_log_path() -> pathlib.Path:
     """Return the debug log path for deferred window events."""
     return get_tracking_dir() / "window_event_debug.log"
+@
+
+To preserve accurate timings through the deferred buffer, [[stop]] and
+[[start]] event lines carry the hook timestamp explicitly instead of
+borrowing the later execution time.  The parser keeps [[window-switch]]
+lines in their original textual form because they carry state rather
+than a timing edge.
+
+<<helper functions>>=
+def build_window_event_line(
+    action: str,
+    labels: List[str],
+    when: Optional[datetime.datetime] = None,
+) -> str:
+    """Return one deferred stop/start event line."""
+    if when is None:
+        when = datetime.datetime.now()
+    return (
+        f"{action} {when.isoformat()} "
+        + " ".join(labels)
+    ).rstrip()
+
+
+def parse_window_event_line(line: str) -> dict:
+    """Parse one deferred buffer line into structured fields."""
+    if line.startswith("window-switch "):
+        parts = line.split()
+        result = {
+            "kind": "window-switch",
+            "raw": line,
+            "target_tracked": parts[1] == "tracked",
+            "source_tracked": None,
+        }
+        if len(parts) > 2:
+            result["source_tracked"] = (
+                parts[2] == "from-tracked"
+            )
+        return result
+
+    parts = line.split()
+    if not parts:
+        return {"kind": "unknown", "raw": line}
+    if parts[0] not in {"stop", "start"}:
+        return {"kind": "unknown", "raw": line}
+
+    when = None
+    labels = []
+    if len(parts) > 1:
+        try:
+            when = datetime.datetime.fromisoformat(parts[1])
+            labels = parts[2:]
+        except ValueError:
+            labels = parts[1:]
+    return {
+        "kind": parts[0],
+        "raw": line,
+        "when": when,
+        "labels": labels,
+    }
 @
 
 The main diagnostic emitter writes to the log file and optionally sends
@@ -5087,26 +5209,23 @@ switch_target_tracked = None
 switch_source_tracked = None
 suppress_execution_notifications = False
 last_stop_labels = []
+last_stop_time = None
 last_start_labels = []
+last_start_time = None
 
 for line in lines:
-    if line.startswith("stop "):
+    parsed = parse_window_event_line(line)
+    if parsed["kind"] == "stop":
         stop_count += 1
-        last_stop_labels = line[len("stop "):].split()
-    elif line == "stop":
-        stop_count += 1
-        last_stop_labels = []
-    elif line.startswith("start "):
+        last_stop_labels = parsed["labels"]
+        last_stop_time = parsed["when"]
+    elif parsed["kind"] == "start":
         start_count += 1
-        last_start_labels = line[len("start "):].split()
-    elif line == "start":
-        start_count += 1
-        last_start_labels = []
-    elif line.startswith("window-switch "):
-        parts = line.split()
-        switch_target_tracked = parts[1] == "tracked"
-        if len(parts) > 2:
-            switch_source_tracked = parts[2] == "from-tracked"
+        last_start_labels = parsed["labels"]
+        last_start_time = parsed["when"]
+    elif parsed["kind"] == "window-switch":
+        switch_target_tracked = parsed["target_tracked"]
+        switch_source_tracked = parsed["source_tracked"]
 
 if (
     switch_target_tracked is True
@@ -5190,6 +5309,7 @@ emit_window_event_debug(
 stop_tracking_labels(
     who=who,
     labels=last_stop_labels,
+    end_time=last_stop_time,
     quiet_if_missing=True,
     update_tmux_context=False,
 )
@@ -5217,7 +5337,11 @@ emit_window_event_debug(
 start_tracking_labels(
     who=who,
     labels=last_start_labels,
-    start_time=datetime.datetime.now(),
+    start_time=(
+        last_start_time
+        if last_start_time is not None
+        else datetime.datetime.now()
+    ),
     update_tmux_context=False,
 )
 @
@@ -5417,8 +5541,10 @@ def suspend_detached(
     who: Annotated[str, who_opt] = default_username,
 ):
     """Suspend labels when a tracked pane loses focus."""
-    labels = read_pane_labels(
-        pane_id, who, tmux_server_key,
+    labels = with_tmux_context_lock(
+        lambda: read_pane_labels(
+            pane_id, who, tmux_server_key,
+        )
     )
     if not labels:
         return
@@ -5444,8 +5570,10 @@ def window_focus_out_detached(
     window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return
-    labels = read_window_labels(
-        window_id, who, tmux_server_key,
+    labels = with_tmux_context_lock(
+        lambda: read_window_labels(
+            window_id, who, tmux_server_key,
+        )
     )
     if not labels:
         return
@@ -5453,7 +5581,9 @@ def window_focus_out_detached(
         who,
         tmux_server_key,
         session_id,
-        "stop " + " ".join(labels),
+        build_window_event_line(
+            "stop", labels,
+        ),
     )
 @
 
@@ -5475,8 +5605,10 @@ def window_focus_in_detached(
     window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return
-    labels = read_window_labels(
-        window_id, who, tmux_server_key,
+    labels = with_tmux_context_lock(
+        lambda: read_window_labels(
+            window_id, who, tmux_server_key,
+        )
     )
     if not labels:
         return
@@ -5484,7 +5616,9 @@ def window_focus_in_detached(
         who,
         tmux_server_key,
         session_id,
-        "start " + " ".join(labels),
+        build_window_event_line(
+            "start", labels,
+        ),
     )
 @
 
@@ -5570,17 +5704,23 @@ def window_switch_detached(
     """Record a deferred window-switch event."""
     selected_window_id = get_tmux_selected_window_id(session_id)
     last_window_id = get_tmux_last_window_id(session_id)
-    selected_is_tracked = (
-        selected_window_id is not None
-        and read_window_labels(
-            selected_window_id, who, tmux_server_key,
-        ) is not None
-    )
-    source_is_tracked = (
-        last_window_id is not None
-        and read_window_labels(
-            last_window_id, who, tmux_server_key,
-        ) is not None
+    def read_tracking_flags():
+        selected_is_tracked = (
+            selected_window_id is not None
+            and read_window_labels(
+                selected_window_id, who, tmux_server_key,
+            ) is not None
+        )
+        source_is_tracked = (
+            last_window_id is not None
+            and read_window_labels(
+                last_window_id, who, tmux_server_key,
+            ) is not None
+        )
+        return selected_is_tracked, source_is_tracked
+
+    selected_is_tracked, source_is_tracked = with_tmux_context_lock(
+        read_tracking_flags
     )
     append_and_check_window_event(
         who, tmux_server_key, session_id,
@@ -5838,10 +5978,12 @@ All three relevant tmux events---[[pane-focus-out]],
 [[pane-focus-in]], and [[session-window-changed]]---write to the same
 shared file under a file lock.  Each event appends a single line:
 \begin{description}
-\item[[[pane-focus-out]]] appends [[stop label1 label2 ...]],
-    recording the labels from the departing window.
-\item[[[pane-focus-in]]] appends [[start label1 label2 ...]],
-    recording the labels from the arriving window.
+\item[[[pane-focus-out]]] appends
+    [[stop <timestamp> label1 label2 ...]],
+    recording both the departing labels and the time of the focus loss.
+\item[[[pane-focus-in]]] appends
+    [[start <timestamp> label1 label2 ...]],
+    recording both the arriving labels and the time of the focus gain.
 \item[[[session-window-changed]]] appends either
     [[window-switch tracked from-tracked]],
     [[window-switch tracked from-untracked]],
@@ -5886,6 +6028,12 @@ File locking ([[fcntl.flock]]) prevents races between the hooks, which
 tmux may invoke as overlapping [[run-shell]] subprocesses.  The lock is
 held for the duration of the append-check-execute cycle, ensuring
 atomic transitions.
+
+Those timestamped [[stop]] and [[start]] lines also preserve accurate
+time accounting across hook latency.  The buffer may execute a little
+later than the underlying focus event, but the deferred stop and restart
+still use the recorded event times rather than [[datetime.now()]] at the
+moment of execution.
 
 Start is idempotent: calling [[start_tracking_labels]] for labels that
 are already active is a no-op.  This means the brief window where both
@@ -6421,16 +6569,24 @@ def test_install_tmux_hook_once_skips_duplicate_command():
 def test_event_buffer_alt_tab_no_execute(temp_tracking_dir):
     """Balanced stop/start without switch stays buffered."""
     who = "me"
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    start_event = build_window_event_line(
+        "start", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            stop_event,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start work",
+            start_event,
         )
 
     assert mock_stop.call_count == 0
@@ -6438,7 +6594,7 @@ def test_event_buffer_alt_tab_no_execute(temp_tracking_dir):
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == (
-        "stop work\nstart work\n"
+        f"{stop_event}\n{start_event}\n"
     )
 @
 
@@ -6450,16 +6606,22 @@ def test_event_buffer_window_switch_triggers(
 ):
     """Switch marker executes the last stop/start pair and clears state."""
     who = "me"
+    stop_time = datetime.datetime(2026, 2, 20, 10, 0)
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6469,12 +6631,14 @@ def test_event_buffer_window_switch_triggers(
     mock_stop.assert_called_once_with(
         who=who,
         labels=["work"],
+        end_time=stop_time,
         quiet_if_missing=True,
         update_tmux_context=False,
     )
     assert mock_start.call_count == 1
     assert mock_start.call_args.kwargs["who"] == who
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["start_time"] == start_time
     assert mock_start.call_args.kwargs["update_tmux_context"] is False
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6489,24 +6653,40 @@ def test_event_buffer_stale_pairs_ignored(
 ):
     """Repeated Alt-Tab cycles do not execute without switch."""
     who = "me"
+    stop_one = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    start_one = build_window_event_line(
+        "start", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
+    stop_two = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 2),
+    )
+    start_two = build_window_event_line(
+        "start", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 3),
+    )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            stop_one,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start work",
+            start_one,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            stop_two,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start work",
+            start_two,
         )
 
     assert mock_stop.call_count == 0
@@ -6514,7 +6694,7 @@ def test_event_buffer_stale_pairs_ignored(
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == (
-        "stop work\nstart work\nstop work\nstart work\n"
+        f"{stop_one}\n{start_one}\n{stop_two}\n{start_two}\n"
     )
 @
 
@@ -6526,13 +6706,23 @@ def test_event_buffer_shared_labels_stop_before_start(
 ):
     """Shared labels are stopped before the replacement set starts."""
     who = "me"
+    stop_time = datetime.datetime(2026, 2, 20, 10, 0)
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
     calls = []
 
     def record_stop(**kwargs):
-        calls.append(("stop", kwargs["labels"]))
+        calls.append((
+            "stop",
+            kwargs["labels"],
+            kwargs["end_time"],
+        ))
 
     def record_start(**kwargs):
-        calls.append(("start", kwargs["labels"]))
+        calls.append((
+            "start",
+            kwargs["labels"],
+            kwargs["start_time"],
+        ))
 
     with patch(
         "nytid.cli.track.stop_tracking_labels",
@@ -6543,11 +6733,15 @@ def test_event_buffer_shared_labels_stop_before_start(
     ):
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work grading",
+            build_window_event_line(
+                "stop", ["work", "grading"], stop_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start work admin",
+            build_window_event_line(
+                "start", ["work", "admin"], start_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6555,8 +6749,8 @@ def test_event_buffer_shared_labels_stop_before_start(
         )
 
     assert calls == [
-        ("stop", ["work", "grading"]),
-        ("start", ["work", "admin"]),
+        ("stop", ["work", "grading"], stop_time),
+        ("start", ["work", "admin"], start_time),
     ]
 @
 
@@ -6572,6 +6766,14 @@ def test_event_buffer_locking(
     who = "me"
     barrier = threading.Barrier(4)
     calls = []
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    start_event = build_window_event_line(
+        "start", ["admin"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
 
     def record_stop(**kwargs):
         calls.append(("stop", kwargs["labels"]))
@@ -6594,8 +6796,8 @@ def test_event_buffer_locking(
         side_effect=record_start,
     ):
         threads = [
-            threading.Thread(target=worker, args=("stop work",)),
-            threading.Thread(target=worker, args=("start admin",)),
+            threading.Thread(target=worker, args=(stop_event,)),
+            threading.Thread(target=worker, args=(start_event,)),
             threading.Thread(
                 target=worker,
                 args=("window-switch tracked from-tracked",),
@@ -6619,16 +6821,24 @@ def test_event_buffer_isolated_by_session(temp_tracking_dir):
     """Different tmux sessions for one worker use different buffers."""
     who = "me"
     other_session = "$2"
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    start_event = build_window_event_line(
+        "start", ["admin"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            stop_event,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, other_session,
-            "start admin",
+            start_event,
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, other_session,
@@ -6641,7 +6851,7 @@ def test_event_buffer_isolated_by_session(temp_tracking_dir):
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
-    ).read_text() == "stop work\n"
+    ).read_text() == f"{stop_event}\n"
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, other_session,
     ).read_text() == ""
@@ -6651,12 +6861,15 @@ def test_event_buffer_tracked_to_untracked_switch_stops_only(
 ):
     """Switching to an untracked window still suspends tracked labels."""
     who = "me"
+    stop_time = datetime.datetime(2026, 2, 20, 10, 0)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6666,6 +6879,7 @@ def test_event_buffer_tracked_to_untracked_switch_stops_only(
     mock_stop.assert_called_once_with(
         who=who,
         labels=["work"],
+        end_time=stop_time,
         quiet_if_missing=True,
         update_tmux_context=False,
     )
@@ -6679,12 +6893,15 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
 ):
     """Switching from untracked to tracked window starts labels."""
     who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6695,6 +6912,7 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
     mock_start.assert_called_once()
     assert mock_start.call_args.kwargs["who"] == who
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["start_time"] == start_time
     assert mock_start.call_args.kwargs["update_tmux_context"] is False
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6705,12 +6923,16 @@ def test_event_buffer_late_focus_out_still_triggers_switch(
 ):
     """Ordering in, switch, out still executes a tracked switch once."""
     who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
+    stop_time = datetime.datetime(2026, 2, 20, 10, 2)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6720,17 +6942,21 @@ def test_event_buffer_late_focus_out_still_triggers_switch(
         assert mock_start.call_count == 0
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+            ),
         )
 
     mock_stop.assert_called_once_with(
         who=who,
         labels=["work"],
+        end_time=stop_time,
         quiet_if_missing=True,
         update_tmux_context=False,
     )
     mock_start.assert_called_once()
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["start_time"] == start_time
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
@@ -6740,6 +6966,8 @@ def test_event_buffer_late_focus_out_ordering_6(
 ):
     """Ordering switch, in, out also waits for the final tracked stop."""
     who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
+    stop_time = datetime.datetime(2026, 2, 20, 10, 2)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
@@ -6749,23 +6977,29 @@ def test_event_buffer_late_focus_out_ordering_6(
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
         )
         assert mock_stop.call_count == 0
         assert mock_start.call_count == 0
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+            ),
         )
 
     mock_stop.assert_called_once_with(
         who=who,
         labels=["work"],
+        end_time=stop_time,
         quiet_if_missing=True,
         update_tmux_context=False,
     )
     mock_start.assert_called_once()
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["start_time"] == start_time
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
@@ -6775,12 +7009,15 @@ def test_event_buffer_backward_compatible_old_switch_marker(
 ):
     """Old switch markers still allow the historical start-only path."""
     who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "start admin",
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6790,18 +7027,42 @@ def test_event_buffer_backward_compatible_old_switch_marker(
     assert mock_stop.call_count == 0
     mock_start.assert_called_once()
     assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert mock_start.call_args.kwargs["start_time"] == start_time
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
+
+
+def test_parse_window_event_line_keeps_old_format():
+    """Old stop/start lines still parse without timestamps."""
+    parsed_stop = parse_window_event_line("stop work admin")
+    parsed_start = parse_window_event_line("start review")
+
+    assert parsed_stop == {
+        "kind": "stop",
+        "raw": "stop work admin",
+        "when": None,
+        "labels": ["work", "admin"],
+    }
+    assert parsed_start == {
+        "kind": "start",
+        "raw": "start review",
+        "when": None,
+        "labels": ["review"],
+    }
 
 def test_window_event_debug_disabled_by_default(temp_tracking_dir):
     """Without [[track.debug]], window-event tracing stays silent."""
     import typerconf as config
     config.set(TRACK_DEBUG_CONFIG, None)
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
     try:
         append_and_check_window_event(
             "me", TEST_SERVER_KEY, TEST_SESSION_ID,
-            "stop work",
+            stop_event,
         )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -6813,6 +7074,14 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
     who = "me"
     import typerconf as config
     config.set(TRACK_DEBUG_CONFIG, "1")
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    start_event = build_window_event_line(
+        "start", ["admin"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
     try:
         with patch(
             "nytid.cli.track.subprocess.run"
@@ -6823,11 +7092,11 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
         ):
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "stop work",
+                stop_event,
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "start admin",
+                start_event,
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6838,8 +7107,8 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
 
     log_text = window_event_debug_log_path().read_text()
     assert "action=append" in log_text
-    assert "event='stop work'" in log_text
-    assert "event='start admin'" in log_text
+    assert f"event={stop_event!r}" in log_text
+    assert f"event={start_event!r}" in log_text
     assert "event='window-switch tracked'" in log_text
     assert "action=execute-switch" in log_text
     assert "action=execute-stop" in log_text
@@ -6860,6 +7129,10 @@ def test_window_event_debug_ignores_missing_notify_send(
     """Debug mode tolerates hosts without [[notify-send]]."""
     import typerconf as config
     config.set(TRACK_DEBUG_CONFIG, "1")
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
     try:
         with patch(
             "nytid.cli.track.subprocess.run",
@@ -6867,7 +7140,7 @@ def test_window_event_debug_ignores_missing_notify_send(
         ):
             append_and_check_window_event(
                 "me", TEST_SERVER_KEY, TEST_SESSION_ID,
-                "stop work",
+                stop_event,
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -6881,6 +7154,10 @@ def test_window_event_debug_notifies_stop_only_execution(
     who = "me"
     import typerconf as config
     config.set(TRACK_DEBUG_CONFIG, "1")
+    stop_event = build_window_event_line(
+        "stop", ["work"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
     try:
         with patch(
             "nytid.cli.track.subprocess.run"
@@ -6891,7 +7168,7 @@ def test_window_event_debug_notifies_stop_only_execution(
         ):
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "stop work",
+                stop_event,
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6918,6 +7195,10 @@ def test_window_event_debug_notifies_start_only_execution(
     who = "me"
     import typerconf as config
     config.set(TRACK_DEBUG_CONFIG, "1")
+    start_event = build_window_event_line(
+        "start", ["admin"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+    )
     try:
         with patch(
             "nytid.cli.track.subprocess.run"
@@ -6928,7 +7209,7 @@ def test_window_event_debug_notifies_start_only_execution(
         ):
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "start admin",
+                start_event,
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -6984,6 +7265,7 @@ def test_manual_stop_prevents_window_resume(
             "--pane-id", "%7",
             "--server-key", TEST_SERVER_KEY,
             "--session-id", TEST_SESSION_ID,
+            "--who", who,
         ])
         runner.invoke(cli, [
             "_window-focus-in-detached",
@@ -7002,6 +7284,39 @@ def test_manual_stop_prevents_window_resume(
     assert "email" not in active
 
     runner.invoke(cli, ["stop"])
+
+
+def test_window_focus_out_detached_reads_labels_under_lock(
+    temp_tracking_dir,
+):
+    """Detached window hooks read tracked labels through the context lock."""
+    who = "me"
+    write_window_labels(
+        "@1", who, TEST_SERVER_KEY,
+        ["work"],
+    )
+
+    with patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value="@1",
+    ), patch(
+        "nytid.cli.track.append_and_check_window_event",
+    ) as mock_append:
+        runner.invoke(cli, [
+            "_window-focus-out-detached",
+            "--pane-id", "%7",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
+            "--who", who,
+        ])
+
+    mock_append.assert_called_once()
+    parsed = parse_window_event_line(
+        mock_append.call_args.args[3]
+    )
+    assert parsed["kind"] == "stop"
+    assert parsed["labels"] == ["work"]
+    assert parsed["when"] is not None
 
 def test_get_tmux_window_id_for_pane_reads_live_tmux_state():
     """Current window id is resolved from the current tmux pane."""
@@ -9259,6 +9574,9 @@ from nytid.cli.track import (
     delete_window_labels,
     suspend_tracking_labels,
     resume_tracking_labels,
+    build_window_event_line,
+    parse_window_event_line,
+    with_tmux_context_lock,
     window_event_buffer_path,
     window_event_debug_log_path,
     append_and_check_window_event,

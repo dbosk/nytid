@@ -6133,13 +6133,21 @@ with a pure-read helper that returns the list of active descendant IDs
 without mutating anything.
 
 <<helpers>>=
-def get_active_descendant_ids(todo_id, todos):
-    """Return IDs of all descendants on the active stack.
+def get_active_descendant_ids(
+    todo_id, todos, who=None
+):
+    """Return IDs of active descendants for one worker.
 
     Pure read---no mutations.  Depth-first order
-    (deepest descendants first).
+    (deepest descendants first).  When ``who`` is
+    given, only descendants active for that worker
+    are returned.
     """
     stack = load_active_stack()
+    if who is not None:
+        stack = filter_ids_by_worker(
+            todos, stack, who
+        )
     found = []
 
     def collect(parent_id):
@@ -6155,19 +6163,24 @@ def get_active_descendant_ids(todo_id, todos):
 
 [[stop_active_descendants]] builds on that traversal: for each active
 descendant it stops tracking, then removes all of them from the stack
-in a single mutation.
+in a single mutation.  The optional [[who]] filter matters because the
+stack is global across workers while tracking sessions are not.
 
 <<helpers>>=
-def stop_active_descendants(todo_id, todos):
-    """Stop tracking and deactivate all descendants.
+def stop_active_descendants(
+    todo_id, todos, who=None
+):
+    """Stop tracking and deactivate descendants.
 
     Recursively walks children of ``todo_id``,
     stopping tracking and removing each active
     descendant from the stack.  Returns the list of
-    IDs that were deactivated.
+    IDs that were deactivated.  When ``who`` is
+    given, only that worker's descendants are
+    touched.
     """
     stopped_ids = get_active_descendant_ids(
-        todo_id, todos
+        todo_id, todos, who=who
     )
 
     if not stopped_ids:
@@ -6195,7 +6208,7 @@ def stop_active_descendants(todo_id, todos):
 @
 
 Callers rarely want just one piece of that protocol.  The common
-high-level operation is 
+high-level operation is
 \enquote{stop this todo the same way [[todo stop]] would}:
 remove the target from the stack, stop its own
 tracking labels, then unwind any active descendants beneath it.
@@ -6218,9 +6231,12 @@ def stop_todo_hierarchy(todo_id, who=None):
     resolved_id, item, _, todos, _ = stop_todo_state(
         todo_id, who=who
     )
+    resolved_who = who
+    if resolved_who is None and item is not None:
+        resolved_who = item.who or default_username
     stop_todo_tracking(resolved_id, item, todos)
     stopped_ids = stop_active_descendants(
-        resolved_id, todos
+        resolved_id, todos, who=resolved_who
     )
     next_id, todos, stack = load_todo_state()
     by_id = {t.id: t for t in todos}
@@ -6466,6 +6482,65 @@ def test_stop_parent_ignores_inactive_children(
     result = runner.invoke(cli, ["stop", "1"])
     assert result.exit_code == 0
     assert "Auto-stopped child" not in result.output
+
+
+def test_stop_parent_does_not_stop_other_worker_child(
+    temp_todo_dir,
+):
+    """Stopping my parent leaves another worker's child active."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    other_worker = "other-worker"
+    worker = default_username
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["DD1310"],
+            who=worker,
+        ),
+        TodoItem(
+            id=2,
+            title="Other worker child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            labels=["DD1310"],
+            who=other_worker,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    worker_session = ActiveSession()
+    worker_session.start_labels(
+        ["DD1310", "todo:1"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    save_active_session(worker_session, worker)
+
+    other_session = ActiveSession()
+    other_session.start_labels(
+        ["DD1310", "todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(other_session, other_worker)
+
+    result = runner.invoke(cli, ["stop", "1"])
+    assert result.exit_code == 0
+    assert "Auto-stopped child" not in result.output
+
+    assert load_active_stack() == [2]
+    other_session = load_active_session(other_worker)
+    active = other_session.get_active_labels()
+    assert "DD1310" in active
+    assert "todo:2" in active
 @
 
 That delegation removes the need for a separate stale-label sweep here.
@@ -8030,6 +8105,56 @@ def test_finalize_detached_todo_keeps_done_descendant(
     child = next(t for t in todos if t.id == 2)
     assert parent.status == "pending"
     assert child.status == "done"
+
+
+def test_finalize_detached_todo_keeps_other_worker_descendant(
+    temp_todo_dir,
+):
+    """Detached finalize leaves another worker's child running."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    other_worker = "other-worker"
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who=default_username,
+        ),
+        TodoItem(
+            id=2,
+            title="Other worker child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            status="in-progress",
+            who=other_worker,
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    other_session = ActiveSession()
+    other_session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(other_session, other_worker)
+
+    finalize_detached_todo(1, 0)
+
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    child = next(t for t in todos if t.id == 2)
+    assert parent.status == "pending"
+    assert child.status == "in-progress"
+    assert load_active_stack() == [2]
+    other_session = load_active_session(other_worker)
+    assert "todo:2" in other_session.get_active_labels()
 
 
 def test_read_detached_exit_code_parses_signal(
