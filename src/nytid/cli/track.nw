@@ -4367,6 +4367,7 @@ def run_tmux_command(
                     window_id,
                     focus_who,
                     tmux_server_key,
+                    focus_labels,
                 )
             else:
                 write_pane_labels(
@@ -5350,9 +5351,15 @@ start_tracking_labels(
 
 The suspend helper stops only the labels that are currently active
 in the worker's session---any label already stopped (by the user
-or another process) is silently skipped.  It writes the actually
-stopped labels to the state file, so the state file records the
-truth rather than the caller's optimistic assumption.
+or another process) is silently skipped.  The subtle part is that
+this filtering must happen inside the same locked mutation that
+performs the stop.  A pre-lock snapshot can go stale between the
+read and the write, leaving the suspend state file claiming that a
+label was paused even though another command had already stopped it.
+
+We therefore delegate to [[stop_tracking_labels_if_active()]] and
+persist only the subset that helper actually stopped.  The state file
+then records the truth rather than the caller's optimistic assumption.
 
 <<helper functions>>=
 def suspend_tracking_labels(
@@ -5366,24 +5373,17 @@ def suspend_tracking_labels(
     Stops whichever of ``labels`` are still active and
     writes them to the pane's suspend state file.
     """
-    session = load_active_session(who)
-    active = set(session.get_active_labels())
-    to_suspend = [
-        lbl for lbl in labels if lbl in active
-    ]
-    if not to_suspend:
-        return
-
-    stop_tracking_labels(
+    _, _, stopped_labels = stop_tracking_labels_if_active(
         who=who,
-        labels=to_suspend,
-        quiet_if_missing=True,
+        labels=labels,
         update_tmux_context=False,
     )
+    if not stopped_labels:
+        return
     state_path = suspend_state_path(
         pane_id, who, tmux_server_key,
     )
-    write_suspend_state(state_path, to_suspend)
+    write_suspend_state(state_path, stopped_labels)
 @
 
 We delete the state file \emph{before} restarting labels so that a
@@ -5508,6 +5508,12 @@ can be called safely from hooks.  Pane tracking still uses the direct
 [[_suspend-detached]]/[[_resume-detached]] pair, while window tracking
 uses three event-sensor commands that append to the deferred buffer.
 
+Window exit cleanup is a fourth hidden command.  Unlike the focus
+sensors, it cannot derive the window from a live [[TMUX_PANE]] because
+the pane may already be dead when the exit hook runs.  We therefore pass
+the explicit [[window_id]] and remove only that pane's contributed label
+names from the shared window state.
+
 This separation matters because terminal blur alone does not prove that
 the user changed tmux windows.  The focus hooks merely record candidate
 [[stop]] and [[start]] events; only after [[session-window-changed]]
@@ -5518,6 +5524,11 @@ decide whether to execute stop+start, stop-only, or start-only.
 pane_id_opt = typer.Option(
     "--pane-id",
     help="Tmux pane ID (internal use)",
+)
+
+window_id_opt = typer.Option(
+    "--window-id",
+    help="Tmux window ID (internal use)",
 )
 
 tmux_server_key_opt = typer.Option(
@@ -5886,6 +5897,36 @@ def build_detached_window_switch_command(
     return cmd
 @
 
+Window exit cleanup needs different information from the focus-event
+commands.  Once the pane has died we can no longer derive its window via
+[[TMUX_PANE]], so the hook passes the explicit [[window_id]] together
+with the label names that this pane originally registered.  The cleanup
+command removes only those labels; any labels contributed by surviving
+panes in the same tracked window remain untouched.
+
+<<helper functions>>=
+def build_detached_window_cleanup_command(
+    labels: List[str],
+    who: str,
+    window_id: str,
+    tmux_server_key: str,
+) -> str:
+    """Return shell command to remove one pane's window labels."""
+    prefix = build_detached_nytid_prefix()
+    label_args = " ".join(
+        shlex.quote(lbl) for lbl in labels
+    )
+    cmd = (
+        f"{prefix} "
+        f"_cleanup-window-detached {label_args}"
+        f" --window-id {shlex.quote(window_id)}"
+        f" --server-key {shlex.quote(tmux_server_key)}"
+    )
+    if who != default_username:
+        cmd += f" --who {shlex.quote(who)}"
+    return cmd
+@
+
 The pane resume command is simpler: it reads labels from the state file
 written during suspend, so it needs the pane ID and only passes worker
 identity when it differs from the default.
@@ -6173,13 +6214,18 @@ def install_tmux_suspend_cleanup_hook(
         )
 @
 
-Window cleanup removes only the tracked window labels file owned by the
-exiting pane.  The deferred event buffer is \emph{not} removed here,
-even though it also belongs to the same worker, because that buffer is
-shared across all tracked windows for that worker.  If one tracked pane
-were to delete the shared buffer while another tracked window was still
-alive, it could discard pending stop/start events that belong to the
-surviving window.
+Window cleanup must be more precise than pane cleanup because the window
+labels file is shared state.  Several panes in the same tracked window
+may register labels there over time, and deleting the whole file when
+one pane exits would erase labels still owned by surviving work.
+
+We therefore install a cleanup hook that removes only the labels this
+launch contributed.  The deferred event buffer is \emph{not} removed
+here, even though it also belongs to the same worker, because that
+buffer is shared across all tracked windows for that worker.  If one
+tracked pane were to delete the shared buffer while another tracked
+window was still alive, it could discard pending stop/start events that
+belong to the surviving window.
 
 The guard still protects against inherited cleanup hooks in descendant
 panes or windows.  Unlike the session dispatcher hooks, this cleanup
@@ -6192,13 +6238,16 @@ def install_tmux_window_cleanup_hook(
     window_id: str,
     who: str,
     tmux_server_key: str,
+    labels: List[str],
 ) -> None:
-    """Install cleanup hook for tracked window labels file."""
-    labels_file = window_labels_path(
-        window_id, who, tmux_server_key,
-    )
+    """Install cleanup hook for one pane's window labels."""
     cleanup_cmd = (
-        f"rm -f {shlex.quote(str(labels_file))}"
+        build_detached_window_cleanup_command(
+            labels,
+            who,
+            window_id,
+            tmux_server_key,
+        )
     )
     guarded = (
         "if-shell "
@@ -6218,8 +6267,10 @@ def install_tmux_window_cleanup_hook(
         )
 @
 
-The finalize command builder does not need a [[pane_id]] parameter
-anymore---cleanup is handled by the hook above.
+The track-finalize command builder still does not need a [[pane_id]]
+parameter.  Pane-specific cleanup is handled either by [[_stop-detached]]
+while the pane is still alive or by the dedicated window-cleanup hook
+above once the pane is gone.
 
 <<helper functions>>=
 def build_detached_track_finalize_command(
@@ -6261,6 +6312,31 @@ def stop_detached(
         labels=labels,
         quiet_if_missing=True,
         update_tmux_context=True,
+    )
+@
+
+
+The companion window-cleanup command handles the case where the pane has
+already died, so there is no live [[TMUX_PANE]] from which to recover the
+window identity.  It receives the explicit [[window_id]] and removes only
+the given label names from that shared window file.
+
+<<detached finalize command>>=
+@cli.command(name="_cleanup-window-detached", hidden=True)
+def cleanup_window_detached(
+    labels: Annotated[List[str], detached_labels_arg],
+    window_id: Annotated[str, window_id_opt],
+    tmux_server_key: Annotated[str, tmux_server_key_opt],
+    who: Annotated[str, who_opt] = default_username,
+):
+    """Remove one pane's labels from tracked window state."""
+    with_tmux_context_lock(
+        lambda: remove_window_labels(
+            window_id,
+            who,
+            tmux_server_key,
+            list(labels),
+        )
     )
 @
 
@@ -6531,6 +6607,28 @@ def test_install_tmux_window_sync_hooks_register_session_hooks():
     assert mock_install.call_args.args[0] == TEST_SESSION_ID
     assert mock_install.call_args.args[1] == "session-window-changed"
     assert "_window-switch-detached" in mock_install.call_args.args[2]
+
+def test_install_tmux_window_cleanup_hook_targets_label_cleanup():
+    """Window cleanup hook removes only this pane's labels."""
+    with patch("nytid.cli.track.subprocess.run") as mock_run:
+        install_tmux_window_cleanup_hook(
+            "%7",
+            "@42",
+            "me",
+            TEST_SERVER_KEY,
+            ["work", "email"],
+        )
+
+    assert len(mock_run.call_args_list) == 2
+    first = mock_run.call_args_list[0].args[0]
+    assert first[:6] == [
+        "tmux", "set-hook", "-ap", "-t", "%7",
+        "pane-exited",
+    ]
+    assert "_cleanup-window-detached" in first[6]
+    assert "--window-id @42" in first[6]
+    assert "work" in first[6]
+    assert "email" in first[6]
 
 def test_install_tmux_hook_once_preserves_existing_hook():
     """Hook installer appends nytid without overwriting existing hooks."""
@@ -7615,6 +7713,32 @@ def test_suspend_skips_already_stopped(
     )
     runner.invoke(cli, ["stop"])
 
+def test_suspend_records_only_labels_stopped_under_lock(
+    temp_tracking_dir,
+):
+    """Suspend persists only the subset actually stopped."""
+    pane_id = "%66"
+    with patch(
+        "nytid.cli.track.stop_tracking_labels_if_active",
+        return_value=(ActiveSession(), [], ["work"]),
+    ) as mock_stop:
+        suspend_tracking_labels(
+            who=default_username,
+            labels=["work", "email"],
+            pane_id=pane_id,
+            tmux_server_key=TEST_SERVER_KEY,
+        )
+
+    mock_stop.assert_called_once_with(
+        who=default_username,
+        labels=["work", "email"],
+        update_tmux_context=False,
+    )
+    state_path = suspend_state_path(
+        pane_id, default_username, TEST_SERVER_KEY,
+    )
+    assert read_suspend_state(state_path) == ["work"]
+
 def test_resume_noop_without_state_file(
     temp_tracking_dir,
 ):
@@ -7692,6 +7816,18 @@ def test_build_detached_window_switch_command():
     assert "--pane-id" not in cmd
     assert "--server-key" in cmd
     assert "--session-id" in cmd
+
+def test_build_detached_window_cleanup_command():
+    """Window cleanup command carries window identity and labels."""
+    cmd = build_detached_window_cleanup_command(
+        ["work", "email"], "me", "@42", TEST_SERVER_KEY,
+    )
+    assert "_cleanup-window-detached" in cmd
+    assert "--window-id" in cmd
+    assert "--server-key" in cmd
+    assert "@42" in cmd
+    assert "work" in cmd
+    assert "email" in cmd
 
 def test_build_detached_nytid_prefix_reuses_current_nytid_script(
     tmp_path,
@@ -10321,6 +10457,35 @@ def test_stop_detached_unregisters_window_labels(
         window_id, default_username, TEST_SERVER_KEY,
     )
     assert remaining is None or "X" not in remaining
+
+def test_cleanup_window_detached_preserves_other_labels(
+    temp_tracking_dir,
+):
+    """Window cleanup removes only the exiting pane's labels."""
+    window_id = "@42"
+    write_window_labels(
+        window_id,
+        default_username,
+        TEST_SERVER_KEY,
+        ["X", "shared", "Y"],
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "_cleanup-window-detached",
+            "X",
+            "shared",
+            "--window-id",
+            window_id,
+            "--server-key",
+            TEST_SERVER_KEY,
+        ],
+    )
+    assert result.exit_code == 0
+    assert read_window_labels(
+        window_id, default_username, TEST_SERVER_KEY,
+    ) == ["Y"]
 @
 
 The [[--timeout]] option only applies to direct subprocesses, not
