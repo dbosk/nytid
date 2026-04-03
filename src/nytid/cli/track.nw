@@ -4819,6 +4819,65 @@ def window_labels_path(
     )
 @
 
+Tmux's [[session-window-changed]] hook runs the switch command via
+[[run-shell]], which spawns an asynchronous subprocess.  By the time
+that subprocess queries tmux for the \enquote{last window} (via
+[[$0:!]]), the pointer has already advanced---empirically, both
+[[#{window_id}]] and [[$0:!]] resolve to the same window after the
+switch.  We therefore maintain our own state file that records the
+last selected window per session and worker.  Each invocation of
+[[window_switch_detached]] reads the previous value (the source
+window) and writes the current value, giving the next invocation
+a reliable baseline.
+
+<<helper functions>>=
+def last_selected_window_path(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+) -> pathlib.Path:
+    """Return path to the last-selected-window state file."""
+    return (
+        get_tracking_dir()
+        / f"last_window"
+        f"_{sanitize_tmux_id(tmux_server_key)}"
+        f"_{sanitize_tmux_id(session_id)}"
+        f"_{sanitize_who(who)}.txt"
+    )
+
+
+def read_last_selected_window(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+) -> Optional[str]:
+    """Read the last-selected window ID, or ``None``."""
+    path = last_selected_window_path(
+        who, tmux_server_key, session_id,
+    )
+    try:
+        text = path.read_text().strip()
+        return text if text else None
+    except OSError:
+        return None
+
+
+def write_last_selected_window(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+    window_id: str,
+) -> None:
+    """Record the currently selected window ID."""
+    path = last_selected_window_path(
+        who, tmux_server_key, session_id,
+    )
+    ensure_tracking_dir()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(window_id + "\n")
+    tmp.rename(path)
+@
+
 We reuse the same absent-versus-empty distinction as for panes:
 [[None]] means the window is not tracked, while an empty list means the
 tracked file exists but currently has no labels.
@@ -5699,10 +5758,16 @@ def get_tmux_last_window_id(
     return window_id if window_id else None
 @
 
-The switch command now records both ends of the switch.  That lets the
+The switch command records both ends of the switch.  That lets the
 buffer defer the tracked-to-tracked case until the matching [[stop]]
 arrives, while preserving the simpler start-only behaviour for
 untracked-to-tracked switches.
+
+Because tmux's [[$0:!]] target is unreliable in [[run-shell]]
+subprocesses (see the [[last_selected_window_path]] discussion above),
+the switch command reads the source window from our self-managed state
+file instead.  It then writes the newly selected window for the next
+invocation.
 
 <<detached window switch command>>=
 @cli.command(
@@ -5714,25 +5779,40 @@ def window_switch_detached(
     who: Annotated[str, who_opt] = default_username,
 ):
     """Record a deferred window-switch event."""
-    selected_window_id = get_tmux_selected_window_id(session_id)
-    last_window_id = get_tmux_last_window_id(session_id)
-    def read_tracking_flags():
+    selected_window_id = get_tmux_selected_window_id(
+        session_id,
+    )
+    def read_and_update():
+        prev_window_id = read_last_selected_window(
+            who, tmux_server_key, session_id,
+        )
+        if selected_window_id:
+            write_last_selected_window(
+                who,
+                tmux_server_key,
+                session_id,
+                selected_window_id,
+            )
         selected_is_tracked = (
             selected_window_id is not None
             and read_window_labels(
-                selected_window_id, who, tmux_server_key,
+                selected_window_id,
+                who,
+                tmux_server_key,
             ) is not None
         )
         source_is_tracked = (
-            last_window_id is not None
+            prev_window_id is not None
             and read_window_labels(
-                last_window_id, who, tmux_server_key,
+                prev_window_id,
+                who,
+                tmux_server_key,
             ) is not None
         )
         return selected_is_tracked, source_is_tracked
 
-    selected_is_tracked, source_is_tracked = with_tmux_context_lock(
-        read_tracking_flags
+    selected_is_tracked, source_is_tracked = (
+        with_tmux_context_lock(read_and_update)
     )
     append_and_check_window_event(
         who, tmux_server_key, session_id,
@@ -6093,23 +6173,30 @@ a confusing delay.
 
 We compensate by injecting a synthetic [[window-switch]] event into the
 buffer right after hook installation.  The destination is always tracked
-(we just wrote its labels), and we determine the source by inspecting
-the previous window via [[get_tmux_last_window_id]].  This mirrors the
-logic in [[window_switch_detached]], and the buffer's order-independent
-trigger ensures correctness regardless of whether the synthetic event
-arrives before or after the [[pane-focus-in]] hook.
+(we just wrote its labels), and we determine the source from the
+self-managed state file.  We also seed the state file with the new
+window ID so that the first real [[session-window-changed]] hook reads
+the correct source.  The buffer's order-independent trigger ensures
+correctness regardless of whether the synthetic event arrives before or
+after the [[pane-focus-in]] hook.
 
 <<seed deferred buffer for new window>>=
-last_wid = get_tmux_last_window_id(
-    session_id,
+prev_wid = read_last_selected_window(
+    focus_who, tmux_server_key, session_id,
 )
 source_is_tracked = (
-    last_wid is not None
+    prev_wid is not None
     and read_window_labels(
-        last_wid,
+        prev_wid,
         focus_who,
         tmux_server_key,
     ) is not None
+)
+write_last_selected_window(
+    focus_who,
+    tmux_server_key,
+    session_id,
+    window_id,
 )
 append_and_check_window_event(
     focus_who,
@@ -7634,6 +7721,35 @@ def test_get_tmux_last_window_id_reads_live_tmux_state():
         text=True,
         check=True,
     )
+
+def test_last_selected_window_round_trip(temp_tracking_dir):
+    """Write and read the last-selected window state file."""
+    write_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID, "@5",
+    )
+    assert read_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+    ) == "@5"
+
+def test_last_selected_window_returns_none_when_absent(
+    temp_tracking_dir,
+):
+    """Missing state file returns None, not an error."""
+    assert read_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+    ) is None
+
+def test_last_selected_window_overwrite(temp_tracking_dir):
+    """Successive writes replace the previous value."""
+    write_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID, "@5",
+    )
+    write_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID, "@8",
+    )
+    assert read_last_selected_window(
+        "me", TEST_SERVER_KEY, TEST_SESSION_ID,
+    ) == "@8"
 
 def test_get_current_tracked_window_id_ignores_untracked_window(
     temp_tracking_dir,
@@ -9878,6 +9994,9 @@ from nytid.cli.track import (
     get_tmux_window_id_for_pane,
     get_tmux_selected_window_id,
     get_tmux_last_window_id,
+    last_selected_window_path,
+    read_last_selected_window,
+    write_last_selected_window,
     has_tracked_window_state,
     get_current_tracked_window_id,
     install_tmux_hook_once,
