@@ -4362,6 +4362,7 @@ def run_tmux_command(
                     focus_who,
                     tmux_server_key,
                 )
+                <<seed deferred buffer for new window>>
                 install_tmux_window_cleanup_hook(
                     pane_id,
                     window_id,
@@ -6081,6 +6082,48 @@ are already active is a no-op.  This means the brief window where both
 the old and new labels may be active (if [[pane-focus-in]] fires before
 [[session-window-changed]] executes the stop) is harmless.
 
+There is one edge case where the hooks alone are insufficient.  When
+[[run_tmux_command]] creates a new window (via [[tmux new-window]]),
+tmux fires [[session-window-changed]] immediately---before we have
+installed the hooks.  That initial switch event is therefore lost, and
+subsequent [[pane-focus-in]]/[[pane-focus-out]] events accumulate in the
+buffer without a [[window-switch]] marker to trigger execution.  The
+buffer only resolves when the user manually switches windows, producing
+a confusing delay.
+
+We compensate by injecting a synthetic [[window-switch]] event into the
+buffer right after hook installation.  The destination is always tracked
+(we just wrote its labels), and we determine the source by inspecting
+the previous window via [[get_tmux_last_window_id]].  This mirrors the
+logic in [[window_switch_detached]], and the buffer's order-independent
+trigger ensures correctness regardless of whether the synthetic event
+arrives before or after the [[pane-focus-in]] hook.
+
+<<seed deferred buffer for new window>>=
+last_wid = get_tmux_last_window_id(
+    session_id,
+)
+source_is_tracked = (
+    last_wid is not None
+    and read_window_labels(
+        last_wid,
+        focus_who,
+        tmux_server_key,
+    ) is not None
+)
+append_and_check_window_event(
+    focus_who,
+    tmux_server_key,
+    session_id,
+    "window-switch tracked"
+    + (
+        " from-tracked"
+        if source_is_tracked
+        else " from-untracked"
+    ),
+)
+@
+
 Because multiple nytid launches may target the same tmux session, we
 must avoid appending duplicate hook entries.  The
 [[install_tmux_hook_once]] helper queries existing hooks first and skips
@@ -7129,8 +7172,124 @@ def test_event_buffer_backward_compatible_old_switch_marker(
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
+@
 
+When [[run_tmux_command]] creates a new window, it injects a synthetic
+[[window-switch]] event after hook installation to compensate for the
+missed [[session-window-changed]] (see
+[[<<seed deferred buffer for new window>>]]).
+If the source window was untracked, the synthetic event plus a
+[[pane-focus-in]] [[start]] line should trigger immediately.  If the
+source was tracked, the buffer must wait for the matching [[stop]].
 
+<<test functions>>=
+def test_synthetic_window_switch_from_untracked_triggers(
+    temp_tracking_dir,
+):
+    """Synthetic switch from untracked triggers start-only."""
+    who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 0)
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ) as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels",
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start", ["devel", "nytid"], start_time,
+            ),
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-untracked",
+        )
+
+    assert mock_stop.call_count == 0
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == [
+        "devel", "nytid",
+    ]
+    assert mock_start.call_args.kwargs[
+        "start_time"
+    ] == start_time
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_synthetic_switch_before_focus_in_still_triggers(
+    temp_tracking_dir,
+):
+    """Synthetic switch arriving before focus-in waits correctly."""
+    who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 0)
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ) as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels",
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-untracked",
+        )
+        assert mock_start.call_count == 0
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start", ["devel", "nytid"], start_time,
+            ),
+        )
+
+    assert mock_stop.call_count == 0
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == [
+        "devel", "nytid",
+    ]
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+
+def test_synthetic_switch_from_tracked_waits_for_stop(
+    temp_tracking_dir,
+):
+    """Synthetic switch from tracked defers until stop arrives."""
+    who = "me"
+    start_time = datetime.datetime(2026, 2, 20, 10, 1)
+    stop_time = datetime.datetime(2026, 2, 20, 10, 0)
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ) as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels",
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start", ["admin"], start_time,
+            ),
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-tracked",
+        )
+        assert mock_stop.call_count == 0
+        assert mock_start.call_count == 0
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+            ),
+        )
+
+    mock_stop.assert_called_once()
+    assert mock_stop.call_args.kwargs["labels"] == ["work"]
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
+    assert window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ).read_text() == ""
+@
+
+<<test functions>>=
 def test_parse_window_event_line_keeps_old_format():
     """Old stop/start lines still parse without timestamps."""
     parsed_stop = parse_window_event_line("stop work admin")
