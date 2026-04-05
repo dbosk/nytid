@@ -5769,6 +5769,16 @@ the switch command reads the source window from our self-managed state
 file instead.  It then writes the newly selected window for the next
 invocation.
 
+When [[tmux new-window]] creates a tracked window, the seed
+(see~[[<<seed deferred buffer for new window>>]]) updates
+[[last_selected_window]] to point to the new window and injects the
+authoritative [[window-switch]] event.  Tmux may still fire
+[[session-window-changed]] after the seed has already handled the
+creation, causing this hook to read back the same window ID for both
+source and destination.  We detect this by comparing the two IDs: a
+real switch always changes the selected window, so equality means
+the hook fired redundantly and should be silently discarded.
+
 <<detached window switch command>>=
 @cli.command(
     name="_window-switch-detached", hidden=True
@@ -5786,6 +5796,11 @@ def window_switch_detached(
         prev_window_id = read_last_selected_window(
             who, tmux_server_key, session_id,
         )
+        if (
+            prev_window_id
+            and prev_window_id == selected_window_id
+        ):
+            return None
         if selected_window_id:
             write_last_selected_window(
                 who,
@@ -5811,9 +5826,10 @@ def window_switch_detached(
         )
         return selected_is_tracked, source_is_tracked
 
-    selected_is_tracked, source_is_tracked = (
-        with_tmux_context_lock(read_and_update)
-    )
+    result = with_tmux_context_lock(read_and_update)
+    if result is None:
+        return
+    selected_is_tracked, source_is_tracked = result
     append_and_check_window_event(
         who, tmux_server_key, session_id,
         (
@@ -6180,6 +6196,22 @@ the correct source.  The buffer's order-independent trigger ensures
 correctness regardless of whether the synthetic event arrives before or
 after the [[pane-focus-in]] hook.
 
+When session-level hooks are already installed (because a previous
+tracked window was created in the same tmux session), the
+[[session-window-changed]] hook fires \emph{during} [[tmux new-window]],
+before we have written window labels for the new window.  That hook
+invocation races with this seed and may deposit a stale
+[[window-switch untracked]] event in the buffer (the new window has
+no labels yet).  We flush the buffer before appending the synthetic
+event so that stale entries from this race cannot interfere with the
+authoritative seed event.
+
+The [[prev == selected]] guard in
+[[<<detached window switch command>>]] provides a second line of
+defence: if the hook fires \emph{after} the seed has already
+written [[last_selected_window]], it sees the same window ID for
+source and destination and discards the event.
+
 <<seed deferred buffer for new window>>=
 prev_wid = read_last_selected_window(
     focus_who, tmux_server_key, session_id,
@@ -6198,6 +6230,13 @@ write_last_selected_window(
     session_id,
     window_id,
 )
+seed_buffer_path = window_event_buffer_path(
+    focus_who, tmux_server_key, session_id,
+)
+try:
+    seed_buffer_path.write_text("")
+except OSError:
+    pass
 append_and_check_window_event(
     focus_who,
     tmux_server_key,
@@ -7374,6 +7413,84 @@ def test_synthetic_switch_from_tracked_waits_for_stop(
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
+@
+
+When the [[session-window-changed]] hook fires after the seed has already
+written [[last_selected_window]], it reads the same window ID for both
+source and destination.  The [[prev == selected]] guard discards the
+event silently.
+
+<<test functions>>=
+def test_window_switch_detached_skips_when_prev_equals_selected(
+    temp_tracking_dir,
+):
+    """Hook is a no-op when last-selected matches current window."""
+    who = "me"
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, "@3",
+    )
+    write_window_labels(
+        "@3", who, TEST_SERVER_KEY, ["devel", "nytid"],
+    )
+    with patch(
+        "nytid.cli.track.get_tmux_selected_window_id",
+        return_value="@3",
+    ), patch(
+        "nytid.cli.track.append_and_check_window_event",
+    ) as mock_append:
+        runner.invoke(cli, [
+            "_window-switch-detached",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
+            "--who", who,
+        ])
+
+    mock_append.assert_not_called()
+@
+
+The seed flushes the buffer before appending its synthetic event.
+We verify the flush-then-append pattern at the buffer level: a
+pre-existing stale event must be gone after the truncation, and only
+the new event should remain.
+
+<<test functions>>=
+def test_seed_flush_pattern_clears_stale_buffer(
+    temp_tracking_dir,
+):
+    """Truncating before append removes stale events."""
+    who = "me"
+    buf = window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    )
+    buf.parent.mkdir(parents=True, exist_ok=True)
+    buf.write_text(
+        "window-switch untracked from-tracked\n"
+    )
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, "@1",
+    )
+    write_window_labels(
+        "@3", who, TEST_SERVER_KEY, ["devel"],
+    )
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ), patch(
+        "nytid.cli.track.start_tracking_labels",
+    ):
+        seed_buffer_path = window_event_buffer_path(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+        )
+        try:
+            seed_buffer_path.write_text("")
+        except OSError:
+            pass
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            "window-switch tracked from-untracked",
+        )
+    content = buf.read_text()
+    assert "untracked from-tracked" not in content
+    assert "tracked from-untracked" in content
 @
 
 <<test functions>>=
@@ -10006,6 +10123,7 @@ from nytid.cli.track import (
     build_detached_window_focus_out_command,
     build_detached_window_focus_in_command,
     build_detached_window_switch_command,
+    build_detached_window_cleanup_command,
     install_tmux_window_sync_hooks,
     install_tmux_window_cleanup_hook,
     default_username
