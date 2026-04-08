@@ -4356,13 +4356,13 @@ def run_tmux_command(
                     tmux_server_key,
                     focus_labels,
                 )
+                <<seed deferred buffer for new window>>
                 install_tmux_window_sync_hooks(
                     session_id,
                     pane_id,
                     focus_who,
                     tmux_server_key,
                 )
-                <<seed deferred buffer for new window>>
                 install_tmux_window_cleanup_hook(
                     pane_id,
                     window_id,
@@ -5197,9 +5197,52 @@ def emit_window_event_debug(
         pass
 @
 
-The core function appends one event line, then checks the trigger
-condition under the same lock.  All three hooks call this function;
-the only difference is the line they append.
+The core logic appends one event line and then checks the trigger
+condition while holding the buffer's file lock.  We split this into
+two layers so that more than one append can happen under a single
+[[flock]] transaction:
+
+\begin{description}
+\item[Inner body]
+  [[_process_window_event_locked]] assumes the file descriptor is
+  already open and locked.  It performs the append, parses the full
+  buffer, checks the trigger condition, executes the deferred
+  transition on a match, and (on a match) truncates the buffer so
+  subsequent calls within the same locked transaction start from an
+  empty file.  This body can therefore be invoked repeatedly under
+  one lock hold, building up a multi-line fact set whose final
+  append fires the trigger.
+\item[Single-line wrapper]
+  [[append_and_check_window_event]] is what the tmux hook
+  subprocesses call.  It keeps the original public signature, opens
+  the buffer, acquires the lock, delegates to the inner body for
+  exactly one line, and releases.
+\item[Seed wrapper]
+  [[seed_window_event_buffer]] is the entry point
+  [[run_tmux_command]] uses when creating a new tracked window.  It
+  acquires the lock \emph{once}, truncates the buffer under the lock
+  to discard anything earlier hook subprocesses deposited, then
+  feeds its seed lines one at a time through the inner body, still
+  under the same lock, and releases only after the final append has
+  had a chance to fire the trigger.
+\end{description}
+
+Holding one lock across the whole seed transaction is essential:
+splitting the seed into separate [[append_and_check_window_event]]
+calls would release the lock between lines, letting a concurrent
+hook subprocess squeeze in its own [[window-switch]] marker or a
+stray [[stop]] between the seed's [[start]] and its marker, and
+fire the trigger on a half-built fact set.
+
+Concurrent hook subprocesses are blocked, not lost.
+[[fcntl.flock]] with [[LOCK_EX]] blocks (we never pass
+[[LOCK_NB]]), so any hook fired during the seed's lock-hold simply
+waits in its own [[flock]] call until the seed releases.  Tmux
+[[run-shell]] processes have no timeout, so a queued hook just
+keeps waiting; no event is dropped by the lock itself.  Once the
+seed releases, queued hooks acquire the lock in turn and observe
+the post-seed buffer state (empty for \emph{from-untracked}, or
+holding the marker for \emph{from-tracked}).
 
 The trigger condition still waits for a real [[window-switch]] marker,
 but that marker also records whether the destination window is tracked.
@@ -5207,6 +5250,25 @@ That lets the buffer distinguish three legitimate cases: tracked to
 tracked (stop then start), tracked to untracked (stop only), and
 untracked to tracked (start only).  Once the trigger fires, we execute
 the deferred transition and truncate the file.
+
+<<helper functions>>=
+def _process_window_event_locked(
+    fd: int,
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+    event_line: str,
+) -> None:
+    """Append one event line and fire the trigger if ready.
+
+    The caller must have already opened ``fd`` and acquired an
+    exclusive ``fcntl.flock`` on it.  On a successful trigger this
+    function truncates the buffer so subsequent appends within the
+    same locked transaction start from an empty file.
+    """
+    <<append event line>>
+    <<check trigger condition>>
+@
 
 <<helper functions>>=
 def append_and_check_window_event(
@@ -5217,11 +5279,11 @@ def append_and_check_window_event(
 ) -> None:
     """Append an event line and execute if the trigger condition is met.
 
-    The trigger fires only after a ``window-switch ...`` marker is
-    present.  Depending on whether the destination window is tracked,
-    the buffer executes either the last stop/start pair, just the last
-    stop, or just the last start.  All operations happen under an
-    exclusive file lock.
+    This is the single-line entry point used by the tmux hook
+    subprocesses.  It opens the buffer, acquires an exclusive
+    ``fcntl.flock``, delegates to
+    ``_process_window_event_locked`` for exactly one line, and
+    releases the lock.
     """
     ensure_tracking_dir()
     path = window_event_buffer_path(
@@ -5234,8 +5296,57 @@ def append_and_check_window_event(
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        <<append event line>>
-        <<check trigger condition>>
+        _process_window_event_locked(
+            fd, who, tmux_server_key,
+            session_id, event_line,
+        )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+@
+
+The seed entry point holds one [[flock]] across a truncate followed
+by a sequence of inner-body calls.  Holding the lock for the entire
+transaction prevents any concurrent tmux hook subprocess from
+interleaving lines into the buffer between the seed's truncate and
+its final append.  Any hook fired during the seed simply blocks on
+its own [[flock]] call and observes the post-seed buffer state once
+the seed releases---either empty (when the seed's final append
+triggered the deferred-switch execution) or holding exactly the seed
+lines the caller supplied.
+
+<<helper functions>>=
+def seed_window_event_buffer(
+    who: str,
+    tmux_server_key: str,
+    session_id: str,
+    event_lines: List[str],
+) -> None:
+    """Atomically reset the buffer and apply a sequence of seed lines.
+
+    Holds one exclusive ``fcntl.flock`` across an initial
+    ``os.ftruncate`` and one
+    ``_process_window_event_locked`` call per line in
+    ``event_lines``, preventing concurrent hook subprocesses from
+    interleaving into the seed transaction.
+    """
+    ensure_tracking_dir()
+    path = window_event_buffer_path(
+        who, tmux_server_key, session_id,
+    )
+    fd = os.open(
+        str(path),
+        os.O_RDWR | os.O_CREAT,
+        0o644,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        for line in event_lines:
+            _process_window_event_locked(
+                fd, who, tmux_server_key,
+                session_id, line,
+            )
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -6178,39 +6289,121 @@ are already active is a no-op.  This means the brief window where both
 the old and new labels may be active (if [[pane-focus-in]] fires before
 [[session-window-changed]] executes the stop) is harmless.
 
-There is one edge case where the hooks alone are insufficient.  When
-[[run_tmux_command]] creates a new window (via [[tmux new-window]]),
-tmux fires [[session-window-changed]] immediately---before we have
-installed the hooks.  That initial switch event is therefore lost, and
-subsequent [[pane-focus-in]]/[[pane-focus-out]] events accumulate in the
-buffer without a [[window-switch]] marker to trigger execution.  The
-buffer only resolves when the user manually switches windows, producing
-a confusing delay.
+There is one edge case where the hooks alone are insufficient, and
+it is worth explaining the failure mode in detail because the seed's
+shape is dictated by what goes wrong without it.
 
-We compensate by injecting a synthetic [[window-switch]] event into the
-buffer right after hook installation.  The destination is always tracked
-(we just wrote its labels), and we determine the source from the
-self-managed state file.  We also seed the state file with the new
-window ID so that the first real [[session-window-changed]] hook reads
-the correct source.  The buffer's order-independent trigger ensures
-correctness regardless of whether the synthetic event arrives before or
-after the [[pane-focus-in]] hook.
+When [[run_tmux_command]] creates a new tracked window (via
+[[tmux new-window]]), tmux fires [[session-window-changed]] almost
+immediately.  An earlier design simply had the seed write a single
+[[window-switch tracked from-untracked]] marker into the deferred
+buffer and relied on the next real focus events to complete the
+fact set.  The real-world failure showed up in the debug log as a
+sequence like this (times from an actual 2026-04-05 incident):
 
-When session-level hooks are already installed (because a previous
-tracked window was created in the same tmux session), the
-[[session-window-changed]] hook fires \emph{during} [[tmux new-window]],
-before we have written window labels for the new window.  That hook
-invocation races with this seed and may deposit a stale
-[[window-switch untracked]] event in the buffer (the new window has
-no labels yet).  We flush the buffer before appending the synthetic
-event so that stale entries from this race cannot interfere with the
-authoritative seed event.
+\begin{quote}
+\begin{tabular}{ll}
+\texttt{20:36:55} & append [[window-switch tracked from-untracked]] \\
+\texttt{20:36:59} & append [[stop … devel nytid]] (4 seconds later) \\
+\texttt{20:52:00} & append [[start … devel nytid]] (15 minutes later) \\
+\texttt{20:52:00} & \texttt{execute-switch} uses the 20:36:59 stop \\
+                  & \qquad and the 20:52:00 start \\
+\end{tabular}
+\end{quote}
 
+The seed's lone marker does not satisfy any of the trigger
+conditions in [[<<check trigger condition>>]] (they all require at
+least one [[start]] or [[stop]] line), so the marker sat waiting.
+Four seconds later a real [[pane-focus-out]]---either the user
+alt-tabbing to a browser or tmux emitting a spurious focus-out on a
+fresh pane---deposited a [[stop]] line into the same buffer.  The
+combination still did not trigger: tracked-to-tracked needs a
+matching [[start]], untracked needs [[stop == start + 1]] with
+[[target]] being untracked, and the marker here claims [[target]]
+tracked.  Fifteen minutes later the user returned to the window, a
+real [[pane-focus-in]] wrote [[start @ 20:52:00]], and the
+trigger finally fired as a tracked-to-tracked switch---with
+[[execute-switch]] retroactively stopping tracking at the stale
+20:36:59 timestamp.  The result was a 4--6 second phantom history
+entry at 20:36 and the real tracking window gone.
+
+The invariant that [[_process_window_event_locked]] depends on is
+therefore that \emph{every state written to the buffer must be
+either empty or immediately fireable}.  The old single-marker seed
+violated that invariant: it was a half-fact waiting to be joined
+with whatever arrived next.  The fix enforces the invariant
+structurally.
+
+We compensate in two structural ways.
+
+\paragraph{Seed before pane focus hooks.}
+[[run_tmux_command]] runs the seed \emph{before} calling
+[[install_tmux_window_sync_hooks]] on the new pane.  During the
+window between [[tmux new-window]] and
+[[install_tmux_window_sync_hooks]] the new pane has no
+[[pane-focus-out]] or [[pane-focus-in]] hook installed.  If tmux ever
+delivers an initial focus event for the freshly-focused pane, it has
+no subscriber and drops silently.  The seed's synthetic [[start]]
+line therefore cannot later be duplicated by a stray real focus-in
+event, and no stray focus-out can desync the trigger counts before
+the seed has fired.  After [[install_tmux_window_sync_hooks]]
+completes, every subsequent focus event is a real user action, and
+those are always paired (out/in), so they cannot desync the counts
+the way a single stray can.
+
+\paragraph{Self-triggering seed transaction.}
+For the common \emph{from-untracked} case---a new tracked window
+created from an untracked source---the seed writes a complete,
+immediately-fireable fact set:
+\begin{enumerate}
+\item [[start <now> <new_labels>]], and
+\item [[window-switch tracked from-untracked]].
+\end{enumerate}
+By the trigger rules, this fact set matches
+[[start_count == stop_count + 1]] with [[source != tracked]], so the
+final append fires [[<<execute deferred window start>>]] inside
+[[seed_window_event_buffer]] and truncates the buffer in the same
+transaction.  The buffer is therefore empty by the time
+[[install_tmux_window_sync_hooks]] installs the real focus hooks,
+and no stray focus event can poison it.  The [[start_tracking_labels]]
+call inside the execute path is idempotent because the synchronous
+[[track start --window]] has already started the new labels, so the
+synthetic fire is harmless.
+
+For the \emph{from-tracked} case---a new tracked window created while
+another tracked window was the source---the seed still writes only
+the [[window-switch tracked from-tracked]] marker.  Fully
+synthesizing a stop for the old labels would desync against the
+real [[pane-focus-out]] that fires on the old pane (whose hooks
+were already installed by its own launch), because the resulting
+double-count would poison the trigger on the next real switch.  The
+from-tracked half-fact problem is therefore \emph{not} solved by
+this change; it is deferred to a follow-up that will likely need
+either label-aware triggering or a drain mechanism.  The seed still
+truncates the buffer before writing its marker under one
+[[fcntl.flock]], which closes a pre-existing flush race, so this
+change is strictly better for from-tracked even though the deeper
+bug remains.
+
+\paragraph{Atomic flock transaction.}
+The seed uses [[seed_window_event_buffer]], which holds one
+[[fcntl.flock]] across the [[ftruncate]] and the sequence of
+[[_process_window_event_locked]] calls.  Concurrent tmux hook
+subprocesses block on their own [[flock]] call and observe the
+post-seed buffer state only once the seed releases---never an
+interleaved intermediate state.  Tmux does not time out
+[[run-shell]] subprocesses, so queued hooks simply wait for their
+turn without event loss.
+
+\paragraph{Redundant session hook.}
 The [[prev == selected]] guard in
 [[<<detached window switch command>>]] provides a second line of
-defence: if the hook fires \emph{after} the seed has already
-written [[last_selected_window]], it sees the same window ID for
-source and destination and discards the event.
+defence: if [[session-window-changed]] fires \emph{after} the seed
+has already written [[last_selected_window]], the hook sees the same
+window ID for source and destination and discards the event.  The
+seed's in-transaction [[ftruncate]] also wipes any hook output that
+landed during the brief window between [[tmux new-window]] and the
+seed acquiring the lock.
 
 <<seed deferred buffer for new window>>=
 prev_wid = read_last_selected_window(
@@ -6230,23 +6423,22 @@ write_last_selected_window(
     session_id,
     window_id,
 )
-seed_buffer_path = window_event_buffer_path(
-    focus_who, tmux_server_key, session_id,
-)
-try:
-    seed_buffer_path.write_text("")
-except OSError:
-    pass
-append_and_check_window_event(
+if source_is_tracked:
+    seed_event_lines = [
+        "window-switch tracked from-tracked",
+    ]
+else:
+    seed_event_lines = [
+        build_window_event_line(
+            "start", focus_labels,
+        ),
+        "window-switch tracked from-untracked",
+    ]
+seed_window_event_buffer(
     focus_who,
     tmux_server_key,
     session_id,
-    "window-switch tracked"
-    + (
-        " from-tracked"
-        if source_is_tracked
-        else " from-untracked"
-    ),
+    seed_event_lines,
 )
 @
 
@@ -7448,49 +7640,141 @@ def test_window_switch_detached_skips_when_prev_equals_selected(
     mock_append.assert_not_called()
 @
 
-The seed flushes the buffer before appending its synthetic event.
-We verify the flush-then-append pattern at the buffer level: a
-pre-existing stale event must be gone after the truncation, and only
-the new event should remain.
+The seed wipes any stale pre-existing buffer content under the same
+[[flock]] it uses for its synthetic appends.  We verify that a stale
+line deposited before the seed runs is gone afterwards and that the
+[[from-untracked]] seed transaction leaves the buffer empty (because
+the final marker fires the trigger and truncates).
 
 <<test functions>>=
-def test_seed_flush_pattern_clears_stale_buffer(
+def test_seed_window_event_buffer_from_untracked_fires_and_empties(
     temp_tracking_dir,
 ):
-    """Truncating before append removes stale events."""
+    """from-untracked seed fires the trigger and truncates the buffer."""
     who = "me"
     buf = window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     )
     buf.parent.mkdir(parents=True, exist_ok=True)
+    # Stale hook output deposited before the seed runs.
     buf.write_text(
         "window-switch untracked from-tracked\n"
     )
-    write_last_selected_window(
-        who, TEST_SERVER_KEY, TEST_SESSION_ID, "@1",
-    )
-    write_window_labels(
-        "@3", who, TEST_SERVER_KEY, ["devel"],
-    )
+    start_time = datetime.datetime(2026, 2, 20, 10, 0)
     with patch(
         "nytid.cli.track.stop_tracking_labels",
-    ), patch(
+    ) as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels",
-    ):
-        seed_buffer_path = window_event_buffer_path(
+    ) as mock_start:
+        seed_window_event_buffer(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            [
+                build_window_event_line(
+                    "start", ["devel", "nytid"], start_time,
+                ),
+                "window-switch tracked from-untracked",
+            ],
         )
-        try:
-            seed_buffer_path.write_text("")
-        except OSError:
-            pass
-        append_and_check_window_event(
+    # The final marker fires execute-start and truncates.
+    assert buf.read_text() == ""
+    assert mock_stop.call_count == 0
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == [
+        "devel", "nytid",
+    ]
+
+def test_seed_window_event_buffer_from_tracked_keeps_marker(
+    temp_tracking_dir,
+):
+    """from-tracked seed truncates and leaves exactly the marker.
+
+    The from-tracked case is a known limitation of the current design:
+    we only write the marker and let the real ``pane-focus-out`` from
+    the old pane complete the fact set.  The test pins current
+    behaviour so a regression is caught.
+    """
+    who = "me"
+    buf = window_event_buffer_path(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    )
+    buf.parent.mkdir(parents=True, exist_ok=True)
+    buf.write_text("stop 2026-02-20T09:00:00 stale\n")
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ) as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels",
+    ) as mock_start:
+        seed_window_event_buffer(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-untracked",
+            ["window-switch tracked from-tracked"],
         )
     content = buf.read_text()
-    assert "untracked from-tracked" not in content
-    assert "tracked from-untracked" in content
+    assert "stale" not in content
+    assert content.strip() == (
+        "window-switch tracked from-tracked"
+    )
+    assert mock_stop.call_count == 0
+    assert mock_start.call_count == 0
+
+def test_seed_from_untracked_prevents_stale_stop_phantom(
+    temp_tracking_dir,
+):
+    """Regression test for the 2026-04-05 20:36 phantom entry bug.
+
+    With the old single-marker seed, a spurious ``pane-focus-out``
+    arriving a few seconds after window creation would join the
+    lone marker and later fire the trigger against a stale stop
+    timestamp, producing a 2--6 second phantom history entry.  The
+    self-triggering seed must leave the buffer empty so that the
+    stray stop lands into a fresh buffer and waits harmlessly for
+    its own partner.
+    """
+    who = "me"
+    start_time = datetime.datetime(2026, 4, 5, 20, 36, 53)
+    stale_stop_time = datetime.datetime(2026, 4, 5, 20, 36, 59)
+    real_start_time = datetime.datetime(2026, 4, 5, 20, 52, 0)
+    with patch(
+        "nytid.cli.track.stop_tracking_labels",
+    ) as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels",
+    ) as mock_start:
+        # Seed: from-untracked, fires execute-start and truncates.
+        seed_window_event_buffer(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            [
+                build_window_event_line(
+                    "start",
+                    ["devel", "nytid"],
+                    start_time,
+                ),
+                "window-switch tracked from-untracked",
+            ],
+        )
+        mock_start.reset_mock()
+        # Stray pane-focus-out arrives 6 seconds later.
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "stop",
+                ["devel", "nytid"],
+                stale_stop_time,
+            ),
+        )
+        # 15 minutes later the user returns: pane-focus-in.
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start",
+                ["devel", "nytid"],
+                real_start_time,
+            ),
+        )
+    # No trigger should have fired---no marker is present in the
+    # post-seed sequence, so stop_tracking_labels is never called.
+    # The phantom-entry bug would have called mock_stop here with
+    # end_time equal to the stale stop timestamp.
+    assert mock_stop.call_count == 0
+    assert mock_start.call_count == 0
 @
 
 <<test functions>>=
@@ -10108,6 +10392,7 @@ from nytid.cli.track import (
     window_event_buffer_path,
     window_event_debug_log_path,
     append_and_check_window_event,
+    seed_window_event_buffer,
     get_tmux_window_id_for_pane,
     get_tmux_selected_window_id,
     get_tmux_last_window_id,
