@@ -4370,21 +4370,48 @@ def run_tmux_command(
 Tracked window launches need one stronger serialization guarantee than
 steady-state hooks.  The [[tmux new-window]] command itself may spawn a
 [[session-window-changed]] hook before we have written the new window's
-labels, updated [[last_selected_window]], seeded the deferred buffer, or
-installed the new pane's hooks.  We therefore hold the tmux-context lock
-across that entire launch/setup phase for [[--window]] auto-suspend
-launches.
+labels and updated [[last_selected_window]].  We therefore hold the
+tmux-context lock across a narrow \enquote{hook-observability} phase
+that covers [[new-window]], label publication, and the
+[[last_selected_window]] write.
 
-The lock begins
-before invoking [[tmux new-window]] so any hook spawned by that command
-must wait before it can snapshot tmux context state.  We release the
-lock immediately after the seed and hook installation complete; holding
-it through the later [[tmux wait-for]] calls would block steady-state
-hooks for the lifetime of the tracked process.
+The lock begins before invoking [[tmux new-window]] so any detached
+hook spawned by that command is forced to wait on the flock before it
+can snapshot tmux-context state.  We release the lock as soon as
+[[last_selected_window]] has been updated: from that moment on, the
+[[prev == selected]] guard in [[window_switch_detached]] already
+discards any redundant hook event, so keeping the lock held any longer
+serves no purpose.
+
+Crucially, we must not hold the tmux-context lock across
+[[seed_window_event_buffer]].  On the [[from-untracked]] path, the
+seed's self-trigger calls [[start_tracking_labels]], which delegates to
+[[mutate_worker_tracking_state]]---and that function acquires the
+tmux-context lock internally via its own [[open]] plus [[fcntl.flock]].
+Linux [[flock]] is associated with the open file description, not the
+process: a second [[open]] on the same path from the same process gets
+an independent lock and blocks waiting for the first to release.
+Holding the context lock across the seed therefore self-deadlocks the
+tracked-window launch path.  Splitting the phases keeps the narrow
+serialization intact while letting the seed acquire the context lock
+cleanly.
+
+We also install the new pane's sync and cleanup hooks outside the
+context lock.  Those calls are just [[tmux set-hook]] invocations; they
+publish no hook-observable state that needs the lock.  The brief gap
+between lock release and [[install_tmux_window_sync_hooks]] is benign:
+the only events that could fire in that gap are [[pane-focus-in]] on
+the new pane (which has no hooks yet, so nothing to dispatch) and
+[[session-window-changed]] (whose detached body now sees
+[[prev == selected]] and discards).
 
 <<launch tmux command and install hooks>>=
-def launch_and_install():
+needs_finalize = False
+source_is_tracked = False
+
+def launch_and_publish_state():
     nonlocal pane_id, window_id, session_id
+    nonlocal needs_finalize, source_is_tracked
 
     result = subprocess.run(
         tmux_args,
@@ -4412,20 +4439,27 @@ def launch_and_install():
                 tmux_server_key,
                 focus_labels,
             )
-            <<seed deferred buffer for new window>>
-            install_tmux_window_sync_hooks(
+            prev_wid = read_last_selected_window(
+                focus_who,
+                tmux_server_key,
                 session_id,
-                pane_id,
+            )
+            source_is_tracked = (
+                prev_wid is not None
+                and read_window_labels(
+                    prev_wid,
+                    focus_who,
+                    tmux_server_key,
+                )
+                is not None
+            )
+            write_last_selected_window(
                 focus_who,
                 tmux_server_key,
-            )
-            install_tmux_window_cleanup_hook(
-                pane_id,
+                session_id,
                 window_id,
-                focus_who,
-                tmux_server_key,
-                focus_labels,
             )
+            needs_finalize = True
         else:
             write_pane_labels(
                 pane_id,
@@ -4445,9 +4479,42 @@ def launch_and_install():
             )
 
 if focus_window and focus_labels and focus_who:
-    with_tmux_context_lock(launch_and_install)
+    with_tmux_context_lock(launch_and_publish_state)
 else:
-    launch_and_install()
+    launch_and_publish_state()
+
+if needs_finalize:
+    if source_is_tracked:
+        seed_event_lines = [
+            "window-switch tracked from-tracked",
+        ]
+    else:
+        seed_event_lines = [
+            build_window_event_line(
+                "start",
+                focus_labels,
+            ),
+            "window-switch tracked from-untracked",
+        ]
+    seed_window_event_buffer(
+        focus_who,
+        tmux_server_key,
+        session_id,
+        seed_event_lines,
+    )
+    install_tmux_window_sync_hooks(
+        session_id,
+        pane_id,
+        focus_who,
+        tmux_server_key,
+    )
+    install_tmux_window_cleanup_hook(
+        pane_id,
+        window_id,
+        focus_who,
+        tmux_server_key,
+        focus_labels,
+    )
 @
 
 When [[--no-block]] is used, the tmux pane needs to call
@@ -5912,10 +5979,11 @@ the switch command reads the source window from our self-managed state
 file instead.  It then writes the newly selected window for the next
 invocation.
 
-When [[tmux new-window]] creates a tracked window, the seed
-(see~[[<<seed deferred buffer for new window>>]]) updates
-[[last_selected_window]] to point to the new window and injects the
-authoritative [[window-switch]] event.  Tmux may still fire
+When [[tmux new-window]] creates a tracked window, the parent's
+launch/setup phase (see~[[<<launch tmux command and install hooks>>]])
+updates [[last_selected_window]] to point to the new window and later
+injects the authoritative [[window-switch]] event into the deferred
+buffer via [[seed_window_event_buffer]].  Tmux may still fire
 [[session-window-changed]] after the seed has already handled the
 creation, causing this hook to read back the same window ID for both
 source and destination.  We detect this by comparing the two IDs: a
@@ -6384,32 +6452,45 @@ those are always paired (out/in), so they cannot desync the counts
 the way a single stray can.
 
 \paragraph{Locked launch/setup phase.}
-[[run_tmux_command]] now holds [[with_tmux_context_lock]] across the
-entire tracked-window launch/setup phase, starting before
-[[tmux new-window]] itself.  This matters because the detached
-[[window_switch_detached]] hook also snapshots and updates
-[[last_selected_window]] under that same lock.  Without this shared
-serialization, a hook spawned by [[tmux new-window]] could read stale
-context state just before the seed updates it, then block on the buffer
-lock and append an obsolete [[window-switch]] marker after the seed had
-finished.  With the shared context lock, such a hook cannot observe the
-pre-seed state at all; it starts only after labels,
-[[last_selected_window]], the seed buffer, and the new pane's hooks are
-already coherent.
+[[run_tmux_command]] holds [[with_tmux_context_lock]] across a narrow
+phase that covers [[tmux new-window]], label publication, and the
+[[last_selected_window]] write.  The lock begins \emph{before}
+[[new-window]] so that any detached
+[[session-window-changed]] hook spawned by that call must wait for the
+parent to finish publishing state before it can snapshot
+[[last_selected_window]].  The lock is released immediately after
+[[last_selected_window]] has been updated---from that moment on, the
+[[prev == selected]] guard in [[window_switch_detached]] already
+discards any redundant hook event, so holding the lock longer serves
+no purpose.
 
-This only works because we install the focus and
-[[session-window-changed]] hooks with [[run-shell -b]].  Without [[-b]],
-[[run-shell]] is synchronous from the tmux server's point of view: the
-server blocks until the hook process exits.  A prior
-[[session-window-changed]] hook fired by our own [[tmux new-window]]
-call would then enter [[with_tmux_context_lock]] and block on the
-[[flock]] the parent holds, while the tmux server in turn blocks waiting
-for that hook to finish, while the parent blocks in [[subprocess.run]]
-waiting for [[new-window]] to return---a three-way deadlock through the
-tmux server.  With [[-b]], tmux forks the hook and returns immediately,
-so [[new-window]] completes, the parent finishes setup and releases the
-lock, and the detached hook then acquires the lock and runs against
-post-seed state (where the [[prev == selected]] guard discards the
+The lock is deliberately \emph{not} held across
+[[seed_window_event_buffer]] or across
+[[install_tmux_window_sync_hooks]].  For the
+[[seed_window_event_buffer]] call the reason is a correctness
+requirement: on the [[from-untracked]] path the seed self-triggers
+[[start_tracking_labels]], which delegates to
+[[mutate_worker_tracking_state]]---and that function acquires the
+tmux-context lock internally by [[open]]ing the same lock file and
+calling [[fcntl.flock]] on it.  Linux [[flock]] is scoped to the open
+file description, not the process: a second [[open]] on the same path
+from the same process produces an independent OFD whose flock call
+blocks waiting for the first to release.  Holding the context lock
+across the seed therefore self-deadlocks the tracked-window launch
+path.  For [[install_tmux_window_sync_hooks]] the reason is simply
+that [[tmux set-hook]] publishes no hook-observable state that needs
+the lock; keeping it inside would widen the critical section without
+benefit.
+
+This design relies on the focus and [[session-window-changed]] hooks
+being installed with [[run-shell -b]].  Without [[-b]],
+[[run-shell]] is synchronous from the tmux server's point of view and
+the same three-way deadlock (parent in [[subprocess.run]], tmux server
+in [[run-shell]], hook process in [[flock]]) reappears.  With [[-b]],
+tmux forks the hook and returns immediately, so [[new-window]]
+completes, the parent finishes the locked phase and releases the lock,
+and the detached hook then runs against the already-published
+[[last_selected_window]] (where [[prev == selected]] discards the
 now-redundant event).
 
 \paragraph{Self-triggering seed transaction.}
@@ -6457,51 +6538,15 @@ turn without event loss.
 
 \paragraph{Redundant session hook.}
 The [[prev == selected]] guard in
-[[<<detached window switch command>>]] provides a second line of
-defence: if [[session-window-changed]] fires \emph{after} the seed
-has already written [[last_selected_window]], the hook sees the same
-window ID for source and destination and discards the event.  This is
-now a backstop rather than the primary race fix: the launch/setup lock
-already prevents the hook from observing pre-seed context state, and the
-buffer transaction still wipes any output that landed before the seed
+[[<<detached window switch command>>]] is the primary defence against
+the stale-snapshot race.  If [[session-window-changed]] fires after the
+parent has already written [[last_selected_window]], the hook sees the
+same window ID for source and destination and discards the event.  The
+narrow launch/setup lock only needs to cover the window up to that
+write; once [[last_selected_window]] names the new window, the guard
+handles every subsequent hook firing on its own.  The buffer
+transaction independently wipes any output that landed before the seed
 acquired the buffer lock.
-
-<<seed deferred buffer for new window>>=
-prev_wid = read_last_selected_window(
-    focus_who, tmux_server_key, session_id,
-)
-source_is_tracked = (
-    prev_wid is not None
-    and read_window_labels(
-        prev_wid,
-        focus_who,
-        tmux_server_key,
-    ) is not None
-)
-write_last_selected_window(
-    focus_who,
-    tmux_server_key,
-    session_id,
-    window_id,
-)
-if source_is_tracked:
-    seed_event_lines = [
-        "window-switch tracked from-tracked",
-    ]
-else:
-    seed_event_lines = [
-        build_window_event_line(
-            "start", focus_labels,
-        ),
-        "window-switch tracked from-untracked",
-    ]
-seed_window_event_buffer(
-    focus_who,
-    tmux_server_key,
-    session_id,
-    seed_event_lines,
-)
-@
 
 Because multiple nytid launches may target the same tmux session, we
 must avoid appending duplicate hook entries.  The
@@ -11337,16 +11382,18 @@ def test_install_tmux_exit_hooks_guards_pane_id():
             assert "%42" in hook_value
             assert hook_cmd in hook_value
 
-The tracked-window launch path now holds the tmux-context lock across
-the whole setup phase, but releases it before the later readiness wait.
-That is the narrow serialization we want: hook-visible state must be
-coherent before detached hooks run, without blocking steady-state hooks
-for the lifetime of the tmux command.
+The tracked-window launch path holds the tmux-context lock only across
+the narrow hook-observability phase: [[new-window]], label publication,
+and the [[last_selected_window]] write.  It explicitly releases the
+lock before [[seed_window_event_buffer]] and the window sync/cleanup
+hook installs, because the seed self-triggers
+[[start_tracking_labels]] which re-acquires the same lock through
+[[mutate_worker_tracking_state]] and would otherwise self-deadlock.
 
 def test_run_tmux_command_locks_window_launch_setup(
     temp_tracking_dir,
 ):
-    """Tracked-window setup stays inside the tmux-context lock."""
+    """Lock covers only the hook-observability phase."""
     events = []
 
     def fake_with_tmux_context_lock(callback):
@@ -11392,6 +11439,20 @@ def test_run_tmux_command_locks_window_launch_setup(
         side_effect=lambda *args, **kwargs:
         events.append("exit-hooks"),
     ), patch(
+        "nytid.cli.track.write_window_labels",
+        side_effect=lambda *args, **kwargs:
+        events.append("write-labels"),
+    ), patch(
+        "nytid.cli.track.read_last_selected_window",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.read_window_labels",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.write_last_selected_window",
+        side_effect=lambda *args, **kwargs:
+        events.append("write-last-selected"),
+    ), patch(
         "nytid.cli.track.seed_window_event_buffer",
         side_effect=lambda *args, **kwargs:
         events.append("seed"),
@@ -11417,16 +11478,18 @@ def test_run_tmux_command_locks_window_launch_setup(
         )
 
     assert result is None
-    assert events[:6] == [
+    assert events == [
         "lock-enter",
         "new-window",
         "exit-hooks",
+        "write-labels",
+        "write-last-selected",
+        "lock-exit",
         "seed",
         "sync-hooks",
         "cleanup-hook",
+        "ready",
     ]
-    assert events[6] == "lock-exit"
-    assert events[7] == "ready"
 
 def test_tracking_entry_with_who():
     """Test TrackingEntry serialization with who field"""
