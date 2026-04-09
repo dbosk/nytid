@@ -4330,63 +4330,7 @@ def run_tmux_command(
             tmux_server_key = build_tmux_server_key(
                 socket.gethostname(), socket_path,
             )
-        result = subprocess.run(
-            tmux_args,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        pane_info = result.stdout.strip().split()
-        if pane_info:
-            pane_id = pane_info[0]
-        if len(pane_info) > 1:
-            window_id = pane_info[1]
-        if len(pane_info) > 2:
-            session_id = pane_info[2]
-        install_tmux_exit_hooks(pane_id, hook_command)
-        if focus_labels and focus_who:
-            if not tmux_server_key:
-                raise RuntimeError(
-                    "tmux server key missing for auto-suspend launch"
-                )
-            if focus_window and window_id and session_id:
-                write_window_labels(
-                    window_id,
-                    focus_who,
-                    tmux_server_key,
-                    focus_labels,
-                )
-                <<seed deferred buffer for new window>>
-                install_tmux_window_sync_hooks(
-                    session_id,
-                    pane_id,
-                    focus_who,
-                    tmux_server_key,
-                )
-                install_tmux_window_cleanup_hook(
-                    pane_id,
-                    window_id,
-                    focus_who,
-                    tmux_server_key,
-                    focus_labels,
-                )
-            else:
-                write_pane_labels(
-                    pane_id,
-                    focus_who,
-                    tmux_server_key,
-                    focus_labels,
-                )
-                install_tmux_focus_hooks(
-                    pane_id,
-                    focus_who,
-                    tmux_server_key,
-                )
-                install_tmux_suspend_cleanup_hook(
-                    pane_id,
-                    focus_who,
-                    tmux_server_key,
-                )
+        <<launch tmux command and install hooks>>
         subprocess.run(
             ["tmux", "wait-for", "-S", ready_channel],
             check=True,
@@ -4421,6 +4365,89 @@ def run_tmux_command(
                 os.rmdir(completion_guard)
             except OSError:
                 pass
+@
+
+Tracked window launches need one stronger serialization guarantee than
+steady-state hooks.  The [[tmux new-window]] command itself may spawn a
+[[session-window-changed]] hook before we have written the new window's
+labels, updated [[last_selected_window]], seeded the deferred buffer, or
+installed the new pane's hooks.  We therefore hold the tmux-context lock
+across that entire launch/setup phase for [[--window]] auto-suspend
+launches.
+
+The lock begins
+before invoking [[tmux new-window]] so any hook spawned by that command
+must wait before it can snapshot tmux context state.  We release the
+lock immediately after the seed and hook installation complete; holding
+it through the later [[tmux wait-for]] calls would block steady-state
+hooks for the lifetime of the tracked process.
+
+<<launch tmux command and install hooks>>=
+def launch_and_install():
+    nonlocal pane_id, window_id, session_id
+
+    result = subprocess.run(
+        tmux_args,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pane_info = result.stdout.strip().split()
+    if pane_info:
+        pane_id = pane_info[0]
+    if len(pane_info) > 1:
+        window_id = pane_info[1]
+    if len(pane_info) > 2:
+        session_id = pane_info[2]
+    install_tmux_exit_hooks(pane_id, hook_command)
+    if focus_labels and focus_who:
+        if not tmux_server_key:
+            raise RuntimeError(
+                "tmux server key missing for auto-suspend launch"
+            )
+        if focus_window and window_id and session_id:
+            write_window_labels(
+                window_id,
+                focus_who,
+                tmux_server_key,
+                focus_labels,
+            )
+            <<seed deferred buffer for new window>>
+            install_tmux_window_sync_hooks(
+                session_id,
+                pane_id,
+                focus_who,
+                tmux_server_key,
+            )
+            install_tmux_window_cleanup_hook(
+                pane_id,
+                window_id,
+                focus_who,
+                tmux_server_key,
+                focus_labels,
+            )
+        else:
+            write_pane_labels(
+                pane_id,
+                focus_who,
+                tmux_server_key,
+                focus_labels,
+            )
+            install_tmux_focus_hooks(
+                pane_id,
+                focus_who,
+                tmux_server_key,
+            )
+            install_tmux_suspend_cleanup_hook(
+                pane_id,
+                focus_who,
+                tmux_server_key,
+            )
+
+if focus_window and focus_labels and focus_who:
+    with_tmux_context_lock(launch_and_install)
+else:
+    launch_and_install()
 @
 
 When [[--no-block]] is used, the tmux pane needs to call
@@ -5239,10 +5266,15 @@ Concurrent hook subprocesses are blocked, not lost.
 [[LOCK_NB]]), so any hook fired during the seed's lock-hold simply
 waits in its own [[flock]] call until the seed releases.  Tmux
 [[run-shell]] processes have no timeout, so a queued hook just
-keeps waiting; no event is dropped by the lock itself.  Once the
-seed releases, queued hooks acquire the lock in turn and observe
-the post-seed buffer state (empty for \emph{from-untracked}, or
-holding the marker for \emph{from-tracked}).
+keeps waiting; no event is dropped by the buffer lock itself.
+
+New-window launches also use the tmux-context lock.  [[run_tmux_command]]
+holds that lock from the [[tmux new-window]] invocation through label
+publication, [[last_selected_window]] update, seeding, and hook
+installation.  That earlier lock serializes the seed against any
+detached [[session-window-changed]] hook spawned by [[new-window]], so a
+hook cannot snapshot stale context state and then append an obsolete
+marker after the seed releases the buffer lock.
 
 The trigger condition still waits for a real [[window-switch]] marker,
 but that marker also records whether the destination window is tracked.
@@ -6327,14 +6359,14 @@ trigger finally fired as a tracked-to-tracked switch---with
 20:36:59 timestamp.  The result was a 4--6 second phantom history
 entry at 20:36 and the real tracking window gone.
 
-The invariant that [[_process_window_event_locked]] depends on is
-therefore that \emph{every state written to the buffer must be
-either empty or immediately fireable}.  The old single-marker seed
-violated that invariant: it was a half-fact waiting to be joined
-with whatever arrived next.  The fix enforces the invariant
-structurally.
+The old single-marker seed therefore violated the property we want for
+the common [[from-untracked]] launch path: once the seed finishes, the
+buffer should be either empty or already fireable, not a half-fact
+waiting to be joined with whatever arrives next.  The fix enforces that
+property structurally for [[from-untracked]] launches, while still
+leaving [[from-tracked]] as a documented temporary exception.
 
-We compensate in two structural ways.
+We compensate in three structural ways.
 
 \paragraph{Seed before pane focus hooks.}
 [[run_tmux_command]] runs the seed \emph{before} calling
@@ -6350,6 +6382,20 @@ the seed has fired.  After [[install_tmux_window_sync_hooks]]
 completes, every subsequent focus event is a real user action, and
 those are always paired (out/in), so they cannot desync the counts
 the way a single stray can.
+
+\paragraph{Locked launch/setup phase.}
+[[run_tmux_command]] now holds [[with_tmux_context_lock]] across the
+entire tracked-window launch/setup phase, starting before
+[[tmux new-window]] itself.  This matters because the detached
+[[window_switch_detached]] hook also snapshots and updates
+[[last_selected_window]] under that same lock.  Without this shared
+serialization, a hook spawned by [[tmux new-window]] could read stale
+context state just before the seed updates it, then block on the buffer
+lock and append an obsolete [[window-switch]] marker after the seed had
+finished.  With the shared context lock, such a hook cannot observe the
+pre-seed state at all; it starts only after labels,
+[[last_selected_window]], the seed buffer, and the new pane's hooks are
+already coherent.
 
 \paragraph{Self-triggering seed transaction.}
 For the common \emph{from-untracked} case---a new tracked window
@@ -6377,13 +6423,12 @@ synthesizing a stop for the old labels would desync against the
 real [[pane-focus-out]] that fires on the old pane (whose hooks
 were already installed by its own launch), because the resulting
 double-count would poison the trigger on the next real switch.  The
-from-tracked half-fact problem is therefore \emph{not} solved by
-this change; it is deferred to a follow-up that will likely need
-either label-aware triggering or a drain mechanism.  The seed still
-truncates the buffer before writing its marker under one
-[[fcntl.flock]], which closes a pre-existing flush race, so this
-change is strictly better for from-tracked even though the deeper
-bug remains.
+launch/setup lock removes the stale-context race against
+[[session-window-changed]], but the deeper [[from-tracked]] half-fact
+problem remains: after the seed completes, the buffer deliberately
+holds that lone marker and still depends on the real stop from the old
+pane.  This limitation is therefore deferred to a follow-up that will
+likely need either label-aware triggering or a drain mechanism.
 
 \paragraph{Atomic flock transaction.}
 The seed uses [[seed_window_event_buffer]], which holds one
@@ -6400,10 +6445,11 @@ The [[prev == selected]] guard in
 [[<<detached window switch command>>]] provides a second line of
 defence: if [[session-window-changed]] fires \emph{after} the seed
 has already written [[last_selected_window]], the hook sees the same
-window ID for source and destination and discards the event.  The
-seed's in-transaction [[ftruncate]] also wipes any hook output that
-landed during the brief window between [[tmux new-window]] and the
-seed acquiring the lock.
+window ID for source and destination and discards the event.  This is
+now a backstop rather than the primary race fix: the launch/setup lock
+already prevents the hook from observing pre-seed context state, and the
+buffer transaction still wipes any output that landed before the seed
+acquired the buffer lock.
 
 <<seed deferred buffer for new window>>=
 prev_wid = read_last_selected_window(
@@ -7492,13 +7538,13 @@ def test_event_buffer_backward_compatible_old_switch_marker(
     ).read_text() == ""
 @
 
-When [[run_tmux_command]] creates a new window, it injects a synthetic
-[[window-switch]] event after hook installation to compensate for the
-missed [[session-window-changed]] (see
-[[<<seed deferred buffer for new window>>]]).
-If the source window was untracked, the synthetic event plus a
-[[pane-focus-in]] [[start]] line should trigger immediately.  If the
-source was tracked, the buffer must wait for the matching [[stop]].
+When [[run_tmux_command]] creates a new tracked window, it seeds the
+deferred buffer before installing the new pane's focus hooks.  If the
+source window was untracked, the seed writes a synthetic [[start]] plus
+[[window-switch tracked from-untracked]] and self-triggers immediately.
+If the source was tracked, the seed still writes only the
+[[from-tracked]] marker and the buffer must wait for the matching
+[[stop]].
 
 <<test functions>>=
 def test_synthetic_window_switch_from_untracked_triggers(
@@ -10361,6 +10407,7 @@ from nytid.cli.track import (
     build_tmux_wait_wrapper,
     build_tmux_hook_command,
     install_tmux_exit_hooks,
+    run_tmux_command,
     build_tmux_server_key,
     parse_tmux_socket_path,
     get_current_tmux_server_key,
@@ -11274,6 +11321,97 @@ def test_install_tmux_exit_hooks_guards_pane_id():
             assert "display-message" in hook_value
             assert "%42" in hook_value
             assert hook_cmd in hook_value
+
+The tracked-window launch path now holds the tmux-context lock across
+the whole setup phase, but releases it before the later readiness wait.
+That is the narrow serialization we want: hook-visible state must be
+coherent before detached hooks run, without blocking steady-state hooks
+for the lifetime of the tmux command.
+
+def test_run_tmux_command_locks_window_launch_setup(
+    temp_tracking_dir,
+):
+    """Tracked-window setup stays inside the tmux-context lock."""
+    events = []
+
+    def fake_with_tmux_context_lock(callback):
+        events.append("lock-enter")
+        try:
+            return callback()
+        finally:
+            events.append("lock-exit")
+
+    def fake_subprocess_run(args, **kwargs):
+        if args[:2] == ["tmux", "new-window"]:
+            events.append("new-window")
+            class Result:
+                stdout = "%42 @7 $9\n"
+            return Result()
+        if args[:4] == ["tmux", "wait-for", "-S", "ready-chan"]:
+            events.append("ready")
+            class Result:
+                stdout = ""
+            return Result()
+        events.append(tuple(args[:2]))
+        class Result:
+            stdout = ""
+        return Result()
+
+    with patch(
+        "nytid.cli.track.make_tmux_channel",
+        side_effect=["ready-chan"],
+    ), patch(
+        "nytid.cli.track.parse_tmux_socket_path",
+        return_value="/tmp/tmux.sock",
+    ), patch(
+        "nytid.cli.track.build_tmux_server_key",
+        return_value=TEST_SERVER_KEY,
+    ), patch(
+        "nytid.cli.track.with_tmux_context_lock",
+        side_effect=fake_with_tmux_context_lock,
+    ), patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=fake_subprocess_run,
+    ), patch(
+        "nytid.cli.track.install_tmux_exit_hooks",
+        side_effect=lambda *args, **kwargs:
+        events.append("exit-hooks"),
+    ), patch(
+        "nytid.cli.track.seed_window_event_buffer",
+        side_effect=lambda *args, **kwargs:
+        events.append("seed"),
+    ), patch(
+        "nytid.cli.track.install_tmux_window_sync_hooks",
+        side_effect=lambda *args, **kwargs:
+        events.append("sync-hooks"),
+    ), patch(
+        "nytid.cli.track.install_tmux_window_cleanup_hook",
+        side_effect=lambda *args, **kwargs:
+        events.append("cleanup-hook"),
+    ):
+        result = run_tmux_command(
+            ["/bin/bash"],
+            cwd="/tmp",
+            env={"TMUX": "client,1,0"},
+            window=True,
+            window_name="track:work",
+            block=False,
+            focus_labels=["work"],
+            focus_who="me",
+            focus_window=True,
+        )
+
+    assert result is None
+    assert events[:6] == [
+        "lock-enter",
+        "new-window",
+        "exit-hooks",
+        "seed",
+        "sync-hooks",
+        "cleanup-hook",
+    ]
+    assert events[6] == "lock-exit"
+    assert events[7] == "ready"
 
 def test_tracking_entry_with_who():
     """Test TrackingEntry serialization with who field"""
