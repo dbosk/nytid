@@ -4408,10 +4408,11 @@ the new pane (which has no hooks yet, so nothing to dispatch) and
 <<launch tmux command and install hooks>>=
 needs_finalize = False
 source_is_tracked = False
+source_window_id = None
 
 def launch_and_publish_state():
     nonlocal pane_id, window_id, session_id
-    nonlocal needs_finalize, source_is_tracked
+    nonlocal needs_finalize, source_is_tracked, source_window_id
 
     result = subprocess.run(
         tmux_args,
@@ -4444,6 +4445,7 @@ def launch_and_publish_state():
                 tmux_server_key,
                 session_id,
             )
+            source_window_id = prev_wid
             source_is_tracked = (
                 prev_wid is not None
                 and read_window_labels(
@@ -4486,15 +4488,26 @@ else:
 if needs_finalize:
     if source_is_tracked:
         seed_event_lines = [
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id=source_window_id,
+                target_window_id=window_id,
+            ),
         ]
     else:
         seed_event_lines = [
             build_window_event_line(
                 "start",
                 focus_labels,
+                window_id=window_id,
             ),
-            "window-switch tracked from-untracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=False,
+                source_window_id=source_window_id,
+                target_window_id=window_id,
+            ),
         ]
     seed_window_event_buffer(
         focus_who,
@@ -5181,23 +5194,52 @@ def window_event_debug_log_path() -> pathlib.Path:
 
 To preserve accurate timings through the deferred buffer, [[stop]] and
 [[start]] event lines carry the hook timestamp explicitly instead of
-borrowing the later execution time.  The parser keeps [[window-switch]]
-lines in their original textual form because they carry state rather
-than a timing edge.
+borrowing the later execution time.  Those lines now also carry the tmux
+[[window_id]] they describe.  The [[window-switch]] markers likewise carry
+the tracked/untracked state together with the source and target window
+IDs.  With those IDs in hand, the matcher can look for the stop that
+belongs to the source window and the start that belongs to the target
+window, instead of guessing from the last stop/start lines in the file.
 
 <<helper functions>>=
 def build_window_event_line(
     action: str,
     labels: List[str],
     when: Optional[datetime.datetime] = None,
+    window_id: Optional[str] = None,
 ) -> str:
     """Return one deferred stop/start event line."""
     if when is None:
         when = datetime.datetime.now()
-    return (
-        f"{action} {when.isoformat()} "
-        + " ".join(labels)
-    ).rstrip()
+    parts = [action, when.isoformat()]
+    if window_id is not None:
+        parts.append(f"window={window_id}")
+    parts.extend(labels)
+    return " ".join(parts)
+
+
+def build_window_switch_event_line(
+    target_tracked: bool,
+    source_tracked: Optional[bool] = None,
+    source_window_id: Optional[str] = None,
+    target_window_id: Optional[str] = None,
+) -> str:
+    """Return one deferred window-switch marker line."""
+    parts = [
+        "window-switch",
+        "tracked" if target_tracked else "untracked",
+    ]
+    if source_tracked is not None:
+        parts.append(
+            "from-tracked"
+            if source_tracked
+            else "from-untracked"
+        )
+    if source_window_id is not None:
+        parts.append(f"source={source_window_id}")
+    if target_window_id is not None:
+        parts.append(f"target={target_window_id}")
+    return " ".join(parts)
 
 
 def parse_window_event_line(line: str) -> dict:
@@ -5209,11 +5251,22 @@ def parse_window_event_line(line: str) -> dict:
             "raw": line,
             "target_tracked": parts[1] == "tracked",
             "source_tracked": None,
+            "source_window_id": None,
+            "target_window_id": None,
         }
-        if len(parts) > 2:
-            result["source_tracked"] = (
-                parts[2] == "from-tracked"
-            )
+        for token in parts[2:]:
+            if token == "from-tracked":
+                result["source_tracked"] = True
+            elif token == "from-untracked":
+                result["source_tracked"] = False
+            elif token.startswith("source="):
+                result["source_window_id"] = (
+                    token.split("=", 1)[1] or None
+                )
+            elif token.startswith("target="):
+                result["target_window_id"] = (
+                    token.split("=", 1)[1] or None
+                )
         return result
 
     parts = line.split()
@@ -5222,20 +5275,260 @@ def parse_window_event_line(line: str) -> dict:
     if parts[0] not in {"stop", "start"}:
         return {"kind": "unknown", "raw": line}
 
+    tokens = parts[1:]
     when = None
-    labels = []
-    if len(parts) > 1:
+    if tokens:
         try:
-            when = datetime.datetime.fromisoformat(parts[1])
-            labels = parts[2:]
+            when = datetime.datetime.fromisoformat(tokens[0])
+            tokens = tokens[1:]
         except ValueError:
-            labels = parts[1:]
+            pass
+
+    window_id = None
+    if tokens and tokens[0].startswith("window="):
+        window_id = tokens[0].split("=", 1)[1] or None
+        tokens = tokens[1:]
+
     return {
         "kind": parts[0],
         "raw": line,
         "when": when,
-        "labels": labels,
+        "labels": tokens,
+        "window_id": window_id,
     }
+@
+
+The matcher now consumes one coherent switch transaction rather than
+counting the whole file and taking whichever stop/start happened to be
+last.  We still keep the original on-disk buffer, but we normalize the
+parsed view before matching:
+
+\begin{description}
+\item[Duplicate switch markers]
+  Adjacent [[window-switch]] lines with the same source, target, and
+  tracked-state annotations describe one tmux switch, so later matching
+  should not treat them as separate transactions.
+\item[Alt-Tab blur pairs]
+  A plain terminal blur produces [[stop]] followed by [[start]] for the
+  same window and no switch marker.  Those two lines cancel out as noise:
+  they must not later be reused as the target start for an unrelated
+  window switch.
+\item[Nearest matching edges]
+  Once the noise is collapsed away, the matcher scans backward for the
+  newest [[window-switch]] marker whose required source [[stop]] and
+  target [[start]] edges can be found for the windows named in that
+  marker.
+\end{description}
+
+We keep a legacy fallback for older buffers that lack window metadata.
+That preserves compatibility with historical [[window-switch tracked]]
+markers while routing all new tmux-generated lines through the stricter
+window-aware matcher.
+
+<<helper functions>>=
+def window_event_has_metadata(event: dict) -> bool:
+    """Return whether a parsed deferred event carries window metadata."""
+    if event["kind"] in {"stop", "start"}:
+        return event.get("window_id") is not None
+    if event["kind"] == "window-switch":
+        return (
+            event.get("source_window_id") is not None
+            or event.get("target_window_id") is not None
+        )
+    return False
+
+
+def is_duplicate_window_switch_event(
+    previous: dict,
+    current: dict,
+) -> bool:
+    """Return whether two adjacent switch markers describe one switch."""
+    return (
+        previous["kind"] == "window-switch"
+        and current["kind"] == "window-switch"
+        and previous["target_tracked"] == current["target_tracked"]
+        and previous["source_tracked"] == current["source_tracked"]
+        and previous.get("source_window_id")
+        == current.get("source_window_id")
+        and previous.get("target_window_id")
+        == current.get("target_window_id")
+    )
+
+
+def is_window_blur_pair(previous: dict, current: dict) -> bool:
+    """Return whether adjacent stop/start lines cancel as blur noise."""
+    return (
+        previous["kind"] == "stop"
+        and current["kind"] == "start"
+        and previous.get("window_id") is not None
+        and previous.get("window_id") == current.get("window_id")
+    )
+
+
+def normalize_window_event_buffer(lines: List[str]) -> List[dict]:
+    """Collapse duplicate switch markers and blur pairs."""
+    events = []
+    for line in lines:
+        event = parse_window_event_line(line)
+        if (
+            events
+            and is_duplicate_window_switch_event(
+                events[-1], event,
+            )
+        ):
+            continue
+        if events and is_window_blur_pair(events[-1], event):
+            events.pop()
+            continue
+        events.append(event)
+    return events
+
+
+def find_nearest_window_event(
+    events: List[dict],
+    switch_index: int,
+    kind: str,
+    window_id: Optional[str],
+) -> Optional[dict]:
+    """Return the closest buffered event for ``window_id``."""
+    if window_id is None:
+        return None
+    for offset in range(1, len(events) + 1):
+        right_index = switch_index + offset
+        if right_index < len(events):
+            event = events[right_index]
+            if (
+                event["kind"] == kind
+                and event.get("window_id") == window_id
+            ):
+                return event
+
+        left_index = switch_index - offset
+        if left_index >= 0:
+            event = events[left_index]
+            if (
+                event["kind"] == kind
+                and event.get("window_id") == window_id
+            ):
+                return event
+    return None
+
+
+def find_legacy_window_event_transition(
+    events: List[dict],
+) -> Optional[dict]:
+    """Return one executable transition for legacy buffer lines."""
+    stop_count = 0
+    start_count = 0
+    switch_target_tracked = None
+    switch_source_tracked = None
+    last_stop_event = None
+    last_start_event = None
+
+    for event in events:
+        if event["kind"] == "stop":
+            stop_count += 1
+            last_stop_event = event
+        elif event["kind"] == "start":
+            start_count += 1
+            last_start_event = event
+        elif event["kind"] == "window-switch":
+            switch_target_tracked = event["target_tracked"]
+            switch_source_tracked = event["source_tracked"]
+
+    switch = {
+        "target_tracked": switch_target_tracked,
+        "source_tracked": switch_source_tracked,
+    }
+    if (
+        switch_target_tracked is True
+        and stop_count == start_count
+        and stop_count > 0
+    ):
+        return {
+            "execution": "switch",
+            "switch": switch,
+            "stop_event": last_stop_event,
+            "start_event": last_start_event,
+        }
+    if (
+        switch_target_tracked is False
+        and stop_count == start_count + 1
+    ):
+        return {
+            "execution": "stop",
+            "switch": switch,
+            "stop_event": last_stop_event,
+            "start_event": None,
+        }
+    if (
+        switch_target_tracked is True
+        and start_count == stop_count + 1
+        and switch_source_tracked is not True
+    ):
+        return {
+            "execution": "start",
+            "switch": switch,
+            "stop_event": None,
+            "start_event": last_start_event,
+        }
+    return None
+
+
+def find_window_event_transition(lines: List[str]) -> Optional[dict]:
+    """Return one executable deferred transition from ``lines``."""
+    events = normalize_window_event_buffer(lines)
+    if not events:
+        return None
+
+    if not any(
+        window_event_has_metadata(event)
+        for event in events
+    ):
+        return find_legacy_window_event_transition(events)
+
+    for switch_index in range(len(events) - 1, -1, -1):
+        switch = events[switch_index]
+        if switch["kind"] != "window-switch":
+            continue
+
+        stop_event = None
+        if switch["source_tracked"] is True:
+            stop_event = find_nearest_window_event(
+                events,
+                switch_index,
+                "stop",
+                switch.get("source_window_id"),
+            )
+            if stop_event is None:
+                continue
+
+        start_event = None
+        if switch["target_tracked"] is True:
+            start_event = find_nearest_window_event(
+                events,
+                switch_index,
+                "start",
+                switch.get("target_window_id"),
+            )
+            if start_event is None:
+                continue
+
+        if switch["target_tracked"] is False:
+            execution = "stop"
+        elif switch["source_tracked"] is not True:
+            execution = "start"
+        else:
+            execution = "switch"
+
+        return {
+            "execution": execution,
+            "switch": switch,
+            "stop_event": stop_event,
+            "start_event": start_event,
+        }
+
+    return None
 @
 
 The main diagnostic emitter writes to the log file and optionally sends
@@ -5344,11 +5637,12 @@ hook cannot snapshot stale context state and then append an obsolete
 marker after the seed releases the buffer lock.
 
 The trigger condition still waits for a real [[window-switch]] marker,
-but that marker also records whether the destination window is tracked.
-That lets the buffer distinguish three legitimate cases: tracked to
-tracked (stop then start), tracked to untracked (stop only), and
-untracked to tracked (start only).  Once the trigger fires, we execute
-the deferred transition and truncate the file.
+but it no longer executes by comparing global stop/start counts.  The
+matcher first collapses same-window blur pairs and duplicate switch
+markers, then searches backward for the newest switch whose required
+source [[stop]] and target [[start]] edges can be matched to the window
+IDs recorded in that marker.  Once such a switch is found, we execute the
+deferred transition and truncate the file.
 
 <<helper functions>>=
 def _process_window_event_locked(
@@ -5459,7 +5753,8 @@ os.write(fd, (event_line + "\n").encode())
 os.fsync(fd)
 @
 
-After appending, we re-read the entire file and parse it:
+After appending, we re-read the entire file and ask the matcher whether
+one coherent deferred switch is now complete:
 
 <<check trigger condition>>=
 os.lseek(fd, 0, os.SEEK_SET)
@@ -5474,48 +5769,32 @@ emit_window_event_debug(
     content,
 )
 
-stop_count = 0
-start_count = 0
-switch_target_tracked = None
-switch_source_tracked = None
+transition = find_window_event_transition(lines)
+if transition is None:
+    return
+
+switch_target_tracked = transition["switch"]["target_tracked"]
+switch_source_tracked = transition["switch"]["source_tracked"]
 suppress_execution_notifications = False
 last_stop_labels = []
 last_stop_time = None
 last_start_labels = []
 last_start_time = None
 
-for line in lines:
-    parsed = parse_window_event_line(line)
-    if parsed["kind"] == "stop":
-        stop_count += 1
-        last_stop_labels = parsed["labels"]
-        last_stop_time = parsed["when"]
-    elif parsed["kind"] == "start":
-        start_count += 1
-        last_start_labels = parsed["labels"]
-        last_start_time = parsed["when"]
-    elif parsed["kind"] == "window-switch":
-        switch_target_tracked = parsed["target_tracked"]
-        switch_source_tracked = parsed["source_tracked"]
+if transition["stop_event"] is not None:
+    last_stop_labels = transition["stop_event"]["labels"]
+    last_stop_time = transition["stop_event"]["when"]
+if transition["start_event"] is not None:
+    last_start_labels = transition["start_event"]["labels"]
+    last_start_time = transition["start_event"]["when"]
 
-if (
-    switch_target_tracked is True
-    and stop_count == start_count
-    and stop_count > 0
-):
+if transition["execution"] == "switch":
     <<execute deferred window switch>>
     os.ftruncate(fd, 0)
-elif (
-    switch_target_tracked is False
-    and stop_count == start_count + 1
-):
+elif transition["execution"] == "stop":
     <<execute deferred window stop>>
     os.ftruncate(fd, 0)
-elif (
-    switch_target_tracked is True
-    and start_count == stop_count + 1
-    and switch_source_tracked is not True
-):
+elif transition["execution"] == "start":
     <<execute deferred window start>>
     os.ftruncate(fd, 0)
 @
@@ -5864,6 +6143,7 @@ def window_focus_out_detached(
         session_id,
         build_window_event_line(
             "stop", labels,
+            window_id=window_id,
         ),
     )
 @
@@ -5899,6 +6179,7 @@ def window_focus_in_detached(
         session_id,
         build_window_event_line(
             "start", labels,
+            window_id=window_id,
         ),
     )
 @
@@ -6035,23 +6316,29 @@ def window_switch_detached(
                 tmux_server_key,
             ) is not None
         )
-        return selected_is_tracked, source_is_tracked
+        return (
+            selected_is_tracked,
+            source_is_tracked,
+            prev_window_id,
+        )
 
     result = with_tmux_context_lock(read_and_update)
     if result is None:
         return
-    selected_is_tracked, source_is_tracked = result
+    (
+        selected_is_tracked,
+        source_is_tracked,
+        prev_window_id,
+    ) = result
     append_and_check_window_event(
-        who, tmux_server_key, session_id,
-        (
-            "window-switch tracked"
-            if selected_is_tracked
-            else "window-switch untracked"
-        )
-        + (
-            " from-tracked"
-            if source_is_tracked
-            else " from-untracked"
+        who,
+        tmux_server_key,
+        session_id,
+        build_window_switch_event_line(
+            target_tracked=selected_is_tracked,
+            source_tracked=source_is_tracked,
+            source_window_id=prev_window_id,
+            target_window_id=selected_window_id,
         ),
     )
 @
@@ -7137,10 +7424,12 @@ def test_event_buffer_alt_tab_no_execute(temp_tracking_dir):
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     start_event = build_window_event_line(
         "start", ["work"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@1",
     )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
@@ -7169,7 +7458,7 @@ pair and a [[window-switch]] marker.
 def test_event_buffer_window_switch_triggers(
     temp_tracking_dir,
 ):
-    """Switch marker executes the last stop/start pair and clears state."""
+    """Window-aware switch markers execute one matched transition."""
     who = "me"
     stop_time = datetime.datetime(2026, 2, 20, 10, 0)
     start_time = datetime.datetime(2026, 2, 20, 10, 1)
@@ -7180,17 +7469,24 @@ def test_event_buffer_window_switch_triggers(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work"], stop_time,
+                window_id="@1",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["admin"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     mock_stop.assert_called_once_with(
@@ -7208,6 +7504,55 @@ def test_event_buffer_window_switch_triggers(
     assert window_event_buffer_path(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
     ).read_text() == ""
+
+def test_event_buffer_does_not_reuse_source_start_for_target(
+    temp_tracking_dir,
+):
+    """Source-window history cannot satisfy the target restart edge."""
+    who = "me"
+    stale_start_time = datetime.datetime(2026, 2, 20, 9, 59)
+    stop_time = datetime.datetime(2026, 2, 20, 10, 0)
+    target_start_time = datetime.datetime(2026, 2, 20, 10, 1)
+    with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
+        "nytid.cli.track.start_tracking_labels"
+    ) as mock_start:
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start", ["work"], stale_start_time,
+                window_id="@1",
+            ),
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "stop", ["work"], stop_time,
+                window_id="@1",
+            ),
+        )
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
+        )
+        assert mock_stop.call_count == 0
+        assert mock_start.call_count == 0
+        append_and_check_window_event(
+            who, TEST_SERVER_KEY, TEST_SESSION_ID,
+            build_window_event_line(
+                "start", ["admin"], target_start_time,
+                window_id="@2",
+            ),
+        )
+
+    mock_stop.assert_called_once()
+    assert mock_stop.call_args.kwargs["labels"] == ["work"]
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["labels"] == ["admin"]
 @
 
 Stale Alt-Tab pairs must remain harmless until a real window switch
@@ -7221,18 +7566,22 @@ def test_event_buffer_stale_pairs_ignored(
     stop_one = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     start_one = build_window_event_line(
         "start", ["work"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@1",
     )
     stop_two = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 2),
+        window_id="@1",
     )
     start_two = build_window_event_line(
         "start", ["work"],
         datetime.datetime(2026, 2, 20, 10, 3),
+        window_id="@1",
     )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
@@ -7300,17 +7649,24 @@ def test_event_buffer_shared_labels_stop_before_start(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work", "grading"], stop_time,
+                window_id="@1",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["work", "admin"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     assert calls == [
@@ -7334,10 +7690,12 @@ def test_event_buffer_locking(
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     start_event = build_window_event_line(
         "start", ["admin"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@2",
     )
 
     def record_stop(**kwargs):
@@ -7365,7 +7723,14 @@ def test_event_buffer_locking(
             threading.Thread(target=worker, args=(start_event,)),
             threading.Thread(
                 target=worker,
-                args=("window-switch tracked from-tracked",),
+                args=(
+                    build_window_switch_event_line(
+                        target_tracked=True,
+                        source_tracked=True,
+                        source_window_id="@1",
+                        target_window_id="@2",
+                    ),
+                ),
             ),
         ]
         for thread in threads:
@@ -7389,10 +7754,12 @@ def test_event_buffer_isolated_by_session(temp_tracking_dir):
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     start_event = build_window_event_line(
         "start", ["admin"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@2",
     )
     with patch("nytid.cli.track.stop_tracking_labels") as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels"
@@ -7407,7 +7774,12 @@ def test_event_buffer_isolated_by_session(temp_tracking_dir):
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, other_session,
-            "window-switch tracked from-untracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=False,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     assert mock_stop.call_count == 0
@@ -7434,11 +7806,17 @@ def test_event_buffer_tracked_to_untracked_switch_stops_only(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work"], stop_time,
+                window_id="@1",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch untracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=False,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     mock_stop.assert_called_once_with(
@@ -7466,11 +7844,17 @@ def test_event_buffer_untracked_to_tracked_switch_starts_only(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["admin"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-untracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=False,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     assert mock_stop.call_count == 0
@@ -7497,11 +7881,17 @@ def test_event_buffer_late_focus_out_still_triggers_switch(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["admin"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
         assert mock_stop.call_count == 0
         assert mock_start.call_count == 0
@@ -7509,6 +7899,7 @@ def test_event_buffer_late_focus_out_still_triggers_switch(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work"], stop_time,
+                window_id="@1",
             ),
         )
 
@@ -7538,12 +7929,18 @@ def test_event_buffer_late_focus_out_ordering_6(
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["admin"], start_time,
+                window_id="@2",
             ),
         )
         assert mock_stop.call_count == 0
@@ -7552,6 +7949,7 @@ def test_event_buffer_late_focus_out_ordering_6(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work"], stop_time,
+                window_id="@1",
             ),
         )
 
@@ -7622,11 +8020,17 @@ def test_synthetic_window_switch_from_untracked_triggers(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["devel", "nytid"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-untracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=False,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
 
     assert mock_stop.call_count == 0
@@ -7654,13 +8058,19 @@ def test_synthetic_switch_before_focus_in_still_triggers(
     ) as mock_start:
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-untracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=False,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
         assert mock_start.call_count == 0
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["devel", "nytid"], start_time,
+                window_id="@2",
             ),
         )
 
@@ -7689,11 +8099,17 @@ def test_synthetic_switch_from_tracked_waits_for_stop(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "start", ["admin"], start_time,
+                window_id="@2",
             ),
         )
         append_and_check_window_event(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            "window-switch tracked from-tracked",
+            build_window_switch_event_line(
+                target_tracked=True,
+                source_tracked=True,
+                source_window_id="@1",
+                target_window_id="@2",
+            ),
         )
         assert mock_stop.call_count == 0
         assert mock_start.call_count == 0
@@ -7701,6 +8117,7 @@ def test_synthetic_switch_from_tracked_waits_for_stop(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
             build_window_event_line(
                 "stop", ["work"], stop_time,
+                window_id="@1",
             ),
         )
 
@@ -7744,6 +8161,38 @@ def test_window_switch_detached_skips_when_prev_equals_selected(
         ])
 
     mock_append.assert_not_called()
+
+def test_window_switch_detached_emits_window_aware_marker(
+    temp_tracking_dir,
+):
+    """Detached switch hook records source and target window ids."""
+    who = "me"
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, "@1",
+    )
+    write_window_labels("@1", who, TEST_SERVER_KEY, ["work"])
+    write_window_labels("@2", who, TEST_SERVER_KEY, ["admin"])
+
+    with patch(
+        "nytid.cli.track.get_tmux_selected_window_id",
+        return_value="@2",
+    ), patch(
+        "nytid.cli.track.append_and_check_window_event",
+    ) as mock_append:
+        runner.invoke(cli, [
+            "_window-switch-detached",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
+            "--who", who,
+        ])
+
+    mock_append.assert_called_once()
+    parsed = parse_window_event_line(mock_append.call_args.args[3])
+    assert parsed["kind"] == "window-switch"
+    assert parsed["target_tracked"] is True
+    assert parsed["source_tracked"] is True
+    assert parsed["source_window_id"] == "@1"
+    assert parsed["target_window_id"] == "@2"
 @
 
 The seed wipes any stale pre-existing buffer content under the same
@@ -7777,8 +8226,14 @@ def test_seed_window_event_buffer_from_untracked_fires_and_empties(
             [
                 build_window_event_line(
                     "start", ["devel", "nytid"], start_time,
+                    window_id="@2",
                 ),
-                "window-switch tracked from-untracked",
+                build_window_switch_event_line(
+                    target_tracked=True,
+                    source_tracked=False,
+                    source_window_id="@1",
+                    target_window_id="@2",
+                ),
             ],
         )
     # The final marker fires execute-start and truncates.
@@ -7810,15 +8265,19 @@ def test_seed_window_event_buffer_from_tracked_keeps_marker(
     ) as mock_stop, patch(
         "nytid.cli.track.start_tracking_labels",
     ) as mock_start:
+        marker = build_window_switch_event_line(
+            target_tracked=True,
+            source_tracked=True,
+            source_window_id="@1",
+            target_window_id="@2",
+        )
         seed_window_event_buffer(
             who, TEST_SERVER_KEY, TEST_SESSION_ID,
-            ["window-switch tracked from-tracked"],
+            [marker],
         )
     content = buf.read_text()
     assert "stale" not in content
-    assert content.strip() == (
-        "window-switch tracked from-tracked"
-    )
+    assert content.strip() == marker
     assert mock_stop.call_count == 0
     assert mock_start.call_count == 0
 
@@ -7852,8 +8311,14 @@ def test_seed_from_untracked_prevents_stale_stop_phantom(
                     "start",
                     ["devel", "nytid"],
                     start_time,
+                    window_id="@2",
                 ),
-                "window-switch tracked from-untracked",
+                build_window_switch_event_line(
+                    target_tracked=True,
+                    source_tracked=False,
+                    source_window_id="@1",
+                    target_window_id="@2",
+                ),
             ],
         )
         mock_start.reset_mock()
@@ -7864,6 +8329,7 @@ def test_seed_from_untracked_prevents_stale_stop_phantom(
                 "stop",
                 ["devel", "nytid"],
                 stale_stop_time,
+                window_id="@2",
             ),
         )
         # 15 minutes later the user returns: pane-focus-in.
@@ -7873,6 +8339,7 @@ def test_seed_from_untracked_prevents_stale_stop_phantom(
                 "start",
                 ["devel", "nytid"],
                 real_start_time,
+                window_id="@2",
             ),
         )
     # No trigger should have fired---no marker is present in the
@@ -7894,12 +8361,45 @@ def test_parse_window_event_line_keeps_old_format():
         "raw": "stop work admin",
         "when": None,
         "labels": ["work", "admin"],
+        "window_id": None,
     }
     assert parsed_start == {
         "kind": "start",
         "raw": "start review",
         "when": None,
         "labels": ["review"],
+        "window_id": None,
+    }
+
+def test_parse_window_event_line_reads_window_metadata():
+    """Window-aware deferred events preserve source and target ids."""
+    start_line = build_window_event_line(
+        "start",
+        ["admin"],
+        datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@2",
+    )
+    switch_line = build_window_switch_event_line(
+        target_tracked=True,
+        source_tracked=True,
+        source_window_id="@1",
+        target_window_id="@2",
+    )
+
+    assert parse_window_event_line(start_line) == {
+        "kind": "start",
+        "raw": start_line,
+        "when": datetime.datetime(2026, 2, 20, 10, 1),
+        "labels": ["admin"],
+        "window_id": "@2",
+    }
+    assert parse_window_event_line(switch_line) == {
+        "kind": "window-switch",
+        "raw": switch_line,
+        "target_tracked": True,
+        "source_tracked": True,
+        "source_window_id": "@1",
+        "target_window_id": "@2",
     }
 
 def test_window_event_debug_disabled_by_default(temp_tracking_dir):
@@ -7928,10 +8428,12 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     start_event = build_window_event_line(
         "start", ["admin"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@2",
     )
     try:
         with patch(
@@ -7951,7 +8453,12 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch tracked from-tracked",
+                build_window_switch_event_line(
+                    target_tracked=True,
+                    source_tracked=True,
+                    source_window_id="@1",
+                    target_window_id="@2",
+                ),
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -7960,7 +8467,10 @@ def test_window_event_debug_logs_and_notifies(temp_tracking_dir):
     assert "action=append" in log_text
     assert f"event={stop_event!r}" in log_text
     assert f"event={start_event!r}" in log_text
-    assert "event='window-switch tracked'" in log_text
+    assert (
+        "event='window-switch tracked from-tracked "
+        "source=@1 target=@2'" in log_text
+    )
     assert "action=execute-switch" in log_text
     assert "action=execute-stop" in log_text
     assert "action=execute-start" in log_text
@@ -7983,6 +8493,7 @@ def test_window_event_debug_ignores_missing_notify_send(
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     try:
         with patch(
@@ -8008,6 +8519,7 @@ def test_window_event_debug_notifies_stop_only_execution(
     stop_event = build_window_event_line(
         "stop", ["work"],
         datetime.datetime(2026, 2, 20, 10, 0),
+        window_id="@1",
     )
     try:
         with patch(
@@ -8023,7 +8535,12 @@ def test_window_event_debug_notifies_stop_only_execution(
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch untracked from-tracked",
+                build_window_switch_event_line(
+                    target_tracked=False,
+                    source_tracked=True,
+                    source_window_id="@1",
+                    target_window_id="@2",
+                ),
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -8049,6 +8566,7 @@ def test_window_event_debug_notifies_start_only_execution(
     start_event = build_window_event_line(
         "start", ["admin"],
         datetime.datetime(2026, 2, 20, 10, 1),
+        window_id="@2",
     )
     try:
         with patch(
@@ -8064,7 +8582,12 @@ def test_window_event_debug_notifies_start_only_execution(
             )
             append_and_check_window_event(
                 who, TEST_SERVER_KEY, TEST_SESSION_ID,
-                "window-switch tracked from-untracked",
+                build_window_switch_event_line(
+                    target_tracked=True,
+                    source_tracked=False,
+                    source_window_id="@1",
+                    target_window_id="@2",
+                ),
             )
     finally:
         config.set(TRACK_DEBUG_CONFIG, None)
@@ -8168,6 +8691,7 @@ def test_window_focus_out_detached_reads_labels_under_lock(
     assert parsed["kind"] == "stop"
     assert parsed["labels"] == ["work"]
     assert parsed["when"] is not None
+    assert parsed["window_id"] == "@1"
 
 def test_get_tmux_window_id_for_pane_reads_live_tmux_state():
     """Current window id is resolved from the current tmux pane."""
@@ -10494,6 +11018,7 @@ from nytid.cli.track import (
     suspend_tracking_labels,
     resume_tracking_labels,
     build_window_event_line,
+    build_window_switch_event_line,
     parse_window_event_line,
     with_tmux_context_lock,
     window_event_buffer_path,
@@ -11381,6 +11906,7 @@ def test_install_tmux_exit_hooks_guards_pane_id():
             assert "display-message" in hook_value
             assert "%42" in hook_value
             assert hook_cmd in hook_value
+@
 
 The tracked-window launch path holds the tmux-context lock only across
 the narrow hook-observability phase: [[new-window]], label publication,
@@ -11390,6 +11916,7 @@ hook installs, because the seed self-triggers
 [[start_tracking_labels]] which re-acquires the same lock through
 [[mutate_worker_tracking_state]] and would otherwise self-deadlock.
 
+<<test functions>>=
 def test_run_tmux_command_locks_window_launch_setup(
     temp_tracking_dir,
 ):
