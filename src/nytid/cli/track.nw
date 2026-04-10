@@ -2300,11 +2300,16 @@ When [[start]] launches a command or tmux shell, it may need to derive one
 extra label from the command name, validate tmux usage, and choose between
 the plain tmux shell path and the prompted direct-shell path.
 
-Launch mode also needs a clear ownership rule for labels.  If a label is already
-active and we launch a child process without [[--replace]], the command would
-appear to belong to that label but the automatic shutdown path would leave the
-old session running.  We therefore require launch-bound labels to be inactive
-unless the user explicitly asks to replace them.
+Launch mode also needs a clear ownership rule for labels.  If a label is
+already active and we launch a child process without saying what should
+happen to the existing session, the command would appear to belong to that
+label but the automatic shutdown path could leave the old session running.
+We therefore require launch-bound labels to be inactive unless the user
+explicitly picks one of two escape hatches: [[--replace]] (discard the old
+session and restart) or [[--continue]] (keep the old session and bind the
+child to it).  The shutdown path treats both cases identically---one
+[[TrackingEntry]] per label at child exit---so the only difference is
+whether the original start time survives.
 
 Track and todo should also present launch context the same way.  We therefore
 compute one context string up front and reuse it for tmux window names and
@@ -2366,10 +2371,11 @@ if launch_requested:
         label for label in labels
         if session.get_label_info(label) is not None
     ]
-    if conflicting_launch_labels and not replace:
+    if conflicting_launch_labels and not (replace or continue_labels):
         typer.echo(
-            "Error: launch mode requires inactive labels or "
-            f"--replace: {', '.join(sorted(conflicting_launch_labels))}",
+            "Error: launch mode requires inactive labels, "
+            "--replace, or --continue: "
+            f"{', '.join(sorted(conflicting_launch_labels))}",
             err=True,
         )
         raise typer.Exit(1)
@@ -2516,6 +2522,51 @@ replace: Annotated[bool, replace_opt] = False,
 
 <<start command docstring examples>>=
 nytid track start labelA --offset -60m --replace  # Restart active label earlier
+@
+
+\subsubsection{Continuing an Already-Active Label in a New Launch}
+
+The [[--replace]] flag is the right answer when the user wants to
+\emph{correct} the start time of an active label.  It is the
+\emph{wrong} answer when the user just wants to keep working on the
+same thing in a fresh tmux window or pane: the in-progress session
+would be discarded, and the minutes already accumulated would
+disappear.
+
+The [[--continue]] flag covers that second case.  With [[--continue]],
+launch mode (i.e.\ [[--window]], [[--pane]], or [[--command]]) accepts
+labels that are already active: the existing session is preserved
+untouched (no [[discard_labels]], no new history entry, original start
+time unchanged), and the launched child process is bound to the same
+labels via the normal window/pane-labels path.  When the window or
+pane exits, the ordinary shutdown path stops the labels and records a
+single [[TrackingEntry]] covering the original start time through the
+child's exit.
+
+The two flags express different intents and are mutually exclusive in
+spirit (though the code tolerates either one being set): pick
+[[--replace]] to rewrite the start time, pick [[--continue]] to
+preserve it.
+
+Outside launch mode [[--continue]] is a no-op: the default behaviour
+of [[track start]] on already-active labels is to silently continue
+them and report \enquote{Already tracking}, so the flag has nothing
+extra to do there.
+
+<<argument and option definitions>>=
+continue_opt = typer.Option(
+    "--continue", "-C",
+    help="If a label is already active, keep its "
+         "current session and bind it to the new "
+         "window/pane/command instead of failing.")
+@
+
+<<start command options>>=
+continue_labels: Annotated[bool, continue_opt] = False,
+@
+
+<<start command docstring examples>>=
+nytid track start devel nytid -W --continue  # Bind active labels to new window
 @
 
 \subsubsection{Worker Identity}
@@ -2823,7 +2874,7 @@ def test_start_without_replace_keeps_original(temp_tracking_dir):
 def test_start_launch_requires_replace_for_active_labels(
     temp_tracking_dir,
 ):
-    """Launch mode rejects already-active labels unless --replace is used."""
+    """Launch mode rejects already-active labels unless --replace or --continue."""
     runner.invoke(cli, ["start", "labelA"])
 
     result = runner.invoke(cli, [
@@ -2831,7 +2882,10 @@ def test_start_launch_requires_replace_for_active_labels(
     ])
 
     assert result.exit_code == 1
-    assert "launch mode requires inactive labels or --replace" in result.stdout
+    assert (
+        "launch mode requires inactive labels, "
+        "--replace, or --continue"
+    ) in result.stdout
 
 
 def test_start_launch_with_replace_restarts_active_label(
@@ -2846,6 +2900,54 @@ def test_start_launch_with_replace_restarts_active_label(
 
     assert result.exit_code == 0
     assert "Replaced: labelA" in result.stdout
+    assert "Running 'echo test'" in result.stdout
+
+
+def test_start_continue_preserves_active_session(temp_tracking_dir):
+    """--continue lets launch mode accept active labels and preserves start time."""
+    runner.invoke(cli, ["start", "labelA", "--offset", "-45m"])
+
+    result = runner.invoke(cli, [
+        "start", "labelA", "--continue", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 0
+    assert "Already tracking: labelA" in result.stdout
+    assert "Replaced" not in result.stdout
+    assert "Running 'echo test'" in result.stdout
+
+    # The original ~45-minute-old start time must survive untouched.
+    session = load_active_session(default_username)
+    start_time, _, _ = session.get_label_info("labelA")
+    delta = datetime.datetime.now() - start_time
+    assert delta.total_seconds() > 40 * 60, (
+        "--continue must not rewrite the original start time"
+    )
+
+
+def test_start_continue_alone_is_noop_without_launch(temp_tracking_dir):
+    """Outside launch mode, --continue is a silent no-op (already the default)."""
+    runner.invoke(cli, ["start", "labelA"])
+
+    result = runner.invoke(cli, [
+        "start", "labelA", "--continue"
+    ])
+
+    assert result.exit_code == 0
+    assert "Already tracking: labelA" in result.stdout
+    assert "Replaced" not in result.stdout
+
+
+def test_start_continue_has_no_effect_on_inactive_labels(temp_tracking_dir):
+    """For labels that are not yet tracked, --continue just starts them normally."""
+    result = runner.invoke(cli, [
+        "start", "labelA", "--continue", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 0
+    # --command adds 'echo' as an implicit label; both get started fresh.
+    assert "Started tracking:" in result.stdout
+    assert "labelA" in result.stdout
     assert "Running 'echo test'" in result.stdout
 @
 
@@ -3777,7 +3879,7 @@ timeout_opt = typer.Option(
          "(GNU format: 50m, 1.5h, 30s)",
 )
 wd_opt = typer.Option(
-    "--wd", "-C",
+    "--wd", "-D",
     help="Working directory for "
          "launched command",
 )
