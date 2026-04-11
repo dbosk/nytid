@@ -3577,6 +3577,97 @@ and [[--env]] flags let the user update only one side of that context.
 If several are supplied, [[--here]] simply provides defaults that the
 more specific flags can still override.
 
+\paragraph{Canonicalizing the working directory.}
+Whichever flag supplies the [[wd]] string, the resulting value is
+persisted to disk and later replayed by [[todo start]], possibly from
+a completely unrelated working directory---a systemd unit, a different
+shell, or an automation worker.  This means relative paths and [[~]]
+references must be resolved \emph{at write time}: at read time we have
+no way to reconstruct the shell cwd or the user's home directory as
+they were when the todo was created.  We therefore route every
+[[wd]]-accepting write site through a single helper, so that
+CLI-sourced strings and YAML-sourced strings from the [[--edit]] path
+both obey the same invariant---persisted [[wd]] is always an absolute,
+tilde-expanded, canonical path.
+
+Composing [[expanduser]] with [[abspath]] is idempotent on
+already-canonical paths, so the helper is safe to apply uniformly on
+both kinds of input: the shell usually expands [[~]] before the CLI
+string ever reaches Python, whereas strings typed into the YAML editor
+buffer have had no such expansion.  We reject non-string input
+defensively because our minimal YAML parser (see
+[[parse_yaml_value]]) returns an [[int]] when the user types
+[[wd: 42]], and passing that straight to [[os.path.expanduser]]
+produces a confusing [[TypeError]] from deep inside [[os.path]].  A
+clear [[typer.Exit]] surfaces the mistake at the exact line of user
+input instead.
+
+<<helpers>>=
+def canonicalize_wd(wd):
+    """Return ``wd`` as an absolute, tilde-expanded path.
+
+    Returns ``None`` for ``None`` or empty string.
+    Exits with an error on non-string, non-``None``
+    input such as an ``int`` parsed from a stray
+    ``wd: 42`` line in YAML front matter.
+    """
+    if wd is None or wd == "":
+        return None
+    if not isinstance(wd, str):
+        typer.echo(
+            f"Error: wd must be a string, "
+            f"got {type(wd).__name__}: {wd!r}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return os.path.abspath(
+        os.path.expanduser(wd)
+    )
+@
+
+Let's verify the helper handles the four interesting cases: a
+relative path resolves against the current directory, a tilde
+reference expands to the home directory, a bare tilde expands to
+the home directory on its own, and a non-string input produces a
+clean error instead of a [[TypeError]].
+
+<<test functions>>=
+def test_canonicalize_wd_resolves_relative(
+    tmp_path, monkeypatch,
+):
+    """canonicalize_wd turns '.' into an absolute path."""
+    monkeypatch.chdir(tmp_path)
+    assert canonicalize_wd(".") == str(tmp_path)
+
+
+def test_canonicalize_wd_expands_tilde():
+    """canonicalize_wd expands '~/foo' against $HOME."""
+    assert canonicalize_wd("~/foo") == os.path.join(
+        os.path.expanduser("~"), "foo",
+    )
+
+
+def test_canonicalize_wd_expands_bare_tilde():
+    """canonicalize_wd expands '~' alone to the home dir."""
+    assert canonicalize_wd("~") == os.path.expanduser("~")
+
+
+def test_canonicalize_wd_none_and_empty():
+    """canonicalize_wd returns None for None or ''."""
+    assert canonicalize_wd(None) is None
+    assert canonicalize_wd("") is None
+
+
+def test_canonicalize_wd_rejects_non_string():
+    """canonicalize_wd rejects non-string input cleanly."""
+    with pytest.raises(typer.Exit):
+        canonicalize_wd(42)
+@
+
+With the helper in place, the resolve step simply routes the CLI
+[[wd_path]] through it.  The [[os.getcwd()]] branch used by
+[[--here]] is already absolute, so it needs no wrapping.
+
 <<resolve wd and env for new todo>>=
 resolved_wd = None
 resolved_env = None
@@ -3584,7 +3675,7 @@ if here:
     resolved_wd = os.getcwd()
     resolved_env = dict(os.environ)
 if wd_path:
-    resolved_wd = os.path.abspath(wd_path)
+    resolved_wd = canonicalize_wd(wd_path)
 if capture_env:
     resolved_env = dict(os.environ)
 @
@@ -3692,7 +3783,7 @@ if estimate:
 if who:
     initial_meta["who"] = who
 if wd_path:
-    initial_meta["wd"] = os.path.abspath(wd_path)
+    initial_meta["wd"] = canonicalize_wd(wd_path)
 elif here:
     initial_meta["wd"] = os.getcwd()
 if run_command:
@@ -3705,12 +3796,12 @@ with CLI flags taking precedence where provided:
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
 meta = parsed.metadata
-resolved_wd = meta.get("wd") or (
+resolved_wd = canonicalize_wd(meta.get("wd")) or (
     os.getcwd() if here else None
 )
 resolved_env = None
 if wd_path:
-    resolved_wd = os.path.abspath(wd_path)
+    resolved_wd = canonicalize_wd(wd_path)
 if here:
     resolved_env = dict(os.environ)
 elif capture_env:
@@ -3827,7 +3918,7 @@ child_deadline = child_meta.get(
     "deadline", parent_deadline
 )
 child_who = child_meta.get("who", parent_who)
-child_wd = child_meta.get("wd")
+child_wd = canonicalize_wd(child_meta.get("wd"))
 child_env = child_meta.get("env", parent_env)
 @
 
@@ -5037,7 +5128,7 @@ if here:
     item.env = dict(os.environ)
 else:
     if wd_path:
-        item.wd = os.path.abspath(wd_path)
+        item.wd = canonicalize_wd(wd_path)
     if capture_env:
         item.env = dict(os.environ)
 if run_command is not None:
@@ -5107,7 +5198,7 @@ item.title = parsed.title
 item.notes = parsed.notes
 meta = parsed.metadata
 if "wd" in meta:
-    item.wd = meta["wd"]
+    item.wd = canonicalize_wd(meta["wd"])
 if "command" in meta:
     item.command = meta["command"]
 if "labels" in meta:
@@ -5180,7 +5271,7 @@ for i, parsed_child in enumerate(parsed.children):
         child.priority = prio
         child_meta = parsed_child.metadata
         if "wd" in child_meta:
-            child.wd = child_meta["wd"]
+            child.wd = canonicalize_wd(child_meta["wd"])
         if "command" in child_meta:
             child.command = child_meta["command"]
         if "labels" in child_meta:
@@ -5212,7 +5303,7 @@ for i, parsed_child in enumerate(parsed.children):
             parent_id=todo_id,
             who=child_meta.get("who", item.who),
             notes=parsed_child.notes,
-            wd=child_meta.get("wd"),
+            wd=canonicalize_wd(child_meta.get("wd")),
             command=child_meta.get("command"),
         )
         todos.append(new_child)
@@ -9970,6 +10061,7 @@ import os
 import pathlib
 import tempfile
 import pytest
+import typer
 from typer.testing import CliRunner
 from unittest.mock import patch, MagicMock
 
@@ -9982,6 +10074,7 @@ from nytid.cli.todo import (
     TodoItem,
     ParsedItem,
     ParsedTodo,
+    canonicalize_wd,
     effective_priority,
     load_todos,
     save_todos,
@@ -10518,6 +10611,159 @@ def test_add_here_captures_wd_and_env(temp_todo_dir):
         "HOME": "/tmp/home",
         "USER": "alice",
     }
+
+
+def test_add_cli_unexpanded_tilde_wd_canonicalizes(
+    temp_todo_dir,
+):
+    """Add --wd '~/foo' expands ~ even when the shell did not."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Tilde task",
+            "--wd", "~/foo",
+            "--top-level",
+        ],
+    )
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.join(
+        os.path.expanduser("~"), "foo",
+    )
+
+
+def test_add_edit_yaml_dot_wd_canonicalizes(
+    temp_todo_dir, tmp_path, monkeypatch,
+):
+    """Editor YAML `wd: .` resolves to the current directory."""
+    monkeypatch.chdir(tmp_path)
+    buffer = (
+        "Editor task\n"
+        "---\n"
+        "wd: .\n"
+        "---\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["add", "--edit", "--top-level"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].wd == str(tmp_path)
+
+
+def test_add_edit_yaml_tilde_wd_canonicalizes(
+    temp_todo_dir,
+):
+    """Editor YAML `wd: ~/foo` expands against $HOME."""
+    buffer = (
+        "Tilde task\n"
+        "---\n"
+        "wd: ~/foo\n"
+        "---\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["add", "--edit", "--top-level"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.join(
+        os.path.expanduser("~"), "foo",
+    )
+
+
+def test_add_edit_yaml_bare_tilde_wd_canonicalizes(
+    temp_todo_dir,
+):
+    """Editor YAML `wd: ~` expands to the home directory."""
+    buffer = (
+        "Bare tilde task\n"
+        "---\n"
+        "wd: ~\n"
+        "---\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["add", "--edit", "--top-level"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.expanduser("~")
+
+
+def test_add_edit_child_yaml_relative_wd_canonicalizes(
+    temp_todo_dir, tmp_path, monkeypatch,
+):
+    """A child's YAML `wd: .` is canonicalized like the parent's."""
+    monkeypatch.chdir(tmp_path)
+    buffer = (
+        "Parent task\n"
+        "\n"
+        "# Child task\n"
+        "---\n"
+        "wd: .\n"
+        "---\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["add", "--edit", "--top-level"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    child = next(t for t in todos if t.title == "Child task")
+    assert child.wd == str(tmp_path)
+
+
+def test_edit_editor_yaml_wd_canonicalizes(
+    temp_todo_dir, tmp_path, monkeypatch,
+):
+    """`todo edit -E` canonicalizes YAML `wd:` just like add."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    monkeypatch.chdir(tmp_path)
+    buffer = (
+        "Original\n"
+        "---\n"
+        "wd: .\n"
+        "---\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["edit", "1", "-E"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].wd == str(tmp_path)
 
 
 def test_edit_run_flag_updates_command(temp_todo_dir):
