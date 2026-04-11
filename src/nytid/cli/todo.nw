@@ -2706,25 +2706,49 @@ def stop_todo_state(todo_id, who=None):
 Completion combines resolution, marking the item done, and
 removing it from the stack in a single locked mutation.
 
+An explicit completion target needs one extra check beyond
+[[resolve_todo_id]].  Stack filtering is enough when the ID is omitted,
+but an explicit ID must still belong to the chosen worker; otherwise
+[[todo done 17]] could silently mutate another worker's task merely
+because todo IDs are global.  We therefore factor the read-only lookup
+into [[resolve_done_target]] so the preflight descendant guard and the
+locked state mutation share the same ownership rule.
+
 <<helpers>>=
+def resolve_done_target(todo_id, todos, who=None):
+    """Resolve a completion target in one worker context."""
+    resolved_id = resolve_todo_id(
+        todo_id, "mark done",
+        who=who, todos=todos,
+    )
+    item = next(
+        (t for t in todos if t.id == resolved_id),
+        None,
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{resolved_id} not found",
+            err=True,
+        )
+        raise typer.Exit(1)
+    owner = item.who or default_username
+    if who is not None and owner != who:
+        typer.echo(
+            f"Error: todo #{resolved_id} belongs to "
+            f"{owner}. Pass --who {owner} to mark done.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return resolved_id, item
+
+
 def complete_todo_state(todo_id, who=None):
     """Mark a todo done and remove it from the active stack."""
 
     def update(next_id, todos, stack):
-        resolved_id = resolve_todo_id(
-            todo_id, "mark done",
-            who=who, todos=todos,
+        resolved_id, item = resolve_done_target(
+            todo_id, todos, who=who
         )
-        item = next(
-            (t for t in todos if t.id == resolved_id),
-            None,
-        )
-        if item is None:
-            typer.echo(
-                f"Error: todo #{resolved_id} not found",
-                err=True,
-            )
-            raise typer.Exit(1)
         item.status = "done"
         stack = [sid for sid in stack if sid != resolved_id]
         return next_id, todos, stack, resolved_id, item
@@ -5735,13 +5759,26 @@ If the item has active descendants (children or deeper) on the stack,
 [[done]] refuses by default---completing a parent while children are
 still being worked on is almost always a mistake.  The [[--force]]
 flag overrides this guard: it recursively marks all active descendants
-as done, stops their tracking, and then completes the parent.
+for that worker as done, stops their tracking, and then completes the
+parent.
+
+An explicit ID still has to stay within one worker's context.
+Otherwise [[todo done 17]] could silently complete another worker's
+task merely because the ID is globally unique, and the descendant
+guard would mix that task's children with the current worker's stack
+view.  We therefore give [[done]] its own [[--who]] option: omitting
+it defaults to the current user, while completing another worker's
+item requires naming that worker explicitly.
 
 <<argument and option definitions>>=
 force_opt = typer.Option(
     "--force", "-f",
     help="Force-complete even if children are "
          "still active (marks them done too)")
+done_who_opt = typer.Option(
+    "--who", "-w",
+    help="Worker owning the todo (default: $USER)",
+    autocompletion=complete_todo_workers)
 @
 
 <<done command>>=
@@ -5750,19 +5787,24 @@ def done(
     todo_id: Annotated[Optional[int],
                        todo_id_arg] = None,
     force: Annotated[bool, force_opt] = False,
+    who: Annotated[Optional[str],
+                   done_who_opt] = default_username,
 ):
     """Mark a todo item as done.
 
-    If no ID given, completes the most recently
-    started task (top of the active stack).
+    If no ID given, completes that worker's most
+    recently started task (top of the active stack).
 
-    Refuses if the item has active children unless
-    --force is used, which also marks all descendants
-    as done.
+    When an explicit ID is given, it must belong to
+    that worker.
+
+    Refuses if the item has active children for that
+    worker unless --force is used, which also marks
+    those descendants as done.
     """
     <<guard active descendants>>
     todo_id, item, next_id, todos, stack = complete_todo_state(
-        todo_id, who=default_username
+        todo_id, who=who
     )
     typer.echo(f"Done: #{todo_id} {item.title}")
 
@@ -5838,10 +5880,59 @@ def test_done_resolves_own_worker_stack_top(
     assert "Other's task" not in result.output
 @
 
+The same worker context applies to explicit IDs.  Otherwise the command
+would accept a globally unique todo ID and mutate another worker's task
+without any explicit confirmation.
+
+<<test functions>>=
+def test_done_explicit_other_worker_requires_who(
+    temp_todo_dir,
+):
+    """Explicit done on another worker's item requires --who."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Other's task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1])
+
+    result = runner.invoke(cli, ["done", "1"])
+    assert result.exit_code == 1
+    assert (
+        "Pass --who other-worker to mark done."
+        in result.output
+    )
+
+
+def test_done_explicit_other_worker_with_who_succeeds(
+    temp_todo_dir,
+):
+    """Explicit done can target another worker when --who matches."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Other's task",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1])
+
+    result = runner.invoke(
+        cli, ["done", "1", "--who", "other-worker"]
+    )
+    assert result.exit_code == 0
+    assert "Other's task" in result.output
+@
+
 The [[--force]] guard prevents accidental completion of a parent whose
-children are still active.  Without [[--force]], the user gets a clear
-error listing the blocking children.  With [[--force]], all descendants
-are completed recursively before the parent.
+children are still active for that worker.  Without [[--force]], the
+user gets a clear error listing the blocking children.  With
+[[--force]], all of that worker's descendants are completed
+recursively before the parent.
 
 <<test functions>>=
 def test_done_refuses_parent_with_active_children(
@@ -5867,6 +5958,42 @@ def test_done_refuses_parent_with_active_children(
     result = runner.invoke(cli, ["done", "1"])
     assert result.exit_code == 1
     assert "active descendants" in result.output
+
+
+def test_done_refuses_only_own_active_descendants(
+    temp_todo_dir,
+):
+    """Done guard ignores another worker's active child."""
+    from nytid.cli.todo import default_username
+
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who=default_username,
+        ),
+        TodoItem(
+            id=2, title="My child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            who=default_username,
+        ),
+        TodoItem(
+            id=3, title="Other child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 2, 3])
+
+    result = runner.invoke(cli, ["done", "1"])
+    assert result.exit_code == 1
+    assert "#2 My child" in result.output
+    assert "#3 Other child" not in result.output
 
 
 def test_done_force_completes_descendants(
@@ -5929,6 +6056,76 @@ def test_done_without_force_on_leaf_works(
     result = runner.invoke(cli, ["done", "2"])
     assert result.exit_code == 0
     assert "Child (leaf)" in result.output
+
+
+def test_done_force_keeps_other_workers_descendants(
+    temp_todo_dir,
+):
+    """Done --force only completes descendants for one worker."""
+    from nytid.cli.track import (
+        load_active_session,
+        save_active_session,
+        ActiveSession,
+        default_username,
+    )
+
+    other_worker = "other-worker"
+    worker = default_username
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who=worker,
+        ),
+        TodoItem(
+            id=2, title="My child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            who=worker,
+        ),
+        TodoItem(
+            id=3, title="Other child",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            parent_id=1,
+            who=other_worker,
+        ),
+    ])
+    save_active_stack([1, 2, 3])
+
+    worker_session = ActiveSession()
+    worker_session.start_labels(
+        ["todo:2"],
+        datetime.datetime(2026, 2, 20, 10, 0),
+    )
+    save_active_session(worker_session, worker)
+
+    other_session = ActiveSession()
+    other_session.start_labels(
+        ["todo:3"],
+        datetime.datetime(2026, 2, 20, 10, 5),
+    )
+    save_active_session(other_session, other_worker)
+
+    result = runner.invoke(
+        cli, ["done", "1", "--force"]
+    )
+    assert result.exit_code == 0
+    assert "#2 My child" in result.output
+    assert "#3 Other child" not in result.output
+
+    _, todos = load_todos()
+    parent = next(t for t in todos if t.id == 1)
+    my_child = next(t for t in todos if t.id == 2)
+    other_child = next(t for t in todos if t.id == 3)
+    assert parent.status == "done"
+    assert my_child.status == "done"
+    assert other_child.status == "in-progress"
+    assert load_active_stack() == [3]
+    other_session = load_active_session(other_worker)
+    assert "todo:3" in other_session.get_active_labels()
 @
 
 Subitems inherit their parent's labels, so a child todo
@@ -6352,15 +6549,17 @@ rather than stopping tracking, it marks each descendant as done.
 
 <<helpers>>=
 def force_complete_descendants(
-    todo_id, todos
+    todo_id, todos, who=None
 ):
-    """Mark all active descendants as done.
+    """Mark active descendants as done.
 
     For each active descendant (depth-first): stop
     tracking, mark done, and remove from the stack.
+    When ``who`` is given, only that worker's
+    descendants are completed.
     """
     desc_ids = get_active_descendant_ids(
-        todo_id, todos
+        todo_id, todos, who=who
     )
     if not desc_ids:
         return
@@ -6396,21 +6595,20 @@ def force_complete_descendants(
 
 The guard chunk checks for active descendants before completing.  Without
 [[--force]], it lists the offending children and exits.  With [[--force]],
-it completes them all recursively before proceeding with the parent.
+it completes them recursively for the selected worker before proceeding
+with the parent.
 
 The guard must resolve the target ID first so it knows which item to
-check.  We use [[resolve_todo_id]] for that, which reads the active
-stack but does not mutate it.
+check.  We use [[resolve_done_target]] for that, which keeps the
+explicit-ID ownership rule aligned with the later locked completion.
 
 <<guard active descendants>>=
 _, preflight_todos = load_todos()
-resolved_id = resolve_todo_id(
-    todo_id, "mark done",
-    who=default_username,
-    todos=preflight_todos,
+resolved_id, _ = resolve_done_target(
+    todo_id, preflight_todos, who=who
 )
 desc_ids = get_active_descendant_ids(
-    resolved_id, preflight_todos
+    resolved_id, preflight_todos, who=who
 )
 if desc_ids and not force:
     by_id = {t.id: t for t in preflight_todos}
@@ -6434,7 +6632,7 @@ if desc_ids and not force:
     raise typer.Exit(1)
 if desc_ids and force:
     force_complete_descendants(
-        resolved_id, preflight_todos
+        resolved_id, preflight_todos, who=who
     )
 @
 
