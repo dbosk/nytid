@@ -2615,9 +2615,10 @@ def resolve_todo_from_tmux_context(
     return None
 @
 
-With that helper in place, [[resolve_todo_id]] tries the tmux context
-before falling back to the global stack top.  Outside tmux the
-behaviour is unchanged.
+With that helper in place, [[resolve_todo_id]] can resolve parallel
+ambiguity transparently: callers that already pass an explicit ID are
+unaffected, and outside tmux the stack-top fallback is still the only
+path---so no existing behaviour changes.
 
 <<helpers>>=
 def resolve_todo_id(
@@ -2628,9 +2629,11 @@ def resolve_todo_id(
     If ``todo_id`` is ``None``, use the top of the active
     stack.  When ``who`` and ``todos`` are given, only
     consider stack entries belonging to that worker.
+
     In a tmux session the current pane or window labels
     are consulted first so that parallel hierarchies
     resolve correctly.
+
     Exits with an actionable error if no active todo
     exists.
     """
@@ -2858,6 +2861,94 @@ def test_resolve_todo_from_tmux_context_deepest(
     assert result == 2
 @
 
+Stale pane labels are harmless too.  A pane may outlive the todo
+whose label it once carried, so the helper must ignore labels that no
+longer appear on the active stack rather than resurrecting completed
+work.
+
+<<test functions>>=
+def test_resolve_todo_from_tmux_context_stale_label(
+    temp_todo_dir,
+):
+    """Stale pane labels that are not on the
+    active stack are ignored."""
+
+    stack = [1, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["todo:99"],
+    ), patch(
+        "nytid.cli.track.get_current_tracked_window_id",
+        return_value=None,
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result is None
+@
+
+Stopping removes the resolved item from the stack.
+[[stop_todo_state]] cannot delegate its implicit-ID path to
+[[resolve_todo_id]] because it needs the intermediate
+[[worker_stack]] to produce a stop-specific error message
+(\enquote{No active todo.\ Specify an ID to stop.}) before the
+resolution step.  [[resolve_todo_id]] would emit a generic
+message instead.  The same tmux-context lookup applies here so
+that [[todo stop]] in a parallel window targets the correct
+hierarchy.
+
+<<helpers>>=
+def stop_todo_state(todo_id, who=None):
+    """Remove a todo from the authoritative active stack."""
+
+    def update(next_id, todos, stack):
+        if todo_id is None:
+            worker_stack = stack
+            if who is not None:
+                worker_stack = filter_ids_by_worker(
+                    todos, stack, who
+                )
+            if not worker_stack:
+                typer.echo(
+                    "No active todo. Specify an ID to stop.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            context_id = resolve_todo_from_tmux_context(
+                who or default_username,
+                worker_stack,
+            )
+            resolved_id = (
+                context_id
+                if context_id is not None
+                else worker_stack[-1]
+            )
+        else:
+            resolved_id = todo_id
+        item = next(
+            (t for t in todos if t.id == resolved_id),
+            None,
+        )
+        if item is None:
+            typer.echo(
+                f"Error: todo #{resolved_id} not found",
+                err=True,
+            )
+            raise typer.Exit(1)
+        stack = [sid for sid in stack if sid != resolved_id]
+        return next_id, todos, stack, resolved_id, item
+
+    next_id, todos, stack, resolved_id, item = apply_todo_mutation(update)
+    return resolved_id, item, next_id, todos, stack
+@
+
 The integration-level tests verify that [[todo stop]] and [[todo done]]
 use the tmux context when no explicit ID is given.  We patch
 [[resolve_todo_from_tmux_context]] directly on the todo module so the
@@ -2925,61 +3016,6 @@ def test_done_uses_tmux_context(temp_todo_dir):
     stack = load_active_stack()
     assert 1 not in stack
     assert 5 in stack
-@
-
-Stopping removes the resolved item from the stack.
-[[stop_todo_state]] cannot delegate its implicit-ID path to
-[[resolve_todo_id]] because it needs the intermediate
-[[worker_stack]] to produce a stop-specific error message
-(\enquote{No active todo.\ Specify an ID to stop.}) before the
-resolution step.  [[resolve_todo_id]] would emit a generic
-message instead.  The same tmux-context lookup applies here so
-that [[todo stop]] in a parallel window targets the correct
-hierarchy.
-
-<<helpers>>=
-def stop_todo_state(todo_id, who=None):
-    """Remove a todo from the authoritative active stack."""
-
-    def update(next_id, todos, stack):
-        if todo_id is None:
-            worker_stack = stack
-            if who is not None:
-                worker_stack = filter_ids_by_worker(
-                    todos, stack, who
-                )
-            if not worker_stack:
-                typer.echo(
-                    "No active todo. Specify an ID to stop.",
-                    err=True,
-                )
-                raise typer.Exit(1)
-            context_id = resolve_todo_from_tmux_context(
-                who or default_username,
-                worker_stack,
-            )
-            resolved_id = (
-                context_id
-                if context_id is not None
-                else worker_stack[-1]
-            )
-        else:
-            resolved_id = todo_id
-        item = next(
-            (t for t in todos if t.id == resolved_id),
-            None,
-        )
-        if item is None:
-            typer.echo(
-                f"Error: todo #{resolved_id} not found",
-                err=True,
-            )
-            raise typer.Exit(1)
-        stack = [sid for sid in stack if sid != resolved_id]
-        return next_id, todos, stack, resolved_id, item
-
-    next_id, todos, stack, resolved_id, item = apply_todo_mutation(update)
-    return resolved_id, item, next_id, todos, stack
 @
 
 Completion combines resolution, marking the item done, and
