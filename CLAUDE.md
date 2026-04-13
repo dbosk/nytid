@@ -57,11 +57,18 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 
 ### Generated vs Handwritten Files
 
-**Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`). The `.gitignore` lists all generated paths. The only handwritten Python files are:
+**Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`) **and all `tests/test_*.py` files**. The `.gitignore` (both root and `tests/.gitignore`) lists all generated paths. The only handwritten Python files are:
 - `src/nytid/__init__.py` (empty package marker)
 - `src/nytid/signup/__init__.py`
 - `src/nytid/signup/hr/timesheet/__init__.py`
 - `src/nytid/httputils.py` (legacy, unused)
+
+**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten file under `tests/` is `tests/conftest.nw` (itself a literate source). **Never edit `tests/test_*.py` directly** — edits vanish on the next `make all`, and they won't even appear in `git status` because they're gitignored. To add or modify a test:
+
+1. Grep for the test name in `src/**/*.nw` to find the literate source — or find the `<<test functions>>=` chunk near the feature the test covers (tests are colocated with the feature they verify).
+2. Edit the `.nw` file.
+3. Run `make all` to regenerate `tests/test_*.py`.
+4. Then run `pytest`.
 
 ### Documentation and Source Relationship
 
@@ -168,7 +175,7 @@ When a code chunk is defined in multiple concatenated blocks (e.g., `<<options f
 
 ### Test Organization
 
-Tests should appear AFTER the functionality they verify:
+Tests live in `<<test functions>>=` chunks inside the same `.nw` file as the feature they verify, and should appear AFTER the functionality they verify:
 
 ```noweb
 \section{Feature Implementation}
@@ -183,6 +190,8 @@ def test_feature_x():
     assert feature_x() == expected
 @
 ```
+
+At build time, all `<<test functions>>=` chunks from a feature `.nw` file are concatenated and tangled into a single `tests/test_<module>.py` file (e.g. `src/nytid/cli/track.nw` → `tests/test_clitrack.py`). **That generated file is gitignored and will be overwritten by `make all`** — see "Generated vs Handwritten Files" above for the consequences.
 
 ### Workflow for Modifying .nw Files
 
@@ -332,6 +341,7 @@ git add src/module.py   # Generated from .nw - DO NOT COMMIT
 ### Test Failures
 - Canvas/LADOK credential failures: Expected in development environments
 - AFS permission errors: Expected when AFS is not available
+- **Test edits seem to disappear after `make all`**: You were editing a generated file. `tests/test_*.py` are tangled from `<<test functions>>=` chunks in `src/**/*.nw`. Grep for the test name in `src/` to find the literate source and edit there instead. See "Generated vs Handwritten Files" above.
 
 ### CLI Warnings
 - Syntax warnings about invalid escape sequences: Non-critical
