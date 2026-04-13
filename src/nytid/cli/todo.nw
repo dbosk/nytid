@@ -2529,6 +2529,96 @@ the active stack.  Because the stack is global (shared across workers),
 items belonging to that worker.  This prevents one worker's [[todo stop]]
 from accidentally targeting another worker's active item.
 
+When multiple independent hierarchies are active in parallel---for
+example, one todo tree in tmux window~A and a different one in
+window~B---the global stack top is ambiguous.  The tracking system
+already stores [[todo:<id>]] labels per tmux pane and window (see
+\cref{track:window-auto-suspend}), so we can consult those labels to
+determine which hierarchy the user is working in \emph{right now}.
+
+[[resolve_todo_from_tmux_context]] reads the current pane's labels
+first (most specific), then falls back to the tracked window's labels.
+It extracts [[todo:<id>]] entries, intersects them with the active
+stack, and returns the one that appears last in stack order---the
+deepest child in the current context.  If the process is not running
+inside tmux, or no labels match, it returns [[None]] and the caller
+falls back to the plain stack top.
+
+<<helpers>>=
+def resolve_todo_from_tmux_context(
+    who, stack,
+):
+    """Return the active todo ID for the current tmux
+    context, or ``None`` if unavailable.
+
+    Reads ``todo:<id>`` labels from the current pane
+    or tracked window and returns the one deepest in
+    the active stack.
+    """
+    try:
+        from nytid.cli.track import (
+            get_current_tmux_server_key,
+            read_pane_labels,
+            read_window_labels,
+            get_current_tracked_window_id,
+        )
+    except ImportError:
+        return None
+
+    server_key = get_current_tmux_server_key()
+    if server_key is None:
+        return None
+
+    stack_set = set(stack)
+
+    def extract_todo_ids(labels):
+        """Parse todo IDs from labels, keep those on stack."""
+        if labels is None:
+            return []
+        ids = []
+        for label in labels:
+            if label.startswith("todo:"):
+                try:
+                    tid = int(label[5:])
+                except ValueError:
+                    continue
+                if tid in stack_set:
+                    ids.append(tid)
+        return ids
+
+    pane_id = os.environ.get("TMUX_PANE")
+    if pane_id:
+        pane_labels = read_pane_labels(
+            pane_id, who, server_key,
+        )
+        candidates = extract_todo_ids(pane_labels)
+        if candidates:
+            return max(
+                candidates,
+                key=lambda tid: stack.index(tid),
+            )
+
+    window_id = get_current_tracked_window_id(
+        who, server_key,
+    )
+    if window_id:
+        win_labels = read_window_labels(
+            window_id, who, server_key,
+        )
+        candidates = extract_todo_ids(win_labels)
+        if candidates:
+            return max(
+                candidates,
+                key=lambda tid: stack.index(tid),
+            )
+
+    return None
+@
+
+With that helper in place, [[resolve_todo_id]] tries the tmux context
+before falling back to the global stack top.  Outside tmux the
+behaviour is unchanged.
+
 <<helpers>>=
 def resolve_todo_id(
     todo_id, action, who=None, todos=None
@@ -2538,6 +2628,9 @@ def resolve_todo_id(
     If ``todo_id`` is ``None``, use the top of the active
     stack.  When ``who`` and ``todos`` are given, only
     consider stack entries belonging to that worker.
+    In a tmux session the current pane or window labels
+    are consulted first so that parallel hierarchies
+    resolve correctly.
     Exits with an actionable error if no active todo
     exists.
     """
@@ -2556,6 +2649,13 @@ def resolve_todo_id(
             err=True,
         )
         raise typer.Exit(1)
+
+    context_id = resolve_todo_from_tmux_context(
+        who or default_username, stack,
+    )
+    if context_id is not None:
+        return context_id
+
     return stack[-1]
 @
 
@@ -2658,13 +2758,184 @@ def activate_todo_state(todo_id, who=None):
     return resolved_id, item, next_id, todos, stack
 @
 
+Let's verify that the tmux context resolution picks the right todo when
+multiple independent hierarchies are active.  With stack [[1, 5, 3]]
+and pane labels containing [[todo:5]], the resolution should return~5
+even though~3 is the global stack top.
+
+<<test functions>>=
+def test_resolve_todo_from_tmux_context_pane(
+    temp_todo_dir,
+):
+    """Pane labels select the correct todo from
+    the active stack, not the global top."""
+
+    stack = [1, 5, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["DD1310", "todo:5"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 5
+
+
+def test_resolve_todo_from_tmux_context_window(
+    temp_todo_dir,
+):
+    """When no pane labels exist, fall back to
+    tracked window labels."""
+
+    stack = [1, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.get_current_tracked_window_id",
+        return_value="@1",
+    ), patch(
+        "nytid.cli.track.read_window_labels",
+        return_value=["todo:3"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 3
+
+
+def test_resolve_todo_from_tmux_context_no_tmux(
+    temp_todo_dir,
+):
+    """Outside tmux the helper returns None."""
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value=None,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", [1, 2],
+        )
+
+    assert result is None
+
+
+def test_resolve_todo_from_tmux_context_deepest(
+    temp_todo_dir,
+):
+    """When pane has parent and child labels, pick the
+    deepest (last in stack order)."""
+
+    stack = [1, 2]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["todo:1", "todo:2"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 2
+@
+
+The integration-level tests verify that [[todo stop]] and [[todo done]]
+use the tmux context when no explicit ID is given.  We patch
+[[resolve_todo_from_tmux_context]] directly on the todo module so the
+full command path exercises the real stack mutation while the tmux
+lookup is deterministic.
+
+<<test functions>>=
+def test_stop_uses_tmux_context(temp_todo_dir):
+    """todo stop without ID targets the context todo,
+    not the global stack top."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(cli, ["stop"])
+
+    assert result.exit_code == 0
+    assert "#1 Tree A root" in result.output
+
+    stack = load_active_stack()
+    assert 1 not in stack
+    assert 5 in stack
+
+
+def test_done_uses_tmux_context(temp_todo_dir):
+    """todo done without ID targets the context todo."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(cli, ["done"])
+
+    assert result.exit_code == 0
+    assert "#1" in result.output
+
+    stack = load_active_stack()
+    assert 1 not in stack
+    assert 5 in stack
+@
+
 Stopping removes the resolved item from the stack.
 [[stop_todo_state]] cannot delegate its implicit-ID path to
 [[resolve_todo_id]] because it needs the intermediate
 [[worker_stack]] to produce a stop-specific error message
 (\enquote{No active todo.\ Specify an ID to stop.}) before the
 resolution step.  [[resolve_todo_id]] would emit a generic
-message instead.
+message instead.  The same tmux-context lookup applies here so
+that [[todo stop]] in a parallel window targets the correct
+hierarchy.
 
 <<helpers>>=
 def stop_todo_state(todo_id, who=None):
@@ -2683,7 +2954,15 @@ def stop_todo_state(todo_id, who=None):
                     err=True,
                 )
                 raise typer.Exit(1)
-            resolved_id = worker_stack[-1]
+            context_id = resolve_todo_from_tmux_context(
+                who or default_username,
+                worker_stack,
+            )
+            resolved_id = (
+                context_id
+                if context_id is not None
+                else worker_stack[-1]
+            )
         else:
             resolved_id = todo_id
         item = next(
@@ -10413,6 +10692,7 @@ from nytid.cli.todo import (
     read_detached_exit_code,
     parse_timeout,
     append_note_to_item,
+    resolve_todo_from_tmux_context,
 )
 
 runner = CliRunner()
