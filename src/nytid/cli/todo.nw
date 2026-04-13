@@ -1160,7 +1160,9 @@ The [[next]] command and the cron script both need to find the
 highest-priority pending task, optionally scoped to a specific
 parent.  Extracting this into a function (rather than a reusable
 chunk) makes the dependency on [[todos]] and [[who]] explicit
-through parameters:
+through parameters.  The worker filter follows the same backward-
+compatibility rule as the active stack: older items with [[who=None]]
+still count as belonging to [[default_username]].
 
 <<sub-item helpers>>=
 def find_pending_by_priority(
@@ -1171,6 +1173,7 @@ def find_pending_by_priority(
     """Find highest-priority pending task.
 
     Optionally filtered by assignee regex and parent.
+    Treats ``who=None`` as ``default_username``.
     Returns None if no matching task is found.
     """
     candidates = [
@@ -1182,7 +1185,9 @@ def find_pending_by_priority(
     if who:
         candidates = [
             t for t in candidates
-            if t.who and re.search(who, t.who)
+            if re.search(
+                who, t.who or default_username
+            )
         ]
     candidates.sort(
         key=effective_priority, reverse=True
@@ -1198,6 +1203,13 @@ leaf: the active todo for the current tmux and worker context.  Keeping
 those helpers separate prevents the old single-chain model from leaking
 back in.
 
+For commands that operate on the current user's own work, the fallback
+must prefer that worker's active entry outside tmux when one exists.
+Otherwise another worker's later stack entry would steal implicit
+resolution for [[next]], [[add]], or [[import]].  But we cannot require
+such an entry: when only one foreign-worker task is active, the old
+single-stack behaviour should still resolve to that task.
+
 <<sub-item helpers>>=
 def get_active_todos(
     todos: List[TodoItem],
@@ -1210,26 +1222,35 @@ def get_active_todos(
 
 def get_current_context_todo(
     todos: List[TodoItem],
-    who: Optional[str] = None,
+    who: Optional[str] = default_username,
 ) -> Optional[TodoItem]:
     """Return the active todo for the current context.
 
     When tmux labels identify one of several parallel active
     hierarchies, return the deepest active todo in that context.
-    Otherwise fall back to the active-stack top.
+    Otherwise prefer that worker's active-stack top, and
+    fall back to the plain active-stack top when the
+    worker has no active entry.
     """
     by_id = {item.id: item for item in todos}
     stack = load_active_stack()
-    if who is not None:
-        stack = filter_ids_by_worker(todos, stack, who)
     if not stack:
         return None
     context_id = resolve_todo_from_tmux_context(
         who or default_username, stack,
     )
-    resolved_id = (
-        context_id if context_id is not None else stack[-1]
-    )
+    if context_id is not None:
+        resolved_id = context_id
+    elif who is not None:
+        worker_stack = filter_ids_by_worker(
+            todos, stack, who,
+        )
+        resolved_id = (
+            worker_stack[-1]
+            if worker_stack else stack[-1]
+        )
+    else:
+        resolved_id = stack[-1]
     return by_id.get(resolved_id)
 @
 
@@ -2712,14 +2733,19 @@ def apply_todo_mutation(callback):
 The next two helpers are read-only policy operations. One picks the
 best top-level candidate when [[todo next]] has no active parent; the
 other renders the active stack as a forest based on real
-[[parent_id]] relationships rather than raw stack position.
+[[parent_id]] relationships rather than raw stack position.  We apply
+the same legacy-worker rule here too, so older top-level items without
+an explicit [[who]] remain visible to the default user.
 
 <<helpers>>=
 def get_top_level_pending_by_priority(
     todos: List[TodoItem],
     who: Optional[str] = None,
 ) -> Optional[TodoItem]:
-    """Return the highest-priority pending top-level todo."""
+    """Return the highest-priority pending top-level todo.
+
+    Treats ``who=None`` as ``default_username``.
+    """
     candidates = [
         item for item in todos
         if item.parent_id is None and item.status == "pending"
@@ -2727,7 +2753,9 @@ def get_top_level_pending_by_priority(
     if who:
         candidates = [
             item for item in candidates
-            if item.who and re.search(who, item.who)
+            if re.search(
+                who, item.who or default_username
+            )
         ]
     candidates.sort(
         key=effective_priority, reverse=True
@@ -7674,6 +7702,72 @@ def test_next_uses_tmux_context_for_parallel_branches(
     assert "Tree B child" not in result.output
 
 
+def test_next_falls_back_to_current_worker_branch(
+    temp_todo_dir,
+):
+    """Outside tmux, next ignores another worker's later
+    stack entry."""
+    save_todos(7, [
+        TodoItem(
+            id=1, title="My root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="My child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            priority=5.0,
+        ),
+        TodoItem(
+            id=5, title="Other root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="other-worker",
+        ),
+        TodoItem(
+            id=6, title="Other child",
+            created="2026-02-20T10:00:00",
+            parent_id=5,
+            priority=9.0,
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    result = runner.invoke(cli, ["next"])
+
+    assert result.exit_code == 0
+    assert "My child" in result.output
+    assert "Other child" not in result.output
+
+
+def test_next_treats_legacy_top_level_items_as_current_worker(
+    temp_todo_dir,
+):
+    """Outside tmux, next still sees legacy top-level items
+    as belonging to the current worker."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="My top-level",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="Other top-level",
+            created="2026-02-20T10:00:00",
+            priority=9.0,
+            who="other-worker",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["next"])
+
+    assert result.exit_code == 0
+    assert "My top-level" in result.output
+    assert "Other top-level" not in result.output
+
+
 def test_next_silent_when_nothing_pending(temp_todo_dir):
     """next warns and exits non-zero if no work matches."""
     save_todos(1, [])
@@ -10403,6 +10497,67 @@ def test_import_auto_parents_under_tmux_context_todo(
     assert child.labels == ["course", "owner/repo"]
 
 
+def test_import_auto_parent_stays_on_current_worker_branch(
+    temp_todo_dir,
+):
+    """Import ignores another worker's later stack entry
+    outside tmux."""
+    save_todos(6, [
+        TodoItem(
+            id=1,
+            title="My root",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["mine"],
+        ),
+        TodoItem(
+            id=5,
+            title="Other root",
+            priority=4.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["other"],
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 8,
+            "title": "Imported on my branch",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 My root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos
+        if t.title == "Imported on my branch"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["mine", "owner/repo"]
+
+
 def test_import_top_level_overrides_auto_parenting(
     temp_todo_dir,
 ):
@@ -11130,6 +11285,48 @@ def test_add_auto_parents_under_tmux_context_todo(
     )
     assert child.parent_id == 1
     assert child.labels == ["course"]
+
+
+def test_add_auto_parent_stays_on_current_worker_branch(
+    temp_todo_dir,
+):
+    """add ignores another worker's later stack entry
+    outside tmux."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="My root",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["mine"],
+        ),
+        TodoItem(
+            id=5, title="Other root",
+            priority=4.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["other"],
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "My child",
+            "--prio", "4.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 My root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos if t.title == "My child"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["mine"]
 
 
 def test_add_append_uses_base_priority_not_deadline_boost(
