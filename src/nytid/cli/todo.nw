@@ -1160,7 +1160,9 @@ The [[next]] command and the cron script both need to find the
 highest-priority pending task, optionally scoped to a specific
 parent.  Extracting this into a function (rather than a reusable
 chunk) makes the dependency on [[todos]] and [[who]] explicit
-through parameters:
+through parameters.  The worker filter follows the same backward-
+compatibility rule as the active stack: older items with [[who=None]]
+still count as belonging to [[default_username]].
 
 <<sub-item helpers>>=
 def find_pending_by_priority(
@@ -1171,6 +1173,7 @@ def find_pending_by_priority(
     """Find highest-priority pending task.
 
     Optionally filtered by assignee regex and parent.
+    Treats ``who=None`` as ``default_username``.
     Returns None if no matching task is found.
     """
     candidates = [
@@ -1182,7 +1185,9 @@ def find_pending_by_priority(
     if who:
         candidates = [
             t for t in candidates
-            if t.who and re.search(who, t.who)
+            if re.search(
+                who, t.who or default_username
+            )
         ]
     candidates.sort(
         key=effective_priority, reverse=True
@@ -1190,30 +1195,74 @@ def find_pending_by_priority(
     return candidates[0] if candidates else None
 @
 
-Auto-parenting and status reporting both need a consistent view of the
-active hierarchy.  Since the active stack is authoritative, these
-helpers read only the stack and never infer activity from the stored
-[[status]] field:
+Status reporting and auto-parenting both read the authoritative active
+stack, but they need different views of it.  [[status]] needs every
+active item in stack order so it can render a forest of active
+hierarchies.  [[next]], [[add]], and [[import]] instead need a single
+leaf: the active todo for the current tmux and worker context.  Keeping
+those helpers separate prevents the old single-chain model from leaking
+back in.
+
+For commands that operate on the current user's own work, the fallback
+must prefer that worker's active entry outside tmux when one exists.
+Otherwise another worker's later stack entry would steal implicit
+resolution for [[next]], [[add]], or [[import]].  But we cannot require
+such an entry: when only one foreign-worker task is active, the old
+single-stack behaviour should still resolve to that task.
 
 <<sub-item helpers>>=
-def get_active_todo_hierarchy(
+def get_active_todos(
     todos: List[TodoItem],
 ) -> List[TodoItem]:
-    """Return the active todo chain from root to leaf."""
+    """Return active todos in normalized stack order."""
     by_id = {item.id: item for item in todos}
     stack = load_active_stack()
     return [by_id[todo_id] for todo_id in stack if todo_id in by_id]
 
 
-def get_currently_tracked_todo(
+def get_current_context_todo(
     todos: List[TodoItem],
+    who: Optional[str] = default_username,
 ) -> Optional[TodoItem]:
-    """Find the innermost active todo for auto-parenting.
+    """Return the active todo for the current context.
 
-    Uses the active stack (top = most recently started).
+    When tmux labels identify one of several parallel active
+    hierarchies, return the deepest active todo in that context.
+    Inside tmux without a tracked local todo, return
+    ``None`` rather than inheriting another window's
+    branch. Outside tmux, catch the tmux-specific
+    lookup error and prefer that worker's active-stack
+    top, falling back to the plain active-stack top
+    when the worker has no active entry.
     """
-    active = get_active_todo_hierarchy(todos)
-    return active[-1] if active else None
+    by_id = {item.id: item for item in todos}
+    stack = load_active_stack()
+    if not stack:
+        return None
+    try:
+        context_id = resolve_todo_from_tmux_context(
+            who or default_username, stack,
+        )
+    except NotInTmuxError:
+        context_id = None
+        in_tmux = False
+    else:
+        in_tmux = True
+    if in_tmux and context_id is None:
+        return None
+    if context_id is not None:
+        resolved_id = context_id
+    elif who is not None:
+        worker_stack = filter_ids_by_worker(
+            todos, stack, who,
+        )
+        resolved_id = (
+            worker_stack[-1]
+            if worker_stack else stack[-1]
+        )
+    else:
+        resolved_id = stack[-1]
+    return by_id.get(resolved_id)
 @
 
 \subsection{Testing Sub-item Helpers}
@@ -2507,9 +2556,13 @@ def gh_close_pr(repo, number):
 @
 
 Several commands share the same convention as [[view]] and [[done]]:
-an explicit ID wins, otherwise we act on the top of the active stack.
+an explicit ID wins, otherwise we act on the current active todo.
+When tmux labels identify one of several parallel hierarchies, that
+means the current context's todo.  Outside tmux we still fall back to
+the worker's active-stack top, but inside tmux an untracked pane or
+window must not silently borrow another branch's active item.
 Extracting that policy into a helper keeps the user-facing error
-message consistent and avoids three copies of the same stack lookup.
+message consistent and avoids three copies of the same lookup.
 
 Commands that modify both todos and the active stack should do so under
 one lock.  These helpers keep that pattern concise and make the active
@@ -2522,29 +2575,163 @@ rendering the current hierarchy.  Third, state-changing wrappers for the
 common transitions activate, stop, and complete, so command bodies can
 state their intent directly.
 
-When no explicit ID is given, stack-based commands resolve to the top of
-the active stack.  Because the stack is global (shared across workers),
-[[resolve_todo_id]] accepts an optional [[who]] together with the full
-[[todos]] list and uses [[filter_ids_by_worker]] to narrow the stack to
-items belonging to that worker.  This prevents one worker's [[todo stop]]
-from accidentally targeting another worker's active item.
+When no explicit ID is given, stack-based commands resolve to the
+current active todo.  Because the stack is global (shared across
+workers), [[resolve_todo_id]] accepts an optional [[who]] together with
+the full [[todos]] list and uses [[filter_ids_by_worker]] to narrow the
+stack to items belonging to that worker.  This prevents one worker's
+[[todo stop]] from accidentally targeting another worker's active item.
+
+When multiple independent hierarchies are active in parallel---for
+example, one todo tree in tmux window~A and a different one in
+window~B---the global stack top is ambiguous.  The tracking system
+already stores [[todo:<id>]] labels per tmux pane and window (see
+\cref{track:window-auto-suspend}), so we can consult those labels to
+determine which hierarchy the user is working in \emph{right now}.
+
+[[resolve_todo_from_tmux_context]] reads the current pane's labels
+first (most specific), then falls back to the tracked window's labels.
+It extracts [[todo:<id>]] entries, intersects them with the active
+stack, and returns the one that appears last in stack order.  Because
+the stack grows by pushing children after their parents---the only way
+it is mutated---the latest stack position is also the deepest child in
+the current context.  If that invariant ever weakens, this helper
+still has a well-defined answer (latest push wins), but callers that
+really need the hierarchy leaf should instead rebuild from
+[[parent_id]] the way [[render_active_todo_forest]] does.
+
+The earlier empty-list sentinel did encode the three states we needed,
+but it did so by overloading the return type: callers had to remember
+that this helper returned either an integer, [[None]], or a list that
+was only ever meaningful when empty.  That made the low-level tmux
+helper harder to read than the policy code built on top of it.
+
+We now move the distinction to a cleaner boundary.  This helper is
+specifically about tmux-local context, so being outside tmux is
+exceptional for [[resolve_todo_from_tmux_context]] even though it is
+perfectly normal for the CLI as a whole.  The helper therefore raises a
+dedicated error outside tmux, returns [[None]] when tmux is active but
+this pane/window has no matching tracked todo, and returns an integer
+when it resolves a local active todo.  That keeps the return type
+coherent while still preserving all three states.  Higher-level helpers
+then catch the exception and apply their own policy: branch-context
+commands fall back to the ordinary stack outside tmux, while tmux
+sessions with no local context remain intentionally local.
+
+<<helpers>>=
+class NotInTmuxError(RuntimeError):
+    """Raised when tmux-local context is requested outside tmux."""
+
+
+def resolve_todo_from_tmux_context(
+    who, stack,
+):
+    """Return the tmux-local active todo ID.
+
+    Reads ``todo:<id>`` labels from the current pane
+    or tracked window and returns the one that appears
+    latest in the active stack (by stack position).
+
+    Raises ``NotInTmuxError`` outside tmux.  Inside
+    tmux, returns ``None`` when the current pane or
+    tracked window has no matching ``todo:<id>``
+    label, and otherwise returns the integer todo ID.
+    """
+    try:
+        from nytid.cli.track import (
+            get_current_tmux_server_key,
+            read_pane_labels,
+            read_window_labels,
+            get_current_tracked_window_id,
+        )
+    except ImportError:
+        raise NotInTmuxError()
+
+    server_key = get_current_tmux_server_key()
+    if server_key is None:
+        raise NotInTmuxError()
+
+    stack_set = set(stack)
+
+    def extract_todo_ids(labels):
+        """Parse todo IDs from labels, keep those on stack."""
+        if labels is None:
+            return []
+        ids = []
+        for label in labels:
+            if label.startswith("todo:"):
+                try:
+                    tid = int(label[5:])
+                except ValueError:
+                    continue
+                if tid in stack_set:
+                    ids.append(tid)
+        return ids
+
+    pane_id = os.environ.get("TMUX_PANE")
+    if pane_id:
+        pane_labels = read_pane_labels(
+            pane_id, who, server_key,
+        )
+        candidates = extract_todo_ids(pane_labels)
+        if candidates:
+            return max(
+                candidates,
+                key=lambda tid: stack.index(tid),
+            )
+
+    window_id = get_current_tracked_window_id(
+        who, server_key,
+    )
+    if window_id:
+        win_labels = read_window_labels(
+            window_id, who, server_key,
+        )
+        candidates = extract_todo_ids(win_labels)
+        if candidates:
+            return max(
+                candidates,
+                key=lambda tid: stack.index(tid),
+            )
+
+    return None
+@
+
+With that helper in place, [[resolve_todo_id]] can resolve parallel
+ambiguity transparently: callers that already pass an explicit ID are
+unaffected.  This helper is the right place to centralize the implicit
+single-item policy because all of [[view]], [[edit]], [[start]],
+[[done]], [[note]], and friends mean the same thing when no ID is given:
+\enquote{use the active todo if there is one; otherwise tell me to be
+explicit}.  Outside tmux we catch the tmux-specific exception and fall
+back to the stack top.  Inside tmux, however, [[None]] now means
+something more precise: the current pane/window has no local tracked
+todo, so there is no implicit item to act on here.
 
 <<helpers>>=
 def resolve_todo_id(
-    todo_id, action, who=None, todos=None
+    todo_id, action, who=None, todos=None, stack=None
 ):
-    """Return an explicit todo ID or the active stack top.
+    """Return an explicit todo ID or current active todo.
 
-    If ``todo_id`` is ``None``, use the top of the active
-    stack.  When ``who`` and ``todos`` are given, only
+    If ``todo_id`` is ``None``, use the current active
+    todo.  When ``who`` and ``todos`` are given, only
     consider stack entries belonging to that worker.
+    When ``stack`` is given, reuse it instead of
+    reloading the authoritative state.
+
+    In a tmux session the current pane or window labels
+    are consulted first so that parallel hierarchies
+    resolve correctly.
+
     Exits with an actionable error if no active todo
     exists.
     """
     if todo_id is not None:
         return todo_id
 
-    stack = load_active_stack()
+    if stack is None:
+        stack = load_active_stack()
     if who is not None and todos is not None:
         stack = filter_ids_by_worker(
             todos, stack, who
@@ -2556,6 +2743,26 @@ def resolve_todo_id(
             err=True,
         )
         raise typer.Exit(1)
+
+    try:
+        context_id = resolve_todo_from_tmux_context(
+            who or default_username, stack,
+        )
+    except NotInTmuxError:
+        context_id = None
+        in_tmux = False
+    else:
+        in_tmux = True
+    if in_tmux and context_id is None:
+        typer.echo(
+            "No active todo. "
+            f"Specify an ID to {action}.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if context_id is not None:
+        return context_id
+
     return stack[-1]
 @
 
@@ -2588,15 +2795,20 @@ def apply_todo_mutation(callback):
 
 The next two helpers are read-only policy operations. One picks the
 best top-level candidate when [[todo next]] has no active parent; the
-other turns the authoritative stack into the nested text shown by
-[[todo status]].
+other renders the active stack as a forest based on real
+[[parent_id]] relationships rather than raw stack position.  We apply
+the same legacy-worker rule here too, so older top-level items without
+an explicit [[who]] remain visible to the default user.
 
 <<helpers>>=
 def get_top_level_pending_by_priority(
     todos: List[TodoItem],
     who: Optional[str] = None,
 ) -> Optional[TodoItem]:
-    """Return the highest-priority pending top-level todo."""
+    """Return the highest-priority pending top-level todo.
+
+    Treats ``who=None`` as ``default_username``.
+    """
     candidates = [
         item for item in todos
         if item.parent_id is None and item.status == "pending"
@@ -2604,7 +2816,9 @@ def get_top_level_pending_by_priority(
     if who:
         candidates = [
             item for item in candidates
-            if item.who and re.search(who, item.who)
+            if re.search(
+                who, item.who or default_username
+            )
         ]
     candidates.sort(
         key=effective_priority, reverse=True
@@ -2612,14 +2826,35 @@ def get_top_level_pending_by_priority(
     return candidates[0] if candidates else None
 
 
-def render_active_todo_hierarchy(
+def render_active_todo_forest(
     items: List[TodoItem],
 ) -> List[str]:
-    """Render the active hierarchy as indented status lines."""
-    return [
-        f"{'  ' * (depth + 1)}#{item.id} {item.title} [{item.status}]"
-        for depth, item in enumerate(items)
-    ]
+    """Render active todos as an indented forest."""
+    order = {
+        item.id: index for index, item in enumerate(items)
+    }
+    children_by_parent = {}
+    for item in items:
+        children_by_parent.setdefault(
+            item.parent_id, []
+        ).append(item)
+    for children in children_by_parent.values():
+        children.sort(key=lambda item: order[item.id])
+
+    lines = []
+
+    def render_tree(item: TodoItem, depth: int):
+        lines.append(
+            f"{'  ' * (depth + 1)}"
+            f"#{item.id} {item.title} [{item.status}]"
+        )
+        for child in children_by_parent.get(item.id, []):
+            render_tree(child, depth + 1)
+
+    for root in get_visible_roots(items):
+        render_tree(root, 0)
+
+    return lines
 @
 
 The final trio are state transitions. Each one performs just one kind
@@ -2627,9 +2862,9 @@ of stack mutation and returns both the resolved item and the normalized
 state that follows from it. This keeps the command bodies declarative:
 [[start]] activates, [[stop]] pauses, and [[done]] completes.
 
-Activation resolves the ID (falling back to the worker's stack top
-when [[who]] is given), verifies the item exists, and pushes it onto
-the shared stack.
+Activation resolves the ID (falling back to the current worker/tmux
+context when [[who]] is given), verifies the item exists, and pushes it
+onto the shared stack.
 
 <<helpers>>=
 def activate_todo_state(todo_id, who=None):
@@ -2658,34 +2893,188 @@ def activate_todo_state(todo_id, who=None):
     return resolved_id, item, next_id, todos, stack
 @
 
+Let's verify that the tmux context resolution picks the right todo when
+multiple independent hierarchies are active.  With stack [[1, 5, 3]]
+and pane labels containing [[todo:5]], the resolution should return~5
+even though~3 is the global stack top.
+
+<<test functions>>=
+def test_resolve_todo_from_tmux_context_pane(
+    temp_todo_dir,
+):
+    """Pane labels select the correct todo from
+    the active stack, not the global top."""
+
+    stack = [1, 5, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["DD1310", "todo:5"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 5
+
+
+def test_resolve_todo_from_tmux_context_window(
+    temp_todo_dir,
+):
+    """When no pane labels exist, fall back to
+    tracked window labels."""
+
+    stack = [1, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.get_current_tracked_window_id",
+        return_value="@1",
+    ), patch(
+        "nytid.cli.track.read_window_labels",
+        return_value=["todo:3"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 3
+
+
+def test_resolve_todo_from_tmux_context_no_tmux(
+    temp_todo_dir,
+):
+    """Outside tmux the helper raises a tmux-specific error."""
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value=None,
+    ):
+        with pytest.raises(NotInTmuxError):
+            resolve_todo_from_tmux_context(
+                "dan-claude", [1, 2],
+            )
+
+
+def test_resolve_todo_from_tmux_context_untracked_tmux(
+    temp_todo_dir,
+):
+    """Inside tmux without tracked labels, return None."""
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.get_current_tracked_window_id",
+        return_value=None,
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", [1, 2],
+        )
+
+    assert result is None
+
+
+def test_resolve_todo_from_tmux_context_deepest(
+    temp_todo_dir,
+):
+    """When pane has parent and child labels, pick the
+    deepest (last in stack order)."""
+
+    stack = [1, 2]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["todo:1", "todo:2"],
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result == 2
+@
+
+Stale pane labels are harmless too.  A pane may outlive the todo whose
+label it once carried, so the helper must ignore labels that no longer
+appear on the active stack rather than resurrecting completed work.
+Because tmux is still active in that situation, the result is still
+[[None]]: there is no local context here, even though tmux itself is
+present.
+
+<<test functions>>=
+def test_resolve_todo_from_tmux_context_stale_label(
+    temp_todo_dir,
+):
+    """Stale pane labels that are not on the
+    active stack are ignored."""
+
+    stack = [1, 3]
+
+    with patch(
+        "nytid.cli.track.get_current_tmux_server_key",
+        return_value="server0",
+    ), patch(
+        "nytid.cli.track.read_pane_labels",
+        return_value=["todo:99"],
+    ), patch(
+        "nytid.cli.track.get_current_tracked_window_id",
+        return_value=None,
+    ), patch.dict(
+        os.environ, {"TMUX_PANE": "%0"}, clear=False,
+    ):
+        result = resolve_todo_from_tmux_context(
+            "dan-claude", stack,
+        )
+
+    assert result is None
+@
+
 Stopping removes the resolved item from the stack.
-[[stop_todo_state]] cannot delegate its implicit-ID path to
-[[resolve_todo_id]] because it needs the intermediate
-[[worker_stack]] to produce a stop-specific error message
-(\enquote{No active todo.\ Specify an ID to stop.}) before the
-resolution step.  [[resolve_todo_id]] would emit a generic
-message instead.
+Earlier versions duplicated the tmux-context logic here because
+[[resolve_todo_id]] always reloaded the stack for itself.  That forced
+[[stop_todo_state]] to reimplement the same policy inside the locked
+mutation callback so it could resolve against the in-memory stack it had
+already loaded.  Once [[resolve_todo_id]] accepts an optional [[stack]],
+that duplication is no longer necessary.
+
+This works better for two reasons.  First, [[stop]] now shares the same
+implicit-ID policy as the other single-item commands: outside tmux it may
+fall back to the stack, but inside tmux an untracked pane/window has no
+implicit active todo.  Second, it still resolves against the authoritative
+locked state, so we do not reintroduce the race that motivated
+[[mutate_todo_state]] in the first place.
 
 <<helpers>>=
 def stop_todo_state(todo_id, who=None):
     """Remove a todo from the authoritative active stack."""
 
     def update(next_id, todos, stack):
-        if todo_id is None:
-            worker_stack = stack
-            if who is not None:
-                worker_stack = filter_ids_by_worker(
-                    todos, stack, who
-                )
-            if not worker_stack:
-                typer.echo(
-                    "No active todo. Specify an ID to stop.",
-                    err=True,
-                )
-                raise typer.Exit(1)
-            resolved_id = worker_stack[-1]
-        else:
-            resolved_id = todo_id
+        resolved_id = resolve_todo_id(
+            todo_id, "stop", who=who,
+            todos=todos, stack=stack,
+        )
         item = next(
             (t for t in todos if t.id == resolved_id),
             None,
@@ -2701,6 +3090,108 @@ def stop_todo_state(todo_id, who=None):
 
     next_id, todos, stack, resolved_id, item = apply_todo_mutation(update)
     return resolved_id, item, next_id, todos, stack
+@
+
+The integration-level tests verify that [[todo stop]] and [[todo done]]
+use the tmux context when no explicit ID is given.  We patch
+[[resolve_todo_from_tmux_context]] directly on the todo module so the
+full command path exercises the real stack mutation while the tmux
+lookup is deterministic.
+
+<<test functions>>=
+def test_stop_uses_tmux_context(temp_todo_dir):
+    """todo stop without ID targets the context todo,
+    not the global stack top."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(cli, ["stop"])
+
+    assert result.exit_code == 0
+    assert "#1 Tree A root" in result.output
+
+    stack = load_active_stack()
+    assert 1 not in stack
+    assert 5 in stack
+
+
+def test_stop_without_local_tmux_context_requires_id(
+    temp_todo_dir,
+):
+    """stop refuses to borrow another tmux window's branch."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=None,
+    ):
+        result = runner.invoke(cli, ["stop"])
+
+    assert result.exit_code == 1
+    assert (
+        "No active todo. Specify an ID to stop."
+        in result.output
+    )
+    assert load_active_stack() == [1, 5]
+
+
+def test_done_uses_tmux_context(temp_todo_dir):
+    """todo done without ID targets the context todo."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(cli, ["done"])
+
+    assert result.exit_code == 0
+    assert "#1" in result.output
+
+    stack = load_active_stack()
+    assert 1 not in stack
+    assert 5 in stack
 @
 
 Completion combines resolution, marking the item done, and
@@ -3573,6 +4064,11 @@ priority, create a single item.  We copy [[title]] into
 with the editor path, where [[title]] is not yet set; both paths
 provide the display name through [[priority_title]] instead.
 
+The implicit parent comes from the operator's current active context,
+not from the assignee of the new todo.  That lets us add or import a
+child for someone else while still nesting it under the branch we are
+currently working in.
+
 <<add via cli flags>>=
 if not title:
     typer.echo(
@@ -3589,12 +4085,16 @@ priority_title = title
 @
 
 Auto-parenting: if no explicit parent is given and we're not forcing
-top-level, check for a currently tracked (in-progress) todo:
+top-level, reuse the current active todo for the current tmux context:
+
+When tmux is active but the current pane/window has no tracked todo,
+that means there is no local parent to inherit, so the new item stays
+top-level.
 
 <<resolve parent id>>=
 resolved_parent = parent
 if parent is None and not top_level:
-    active = get_currently_tracked_todo(todos)
+    active = get_current_context_todo(todos)
     if active is not None:
         resolved_parent = active.id
         typer.echo(
@@ -4319,7 +4819,7 @@ def get_visible_roots(
 
     An item is a visible root when it is a true top-level item
     (parent_id is None) or when its parent is not present in
-    items---e.g.\ because a --who filter removed it.  Pass a
+    items---for example, because a --who filter removed it.  Pass a
     pre-filtered list, not the full todos.
     """
     ids = {t.id for t in items}
@@ -4831,9 +5331,13 @@ children in a readable format. This is the read-only counterpart to
 the editor---you can see exactly what [[--edit]] would show, without
 opening an editor.
 
-When no ID is given, [[view]] shows the task at the top of the
-active stack---the one you're currently working on.  This is the
-natural question a returning user asks: \enquote{What was I doing?}
+When no ID is given, [[view]] shows the current active task---the one
+you're currently working on.  In tmux that means the current pane or
+window context.  If tmux is active but this pane/window is untracked,
+there is no implicit active todo and the user must supply an ID.
+Outside tmux it falls back to the worker's active-stack top.  This is
+the natural question a returning user asks:
+\enquote{What was I doing?}
 
 Because [[note]] and [[done]] follow the same convention, [[view]] now
 uses the shared [[resolve_todo_id()]] helper rather than reimplementing
@@ -4841,7 +5345,7 @@ uses the shared [[resolve_todo_id()]] helper rather than reimplementing
 
 <<argument and option definitions>>=
 todo_id_arg = typer.Argument(
-    help="Todo ID (default: stack top)",
+    help="Todo ID (default: current active todo)",
     autocompletion=complete_todo_ids)
 @
 
@@ -4855,8 +5359,8 @@ def view(
 ):
     """View a todo item with full details.
 
-    If no ID given, shows the currently active task
-    (top of the active stack). Done sub-items are
+    If no ID given, shows the current active task.
+    Done sub-items are
     hidden by default; pass --done to include them.
     """
     _, todos = load_todos()
@@ -5073,6 +5577,43 @@ def test_view_command(temp_todo_dir):
     assert "Child task" in result.stdout
 @
 
+The same default must stay local to the current tmux pane or window.
+An untracked tmux context should not inherit another branch's active
+item.
+
+<<integration tests>>=
+def test_view_without_local_tmux_context_requires_id(
+    temp_todo_dir,
+):
+    """view refuses to borrow another tmux window's active todo."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=None,
+    ):
+        result = runner.invoke(cli, ["view"])
+
+    assert result.exit_code == 1
+    assert (
+        "No active todo. Specify an ID to view."
+        in result.output
+    )
+@
+
 Let's verify that done sub-items are hidden by default and that
 [[--done]] reveals them.  The test includes a done grandchild to
 exercise both filtering levels, and checks for the hint message
@@ -5130,11 +5671,11 @@ their IDs and status, new headings become new children, and removed
 headings are deleted.
 
 Like [[view]], [[note]], and [[done]], [[edit]] treats an explicit ID
-as authoritative but otherwise falls back to the active stack top.
+as authoritative but otherwise falls back to the current active todo.
 The contrast between the two forms is the key rule:
 [[todo edit 7 --title "Updated title"]] edits item~7 even if another
 todo is active, while [[todo edit --title "Updated title"]] edits the
-task at the top of the active stack.  This keeps the common
+current active task.  This keeps the common
 \enquote{resume what I was working on} workflow short without removing
 the explicit escape hatch.
 
@@ -5193,8 +5734,7 @@ def edit(
 ):
     """Edit an existing todo item.
 
-    If no ID given, edits the currently active task
-    (top of the active stack).
+    If no ID given, edits the current active task.
     """
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
@@ -5600,7 +6140,7 @@ def test_edit_reparent_invalid(temp_todo_dir):
 
 
 def test_edit_defaults_to_active_todo(temp_todo_dir):
-    """Edit without ID uses the active stack top."""
+    """Edit without ID uses the current active todo."""
     save_todos(3, [
         TodoItem(
             id=1, title="Parent task",
@@ -5668,8 +6208,8 @@ def reprioritize(
 ):
     """Rerun binary search priority for a todo item.
 
-    If no ID given, reprioritizes the currently active
-    task (top of the active stack).
+    If no ID given, reprioritizes the current active
+    task.
 
     Alias: reprio
     """
@@ -5717,14 +6257,14 @@ def reprio(
     reprioritize(todo_id=todo_id)
 @
 
-Let's verify that [[reprioritize]] also defaults to the active stack
-top:
+Let's verify that [[reprioritize]] also defaults to the current active
+todo:
 
 <<test functions>>=
 def test_reprioritize_defaults_to_active_todo(
     temp_todo_dir,
 ):
-    """Reprioritize without ID uses the active stack top."""
+    """Reprioritize without ID uses the current active todo."""
     save_todos(3, [
         TodoItem(
             id=1, title="Later task",
@@ -5838,10 +6378,14 @@ Marking a todo as done also stops any active tracking for that item.
 If the item has a parent, we check whether all siblings are now done
 and auto-complete the parent.
 
-When no ID is given, [[done]] pops the top of the active stack---the
-most recently started task.  This enables a natural nested workflow:
-[[todo start 5]], [[todo start 7]], [[todo done]] (pops~7),
-[[todo done]] (pops~5).  When an explicit ID is given, that ID is
+When no ID is given, [[done]] completes the current active task.  In a
+tmux session that means the task selected by the current pane or
+window labels.  In an untracked tmux pane/window there is no implicit
+active todo, while outside tmux it falls back to the current worker's
+most recently started task.  This still enables a natural nested
+workflow:
+[[todo start 5]], [[todo start 7]], [[todo done]] (completes~7),
+[[todo done]] (completes~5).  When an explicit ID is given, that ID is
 removed from wherever it appears in the stack.
 
 If the item has active descendants (children or deeper) on the stack,
@@ -5881,8 +6425,8 @@ def done(
 ):
     """Mark a todo item as done.
 
-    If no ID given, completes that worker's most
-    recently started task (top of the active stack).
+    If no ID given, completes that worker's current
+    active task.
 
     When an explicit ID is given, it must belong to
     that worker.
@@ -7000,8 +7544,9 @@ removed item and clean up stale labels left by previously removed
 todos---otherwise orphaned [[todo:N]] labels accumulate in the
 session and generate phantom tracking entries.
 
-An omitted ID means \enquote{remove the currently active todo}, which mirrors
-the way [[done]], [[note]], and [[edit]] already target the stack top.
+An omitted ID means \enquote{remove the current active todo}, which mirrors
+the way [[done]], [[note]], and [[edit]] already target the same
+context-aware default.
 
 <<argument and option definitions>>=
 force_opt = typer.Option(
@@ -7018,8 +7563,7 @@ def rm(
 ):
     """Remove a todo item.
 
-    If no ID given, removes the currently active task
-    (top of the active stack).
+    If no ID given, removes the current active task.
     """
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
@@ -7064,7 +7608,7 @@ Let's verify both the explicit and active-stack forms of [[rm]]:
 
 <<test functions>>=
 def test_rm_defaults_to_active_todo(temp_todo_dir):
-    """Remove without ID uses the active stack top."""
+    """Remove without ID uses the current active todo."""
     save_todos(3, [
         TodoItem(
             id=1, title="Parent task",
@@ -7121,15 +7665,21 @@ through execution-mode options such as [[--headless]], [[--pane]],
 \enquote{what should start?}
 separate from the execution question \enquote{how should it run?}
 
-The behaviour depends on whether a task is currently active:
+The behaviour depends on whether the current context resolves to an
+active task:
 \begin{description}
-\item[Stack non-empty] Start the highest-priority pending
-  \emph{child} of the stack-top task.  This is the decomposition
-  workflow: you started a parent, created sub-tasks, and now
-  [[next]] picks the most urgent child.
-\item[Stack empty] Start the highest-priority pending task
-  among top-level items only (filtered by [[--who]]).
+\item[Active context] Start the highest-priority pending
+  \emph{child} of the current tmux-context task.  This is the
+  decomposition workflow: you started a parent, created sub-tasks, and
+  now [[next]] picks the most urgent child in that branch.
+\item[No active context] Start the highest-priority pending task among
+  top-level items only (filtered by [[--who]]).
 \end{description}
+
+Inside tmux, an untracked pane/window counts as
+\enquote{no active context}: [[next]] may still choose top-level work,
+but it must not descend into a branch that is only active somewhere
+else.
 
 If there is nothing to do (no pending task matches), the command logs a
 warning and exits non-zero.  That makes failed scheduling decisions
@@ -7174,12 +7724,12 @@ def next_cmd(
 ):
     """Start the next highest-priority task.
 
-    If a task is in-progress, starts its next pending
-    child. Otherwise starts the highest-priority
-    pending top-level task.
+    If the current context has an active task, start its
+    next pending child. Otherwise start the highest-
+    priority pending top-level task.
     """
     _, todos = load_todos()
-    active = get_active_todo_hierarchy(todos)
+    active = get_current_context_todo(todos)
 
     <<find next task to start>>
 
@@ -7204,9 +7754,9 @@ def next_cmd(
 @
 
 <<find next task to start>>=
-if active:
+if active is not None:
     target = find_pending_by_priority(
-        todos, who=who, parent_id=active[-1].id
+        todos, who=who, parent_id=active.id
     )
 else:
     target = get_top_level_pending_by_priority(
@@ -7239,7 +7789,7 @@ def test_next_picks_highest_priority(temp_todo_dir):
 
 
 def test_next_picks_child(temp_todo_dir):
-    """next picks pending child of stack-top task."""
+    """next picks a pending child of the active task."""
     save_todos(4, [
         TodoItem(
             id=1, title="Parent",
@@ -7263,6 +7813,166 @@ def test_next_picks_child(temp_todo_dir):
     )
     assert result.exit_code == 0
     assert "Child B" in result.output
+
+
+def test_next_uses_tmux_context_for_parallel_branches(
+    temp_todo_dir,
+):
+    """next follows the current tmux branch, not the
+    global stack fallback."""
+    save_todos(7, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Tree A child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            priority=5.0,
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=6, title="Tree B child",
+            created="2026-02-20T10:00:00",
+            parent_id=5,
+            priority=9.0,
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(
+            cli, ["next", "--who", ""]
+        )
+
+    assert result.exit_code == 0
+    assert "Tree A child" in result.output
+    assert "Tree B child" not in result.output
+
+
+def test_next_falls_back_to_current_worker_branch(
+    temp_todo_dir,
+):
+    """Outside tmux, next ignores another worker's later
+    stack entry."""
+    save_todos(7, [
+        TodoItem(
+            id=1, title="My root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="My child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            priority=5.0,
+        ),
+        TodoItem(
+            id=5, title="Other root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="other-worker",
+        ),
+        TodoItem(
+            id=6, title="Other child",
+            created="2026-02-20T10:00:00",
+            parent_id=5,
+            priority=9.0,
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    result = runner.invoke(cli, ["next"])
+
+    assert result.exit_code == 0
+    assert "My child" in result.output
+    assert "Other child" not in result.output
+
+
+def test_next_in_untracked_tmux_picks_top_level(
+    temp_todo_dir,
+):
+    """Untracked tmux windows do not descend into other branches."""
+
+    save_todos(8, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=2, title="Tree A child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+            priority=9.0,
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+        TodoItem(
+            id=6, title="Tree B child",
+            created="2026-02-20T10:00:00",
+            parent_id=5,
+            priority=8.0,
+        ),
+        TodoItem(
+            id=7, title="Top-level winner",
+            created="2026-02-20T10:00:00",
+            priority=6.0,
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=None,
+    ):
+        result = runner.invoke(
+            cli, ["next", "--who", ""]
+        )
+
+    assert result.exit_code == 0
+    assert "Top-level winner" in result.output
+    assert "Tree A child" not in result.output
+    assert "Tree B child" not in result.output
+
+
+def test_next_treats_legacy_top_level_items_as_current_worker(
+    temp_todo_dir,
+):
+    """Outside tmux, next still sees legacy top-level items
+    as belonging to the current worker."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="My top-level",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="Other top-level",
+            created="2026-02-20T10:00:00",
+            priority=9.0,
+            who="other-worker",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["next"])
+
+    assert result.exit_code == 0
+    assert "My top-level" in result.output
+    assert "Other top-level" not in result.output
 
 
 def test_next_silent_when_nothing_pending(temp_todo_dir):
@@ -7337,8 +8047,8 @@ def test_next_ignores_non_top_level_when_idle(temp_todo_dir):
 
 The active stack is also what the user wants to inspect when asking
 what is currently being worked on.  The [[status]] command mirrors
-[[track status]], but instead of listing independent labels it shows the
-active todo hierarchy from root to leaf.
+[[track status]], but instead of listing independent labels it shows all
+active todo hierarchies as a forest.
 
 This command intentionally trusts the stack rather than searching for
 [[in-progress]] items.  That makes it a useful diagnostic tool too: if
@@ -7348,20 +8058,21 @@ state rather than in a best-effort reconstruction.
 <<status command>>=
 @cli.command()
 def status():
-    """Show the currently active todo hierarchy."""
+    """Show the currently active todo forest."""
     _, todos = load_todos()
-    active = get_active_todo_hierarchy(todos)
+    active = get_active_todos(todos)
     if not active:
         typer.echo("No active todo")
         return
 
-    typer.echo("Active todo hierarchy:")
-    for line in render_active_todo_hierarchy(active):
+    typer.echo("Active todo forest:")
+    for line in render_active_todo_forest(active):
         typer.echo(line)
 @
 
-Let's verify the two boundary cases: no active todo, and a nested
-hierarchy that should be rendered in stack order.
+Let's verify the two boundary cases: no active todo, and active
+hierarchies that should be rendered from [[parent_id]] rather than raw
+stack order.
 
 <<test functions>>=
 def test_status_reports_no_active_todo(temp_todo_dir):
@@ -7378,7 +8089,7 @@ def test_status_reports_no_active_todo(temp_todo_dir):
 
 
 def test_status_shows_active_hierarchy(temp_todo_dir):
-    """status renders the active stack as a hierarchy."""
+    """status renders one active branch as a forest."""
     save_todos(4, [
         TodoItem(
             id=1, title="Parent",
@@ -7398,10 +8109,40 @@ def test_status_shows_active_hierarchy(temp_todo_dir):
     save_active_stack([1, 2, 3])
     result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0
-    assert "Active todo hierarchy:" in result.output
+    assert "Active todo forest:" in result.output
     assert "#1 Parent [in-progress]" in result.output
     assert "#2 Child [in-progress]" in result.output
     assert "#3 Leaf [in-progress]" in result.output
+
+
+def test_status_shows_parallel_active_forest(temp_todo_dir):
+    """status keeps parallel roots separate in the forest."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Tree A child",
+            created="2026-02-20T10:00:00",
+            parent_id=1,
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    save_active_stack([1, 2, 5])
+
+    result = runner.invoke(cli, ["status"])
+
+    assert result.exit_code == 0
+    assert result.output.splitlines() == [
+        "Active todo forest:",
+        "  #1 Tree A root [in-progress]",
+        "    #2 Tree A child [in-progress]",
+        "  #5 Tree B root [in-progress]",
+    ]
 @
 
 Starting a todo delegates to the track system. We start tracking with
@@ -7427,8 +8168,11 @@ Without a [[wd]], the command behaves as before: it starts tracking
 without spawning anything.
 
 As with [[view]] and friends, omitting the ID means \enquote{start the
-task on top of the active stack}.  This is useful when tracking stopped but the
-todo itself remains the current focus.
+current active todo}.  In tmux that follows the pane or window labels;
+an untracked tmux pane/window has no implicit active todo, while
+outside tmux it falls back to the worker's active-stack top.  This is
+useful when tracking stopped but the todo itself remains the current
+focus.
 
 <<start command>>=
 @cli.command()
@@ -7439,8 +8183,7 @@ def start(
 ):
     """Start tracking time for a todo item.
 
-    If no ID given, starts the currently active task
-    (top of the active stack).
+    If no ID given, starts the current active task.
 
     If the todo has a working directory, spawns a
     shell or command in that directory with tracking.
@@ -7594,7 +8337,7 @@ def test_start_pushes_stack(temp_todo_dir):
 
 
 def test_start_defaults_to_active_todo(temp_todo_dir):
-    """Start without ID uses the active stack top."""
+    """Start without ID uses the current active todo."""
     save_todos(3, [
         TodoItem(
             id=1, title="Parent task",
@@ -9366,11 +10109,14 @@ parent can still contribute its own labels and deadline when the user
 does not specify overrides.  This lets a parent like [[DD1310]] provide
 course context while [[owner/repo]] still marks the GitHub source.
 
+If tmux is active but the current pane/window has no tracked todo,
+imports stay top-level rather than inheriting another window's branch.
+
 <<resolve import parent and inherited metadata>>=
 resolved_parent = parent
 parent_item = None
 if parent is None and not top_level:
-    active = get_currently_tracked_todo(todos)
+    active = get_current_context_todo(todos)
     if active is not None:
         resolved_parent = active.id
         typer.echo(
@@ -9897,6 +10643,196 @@ def test_import_auto_parents_under_active_todo(
     assert child.labels == ["course", "owner/repo"]
 
 
+def test_import_auto_parents_under_tmux_context_todo(
+    temp_todo_dir,
+):
+    """Import uses the current tmux branch, not the
+    fallback stack top."""
+    save_todos(6, [
+        TodoItem(
+            id=1,
+            title="Tree A root",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["course"],
+            who="alice",
+        ),
+        TodoItem(
+            id=5,
+            title="Tree B root",
+            priority=4.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["other"],
+            who="alice",
+        ),
+    ])
+    save_active_stack([1, 5])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 7,
+            "title": "Imported on active branch",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ), patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 Tree A root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos
+        if t.title == "Imported on active branch"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["course", "owner/repo"]
+
+
+def test_import_in_untracked_tmux_stays_top_level(
+    temp_todo_dir,
+):
+    """Import stays top-level when tmux has no local context."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1,
+            title="Tree A root",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["course"],
+            who="alice",
+        ),
+        TodoItem(
+            id=5,
+            title="Tree B root",
+            priority=4.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["other"],
+            who="alice",
+        ),
+    ])
+    save_active_stack([1, 5])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 9,
+            "title": "Imported top level",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=None,
+    ), patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under:" not in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos if t.title == "Imported top level"
+    )
+    assert child.parent_id is None
+    assert child.labels == ["owner/repo"]
+
+
+def test_import_auto_parent_stays_on_current_worker_branch(
+    temp_todo_dir,
+):
+    """Import ignores another worker's later stack entry
+    outside tmux."""
+    save_todos(6, [
+        TodoItem(
+            id=1,
+            title="My root",
+            priority=5.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["mine"],
+        ),
+        TodoItem(
+            id=5,
+            title="Other root",
+            priority=4.0,
+            status="in-progress",
+            created="2026-02-20T10:00:00",
+            labels=["other"],
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 8,
+            "title": "Imported on my branch",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 My root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos
+        if t.title == "Imported on my branch"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["mine", "owner/repo"]
+
+
 def test_import_top_level_overrides_auto_parenting(
     temp_todo_dir,
 ):
@@ -10295,7 +11231,7 @@ def test_note_appends_locally(temp_todo_dir):
 
 
 def test_note_defaults_to_active_todo(temp_todo_dir):
-    """Note without ID uses the active stack top."""
+    """Note without ID uses the current active todo."""
     save_todos(3, [
         TodoItem(
             id=1, title="Parent task",
@@ -10413,6 +11349,8 @@ from nytid.cli.todo import (
     read_detached_exit_code,
     parse_timeout,
     append_note_to_item,
+    NotInTmuxError,
+    resolve_todo_from_tmux_context,
 )
 
 runner = CliRunner()
@@ -10446,6 +11384,23 @@ def temp_todo_dir(temp_tracking_dir):
             return_value=DEFAULT_MAX_BOOST,
         ):
             yield temp_dir
+
+
+@pytest.fixture(autouse=True)
+def outside_tmux_by_default():
+    """Make CLI tests explicit about tmux context.
+
+    Most tests exercise the non-tmux fallback path.  We patch the
+    todo module's resolver to raise [[NotInTmuxError]] by default so the
+    suite behaves the same whether pytest itself runs inside tmux or not.
+    Tests that need tmux-specific behavior override this fixture with
+    their own patch.
+    """
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        side_effect=NotInTmuxError,
+    ):
+        yield
 
 
 # All test functions distributed throughout the document
@@ -10579,6 +11534,137 @@ def test_add_append_under_parent(temp_todo_dir):
     appended = next(t for t in todos if t.id == 4)
     assert appended.parent_id == 1
     assert appended.priority == 2.0
+
+
+def test_add_auto_parents_under_tmux_context_todo(
+    temp_todo_dir,
+):
+    """add uses the current tmux branch for auto-parenting."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["course"],
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            priority=4.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["other"],
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=1,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Context child",
+                "--prio", "4.5",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 Tree A root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos if t.title == "Context child"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["course"]
+
+
+def test_add_in_untracked_tmux_stays_top_level(
+    temp_todo_dir,
+):
+    """add stays top-level when tmux has no local context."""
+
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Tree A root",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["course"],
+        ),
+        TodoItem(
+            id=5, title="Tree B root",
+            priority=4.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["other"],
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    with patch(
+        "nytid.cli.todo.resolve_todo_from_tmux_context",
+        return_value=None,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Top-level task",
+                "--prio", "4.5",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under:" not in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos if t.title == "Top-level task"
+    )
+    assert child.parent_id is None
+    assert child.labels == []
+
+
+def test_add_auto_parent_stays_on_current_worker_branch(
+    temp_todo_dir,
+):
+    """add ignores another worker's later stack entry
+    outside tmux."""
+    save_todos(6, [
+        TodoItem(
+            id=1, title="My root",
+            priority=5.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["mine"],
+        ),
+        TodoItem(
+            id=5, title="Other root",
+            priority=4.0,
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            labels=["other"],
+            who="other-worker",
+        ),
+    ])
+    save_active_stack([1, 5])
+
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "My child",
+            "--prio", "4.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Auto-parenting under: #1 My root" in result.output
+    _, todos = load_todos()
+    child = next(
+        t for t in todos if t.title == "My child"
+    )
+    assert child.parent_id == 1
+    assert child.labels == ["mine"]
 
 
 def test_add_append_uses_base_priority_not_deadline_boost(
