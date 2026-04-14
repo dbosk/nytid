@@ -1,0 +1,180 @@
+\chapter{Configurable CLI defaults, the \texttt{cli.utils.defaults}
+module}%
+\label{cli.utils.defaults}
+
+Many CLI options have sensible fallback values---for instance,
+[[nytid todo ls]] lists ten items when invoked without [[-n]]---but
+different users prefer different numbers.
+Rather than hard-coding each such default in the [[typer.Option(...)]]
+call, we read it from the personal [[typerconf]] config on startup and
+let the user override it with [[nytid config <key> -s <value>]].
+
+This module provides the single helper that every CLI module calls to
+resolve its defaults.
+The design is motivated by two observations.
+
+\begin{description}
+\item[Fallback must never raise.]
+  A missing key, a malformed value, or a wrong type must return the
+  hard-coded fallback rather than propagate an exception.
+  We resolve defaults at module import time, so a single corrupt
+  config entry would otherwise break \emph{every} [[nytid]] subcommand
+  until the user fixed the config file by hand.
+
+\item[One disk read per process.]
+  The [[typerconf.get]] module-level function constructs a new
+  [[Config]] object and calls [[read_config]] on every invocation;
+  that is one JSON file read per lookup.
+  With dozens of configurable defaults spread across four CLI
+  modules, that adds up to noticeable latency before Typer even
+  dispatches the subcommand.
+  We read the file once into an in-memory [[Config]] object and reuse
+  it.
+\end{description}
+
+\section{Module structure}
+
+<<[[defaults.py]]>>=
+"""Resolve CLI option defaults from the personal ``typerconf`` config.
+
+All CLI modules use ``default(key, fallback, cast)`` to seed their
+``typer.Option(...)`` declarations. See the ``cli.utils.defaults``
+chapter in the manual for the design rationale.
+"""
+import typerconf
+
+<<cached config helpers>>
+<<the default function>>
+@
+
+\section{Caching the config object}
+
+\label{cli.utils.defaults.cache}
+
+We keep a single [[Config]] object at module scope and populate it on
+first use.
+Doing the read lazily (rather than at import) keeps tests that patch
+[[typerconf]] before calling [[default]] working as expected.
+
+Constructing [[Config]] without a [[conf_file]] argument disables
+automatic write-back, which is exactly what we want: the cache is
+read-only by design.
+The cache is deliberately \emph{not} invalidated when code elsewhere
+calls [[typerconf.set]]: that call writes through its own [[Config]]
+instance to persist a value for \emph{future} invocations, not to
+re-read it within the same process.
+Call sites that write and then read within a single run continue to
+use [[typerconf.get]] directly.
+<<cached config helpers>>=
+_CACHE = None
+
+def _cached_config():
+  """Return a process-lifetime ``Config`` populated from disk once."""
+  global _CACHE
+  if _CACHE is None:
+    cfg = typerconf.Config()
+    cfg.read_config()
+    _CACHE = cfg
+  return _CACHE
+@
+
+For tests that want to exercise a different config within a single
+process, we also expose a private reset hook.
+<<cached config helpers>>=
+def _reset_cache():
+  """Drop the cached config so the next ``default`` call re-reads it."""
+  global _CACHE
+  _CACHE = None
+@
+
+\section{The [[default]] function}
+
+Every caller spells its lookup the same way: a dotted key, a
+fallback, and an optional type cast.
+<<the default function>>=
+def default(key, fallback, cast=None):
+  """Read ``key`` from the cached config, falling back to ``fallback``.
+
+  ``cast``, if given, is applied to the stored value; any
+  ``TypeError`` or ``ValueError`` it raises is swallowed and
+  ``fallback`` is returned.
+  """
+  try:
+    value = _cached_config().get(key)
+  except KeyError:
+    return fallback
+  if cast is None:
+    return value
+  try:
+    return cast(value)
+  except (TypeError, ValueError):
+    return fallback
+@
+
+\section{Tests}
+
+Tests are tangled into [[tests/test_cliutilsdefaults.py]].
+We rely on [[unittest.mock]] to substitute the cached config without
+touching the real config file.
+Every test resets the cache first, via an autouse fixture, so the
+ordering between tests does not matter.
+<<test [[cliutilsdefaults.py]]>>=
+import sys
+sys.path.insert(0, "../src")
+
+import pytest
+from unittest.mock import patch, MagicMock
+
+from nytid.cli.utils import defaults
+from nytid.cli.utils.defaults import default
+
+<<test fixtures>>
+<<test functions>>
+@
+
+<<test fixtures>>=
+@pytest.fixture(autouse=True)
+def reset_defaults_cache():
+  defaults._reset_cache()
+  yield
+  defaults._reset_cache()
+@
+
+A missing key returns the fallback unchanged.
+<<test functions>>=
+def test_default_missing_key_returns_fallback():
+  fake = MagicMock()
+  fake.get.side_effect = KeyError("nope")
+  with patch.object(defaults.typerconf, "Config", return_value=fake):
+    assert default("absent.key", 42) == 42
+@
+
+A present key is cast to the requested type.
+<<test functions>>=
+def test_default_casts_value():
+  fake = MagicMock()
+  fake.get.return_value = "25"
+  with patch.object(defaults.typerconf, "Config", return_value=fake):
+    assert default("todo.ls.count", 10, int) == 25
+@
+
+A malformed value falls back silently rather than raising.
+<<test functions>>=
+def test_default_malformed_value_falls_back():
+  fake = MagicMock()
+  fake.get.return_value = "not a number"
+  with patch.object(defaults.typerconf, "Config", return_value=fake):
+    assert default("todo.ls.count", 10, int) == 10
+@
+
+And the core performance property: the config is read from disk
+exactly once regardless of how many keys we look up.
+<<test functions>>=
+def test_default_reads_config_once():
+  fake = MagicMock()
+  fake.get.side_effect = KeyError("nope")
+  with patch.object(defaults.typerconf, "Config", return_value=fake):
+    for _ in range(5):
+      default("some.key", 0)
+  assert fake.read_config.call_count == 1
+@
