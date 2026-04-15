@@ -154,6 +154,7 @@ import subprocess
 import tempfile
 import typer
 import typerconf as config
+from nytid.cli.utils.defaults import default
 from typing import List, Optional, Dict
 try:
     from typing import Annotated
@@ -401,10 +402,8 @@ DEFAULT_WEEKLY_LIMIT_CONFIG = "track.weekly_limit"
 <<configuration management>>=
 def get_default_weekly_limit() -> float:
     """Get the default weekly hour limit from config"""
-    try:
-        return float(config.get(DEFAULT_WEEKLY_LIMIT_CONFIG))
-    except (KeyError, ValueError):
-        return DEFAULT_WEEKLY_LIMIT_HOURS
+    return default(DEFAULT_WEEKLY_LIMIT_CONFIG,
+                   DEFAULT_WEEKLY_LIMIT_HOURS, float)
 @
 
 Likewise, the daily-limit key belongs with the daily-limit helper.
@@ -416,10 +415,8 @@ DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
 <<configuration management>>=
 def get_default_daily_limit() -> float:
     """Get the default daily hour limit from config"""
-    try:
-        return float(config.get(DEFAULT_DAILY_LIMIT_CONFIG))
-    except (KeyError, ValueError):
-        return DEFAULT_DAILY_LIMIT_HOURS
+    return default(DEFAULT_DAILY_LIMIT_CONFIG,
+                   DEFAULT_DAILY_LIMIT_HOURS, float)
 @
 
 Auto-suspend has both runtime logic and tests that refer to the same
@@ -2311,6 +2308,17 @@ child to it).  The shutdown path treats both cases identically---one
 [[TrackingEntry]] per label at child exit---so the only difference is
 whether the original start time survives.
 
+The same rule must also cover the implicit label contributed by
+[[--command]].  Otherwise a launch could smuggle in an already-active
+command label after the preflight check and silently downgrade a conflict
+to [[Already tracking]].
+
+The effective launch label set should also be the one we report back to the
+user.  If an explicit label matches the implicit command basename, keeping
+the raw pre-deduplicated list would produce noisy output such as
+[[Already tracking: echo, echo]] even though the session state correctly
+tracks only one [[echo]] label.
+
 Track and todo should also present launch context the same way.  We therefore
 compute one context string up front and reuse it for tmux window names and
 as a best-effort [[PS1]] seed.  In tmux the user's [[~/.bashrc]] will
@@ -2320,6 +2328,7 @@ the primary context indicator for pane and window launches.
 <<prepare launch mode>>=
 launch_requested = command is not None or pane or window
 tracking_labels = list(labels)
+launch_owned_labels = list(tracking_labels)
 command_args = None
 command_text = None
 proc_env = None
@@ -2363,22 +2372,6 @@ if launch_requested:
     <<resolve working directory>>
     proc_cwd = wd_path if wd_path else proc_cwd
     proc_env = os.environ.copy()
-    launch_context = build_context_name(
-        "track", tracking_labels
-    )
-
-    conflicting_launch_labels = [
-        label for label in labels
-        if session.get_label_info(label) is not None
-    ]
-    if conflicting_launch_labels and not (replace or continue_labels):
-        typer.echo(
-            "Error: launch mode requires inactive labels, "
-            "--replace, or --continue: "
-            f"{', '.join(sorted(conflicting_launch_labels))}",
-            err=True,
-        )
-        raise typer.Exit(1)
 
     if command is not None:
         try:
@@ -2391,9 +2384,29 @@ if launch_requested:
             raise typer.Exit(1)
         command_text = command
         tracking_labels.append(os.path.basename(command_args[0]))
-        launch_context = build_context_name(
-            "track", tracking_labels
+
+    launch_owned_labels = list(dict.fromkeys(
+        tracking_labels
+    ))
+
+    launch_context = build_context_name(
+        "track", launch_owned_labels
+    )
+
+    conflicting_launch_labels = sorted({
+        label for label in launch_owned_labels
+        if session.get_label_info(label) is not None
+    })
+    if conflicting_launch_labels and not (replace or continue_labels):
+        typer.echo(
+            "Error: launch mode requires inactive labels, "
+            "--replace, or --continue: "
+            f"{', '.join(conflicting_launch_labels)}",
+            err=True,
         )
+        raise typer.Exit(1)
+
+    if command is not None:
         apply_context_prompt(launch_context, proc_env)
     elif pane or window:
         apply_context_prompt(launch_context, proc_env)
@@ -2410,7 +2423,7 @@ is encountered first during shutdown.
 
 <<start tracking and report results>>=
 started, already_tracking, discarded = start_tracking_labels(
-    tracking_labels,
+    launch_owned_labels,
     start_time=start_time,
     who=who,
     replace=replace,
@@ -2542,6 +2555,12 @@ labels via the normal window/pane-labels path.  When the window or
 pane exits, the ordinary shutdown path stops the labels and records a
 single [[TrackingEntry]] covering the original start time through the
 child's exit.
+
+That shutdown obligation belongs to the full effective launch label set,
+not just the subset that happened to be newly started for this launch.
+We therefore freeze the deduplicated ownership set in
+[[launch_owned_labels]] during launch setup and reuse it for both direct
+subprocess cleanup and the detached tmux finalizer.
 
 The two flags express different intents and are mutually exclusive in
 spirit (though the code tolerates either one being set): pick
@@ -2888,6 +2907,21 @@ def test_start_launch_requires_replace_for_active_labels(
     ) in result.stdout
 
 
+def test_start_launch_requires_replace_for_active_command_label(
+    temp_tracking_dir,
+):
+    """Launch mode also rejects an already-active implicit command label."""
+    runner.invoke(cli, ["start", "echo"])
+
+    result = runner.invoke(cli, [
+        "start", "work", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 1
+    assert "launch mode requires inactive labels" in result.stdout
+    assert "echo" in result.stdout
+
+
 def test_start_launch_with_replace_restarts_active_label(
     temp_tracking_dir,
 ):
@@ -2903,8 +2937,8 @@ def test_start_launch_with_replace_restarts_active_label(
     assert "Running 'echo test'" in result.stdout
 
 
-def test_start_continue_preserves_active_session(temp_tracking_dir):
-    """--continue lets launch mode accept active labels and preserves start time."""
+def test_start_continue_stops_borrowed_labels_on_exit(temp_tracking_dir):
+    """--continue preserves the interval but still stops it on exit."""
     runner.invoke(cli, ["start", "labelA", "--offset", "-45m"])
 
     result = runner.invoke(cli, [
@@ -2916,12 +2950,22 @@ def test_start_continue_preserves_active_session(temp_tracking_dir):
     assert "Replaced" not in result.stdout
     assert "Running 'echo test'" in result.stdout
 
-    # The original ~45-minute-old start time must survive untouched.
     session = load_active_session(default_username)
-    start_time, _, _ = session.get_label_info("labelA")
-    delta = datetime.datetime.now() - start_time
-    assert delta.total_seconds() > 40 * 60, (
-        "--continue must not rewrite the original start time"
+    assert session.get_label_info("labelA") is None
+    assert session.get_label_info("echo") is None
+
+    label_entries = [
+        entry for entry in load_tracking_data()
+        if "labelA" in entry.labels
+    ]
+    assert len(label_entries) == 1
+    interval = (
+        label_entries[0].end_time
+        - label_entries[0].start_time
+    )
+    assert interval.total_seconds() > 40 * 60, (
+        "--continue must preserve the original start time "
+        "through child exit"
     )
 
 
@@ -6373,6 +6417,13 @@ source and destination.  We detect this by comparing the two IDs: a
 real switch always changes the selected window, so equality means
 the hook fired redundantly and should be silently discarded.
 
+An absent selected window ID is another case where the hook must do
+nothing.  [[get_tmux_selected_window_id()]] returns [[None]] when the
+detached subprocess cannot read tmux state reliably---for example if the
+session has already disappeared.  Treating that observation failure as a
+real switch to an untracked window would spuriously stop the source
+labels, so we bail out before appending any deferred event.
+
 <<detached window switch command>>=
 @cli.command(
     name="_window-switch-detached", hidden=True
@@ -6386,6 +6437,8 @@ def window_switch_detached(
     selected_window_id = get_tmux_selected_window_id(
         session_id,
     )
+    if selected_window_id is None:
+        return
     def read_and_update():
         prev_window_id = read_last_selected_window(
             who, tmux_server_key, session_id,
@@ -8264,6 +8317,34 @@ def test_window_switch_detached_skips_when_prev_equals_selected(
 
     mock_append.assert_not_called()
 
+
+def test_window_switch_detached_skips_when_selected_window_missing(
+    temp_tracking_dir,
+):
+    """Missing selected-window state must not emit a deferred switch."""
+    who = "me"
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, "@3",
+    )
+
+    with patch(
+        "nytid.cli.track.get_tmux_selected_window_id",
+        return_value=None,
+    ), patch(
+        "nytid.cli.track.append_and_check_window_event",
+    ) as mock_append:
+        runner.invoke(cli, [
+            "_window-switch-detached",
+            "--server-key", TEST_SERVER_KEY,
+            "--session-id", TEST_SESSION_ID,
+            "--who", who,
+        ])
+
+    assert read_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID,
+    ) == "@3"
+    mock_append.assert_not_called()
+
 def test_window_switch_detached_emits_window_aware_marker(
     temp_tracking_dir,
 ):
@@ -9370,17 +9451,17 @@ if launch_requested:
 if command_text is not None:
     typer.echo(
         f"Running '{command_text}' and tracking with "
-        f"labels: {', '.join(sorted(tracking_labels))}"
+        f"labels: {', '.join(sorted(launch_owned_labels))}"
     )
 elif pane:
     typer.echo(
         f"Opening tracked shell in tmux pane with "
-        f"labels: {', '.join(sorted(tracking_labels))}"
+        f"labels: {', '.join(sorted(launch_owned_labels))}"
     )
 else:
     typer.echo(
         f"Opening tracked shell in tmux window with "
-        f"labels: {', '.join(sorted(tracking_labels))}"
+        f"labels: {', '.join(sorted(launch_owned_labels))}"
     )
 @
 
@@ -9449,7 +9530,7 @@ exit_fd, exit_code_file = tempfile.mkstemp(
 os.close(exit_fd)
 finalize_cmd = \
     build_detached_track_finalize_command(
-        tracking_labels, who
+        launch_owned_labels, who
     )
 finalize_cmd += (
     f"; rm -f {shlex.quote(exit_code_file)}"
@@ -9495,22 +9576,23 @@ finally:
 @
 
 <<stop launched labels>>=
+launched_labels = list(launch_owned_labels)
 end_time = datetime.datetime.now()
 session, completed_entries = stop_tracking_labels(
     who=who,
-    labels=started,
+    labels=launched_labels,
     end_time=end_time,
     quiet_if_missing=True,
 )
 @
 
-The launch cleanup path must unregister the labels this command started even
-when they were already auto-suspended before the subprocess exited.  Using the
-freshly computed [[completed_entries]] would miss that case and leave stale
-window or pane declarations behind.
+The launch cleanup path must unregister every label this launch owned even
+when some were only borrowed via [[--continue]] or were already auto-suspended
+before the subprocess exited.  Using the freshly computed
+[[completed_entries]] would miss those cases and leave stale window or pane
+declarations behind.
 
 <<unregister launched labels from tracked tmux context>>=
-launched_labels = list(started)
 if launched_labels:
     unregister_tmux_context_labels(
         launched_labels, who,
@@ -9835,9 +9917,21 @@ requested (or fewer if the history is shorter).
 
 When the user wants to repair history, though, a bare timestamp line is
 not enough: they need a stable way to name one specific entry.  The
-optional [[--id]] flag (which is actually default now) prepends a short, unique 
-prefix of each entry's [[content_hash()]], giving us Git-style identification 
+optional [[--id]] flag (which is actually default now) prepends a short, unique
+prefix of each entry's [[content_hash()]], giving us Git-style identification
 without storing a separate persistent identifier.
+
+Both the default row count and the default for the id column are worth
+configuring, since users tend to settle on a personal preference.  We
+read them once at module import through the shared [[default]] helper
+(\cref{cli.utils.defaults}).
+<<constants>>=
+TRACK_LS_COUNT_CONFIG = "track.ls.count"
+TRACK_LS_ID_CONFIG = "track.ls.id"
+
+DEFAULT_TRACK_LS_COUNT = default(TRACK_LS_COUNT_CONFIG, 10, int)
+DEFAULT_TRACK_LS_ID = default(TRACK_LS_ID_CONFIG, True, bool)
+@
 
 <<argument and option definitions>>=
 ls_labels_arg = typer.Argument(
@@ -9846,11 +9940,13 @@ ls_labels_arg = typer.Argument(
     autocompletion=complete_historical_labels)
 ls_number_opt = typer.Option(
     "--number", "-n",
-    help="Number of entries to show")
+    help="Number of entries to show. "
+         "[config: track.ls.count]")
 ls_id_opt = typer.Option(
     "--id/--no-id",
     help="Remove column with content-hash "
-         "prefixes for entries")
+         "prefixes for entries. "
+         "[config: track.ls.id]")
 @
 
 <<ls command>>=
@@ -9858,8 +9954,8 @@ ls_id_opt = typer.Option(
 def ls_entries(
     labels: Annotated[List[str],
                       ls_labels_arg] = None,
-    n: Annotated[int, ls_number_opt] = 10,
-    show_id: Annotated[bool, ls_id_opt] = True,
+    n: Annotated[int, ls_number_opt] = DEFAULT_TRACK_LS_COUNT,
+    show_id: Annotated[bool, ls_id_opt] = DEFAULT_TRACK_LS_ID,
     who: Annotated[Optional[str],
                    who_filter_opt] = None,
 ):
@@ -10450,6 +10546,18 @@ prorated: if the window is 3 days and the weekly limit is 40 hours, we
 warn after 40 * 3/7 ≈ 17 hours rather than a fixed 40. This keeps the
 warning meaningful for both short and long windows.
 
+The window length and summary toggle are the two defaults worth
+configuring per user; the weekly/daily limits are already config-backed
+elsewhere.
+<<constants>>=
+TRACK_STATS_DAYS_CONFIG = "track.stats.days"
+TRACK_STATS_SUMMARY_CONFIG = "track.stats.summary"
+
+DEFAULT_TRACK_STATS_DAYS = default(TRACK_STATS_DAYS_CONFIG, 1, int)
+DEFAULT_TRACK_STATS_SUMMARY = default(TRACK_STATS_SUMMARY_CONFIG,
+                                      False, bool)
+@
+
 <<argument and option definitions>>=
 stats_labels_arg = typer.Argument(
     help="Filter statistics by specific labels "
@@ -10457,19 +10565,23 @@ stats_labels_arg = typer.Argument(
     autocompletion=complete_historical_labels)
 stats_days_opt = typer.Option(
     "--days", "-n",
-    help="Number of days to include in stats")
+    help="Number of days to include in stats. "
+         "[config: track.stats.days]")
 weekly_limit_opt = typer.Option(
     "--weekly-limit",
     help="Weekly hour limit for warnings "
-         "(uses config default if not specified)")
+         "(uses config default if not specified). "
+         "[config: track.weekly_limit]")
 daily_limit_opt = typer.Option(
     "--daily-limit",
     help="Daily hour limit for warnings "
-         "(uses config default if not specified)")
+         "(uses config default if not specified). "
+         "[config: track.daily_limit]")
 summary_opt = typer.Option(
     "--summary",
     help="Include an overall summary "
-         "for the whole window")
+         "for the whole window. "
+         "[config: track.stats.summary]")
 @
 
 <<stats command>>=
@@ -10477,14 +10589,16 @@ summary_opt = typer.Option(
 def stats(
     labels: Annotated[List[str],
                       stats_labels_arg] = None,
-    days: Annotated[int, stats_days_opt] = 1,
+    days: Annotated[int,
+                    stats_days_opt] = DEFAULT_TRACK_STATS_DAYS,
     weekly_limit: Annotated[Optional[float],
                             weekly_limit_opt] = None,
     daily_limit: Annotated[Optional[float],
                            daily_limit_opt] = None,
     who: Annotated[Optional[str],
                    who_filter_opt] = None,
-    summary: Annotated[bool, summary_opt] = False,
+    summary: Annotated[bool,
+                       summary_opt] = DEFAULT_TRACK_STATS_SUMMARY,
 ):
     """
     Show aggregated statistics for recent tracking history.
@@ -11490,6 +11604,28 @@ def test_start_command_without_labels_uses_command_label(
     assert result.exit_code == 0
     assert "Running 'echo test'" in result.stdout
     assert "tracking with labels: echo" in result.stdout
+
+
+def test_start_command_deduplicates_matching_explicit_label(
+    temp_tracking_dir,
+):
+    """Explicit and implicit command labels should not be reported twice."""
+    result = runner.invoke(cli, [
+        "start", "echo", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 0
+    assert "Started tracking: echo" in result.stdout
+    assert "Started tracking: echo, echo" not in result.stdout
+    assert "Already tracking: echo, echo" not in result.stdout
+    assert "tracking with labels: echo" in result.stdout
+    assert "tracking with labels: echo, echo" not in result.stdout
+
+    entries = load_tracking_data()
+    assert len(entries) > 0
+    last_entry = entries[-1]
+    assert last_entry.labels == ["echo"]
+    assert last_entry.description == "echo test"
 
 
 def test_start_command_uses_command_basename_as_label(temp_tracking_dir):
