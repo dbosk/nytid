@@ -68,10 +68,11 @@ without retyping label names:
 
 The [[switch]] command provides a context-switch mechanism: interrupt
 the current work, do something else, then pick up where you left off.
-Calling [[nytid track switch email]] stops the current labels, saves
-them as the one alternate context, and starts [[email]].  Calling
-[[nytid track switch]] with no arguments swaps back to that saved
-context.
+Calling [[nytid track switch email]] stops the most recent batch,
+saves that batch as the one alternate context, and starts [[email]].
+Use [[nytid track switch --all email]] when you want to stop and save
+all active labels before switching.  Calling [[nytid track switch]]
+with no arguments swaps back to that saved context.
 
 The design keeps one saved alternate context.  A forward [[switch]]
 saves the labels it interrupts, and a bare [[switch]] swaps back to
@@ -2328,7 +2329,9 @@ the primary context indicator for pane and window launches.
 <<prepare launch mode>>=
 launch_requested = command is not None or pane or window
 tracking_labels = list(labels)
+explicit_launch_labels = list(tracking_labels)
 launch_owned_labels = list(tracking_labels)
+launch_cleanup_labels = list(tracking_labels)
 command_args = None
 command_text = None
 proc_env = None
@@ -2383,7 +2386,8 @@ if launch_requested:
             typer.echo("Error: Command cannot be empty", err=True)
             raise typer.Exit(1)
         command_text = command
-        tracking_labels.append(os.path.basename(command_args[0]))
+        command_label = os.path.basename(command_args[0])
+        tracking_labels.append(command_label)
 
     launch_owned_labels = list(dict.fromkeys(
         tracking_labels
@@ -2393,15 +2397,30 @@ if launch_requested:
         "track", launch_owned_labels
     )
 
-    conflicting_launch_labels = sorted({
-        label for label in launch_owned_labels
+    conflicting_explicit_labels = sorted({
+        label for label in explicit_launch_labels
         if session.get_label_info(label) is not None
     })
-    if conflicting_launch_labels and not (replace or continue_labels):
+    conflicting_command_labels = sorted({
+        label for label in launch_owned_labels
+        if (
+            label not in explicit_launch_labels
+            and session.get_label_info(label) is not None
+        )
+    })
+    if conflicting_command_labels and not replace:
+        typer.echo(
+            "Error: launch mode requires inactive labels or "
+            "--replace for implicit command labels: "
+            f"{', '.join(conflicting_command_labels)}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if conflicting_explicit_labels and not (replace or continue_labels):
         typer.echo(
             "Error: launch mode requires inactive labels, "
             "--replace, or --continue: "
-            f"{', '.join(conflicting_launch_labels)}",
+            f"{', '.join(conflicting_explicit_labels)}",
             err=True,
         )
         raise typer.Exit(1)
@@ -2447,6 +2466,14 @@ if already_tracking:
         f"Already tracking: "
         f"{', '.join(sorted(already_tracking))}"
     )
+
+continued_launch_labels = [
+    label for label in already_tracking
+    if label in explicit_launch_labels
+]
+launch_cleanup_labels = list(dict.fromkeys(
+    list(started) + continued_launch_labels
+))
 
 session = load_active_session(who)
 all_active = session.get_active_labels()
@@ -2548,19 +2575,22 @@ disappear.
 
 The [[--continue]] flag covers that second case.  With [[--continue]],
 launch mode (i.e.\ [[--window]], [[--pane]], or [[--command]]) accepts
-labels that are already active: the existing session is preserved
-untouched (no [[discard_labels]], no new history entry, original start
-time unchanged), and the launched child process is bound to the same
-labels via the normal window/pane-labels path.  When the window or
-pane exits, the ordinary shutdown path stops the labels and records a
-single [[TrackingEntry]] covering the original start time through the
-child's exit.
+explicitly requested labels that are already active: the existing
+session is preserved untouched (no [[discard_labels]], no new history
+entry, original start time unchanged), and the launched child process is
+bound to the same labels via the normal window/pane-labels path.  When
+the window or pane exits, the ordinary shutdown path stops those
+explicitly continued labels together with any labels that this launch
+started fresh, recording a single [[TrackingEntry]] covering the
+original start time through the child's exit.
 
-That shutdown obligation belongs to the full effective launch label set,
-not just the subset that happened to be newly started for this launch.
-We therefore freeze the deduplicated ownership set in
-[[launch_owned_labels]] during launch setup and reuse it for both direct
-subprocess cleanup and the detached tmux finalizer.
+Implicit [[--command]] basename labels stay strict.  If the launched
+command would implicitly add [[python]], [[echo]], or a similar basename
+that is already active for unrelated work, [[--continue]] must not
+silently borrow it: the later launch cleanup would otherwise stop
+someone else's session.  We therefore let [[--continue]] bless only the
+labels the user named explicitly, while implicit command labels still
+require [[--replace]] when already active.
 
 The two flags express different intents and are mutually exclusive in
 spirit (though the code tolerates either one being set): pick
@@ -2967,6 +2997,44 @@ def test_start_continue_stops_borrowed_labels_on_exit(temp_tracking_dir):
         "--continue must preserve the original start time "
         "through child exit"
     )
+
+
+def test_start_continue_still_rejects_active_implicit_command_label(
+    temp_tracking_dir,
+):
+    """--continue does not borrow an unrelated implicit command label."""
+    runner.invoke(cli, ["start", "echo"])
+
+    result = runner.invoke(cli, [
+        "start", "work", "--continue", "--command", "echo test"
+    ])
+
+    assert result.exit_code == 1
+    assert "implicit command labels" in result.stdout
+    assert "echo" in result.stdout
+
+    session = load_active_session(default_username)
+    assert session.get_label_info("echo") is not None
+    assert session.get_label_info("work") is None
+
+
+def test_start_replace_restarts_implicit_command_label_for_launch(
+    temp_tracking_dir,
+):
+    """--replace intentionally restarts an active implicit command label."""
+    runner.invoke(cli, ["start", "echo", "--offset", "-20m"])
+
+    result = runner.invoke(cli, [
+        "start", "work", "--replace",
+        "--command", "echo test",
+    ])
+
+    assert result.exit_code == 0
+    assert "Replaced: echo" in result.stdout
+
+    session = load_active_session(default_username)
+    assert session.get_label_info("work") is None
+    assert session.get_label_info("echo") is None
 
 
 def test_start_continue_alone_is_noop_without_launch(temp_tracking_dir):
@@ -5115,8 +5183,47 @@ def write_last_selected_window(
 @
 
 We reuse the same absent-versus-empty distinction as for panes:
-[[None]] means the window is not tracked, while an empty list means the
-tracked file exists but currently has no labels.
+[[None]] means the window is not tracked, while an empty visible label
+set means the tracked file exists but currently has no labels.
+
+Unlike pane state, window state may receive overlapping contributions.
+Two panes in the same tracked window can both contribute [[work]], and a
+single pane exit must not delete [[work]] globally while the other pane
+still owns it.  We therefore persist per-label reference counts on disk.
+The public read helper still returns the visible ordered union of labels,
+and it accepts the older flat-list format for compatibility by treating
+each listed label as count~1.
+
+<<helper functions>>=
+def read_window_label_counts(
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
+) -> Optional[Dict[str, int]]:
+    """Read tracked window label counts, or ``None`` if absent."""
+    path = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if isinstance(data, list):
+        counts = {}
+        for label in data:
+            if label not in counts:
+                counts[label] = 1
+        return counts
+
+    if isinstance(data, dict):
+        counts = {}
+        for label, count in data.items():
+            if isinstance(count, int) and count > 0:
+                counts[label] = count
+        return counts or None
+
+    return None
 
 <<helper functions>>=
 def read_window_labels(
@@ -5125,18 +5232,33 @@ def read_window_labels(
     tmux_server_key: str,
 ) -> Optional[List[str]]:
     """Read tracked window labels, or ``None`` if absent."""
-    path = window_labels_path(
+    counts = read_window_label_counts(
         window_id, who, tmux_server_key,
     )
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    if counts is None:
         return None
+    return list(counts)
 @
 
 Writing again uses an atomic temporary file in the same directory.
 
 <<helper functions>>=
+def write_window_label_counts(
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
+    label_counts: Dict[str, int],
+) -> None:
+    """Atomically write a tracked window's label counts."""
+    path = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(label_counts))
+    tmp.rename(path)
+
+
 def write_window_labels(
     window_id: str,
     who: str,
@@ -5144,17 +5266,19 @@ def write_window_labels(
     labels: List[str],
 ) -> None:
     """Atomically write a tracked window's labels."""
-    path = window_labels_path(
-        window_id, who, tmux_server_key,
+    write_window_label_counts(
+        window_id,
+        who,
+        tmux_server_key,
+        {
+            label: 1 for label in dict.fromkeys(labels)
+        },
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(labels))
-    tmp.rename(path)
 @
 
-As with panes, we merge new labels while preserving order and skipping
-duplicates.
+As with panes, we merge new labels while preserving the visible order.
+Repeated contributions increment the label's reference count instead of
+duplicating it in the visible list.
 
 <<helper functions>>=
 def add_window_labels(
@@ -5164,22 +5288,21 @@ def add_window_labels(
     labels: List[str],
 ) -> None:
     """Add labels to a tracked window's active set."""
-    existing = read_window_labels(
+    existing = read_window_label_counts(
         window_id, who, tmux_server_key,
-    ) or []
-    seen = set(existing)
-    merged = list(existing)
+    ) or {}
     for lbl in labels:
-        if lbl not in seen:
-            merged.append(lbl)
-            seen.add(lbl)
-    write_window_labels(
-        window_id, who, tmux_server_key, merged,
+        if lbl not in existing:
+            existing[lbl] = 0
+        existing[lbl] += 1
+    write_window_label_counts(
+        window_id, who, tmux_server_key, existing,
     )
 @
 
-Removing labels shrinks the file or deletes it entirely when the last
-tracked label disappears.
+Removing labels decrements the corresponding reference counts and only
+drops a visible label once the last contributing pane has gone away.
+The file is deleted entirely when the final count disappears.
 
 <<helper functions>>=
 def remove_window_labels(
@@ -5189,19 +5312,22 @@ def remove_window_labels(
     labels: List[str],
 ) -> None:
     """Remove labels from a tracked window's active set."""
-    existing = read_window_labels(
+    existing = read_window_label_counts(
         window_id, who, tmux_server_key,
     )
     if existing is None:
         return
-    to_remove = set(labels)
-    remaining = [
-        lbl for lbl in existing
-        if lbl not in to_remove
-    ]
-    if remaining:
-        write_window_labels(
-            window_id, who, tmux_server_key, remaining,
+    for label in dict.fromkeys(labels):
+        count = existing.get(label)
+        if count is None:
+            continue
+        if count <= 1:
+            del existing[label]
+        else:
+            existing[label] = count - 1
+    if existing:
+        write_window_label_counts(
+            window_id, who, tmux_server_key, existing,
         )
     else:
         delete_window_labels(
@@ -5856,8 +5982,9 @@ Window exit cleanup needs different information from the focus-event
 commands.  Once the pane has died we can no longer derive its window via
 [[TMUX_PANE]], so the hook passes the explicit [[window_id]] together
 with the label names that this pane originally registered.  The cleanup
-command removes only those labels; any labels contributed by surviving
-panes in the same tracked window remain untouched.
+command decrements only those labels' window reference counts, so any
+labels contributed by surviving panes in the same tracked window remain
+visible until their last owner exits.
 
 <<helper functions>>=
 def build_detached_window_cleanup_command(
@@ -6187,8 +6314,8 @@ def stop_detached(
 
 The companion window-cleanup command handles the case where the pane has
 already died, so there is no live [[TMUX_PANE]] from which to recover the
-window identity.  It receives the explicit [[window_id]] and removes only
-the given label names from that shared window file.
+window identity.  It receives the explicit [[window_id]] and decrements
+only the given label names in that shared window file.
 
 <<detached finalize command>>=
 @cli.command(name="_cleanup-window-detached", hidden=True)
@@ -6431,6 +6558,27 @@ def test_add_window_labels_merges(temp_tracking_dir):
     ) == [
         "a", "b", "c",
     ]
+
+
+def test_remove_window_labels_preserves_shared_label(
+    temp_tracking_dir,
+):
+    """Removing one pane's labels keeps shared labels with remaining owners."""
+    window_id, who = "@42", "me"
+    add_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["shared", "x"],
+    )
+    add_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["shared", "y"],
+    )
+
+    remove_window_labels(
+        window_id, who, TEST_SERVER_KEY, ["shared", "x"],
+    )
+
+    assert read_window_labels(
+        window_id, who, TEST_SERVER_KEY,
+    ) == ["shared", "y"]
 
 def test_remove_window_labels_deletes_when_empty(
     temp_tracking_dir,
@@ -7491,7 +7639,7 @@ exit_fd, exit_code_file = tempfile.mkstemp(
 os.close(exit_fd)
 finalize_cmd = \
     build_detached_track_finalize_command(
-        launch_owned_labels, who
+        launch_cleanup_labels, who
     )
 finalize_cmd += (
     f"; rm -f {shlex.quote(exit_code_file)}"
@@ -7537,7 +7685,7 @@ finally:
 @
 
 <<stop launched labels>>=
-launched_labels = list(launch_owned_labels)
+launched_labels = list(launch_cleanup_labels)
 end_time = datetime.datetime.now()
 session, completed_entries = stop_tracking_labels(
     who=who,
@@ -7547,11 +7695,12 @@ session, completed_entries = stop_tracking_labels(
 )
 @
 
-The launch cleanup path must unregister every label this launch owned even
-when some were only borrowed via [[--continue]] or were already auto-suspended
-before the subprocess exited.  Using the freshly computed
-[[completed_entries]] would miss those cases and leave stale window or pane
-declarations behind.
+The launch cleanup path must unregister the labels whose tracking state
+this launch actually owns: newly started labels plus explicitly
+continued labels.  Using the freshly computed [[completed_entries]]
+would miss auto-suspended cases, while using the full effective launch
+label set would wrongly unregister an unrelated implicit command label
+that [[--continue]] was not allowed to borrow.
 
 <<unregister launched labels from tracked tmux context>>=
 if launched_labels:
@@ -9966,11 +10115,17 @@ def test_cleanup_window_detached_preserves_other_labels(
 ):
     """Window cleanup removes only the exiting pane's labels."""
     window_id = "@42"
-    write_window_labels(
+    add_window_labels(
         window_id,
         default_username,
         TEST_SERVER_KEY,
         ["X", "shared", "Y"],
+    )
+    add_window_labels(
+        window_id,
+        default_username,
+        TEST_SERVER_KEY,
+        ["shared"],
     )
 
     result = runner.invoke(
@@ -9988,7 +10143,7 @@ def test_cleanup_window_detached_preserves_other_labels(
     assert result.exit_code == 0
     assert read_window_labels(
         window_id, default_username, TEST_SERVER_KEY,
-    ) == ["Y"]
+    ) == ["shared", "Y"]
 @
 
 The [[--timeout]] option only applies to direct subprocesses, not
