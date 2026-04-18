@@ -63,7 +63,7 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 - `src/nytid/signup/hr/timesheet/__init__.py`
 - `src/nytid/httputils.py` (legacy, unused)
 
-**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten file under `tests/` is `tests/conftest.nw` (itself a literate source). **Never edit `tests/test_*.py` directly** — edits vanish on the next `make all`, and they won't even appear in `git status` because they're gitignored. To add or modify a test:
+**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish on the next `make all`, and they won't even appear in `git status` because they're gitignored. To add or modify a test:
 
 1. Grep for the test name in `src/**/*.nw` to find the literate source — or find the `<<test functions>>=` chunk near the feature the test covers (tests are colocated with the feature they verify).
 2. Edit the `.nw` file.
