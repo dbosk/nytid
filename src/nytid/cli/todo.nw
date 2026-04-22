@@ -324,7 +324,7 @@ class TodoItem:
     id: int
     title: str
     labels: List[str] = field(default_factory=list)
-    priority: float = 0.0
+    priority: Optional[float] = 0.0
     status: str = "pending"
     created: str = ""
     deadline: Optional[str] = None
@@ -371,7 +371,9 @@ class TodoItem:
         """Create from dictionary (JSON deserialization).
 
         Unknown keys are silently ignored for forward
-        compatibility.
+        compatibility. Missing priority keeps the legacy
+        default of [[0.0]], while an explicit JSON null is
+        preserved as an unset priority.
         """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
@@ -426,13 +428,30 @@ def test_todo_item_from_dict_ignores_unknown():
     item = TodoItem.from_dict(data)
     assert item.id == 1
     assert item.title == "Test"
+
+
+def test_todo_item_from_dict_preserves_null_priority():
+    """Explicit JSON null keeps priority unset."""
+    item = TodoItem.from_dict({
+        "id": 1,
+        "title": "Test",
+        "priority": None,
+    })
+    assert item.priority is None
 @
 
 \section{Effective Priority}
 
-The effective priority determines display and scheduling order.
-Without a deadline, it equals the base priority. With a deadline, we
-add a boost that increases quadratically as the deadline approaches.
+The effective priority determines display and scheduling order for
+ranked items. Without a deadline, it equals the base priority. With a
+deadline, we add a boost that increases quadratically as the deadline
+approaches.
+
+Some items are intentionally left unranked. They still need a stable
+display order, but they should not participate in numeric midpoint
+math. We therefore let [[effective_priority]] return [[None]] when the
+stored priority is unset, and handle mixed ranked/unranked lists with a
+separate display-order helper.
 
 Why quadratic rather than linear? A linear curve would start boosting
 immediately, which is unhelpful for items due in three months. The
@@ -444,15 +463,19 @@ time span, then ramps up sharply---matching the human experience of
 def effective_priority(
     item: TodoItem,
     now: Optional[datetime.datetime] = None,
-) -> float:
+) -> Optional[float]:
     """Compute effective priority including deadline boost.
 
-    Returns base priority plus a deadline-based urgency
-    boost that increases quadratically as the deadline
-    approaches.
+    Returns ``None`` when the stored base priority is
+    unset. Otherwise returns base priority plus a
+    deadline-based urgency boost that increases
+    quadratically as the deadline approaches.
     """
     if now is None:
         now = datetime.datetime.now()
+
+    if item.priority is None:
+        return None
 
     base = item.priority
 
@@ -481,6 +504,57 @@ def effective_priority(
     deadline_boost = max_boost * (urgency ** 2)
 
     return base + deadline_boost
+
+
+def require_effective_priority(
+    item: TodoItem,
+    now: Optional[datetime.datetime] = None,
+) -> float:
+    """Return effective priority for a ranked item."""
+    priority = effective_priority(item, now)
+    if priority is None:
+        raise ValueError(
+            f"todo #{item.id} has no numeric priority"
+        )
+    return priority
+
+
+def todo_display_sort_key(
+    item: TodoItem,
+    now: Optional[datetime.datetime] = None,
+) -> tuple:
+    """Return the user-facing display-order key.
+
+    Ranked items sort before unranked ones. Among the
+    unranked tail, earlier deadlines come first and
+    items without deadlines come last.
+    """
+    priority = effective_priority(item, now)
+    if priority is not None:
+        return (
+            0,
+            -priority,
+            item.created or "",
+            item.id,
+        )
+    return (
+        1,
+        item.deadline is None,
+        item.deadline or "",
+        item.created or "",
+        item.id,
+    )
+
+
+def sort_todos_for_display(
+    items: List[TodoItem],
+    now: Optional[datetime.datetime] = None,
+) -> List[TodoItem]:
+    """Return todos in the shared display order."""
+    return sorted(
+        items,
+        key=lambda item: todo_display_sort_key(item, now),
+    )
 @
 
 \subsection{Testing Effective Priority}
@@ -511,6 +585,17 @@ def test_effective_priority_past_deadline():
     assert result == 5.0 + DEFAULT_MAX_BOOST
 
 
+def test_effective_priority_unset_priority():
+    """Unranked items have no effective priority score."""
+    item = TodoItem(
+        id=1,
+        title="Unranked",
+        priority=None,
+        created="2026-01-01T00:00:00",
+    )
+    assert effective_priority(item) is None
+
+
 def test_effective_priority_quadratic_growth():
     """Boost should be small early and large near deadline."""
     item = TodoItem(
@@ -529,6 +614,45 @@ def test_effective_priority_quadratic_growth():
     assert p_early < p_mid < p_late
     # Early boost should be small (quadratic)
     assert p_early < 1.0
+
+
+def test_sort_todos_for_display_keeps_unranked_tail():
+    """Unranked items sort after ranked ones by deadline."""
+    ranked = TodoItem(
+        id=1,
+        title="Ranked",
+        priority=5.0,
+        created="2026-01-01T00:00:00",
+    )
+    early = TodoItem(
+        id=2,
+        title="Early deadline",
+        priority=None,
+        created="2026-01-02T00:00:00",
+        deadline="2026-01-10T00:00:00",
+    )
+    late = TodoItem(
+        id=3,
+        title="Late deadline",
+        priority=None,
+        created="2026-01-03T00:00:00",
+        deadline="2026-01-20T00:00:00",
+    )
+    someday = TodoItem(
+        id=4,
+        title="No deadline",
+        priority=None,
+        created="2026-01-04T00:00:00",
+    )
+
+    ordered = sort_todos_for_display([
+        late,
+        someday,
+        ranked,
+        early,
+    ])
+
+    assert [item.id for item in ordered] == [1, 2, 3, 4]
 @
 
 \section{Storage}
@@ -1082,12 +1206,14 @@ def get_active_siblings(
     todos: List[TodoItem],
     item: TodoItem,
     who: Optional[str] = None,
+    ranked_only: bool = False,
 ) -> List[TodoItem]:
-    """Get pending/in-progress siblings, sorted by
-    effective priority (highest first).
+    """Get pending/in-progress siblings in the shared
+    priority order.
 
     When ``who`` is given, only siblings assigned to
-    that worker are returned.
+    that worker are returned. When ``ranked_only`` is
+    true, siblings with unset priorities are excluded.
     """
     siblings = get_siblings(todos, item)
     active = [
@@ -1099,7 +1225,17 @@ def get_active_siblings(
             or (s.who or default_username) == who
         )
     ]
-    active.sort(key=effective_priority, reverse=True)
+    if ranked_only:
+        active = [
+            s for s in active
+            if s.priority is not None
+        ]
+        active.sort(
+            key=require_effective_priority,
+            reverse=True,
+        )
+    else:
+        active = sort_todos_for_display(active)
     return active
 @
 
@@ -1130,6 +1266,26 @@ def filter_ids_by_worker(
         if i in by_id
         and (by_id[i].who or default_username) == who
     ]
+
+
+def todo_depth(
+    todos: List[TodoItem],
+    item: TodoItem,
+) -> int:
+    """Return the depth of ``item`` in the todo tree."""
+    by_id = {t.id: t for t in todos}
+    depth = 0
+    seen = set()
+    parent_id = item.parent_id
+    while (
+        parent_id is not None
+        and parent_id in by_id
+        and parent_id not in seen
+    ):
+        seen.add(parent_id)
+        depth += 1
+        parent_id = by_id[parent_id].parent_id
+    return depth
 
 
 def check_parent_completion(
@@ -1180,8 +1336,9 @@ def find_pending_by_priority(
                 who, t.who or default_username
             )
         ]
+    now = datetime.datetime.now()
     candidates.sort(
-        key=effective_priority, reverse=True
+        key=lambda item: todo_display_sort_key(item, now)
     )
     return candidates[0] if candidates else None
 @
@@ -1321,22 +1478,28 @@ def compute_child_priority_range(
     priority and low is the next-lower sibling's priority
     (or a default floor if no lower sibling exists).
     """
+    if parent.priority is None:
+        raise ValueError(
+            "cannot compute child range for "
+            "unprioritized parent"
+        )
     high = parent.priority
     siblings = [
         t for t in todos
         if t.parent_id == parent.parent_id
         and t.id != parent.id
         and t.status != "done"
+        and t.priority is not None
     ]
     lower = [
         s for s in siblings
-        if effective_priority(s) < high
+        if require_effective_priority(s) < high
     ]
     if lower:
         closest = max(
-            lower, key=effective_priority
+            lower, key=require_effective_priority
         )
-        low = effective_priority(closest)
+        low = require_effective_priority(closest)
     else:
         low = high - 10.0
     return (high, low)
@@ -1876,10 +2039,10 @@ and its children (looked up from the full todo list), it produces
 the same markdown format that the editor expects. This enables
 round-tripping: render an existing todo, edit it, parse it back.
 
-Children are sorted by [[effective_priority]] in descending order
-so the most important items appear first---matching the convention
-used throughout the rest of the CLI (the [[ls]] command, task
-selection in [[find_pending_by_priority]], etc.).
+Children use the shared display ordering so the editor shows the same
+mixture the rest of the CLI does: ranked items first, then unranked
+items in deadline order.  That consistency matters because the editor is
+not just a text blob; it is another view of the same priority model.
 
 We only include metadata fields that differ from defaults to keep
 the output clean. The [[wd]], [[command]], [[deadline]],
@@ -1903,10 +2066,8 @@ def render_todo_markdown(
     if item.notes:
         lines.append(item.notes)
         lines.append("")
-    children = sorted(
-        get_children(todos, item.id),
-        key=effective_priority,
-        reverse=True,
+    children = sort_todos_for_display(
+        get_children(todos, item.id)
     )
     for child in children:
         lines.extend(
@@ -1965,10 +2126,8 @@ def render_child_markdown(item, todos, level):
     if item.notes:
         lines.append(item.notes)
         lines.append("")
-    grandchildren = sorted(
-        get_children(todos, item.id),
-        key=effective_priority,
-        reverse=True,
+    grandchildren = sort_todos_for_display(
+        get_children(todos, item.id)
     )
     for child in grandchildren:
         lines.extend(
@@ -2161,8 +2320,16 @@ def binary_search_priority(
     are no siblings, the priority is placed within the
     parent's context range instead of defaulting to 1.0.
     """
-    if not siblings:
-        if parent is not None and todos is not None:
+    ranked_siblings = [
+        sibling for sibling in siblings
+        if sibling.priority is not None
+    ]
+    if not ranked_siblings:
+        if (
+            parent is not None
+            and todos is not None
+            and parent.priority is not None
+        ):
             high, low = compute_child_priority_range(
                 todos, parent
             )
@@ -2170,7 +2337,9 @@ def binary_search_priority(
         return 1.0
 
     sorted_items = sorted(
-        siblings, key=effective_priority, reverse=True
+        ranked_siblings,
+        key=require_effective_priority,
+        reverse=True,
     )
 
     low = 0
@@ -2210,15 +2379,21 @@ def assign_priority_at_position(
         return 1.0
 
     if position == 0:
-        top = effective_priority(sorted_items[0])
+        top = require_effective_priority(sorted_items[0])
         return top + 1.0
 
     if position >= len(sorted_items):
-        bottom = effective_priority(sorted_items[-1])
+        bottom = require_effective_priority(
+            sorted_items[-1]
+        )
         return bottom - 1.0
 
-    above = effective_priority(sorted_items[position - 1])
-    below = effective_priority(sorted_items[position])
+    above = require_effective_priority(
+        sorted_items[position - 1]
+    )
+    below = require_effective_priority(
+        sorted_items[position]
+    )
     return (above + below) / 2.0
 
 
@@ -2226,9 +2401,15 @@ def append_priority_after_siblings(
     siblings: List[TodoItem],
 ) -> float:
     """Return a base priority below all sibling bases."""
-    if not siblings:
+    ranked_siblings = [
+        item for item in siblings
+        if item.priority is not None
+    ]
+    if not ranked_siblings:
         return 1.0
-    bottom = min(item.priority for item in siblings)
+    bottom = min(
+        item.priority for item in ranked_siblings
+    )
     return bottom - 1.0
 @
 
@@ -2811,8 +2992,9 @@ def get_top_level_pending_by_priority(
                 who, item.who or default_username
             )
         ]
+    now = datetime.datetime.now()
     candidates.sort(
-        key=effective_priority, reverse=True
+        key=lambda item: todo_display_sort_key(item, now)
     )
     return candidates[0] if candidates else None
 
@@ -3923,7 +4105,13 @@ Most of the time we infer priority interactively by comparing the new
 item with its siblings. Sometimes, however, the caller already knows the
 numeric value or simply wants to add the item after the current lowest-
 priority sibling. The [[--prio]] option handles the former case, while
-[[--append]] keeps the latter non-interactive:
+[[--append]] keeps the latter non-interactive.
+
+The new [[--skip-priority]] flag covers a third case: capturing a task
+without ranking it yet.  That is useful when triaging a backlog or when
+the right comparison set is not available at creation time.  Unranked
+items sort after ranked ones until [[reprioritize]] assigns them a numeric
+position:
 
 <<argument and option definitions>>=
 prio_opt = typer.Option(
@@ -3932,12 +4120,16 @@ prio_opt = typer.Option(
 append_opt = typer.Option(
     "--append",
     help="Append after lowest-priority sibling")
+skip_prio_opt = typer.Option(
+    "--skip-priority",
+    help="Create without assigning a numeric priority")
 @
 
 <<add command options>>=
 explicit_priority: Annotated[Optional[float],
                              prio_opt] = None,
 append: Annotated[bool, append_opt] = False,
+skip_priority: Annotated[bool, skip_prio_opt] = False,
 @
 
 Like the UNIX [[at]] command, we can capture the current working
@@ -4053,12 +4245,28 @@ particular, [[--prio]] says
 [[--append]] says 
 \enquote{derive a value by placing the item after its
 siblings}. Rather than silently picking one interpretation, we reject
-the combination and ask the user to choose:
+the combination and ask the user to choose.  [[--skip-priority]] is also
+exclusive with both numeric modes: either we store a number now, or we
+store no number and leave the item for later ranking:
 
 <<validate add options>>=
 if explicit_priority is not None and append:
     typer.echo(
         "Error: --prio and --append cannot be used together",
+        err=True,
+    )
+    raise typer.Exit(1)
+if skip_priority and explicit_priority is not None:
+    typer.echo(
+        "Error: --skip-priority and --prio cannot be "
+        "used together",
+        err=True,
+    )
+    raise typer.Exit(1)
+if skip_priority and append:
+    typer.echo(
+        "Error: --skip-priority and --append cannot be "
+        "used together",
         err=True,
     )
     raise typer.Exit(1)
@@ -4141,6 +4349,9 @@ preserves the existing
 the sibling set is scoped to the target worker ([[--who]]) so that
 priorities stay meaningful within one person's task list.
 
+[[--skip-priority]] is the one exception: it deliberately bypasses all
+numeric placement and stores [[None]] instead.
+
 The append path works from stored base priorities, not
 [[effective_priority]].  Deadline boost is intentionally temporary; if we
 reused an effective score as a newly stored base priority, an urgent
@@ -4163,12 +4374,16 @@ temp = TodoItem(
     title=priority_title,
     parent_id=resolved_parent,
 )
-siblings = get_active_siblings(todos, temp, who=who)
+siblings = get_active_siblings(
+    todos, temp, who=who, ranked_only=True,
+)
 parent_ctx = (
     parent_item if resolved_parent is not None
     else None
 )
-if explicit_priority is not None:
+if skip_priority:
+    priority = None
+elif explicit_priority is not None:
     priority = explicit_priority
 elif append:
     if siblings:
@@ -4470,10 +4685,12 @@ so passing it through avoids a second lookup and keeps the function
 independent of global state.  Passing the environment explicitly serves
 the same purpose for context restoration: if the parent captured an
 environment, children created in the editor inherit it unless they say
-otherwise. Priorities are distributed within the
-range computed by [[compute_child_priority_range]] so that children
-sort between their parent and the parent's next-lower sibling in
-flat view:
+otherwise. When the parent has a numeric priority we still distribute
+child priorities within the range computed by
+[[compute_child_priority_range]] so that children sort between their
+parent and the parent's next-lower sibling in flat view.  But when the
+parent itself is unranked there is no meaningful numeric range yet, so
+the children stay unranked too and wait for later [[reprioritize]]:
 
 <<create children from parsed>>=
 def create_children_from_parsed(
@@ -4496,10 +4713,16 @@ def create_children_from_parsed(
     command line before entering the editor.
     """
     nonlocal next_id, todos
-    priorities = distribute_priorities_in_range(
-        len(parsed_children),
-        priority_high, priority_low,
-    )
+    if (
+        priority_high is not None
+        and priority_low is not None
+    ):
+        priorities = distribute_priorities_in_range(
+            len(parsed_children),
+            priority_high, priority_low,
+        )
+    else:
+        priorities = [None] * len(parsed_children)
     for i, parsed_child in enumerate(
         parsed_children
     ):
@@ -4575,13 +4798,19 @@ typer.echo(
 
 For nested children (grandchildren), the sub-range falls between the
 current child's priority and the next child's priority. If this is the
-last child, we use the range's lower bound instead:
+last child, we use the range's lower bound instead.  Unranked children
+propagate the unranked state downward by passing [[None]] for both ends
+of the nested range:
 
 <<nested child priority range>>=
-nested_high = prio
-if i + 1 < len(priorities):
+if prio is None:
+    nested_high = None
+    nested_low = None
+elif i + 1 < len(priorities):
+    nested_high = prio
     nested_low = priorities[i + 1]
 else:
+    nested_high = prio
     nested_low = priority_low
 @
 
@@ -4590,9 +4819,13 @@ context and passes the parent's [[who]] so that any child lacking
 an explicit [[who:]] in its YAML block inherits the same assignee:
 
 <<create children from parsed>>=
-prio_high, prio_low = compute_child_priority_range(
-    todos, parent_item
-)
+if parent_item.priority is None:
+    prio_high = None
+    prio_low = None
+else:
+    prio_high, prio_low = compute_child_priority_range(
+        todos, parent_item
+    )
 create_children_from_parsed(
     parsed.children,
     parent_id_for_children,
@@ -5046,6 +5279,82 @@ def test_ls_rich_progress_stays_in_title_column(
     assert parent_index < progress_index < child_index
 
 
+def test_ls_json_prio_keeps_unranked_tail(
+    temp_todo_dir,
+):
+    """JSON output keeps ranked items first and shows null priority."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Ranked",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="Unranked later",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=None,
+            deadline="2026-03-10",
+        ),
+        TodoItem(
+            id=3, title="Unranked sooner",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=None,
+            deadline="2026-03-01",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["ls", "--format", "json", "--prio", "--who", ""],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert [item["title"] for item in payload] == [
+        "Ranked",
+        "Unranked sooner",
+        "Unranked later",
+    ]
+    assert payload[0]["effective_priority"] == 5.0
+    assert payload[1]["effective_priority"] is None
+
+
+def test_ls_csv_prio_leaves_unranked_blank(
+    temp_todo_dir,
+):
+    """CSV priority column is blank for unranked items."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Ranked",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="Unranked",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            priority=None,
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["ls", "--format", "csv", "--prio", "--who", ""],
+    )
+
+    assert result.exit_code == 0
+    rows = [line.split("\t") for line in result.stdout.splitlines()]
+    data_rows = rows[1:] if rows[0][0] == "id" else rows
+    assert data_rows[0][1] == "5.0"
+    assert data_rows[0][2] == "Ranked"
+    assert data_rows[1][1] == ""
+    assert data_rows[1][2] == "Unranked"
+
+
 def test_ls_done_flag_includes_done(temp_todo_dir):
     """The --done flag includes completed items."""
     save_todos(3, [
@@ -5095,7 +5404,7 @@ else:
     )
 @
 
-JSON output sorts by effective priority and respects the [[-n]] limit
+JSON output uses the shared display order and respects the [[-n]] limit
 just like the rich and CSV paths.  We sort here because JSON consumers
 (scripts, agents) should receive items in the same priority order the
 user would see interactively, and slicing with [[[:count]]] is a
@@ -5107,16 +5416,16 @@ omitting it by default keeps the JSON payload small.
 import json as json_mod
 
 now = datetime.datetime.now()
-sorted_filtered = sorted(
-    filtered,
-    key=lambda t: effective_priority(t, now),
-    reverse=True,
+sorted_filtered = sort_todos_for_display(
+    filtered, now
 )[:count]
 output = []
 for t in sorted_filtered:
     d = t.to_dict()
     if show_prio:
-        d["effective_priority"] = effective_priority(t)
+        d["effective_priority"] = effective_priority(
+            t, now
+        )
     d["tracked_hours"] = tracked_times.get(t.id, 0)
     output.append(d)
 print(json_mod.dumps(output, indent=2))
@@ -5136,13 +5445,16 @@ leading empty cells from [[show_prio]] so the summary stays aligned
 with the task title in both layouts. We use a single [[Console]] to
 respect the terminal width automatically.
 
-Effective priority is the primary sort key but is not surfaced
+Effective priority is still the primary sort key for ranked items but is
+not surfaced
 by default in any output format. The numeric score is an
 internal detail: in table output it clutters the view, and in
 CSV/JSON it adds a field that most scripts do not need.
 Passing [[--prio]] opts in across all three formats, which is
 useful when debugging why an item ranked unexpectedly or when
-writing a script that needs a comparable score.
+writing a script that needs a comparable score.  Unranked items leave
+that field blank (or [[null]] in JSON), making the absence of a numeric
+priority visible instead of pretending it is zero.
 
 <<output rich table>>=
 from rich.console import Console
@@ -5182,31 +5494,25 @@ table.add_column("Status")
 @
 
 <<populate flat rows into rich table>>=
-sorted_items = sorted(
-    filtered,
-    key=lambda t: effective_priority(t, now),
-    reverse=True,
+sorted_items = sort_todos_for_display(
+    filtered, now
 )[:count]
 for item in sorted_items:
     <<add item row to rich table>>
 @
 
 <<populate tree rows into rich table>>=
-top_level = get_visible_roots(filtered)
-top_level.sort(
-    key=lambda t: effective_priority(t, now),
-    reverse=True,
-)
-top_level = top_level[:count]
+top_level = sort_todos_for_display(
+    get_visible_roots(filtered), now
+)[:count]
 for item in top_level:
     <<add item row to rich table>>
-    children = sorted(
+    children = sort_todos_for_display(
         [
             t for t in filtered
             if t.parent_id == item.id
         ],
-        key=lambda t: effective_priority(t, now),
-        reverse=True,
+        now,
     )
     all_children = get_children(todos, item.id)
     if all_children:
@@ -5253,7 +5559,9 @@ tracked_str = (
 )
 table.add_row(
     str(item.id),
-    *([f"{ep:.1f}"] if show_prio else []),
+    *([
+        "" if ep is None else f"{ep:.1f}"
+    ] if show_prio else []),
     item.title,
     item.who or "",
     dl_str,
@@ -5285,7 +5593,9 @@ tracked_str = (
 )
 table.add_row(
     str(child.id),
-    *([f"{ep:.1f}"] if show_prio else []),
+    *([
+        "" if ep is None else f"{ep:.1f}"
+    ] if show_prio else []),
     f"  \u2514\u2500 {child.title}",
     child.who or "",
     dl_str,
@@ -5315,10 +5625,8 @@ if not filtered:
     return
 
 now = datetime.datetime.now()
-sorted_items = sorted(
-    filtered,
-    key=lambda t: effective_priority(t, now),
-    reverse=True,
+sorted_items = sort_todos_for_display(
+    filtered, now
 )[:count]
 dest = open(output, "w", newline="") if output else sys.stdout
 writer = csv.writer(dest, delimiter="\t")
@@ -5335,7 +5643,9 @@ for item in sorted_items:
     tracked = tracked_times.get(item.id, 0)
     writer.writerow([
         item.id,
-        *( [f"{ep:.1f}"] if show_prio else [] ),
+        *([
+            "" if ep is None else f"{ep:.1f}"
+        ] if show_prio else []),
         item.title,
         item.who or "",
         item.deadline or "",
@@ -5418,8 +5728,10 @@ typer.echo(
     f"#{item.id} {item.title} [{item.status}]"
 )
 parts = []
-if item.priority:
+if item.priority is not None:
     parts.append(f"Priority: {item.priority:.1f}")
+else:
+    parts.append("Priority: unset")
 if item.deadline:
     parts.append(f"Deadline: {item.deadline}")
 if item.estimated:
@@ -5502,9 +5814,10 @@ elif item.notes:
         typer.echo(f"  {line}")
 @
 
-Children and grandchildren are sorted by [[effective_priority]] in
-descending order, matching the convention used everywhere else in
-the CLI.
+Children and grandchildren use the same display ordering as [[ls]]:
+ranked items first, then unranked items in deadline order.  That keeps
+[[view]] consistent with the rest of the interface while still showing
+tasks that have not been numerically ranked yet.
 
 Done sub-items are hidden by default for the same reason as in
 [[ls]]---a long list of completed children clutters the view of
@@ -5515,11 +5828,7 @@ though it has completed sub-items.
 
 <<display todo children>>=
 all_children = get_children(todos, item.id)
-children = sorted(
-    all_children,
-    key=effective_priority,
-    reverse=True,
-)
+children = sort_todos_for_display(all_children)
 hidden_done = 0
 if not include_done:
     hidden_done += sum(
@@ -5546,10 +5855,8 @@ if children:
         if child.notes:
             first_line = child.notes.splitlines()[0]
             typer.echo(f"    {first_line}")
-        grandchildren = sorted(
-            get_children(todos, child.id),
-            key=effective_priority,
-            reverse=True,
+        grandchildren = sort_todos_for_display(
+            get_children(todos, child.id)
         )
         if not include_done:
             hidden_done += sum(
@@ -5688,6 +5995,49 @@ def test_view_hides_done_children(temp_todo_dir):
     assert "Done child" in result.stdout
     assert "Done grandchild" in result.stdout
     assert "hidden" not in result.stdout
+
+
+def test_view_shows_unset_priority_and_mixed_child_order(
+    temp_todo_dir,
+):
+    """view prints unset priority and shared child ordering."""
+    save_todos(5, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            priority=None,
+        ),
+        TodoItem(
+            id=2, title="Unranked later",
+            parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=None,
+            deadline="2026-03-10",
+        ),
+        TodoItem(
+            id=3, title="Ranked child",
+            parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=4, title="Unranked sooner",
+            parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=None,
+            deadline="2026-03-01",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["view", "1"])
+
+    assert result.exit_code == 0
+    assert "Priority: unset" in result.stdout
+    assert (
+        result.stdout.index("Ranked child")
+        < result.stdout.index("Unranked sooner")
+        < result.stdout.index("Unranked later")
+    )
 @
 
 \subsection{The [[edit]] Command}
@@ -5900,7 +6250,10 @@ children keep their ID, status, and tracked time. New headings get
 fresh IDs. Priorities are distributed within the parent's context
 range (using [[compute_child_priority_range]]) so that children
 sort correctly in flat view, rather than using absolute sequential
-values.
+values.  Unranked children are the exception: if a child already has no
+priority, reconciliation keeps it that way instead of silently assigning
+one.  New children only receive numeric priorities when the parent has a
+numeric priority and the new child is entering the ranked subset.
 
 <<reconcile children>>=
 <<build existing children index>>
@@ -5921,16 +6274,40 @@ existing_by_title = {
 @
 
 Priority distribution uses the parent's sibling-context range so
-that children sort correctly relative to other top-level items when
-the list is shown flat.  Without this, all children of every parent
-would receive priorities in [0, 1] and would interleave arbitrarily.
+that ranked children sort correctly relative to other top-level items
+when the list is shown flat.  Without this, all children of every
+parent would receive priorities in [0, 1] and would interleave
+arbitrarily.
+
+Existing unranked children do not consume a numeric slot.  They stay in
+the unranked tail until the user runs [[reprioritize]], while ranked or
+new children still share the parent's numeric range.
 <<distribute child priorities>>=
-prio_high, prio_low = compute_child_priority_range(
-    todos, item
-)
-priorities = distribute_priorities_in_range(
-    len(parsed.children), prio_high, prio_low,
-)
+if item.priority is None:
+    ranked_titles = []
+    priorities = []
+else:
+    ranked_titles = [
+        parsed_child.title.strip().lower()
+        for parsed_child in parsed.children
+        if (
+            parsed_child.title.strip().lower()
+            not in existing_by_title
+            or existing_by_title[
+                parsed_child.title.strip().lower()
+            ].priority is not None
+        )
+    ]
+    if ranked_titles:
+        prio_high, prio_low = compute_child_priority_range(
+            todos, item
+        )
+        priorities = distribute_priorities_in_range(
+            len(ranked_titles), prio_high, prio_low,
+        )
+    else:
+        priorities = []
+priority_iter = iter(priorities)
 @
 
 For each child in the parsed document we either update the matching
@@ -5944,8 +6321,18 @@ remain unseen after this loop were removed in the editor.
 <<update or create each parsed child>>=
 new_child_ids = set()
 for i, parsed_child in enumerate(parsed.children):
-    prio = priorities[i] if i < len(priorities) else 0.0
     norm_title = parsed_child.title.strip().lower()
+    existing_child = existing_by_title.get(norm_title)
+    if (
+        item.priority is None
+        or (
+            existing_child is not None
+            and existing_child.priority is None
+        )
+    ):
+        prio = None
+    else:
+        prio = next(priority_iter, None)
     if norm_title in existing_by_title:
         child = existing_by_title.pop(norm_title)
         child.title = parsed_child.title
@@ -6034,6 +6421,66 @@ def test_edit_interactive_reconcile():
     assert (
         parsed.children[0].title == "Existing child"
     )
+
+
+def test_edit_interactive_reconcile_keeps_unranked_child(
+    temp_todo_dir,
+):
+    """Editor reconciliation preserves an existing unranked child."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="Unranked child",
+            parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=None,
+        ),
+    ])
+    buffer = (
+        "Parent\n"
+        "\n"
+        "# Unranked child\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "-E"])
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    child = next(t for t in todos if t.id == 2)
+    assert child.priority is None
+
+
+def test_add_edit_unranked_parent_keeps_children_unranked(
+    temp_todo_dir,
+):
+    """Editor add keeps descendants unranked under unranked parent."""
+    buffer = (
+        "Parent task\n"
+        "\n"
+        "# First child\n"
+        "\n"
+        "# Second child\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["add", "--edit", "--skip-priority", "--top-level"],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert len(todos) == 3
+    assert all(t.priority is None for t in todos)
 
 def test_child_who_appears_in_editor():
     """Child who field survives render/parse roundtrip.
@@ -6225,9 +6672,11 @@ siblings. This reruns the same binary search algorithm used during
 siblings belonging to the same worker, because cross-worker priority
 comparisons are not meaningful.
 
-Like the other single-item commands, an explicit ID overrides the
-active stack, while omitting the ID means \enquote{reprioritize the task
-I am currently working on}.
+An explicit ID still reprioritizes one specific item.  But omitting the
+ID now serves backlog triage: we walk the current worker's unranked,
+non-done items and ask the same binary-search questions for each.  We do
+parents before children so that a child can use its newly ranked parent
+as the upper bound of its own insertion range.
 
 <<reprioritize command>>=
 @cli.command()
@@ -6237,16 +6686,58 @@ def reprioritize(
 ):
     """Rerun binary search priority for a todo item.
 
-    If no ID given, reprioritizes the current active
-    task.
+    If no ID given, reprioritizes all current-worker
+    items without numeric priority, excluding done
+    items.
 
     Alias: reprio
     """
     next_id, todos = load_todos()
-    todo_id = resolve_todo_id(
-        todo_id, "reprioritize",
-        who=default_username, todos=todos,
-    )
+    if todo_id is None:
+        targets = [
+            t for t in todos
+            if t.priority is None
+            and t.status != "done"
+            and (t.who or default_username)
+            == default_username
+        ]
+        if not targets:
+            typer.echo(
+                "No unprioritized todos found for "
+                f"{default_username}."
+            )
+            return
+        targets = sort_todos_for_display(targets)
+        targets.sort(
+            key=lambda item: todo_depth(todos, item)
+        )
+        for item in targets:
+            parent_ctx = next(
+                (
+                    t for t in todos
+                    if t.id == item.parent_id
+                ),
+                None,
+            )
+            siblings = get_active_siblings(
+                todos,
+                item,
+                who=item.who or default_username,
+                ranked_only=True,
+            )
+            new_priority = binary_search_priority(
+                siblings,
+                item.title,
+                parent=parent_ctx,
+                todos=todos,
+            )
+            item.priority = new_priority
+            typer.echo(
+                f"Reprioritized #{item.id}: "
+                f"unset -> {new_priority:.1f}"
+            )
+        save_todos(next_id, todos)
+        return
     item = next(
         (t for t in todos if t.id == todo_id), None
     )
@@ -6260,9 +6751,16 @@ def reprioritize(
     siblings = get_active_siblings(
         todos, item,
         who=item.who or default_username,
+        ranked_only=True,
     )
     new_priority = binary_search_priority(
-        siblings, item.title
+        siblings,
+        item.title,
+        parent=next(
+            (t for t in todos if t.id == item.parent_id),
+            None,
+        ),
+        todos=todos,
     )
     old_priority = item.priority
     item.priority = new_priority
@@ -6270,7 +6768,8 @@ def reprioritize(
     save_todos(next_id, todos)
     typer.echo(
         f"Reprioritized #{todo_id}: "
-        f"{old_priority:.1f} -> {new_priority:.1f}"
+        f"{old_priority if old_priority is None else f'{old_priority:.1f}'}"
+        f" -> {new_priority:.1f}"
     )
 @
 
@@ -6286,54 +6785,100 @@ def reprio(
     reprioritize(todo_id=todo_id)
 @
 
-Let's verify that [[reprioritize]] also defaults to the current active
-todo:
+Let's verify the new no-argument batch mode: it should only touch the
+current worker's unranked, non-done items, visiting parents before
+children so child placement can use the parent's newly assigned numeric
+priority.
 
 <<test functions>>=
-def test_reprioritize_defaults_to_active_todo(
+def test_reprioritize_without_id_batches_current_worker_items(
     temp_todo_dir,
 ):
-    """Reprioritize without ID uses the current active todo."""
-    save_todos(3, [
+    """Bare reprioritize batches current-worker unranked todos."""
+    from nytid.cli.todo import default_username
+
+    save_todos(6, [
         TodoItem(
-            id=1, title="Later task",
-            priority=2.0,
+            id=1, title="Ranked anchor",
+            priority=8.0,
             created="2026-02-20T10:00:00",
+            who=default_username,
         ),
         TodoItem(
-            id=2, title="Active task",
-            priority=9.0,
+            id=2, title="Parent task",
+            priority=None,
             created="2026-02-20T10:00:00",
+            who=default_username,
+        ),
+        TodoItem(
+            id=3, title="Child task",
+            priority=None,
+            parent_id=2,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        ),
+        TodoItem(
+            id=4, title="Done task",
+            priority=None,
+            status="done",
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        ),
+        TodoItem(
+            id=5, title="Other worker task",
+            priority=None,
+            created="2026-02-20T10:00:00",
+            who="other-worker",
         ),
     ])
-    save_active_stack([1, 2])
+
+    seen = []
+
+    def mock_binary_search(siblings, title, **kw):
+        seen.append((title, kw.get("parent")))
+        return 6.0 if title == "Parent task" else 5.0
 
     with patch(
         "nytid.cli.todo.binary_search_priority",
-        return_value=4.5,
+        side_effect=mock_binary_search,
     ):
         result = runner.invoke(cli, ["reprioritize"])
 
     assert result.exit_code == 0
-    assert "Reprioritized #2" in result.output
+    assert "Reprioritized #2: unset -> 6.0" in result.output
+    assert "Reprioritized #3: unset -> 5.0" in result.output
+    assert "#4" not in result.output
+    assert "#5" not in result.output
+    assert seen[0][0] == "Parent task"
+    assert seen[1][0] == "Child task"
+    assert seen[1][1].id == 2
+    _, todos = load_todos()
+    assert next(t for t in todos if t.id == 2).priority == 6.0
+    assert next(t for t in todos if t.id == 3).priority == 5.0
+    assert next(t for t in todos if t.id == 4).priority is None
+    assert next(t for t in todos if t.id == 5).priority is None
 
 
-def test_reprioritize_without_id_requires_active_todo(
+def test_reprioritize_without_id_reports_no_unprioritized(
     temp_todo_dir,
 ):
-    """Reprioritize without ID errors when no active todo exists."""
+    """Bare reprioritize reports when nothing qualifies."""
+    from nytid.cli.todo import default_username
+
     save_todos(2, [
         TodoItem(
             id=1, title="Local task",
+            priority=3.0,
             created="2026-02-20T10:00:00",
+            who=default_username,
         ),
     ])
 
     result = runner.invoke(cli, ["reprioritize"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert (
-        "No active todo. Specify an ID to reprioritize."
+        "No unprioritized todos found for"
         in result.output
     )
 @
@@ -10015,7 +10560,8 @@ def export(
 
 The VTODO format maps naturally to our data model. ICS priority uses
 a 1--9 scale (1 = highest, 9 = lowest), so we need to invert and
-clamp our float priority.
+clamp our float priority.  Unranked items are still exported, but we do
+not invent an ICS priority for them.
 
 <<vtodo export function>>=
 def export_vtodo(todos: List[TodoItem]) -> str:
@@ -10037,8 +10583,13 @@ def export_vtodo(todos: List[TodoItem]) -> str:
 
     cal = Calendar()
 
+    now = datetime.datetime.now()
     max_prio = max(
-        (effective_priority(t) for t in todos),
+        (
+            require_effective_priority(t, now)
+            for t in todos
+            if t.priority is not None
+        ),
         default=1.0,
     )
 
@@ -10058,18 +10609,20 @@ def export_vtodo(todos: List[TodoItem]) -> str:
 @
 
 ICS priority 1 is highest, 9 is lowest. We normalize our effective
-priority into this range.
+priority into this range, but only for items that already have a numeric
+priority.
 
 <<map priority to ics scale>>=
-ep = effective_priority(item)
-if max_prio > 0:
-    normalized = ep / max_prio
-    ics_prio = max(1, min(9, round(
-        9 - normalized * 8
-    )))
-else:
-    ics_prio = 5
-todo.priority = ics_prio
+ep = effective_priority(item, now)
+if ep is not None:
+    if max_prio > 0:
+        normalized = ep / max_prio
+        ics_prio = max(1, min(9, round(
+            9 - normalized * 8
+        )))
+    else:
+        ics_prio = 5
+    todo.priority = ics_prio
 @
 
 <<set vtodo deadline and duration>>=
@@ -11424,6 +11977,7 @@ from nytid.cli.todo import (
     ParsedTodo,
     canonicalize_wd,
     effective_priority,
+    sort_todos_for_display,
     load_todos,
     save_todos,
     get_todo_dir,
@@ -11575,6 +12129,24 @@ def test_add_with_negative_priority(temp_todo_dir):
     assert result.exit_code == 0
     _, todos = load_todos()
     assert todos[0].priority == -3.5
+
+
+def test_add_with_skip_priority_leaves_priority_unset(
+    temp_todo_dir,
+):
+    """--skip-priority stores an unranked todo."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Unranked todo",
+            "--skip-priority",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    assert todos[0].priority is None
 
 
 def test_add_append_uses_bottom_priority(temp_todo_dir):
@@ -11874,6 +12446,48 @@ def test_add_rejects_prio_with_append(temp_todo_dir):
     assert result.exit_code == 1
     assert (
         "--prio and --append cannot be used together"
+        in result.output
+    )
+
+
+def test_add_rejects_skip_priority_with_prio(
+    temp_todo_dir,
+):
+    """--skip-priority and --prio are mutually exclusive."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Conflicting",
+            "--skip-priority",
+            "--prio", "5",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert (
+        "--skip-priority and --prio cannot be used together"
+        in result.output
+    )
+
+
+def test_add_rejects_skip_priority_with_append(
+    temp_todo_dir,
+):
+    """--skip-priority and --append are mutually exclusive."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Conflicting",
+            "--skip-priority",
+            "--append",
+            "--top-level",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert (
+        "--skip-priority and --append cannot be used together"
         in result.output
     )
 
@@ -12286,12 +12900,17 @@ def test_edit_run_flag_updates_command(temp_todo_dir):
 
 def test_export_vtodo(temp_todo_dir):
     """Test VTODO export."""
-    save_todos(2, [
+    save_todos(3, [
         TodoItem(
             id=1, title="Export me",
             priority=5.0,
             created="2026-02-20T10:00:00",
             estimated=2.0,
+        ),
+        TodoItem(
+            id=2, title="Export me too",
+            priority=None,
+            created="2026-02-20T10:00:00",
         ),
     ])
 
@@ -12301,6 +12920,7 @@ def test_export_vtodo(temp_todo_dir):
     assert result.exit_code == 0
     assert "VTODO" in result.stdout
     assert "Export me" in result.stdout
+    assert "Export me too" in result.stdout
 
 
 def test_parent_auto_done(temp_todo_dir):
