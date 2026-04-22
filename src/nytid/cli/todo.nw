@@ -273,7 +273,7 @@ def get_worker_default(worker, attribute):
 \subsection{The TodoItem Dataclass}
 
 Each todo item carries an integer ID, a title, labels that connect to
-the track system, a float priority determined by binary search, a
+the track system, an optional numeric priority, a
 status, timestamps, an optional deadline, an estimated duration in
 hours, a longer description, an optional parent ID for sub-items, and
 an optional worker assignment.
@@ -2318,18 +2318,21 @@ def binary_search_priority(
 
     When ``parent`` and ``todos`` are provided and there
     are no siblings, the priority is placed within the
-    parent's context range instead of defaulting to 1.0.
+    parent's context range when that parent is ranked.
+    Callers must keep children of an unranked parent
+    unranked instead of asking for numeric placement.
     """
     ranked_siblings = [
         sibling for sibling in siblings
         if sibling.priority is not None
     ]
     if not ranked_siblings:
-        if (
-            parent is not None
-            and todos is not None
-            and parent.priority is not None
-        ):
+        if parent is not None and todos is not None:
+            if parent.priority is None:
+                raise ValueError(
+                    "cannot assign numeric priority under "
+                    "an unranked parent"
+                )
             high, low = compute_child_priority_range(
                 todos, parent
             )
@@ -4352,6 +4355,12 @@ priorities stay meaningful within one person's task list.
 [[--skip-priority]] is the one exception: it deliberately bypasses all
 numeric placement and stores [[None]] instead.
 
+An unranked parent is an even stronger constraint.  Until the parent
+itself has a numeric priority there is no child interval to place new
+work into, so every newly added child stays unranked regardless of
+whether the caller asked for [[--prio]], [[--append]], or the default
+interactive comparison.
+
 The append path works from stored base priorities, not
 [[effective_priority]].  Deadline boost is intentionally temporary; if we
 reused an effective score as a newly stored base priority, an urgent
@@ -4381,7 +4390,9 @@ parent_ctx = (
     parent_item if resolved_parent is not None
     else None
 )
-if skip_priority:
+if parent_ctx is not None and parent_ctx.priority is None:
+    priority = None
+elif skip_priority:
     priority = None
 elif explicit_priority is not None:
     priority = explicit_priority
@@ -4839,12 +4850,13 @@ create_children_from_parsed(
 
 \subsection{The [[ls]] Command}
 
-The list command shows todos sorted by effective priority. By default
-it shows only top-level items (those without a parent), keeping the
-list scannable without drowning the user in sub-tasks. The [[--all]]
-option enables the full tree view: top-level items with their children
-indented below. The [[--flat]] option shows a flat priority-sorted
-list instead of the indented tree.
+The list command shows ranked todos first, ordered by effective
+priority, and then any unranked todos in deadline order. By default it
+shows only top-level items (those without a parent), keeping the list
+scannable without drowning the user in sub-tasks. The [[--all]] option
+enables the full tree view: top-level items with their children
+indented below. The [[--flat]] option shows a flat list in that same
+display order instead of the indented tree.
 
 We query tracked time by looking for entries with [[todo:<id>]] labels
 in the track data, connecting the todo system to actual time spent.
@@ -4933,11 +4945,13 @@ def ls(
     output: Annotated[Optional[str],
                       ls_output_opt] = None,
 ):
-    """List todo items sorted by effective priority.
+    """List todo items in display order.
 
-    By default shows only top-level items assigned to the current
-    user. Pass [[--all]] to see the full tree including subtasks,
-    or [[-n N]] to cap the output at N items.
+    Ranked items are shown first by effective priority; unranked
+    items follow in deadline order. By default shows only top-level
+    items assigned to the current user. Pass [[--all]] to see the
+    full tree including subtasks, or [[-n N]] to cap the output at
+    N items.
 
     [[--who]] defaults to [[\\$USER]]; pass an empty string
     ([[--who '']]) to show all assignees.
@@ -6719,6 +6733,15 @@ def reprioritize(
                 ),
                 None,
             )
+            if (
+                parent_ctx is not None
+                and parent_ctx.priority is None
+            ):
+                typer.echo(
+                    f"Skipping #{item.id}: parent "
+                    f"#{parent_ctx.id} is still unranked."
+                )
+                continue
             siblings = get_active_siblings(
                 todos,
                 item,
@@ -6748,6 +6771,22 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
+    parent_ctx = next(
+        (t for t in todos if t.id == item.parent_id),
+        None,
+    )
+    if (
+        parent_ctx is not None
+        and parent_ctx.priority is None
+    ):
+        typer.echo(
+            f"Error: cannot reprioritize #{todo_id} while "
+            f"parent #{parent_ctx.id} is unranked; "
+            "reprioritize the parent first",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     siblings = get_active_siblings(
         todos, item,
         who=item.who or default_username,
@@ -6756,10 +6795,7 @@ def reprioritize(
     new_priority = binary_search_priority(
         siblings,
         item.title,
-        parent=next(
-            (t for t in todos if t.id == item.parent_id),
-            None,
-        ),
+        parent=parent_ctx,
         todos=todos,
     )
     old_priority = item.priority
@@ -6944,6 +6980,38 @@ def test_reprioritize_ignores_other_workers_siblings(
     sibs = captured_siblings["items"]
     assert "Another mine" in sibs
     assert "Other's task" not in sibs
+
+
+def test_reprioritize_child_of_unranked_parent_requires_parent_first(
+    temp_todo_dir,
+):
+    """Explicit child reprioritize refuses an unranked parent."""
+    save_todos(3, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            priority=None,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2,
+            title="Child",
+            priority=None,
+            parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with patch(
+        "nytid.cli.todo.binary_search_priority",
+    ) as mock_search:
+        result = runner.invoke(cli, ["reprioritize", "2"])
+
+    assert result.exit_code == 1
+    mock_search.assert_not_called()
+    assert "parent #1 is unranked" in result.output
+    _, todos = load_todos()
+    assert next(t for t in todos if t.id == 2).priority is None
 @
 
 \subsection{The [[done]] Command}
@@ -10665,6 +10733,11 @@ are implicitly less urgent than recent ones. We scale
 [[created_at]] timestamps linearly across the batch so the
 newest item gets the highest priority.
 
+An unranked parent overrides both ranking modes. Without a
+numeric parent priority there is no child interval to place the
+imported items into, so children of such a parent stay unranked
+until the parent itself is reprioritized.
+
 Imported items are assigned to the current user by default
 (via [[--who]]), matching the behavior of [[todo add]] and
 [[todo ls]]. This ensures that imported items appear when
@@ -10928,7 +11001,9 @@ for gh_item in new_items:
         else "pending"
     )
 
-    if skip_priority:
+    if parent_item is not None and parent_item.priority is None:
+        priority = None
+    elif skip_priority:
         priority = priorities.get(
             gh_item["number"], 0.0
         )
@@ -10986,11 +11061,16 @@ for gh_item in new_items:
 The age heuristic maps creation dates to priorities in the
 range~$[0, 1]$, with the oldest item at~0 and the newest at~1.
 Users can later reprioritize individual items to interleave
-them with existing work.  When we import under a parent, however,
-those priorities must stay within the parent's child range or flat view
-would scatter them outside their subtree.  In that case we scale the
-same oldest-to-newest ordering into the interval returned by
-[[compute_child_priority_range]].
+them with existing work.  When we import under a ranked parent,
+however, those priorities must stay within the parent's child
+range or flat view would scatter them outside their subtree.
+In that case we scale the same oldest-to-newest ordering into
+the interval returned by [[compute_child_priority_range]].
+
+An unranked parent has no numeric child interval yet.  In that
+case the imported children stay unranked too, regardless of
+whether the user asked for the age heuristic or the interactive
+path.
 
 Items missing a [[createdAt]] field (malformed API responses) get a
 far-past fallback so they sort to the bottom of the batch:
@@ -11013,15 +11093,21 @@ for gh_item in new_items:
 timestamps.sort()
 n = len(timestamps)
 if resolved_parent is not None and parent_item is not None:
-    high, low = compute_child_priority_range(
-        todos, parent_item
-    )
-    values = distribute_priorities_in_range(
-        n, high, low
-    )
-    priorities = {}
-    for i, (dt, num) in enumerate(reversed(timestamps)):
-        priorities[num] = values[i]
+    if parent_item.priority is None:
+        priorities = {
+            num: None
+            for _, num in timestamps
+        }
+    else:
+        high, low = compute_child_priority_range(
+            todos, parent_item
+        )
+        values = distribute_priorities_in_range(
+            n, high, low
+        )
+        priorities = {}
+        for i, (dt, num) in enumerate(reversed(timestamps)):
+            priorities[num] = values[i]
 elif n == 1:
     priorities = {timestamps[0][1]: 0.0}
 else:
@@ -11184,8 +11270,118 @@ def test_import_applies_parent_and_wd(temp_todo_dir):
     assert child.labels == ["DD1310", "owner/repo"]
 @
 
-When [[--skip-priority]] is combined with parenting, the newest imported
-item should still receive the highest child priority within the
+An unranked parent has no child interval yet, so imported children must
+also stay unranked.  This should hold for both the age heuristic and the
+interactive path:
+
+<<test functions>>=
+def test_import_parented_skip_priority_under_unranked_parent_keeps_children_unranked(
+    temp_todo_dir,
+):
+    """Unranked parents keep imported children unranked."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Parent task",
+            priority=None,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 2,
+            "title": "Older import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 3,
+            "title": "Newer import",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ), patch(
+        "nytid.cli.todo.compute_child_priority_range",
+    ) as mock_range:
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+                "--parent", "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_range.assert_not_called()
+    _, todos = load_todos()
+    older = next(t for t in todos if t.title == "Older import")
+    newer = next(t for t in todos if t.title == "Newer import")
+    assert older.parent_id == 1
+    assert newer.parent_id == 1
+    assert older.priority is None
+    assert newer.priority is None
+
+
+def test_import_under_unranked_parent_skips_binary_search(
+    temp_todo_dir,
+):
+    """Interactive import also keeps unranked children unranked."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Parent task",
+            priority=None,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 2,
+            "title": "Imported child",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ), patch(
+        "nytid.cli.todo.binary_search_priority",
+    ) as mock_search:
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--parent", "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_search.assert_not_called()
+    _, todos = load_todos()
+    child = next(t for t in todos if t.title == "Imported child")
+    assert child.parent_id == 1
+    assert child.priority is None
+@
+
+When [[--skip-priority]] is combined with a ranked parent, the newest
+imported item should still receive the highest child priority within the
 parent's range:
 
 <<test functions>>=
@@ -12215,6 +12411,67 @@ def test_add_append_under_parent(temp_todo_dir):
     appended = next(t for t in todos if t.id == 4)
     assert appended.parent_id == 1
     assert appended.priority == 2.0
+
+
+def test_add_under_unranked_parent_skips_binary_search(
+    temp_todo_dir,
+):
+    """Children of unranked parents stay unranked."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            priority=None,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with patch(
+        "nytid.cli.todo.binary_search_priority",
+    ) as mock_search:
+        result = runner.invoke(
+            cli,
+            [
+                "add", "-t", "Child",
+                "--parent", "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_search.assert_not_called()
+    _, todos = load_todos()
+    child = next(t for t in todos if t.id == 2)
+    assert child.parent_id == 1
+    assert child.priority is None
+
+
+def test_add_with_explicit_priority_under_unranked_parent_stays_unranked(
+    temp_todo_dir,
+):
+    """Explicit priority does not override an unranked parent."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Parent",
+            priority=None,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Child",
+            "--parent", "1",
+            "--prio", "4.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    _, todos = load_todos()
+    child = next(t for t in todos if t.id == 2)
+    assert child.parent_id == 1
+    assert child.priority is None
 
 
 def test_add_auto_parents_under_tmux_context_todo(
