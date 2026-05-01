@@ -28,7 +28,7 @@ poetry run pip install black
 make all  # Generates Python files from .nw files using notangle, formats with black
 
 # 6. Run tests
-cd tests && make test  # Expected: 14/24 tests pass (failures due to missing Canvas/LADOK/AFS)
+cd tests && make test  # Expected: 552 passing under Python 3.10+ (numbers grow as features land)
 
 # 7. Run the CLI
 poetry run nytid --help
