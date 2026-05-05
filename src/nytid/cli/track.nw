@@ -2314,6 +2314,19 @@ the raw pre-deduplicated list would produce noisy output such as
 [[Already tracking: echo, echo]] even though the session state correctly
 tracks only one [[echo]] label.
 
+Derived tmux work sometimes needs one more label source: the current
+tracked context.  [[--inherit-labels]] reads labels from the current
+tracked tmux window, or from the current tracked pane when no tracked
+window owns that pane.  This is intentionally narrower than the worker's
+full active session, so unrelated labels active elsewhere do not leak
+into the derived launch.
+
+Those inherited labels are already owned by the current tracked context,
+so launch mode may borrow them without an explicit [[--continue]].  The
+same exemption must not apply to unrelated implicit command labels,
+which still need [[--replace]] unless the inherited context already
+contains them.
+
 Track and todo should also present launch context the same way.  We therefore
 compute one context string up front and reuse it for tmux window names and
 as a best-effort [[PS1]] seed.  In tmux the user's [[~/.bashrc]] will
@@ -2324,6 +2337,8 @@ the primary context indicator for pane and window launches.
 launch_requested = command is not None or pane or window
 tracking_labels = list(labels)
 explicit_launch_labels = list(tracking_labels)
+inherited_context_labels = []
+borrowable_launch_labels = []
 launch_owned_labels = list(tracking_labels)
 launch_cleanup_labels = list(tracking_labels)
 command_args = None
@@ -2370,6 +2385,12 @@ if launch_requested:
     proc_cwd = wd_path if wd_path else proc_cwd
     proc_env = os.environ.copy()
 
+    if inherit_labels:
+        inherited_context_labels = get_current_tracked_context_labels(
+            who,
+        )
+        tracking_labels.extend(inherited_context_labels)
+
     if command is not None:
         try:
             command_args = shlex.split(command)
@@ -2386,6 +2407,13 @@ if launch_requested:
     launch_owned_labels = list(dict.fromkeys(
         tracking_labels
     ))
+    borrowable_launch_labels = list(dict.fromkeys(
+        inherited_context_labels
+        + (
+            explicit_launch_labels
+            if continue_labels else []
+        )
+    ))
 
     launch_context = build_context_name(
         "track", launch_owned_labels
@@ -2393,12 +2421,16 @@ if launch_requested:
 
     conflicting_explicit_labels = sorted({
         label for label in explicit_launch_labels
-        if session.get_label_info(label) is not None
+        if (
+            session.get_label_info(label) is not None
+            and label not in borrowable_launch_labels
+        )
     })
     conflicting_command_labels = sorted({
         label for label in launch_owned_labels
         if (
             label not in explicit_launch_labels
+            and label not in inherited_context_labels
             and session.get_label_info(label) is not None
         )
     })
@@ -2461,12 +2493,12 @@ if already_tracking:
         f"{', '.join(sorted(already_tracking))}"
     )
 
-continued_launch_labels = [
+borrowed_launch_labels = [
     label for label in already_tracking
-    if label in explicit_launch_labels
+    if label in borrowable_launch_labels
 ]
 launch_cleanup_labels = list(dict.fromkeys(
-    list(started) + continued_launch_labels
+    list(started) + borrowed_launch_labels
 ))
 
 session = load_active_session(who)
@@ -2610,6 +2642,41 @@ continue_labels: Annotated[bool, continue_opt] = False,
 
 <<start command docstring examples>>=
 nytid track start devel nytid -W --continue  # Bind active labels to new window
+@
+
+\subsubsection{Inheriting the Current Tracked Context}
+
+Sometimes a new tmux window is not a fresh context but a branch from the
+current one: while working on [[kthutils]], the user might discover that
+[[weblogin]] needs a fix first.  The derived window should keep the
+reason for the work---[[work]], [[devel]], and [[kthutils]]---while
+adding the new label [[weblogin]].
+
+The [[--inherit-labels]] flag covers that case.  In launch mode it reads
+labels from the current tracked tmux context and adds them to the launch
+label set before conflict checking and window naming.  If the current
+pane belongs to a tracked window, that window's labels win; otherwise we
+fall back to a tracked pane's labels.  Outside a tracked tmux context,
+the flag is a no-op.
+
+These inherited labels are treated like intentionally borrowed labels:
+launch mode may reuse them even though they are already active, and the
+later launch-cleanup path removes only this launch's contribution from
+tracked tmux state.
+
+<<argument and option definitions>>=
+inherit_labels_opt = typer.Option(
+    "--inherit-labels", "-I",
+    help="In launch mode, add labels from the current tracked "
+         "tmux pane/window context.")
+@
+
+<<start command options>>=
+inherit_labels: Annotated[bool, inherit_labels_opt] = False,
+@
+
+<<start command docstring examples>>=
+nytid track start weblogin -W -I             # Branch from current tracked context
 @
 
 \subsubsection{Worker Identity}
@@ -3055,6 +3122,89 @@ def test_start_continue_has_no_effect_on_inactive_labels(temp_tracking_dir):
     assert "Started tracking:" in result.stdout
     assert "labelA" in result.stdout
     assert "Running 'echo test'" in result.stdout
+
+
+def test_start_window_inherit_labels_borrows_current_context(
+    temp_tracking_dir,
+):
+    """--inherit-labels carries the tracked window context into a new window."""
+    who = default_username
+    runner.invoke(cli, ["start", "work", "devel", "kthutils"])
+    write_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+        ["work", "devel", "kthutils"],
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX": "/tmp/tmux.sock,123,0",
+            "TMUX_PANE": "%7",
+            "SHELL": "/bin/bash",
+        },
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.track.get_tmux_window_id_for_pane",
+            return_value="@42",
+        ), patch(
+            "nytid.cli.track.run_tmux_command",
+            return_value=0,
+        ) as mock_tmux:
+            result = runner.invoke(cli, [
+                "start", "weblogin",
+                "--window",
+                "--inherit-labels",
+                "--auto-suspend",
+            ])
+
+    assert result.exit_code == 0
+    assert "Started tracking: weblogin" in result.stdout
+    assert "Already tracking:" in result.stdout
+    assert "devel" in result.stdout
+    assert "kthutils" in result.stdout
+    assert "work" in result.stdout
+    call_kwargs = mock_tmux.call_args.kwargs
+    assert call_kwargs["window_name"] == (
+        "track:weblogin work devel kthutils"
+    )
+    assert call_kwargs["focus_labels"] == [
+        "weblogin", "work", "devel", "kthutils",
+    ]
+    assert "_stop-detached weblogin work devel kthutils" in (
+        call_kwargs["on_exit_shell"]
+    )
+
+
+def test_start_window_inherit_labels_ignores_untracked_active_labels(
+    temp_tracking_dir,
+):
+    """--inherit-labels does not pull in worker-global labels by itself."""
+    runner.invoke(cli, ["start", "work"])
+
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX": "session",
+            "SHELL": "/bin/bash",
+        },
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.track.run_tmux_command",
+            return_value=0,
+        ) as mock_tmux:
+            result = runner.invoke(cli, [
+                "start", "weblogin",
+                "--window",
+                "--inherit-labels",
+            ])
+
+    assert result.exit_code == 0
+    assert "Already tracking: work" not in result.stdout
+    call_kwargs = mock_tmux.call_args.kwargs
+    assert call_kwargs["window_name"] == "track:weblogin"
+    assert " work" not in call_kwargs["on_exit_shell"]
 @
 
 \subsection{Stop Command}
@@ -5660,6 +5810,43 @@ def get_current_tracked_window_id(
     return window_id
 @
 
+Nested launches that want to branch off from their current tracked
+context need a slightly higher-level helper than
+[[get_current_tracked_window_id()]].  The command cares about the labels
+that define the current pane or window, not just its tmux identifier.
+
+We prefer tracked-window labels over tracked-pane labels because window
+tracking is the broader context: a nested command in a tracked window
+should inherit that window's work labels even if no pane-specific state
+exists.  Only when no tracked window owns the current pane do we fall
+back to pane labels.  Outside tracked tmux state, the helper returns an
+empty list so launch commands can treat inheritance as a no-op.
+
+<<helper functions>>=
+def get_current_tracked_context_labels(
+    who: str,
+) -> list[str]:
+    """Return labels from the current tracked tmux context."""
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return []
+
+    window_id = get_current_tracked_window_id(
+        who, tmux_server_key,
+    )
+    if window_id:
+        return read_window_labels(
+            window_id, who, tmux_server_key,
+        ) or []
+
+    pane_id = os.environ.get("TMUX_PANE")
+    if not pane_id:
+        return []
+    return read_pane_labels(
+        pane_id, who, tmux_server_key,
+    ) or []
+@
+
 \subsubsection{Hidden Detached Commands}
 
 The focus hooks run inside tmux's [[run-shell]], which launches a
@@ -7140,6 +7327,76 @@ def test_get_current_tracked_window_id_uses_live_window_lookup(
                 "me", TEST_SERVER_KEY,
             ) == "@42"
 
+def test_get_current_tracked_context_labels_prefers_window_labels(
+    temp_tracking_dir,
+):
+    """Inherited context prefers tracked window labels over pane labels."""
+    who = "me"
+    write_window_labels(
+        "@42", who, TEST_SERVER_KEY,
+        ["work", "devel", "kthutils"],
+    )
+    write_pane_labels(
+        "%7", who, TEST_SERVER_KEY,
+        ["pane-only"],
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.track.get_tmux_window_id_for_pane",
+            return_value="@42",
+        ):
+            assert get_current_tracked_context_labels(who) == [
+                "work", "devel", "kthutils",
+            ]
+
+def test_get_current_tracked_context_labels_falls_back_to_pane(
+    temp_tracking_dir,
+):
+    """Without a tracked window, inherited context uses pane labels."""
+    who = "me"
+    write_pane_labels(
+        "%7", who, TEST_SERVER_KEY,
+        ["work", "weblogin"],
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
+        clear=True,
+    ):
+        with patch(
+            "nytid.cli.track.get_tmux_window_id_for_pane",
+        ) as mock_lookup:
+            assert get_current_tracked_context_labels(who) == [
+                "work", "weblogin",
+            ]
+    mock_lookup.assert_not_called()
+
+def test_get_current_tracked_context_labels_returns_empty_when_untracked(
+    temp_tracking_dir,
+):
+    """Without tracked pane/window state, inheritance is a no-op."""
+    with patch.dict(
+        os.environ,
+        {
+            "TMUX_PANE": "%7",
+            "TMUX": "/tmp/tmux.sock,123,0",
+        },
+        clear=True,
+    ):
+        assert get_current_tracked_context_labels("me") == []
+
 def test_nested_start_updates_live_tracked_window_only(
     temp_tracking_dir,
 ):
@@ -7690,11 +7947,12 @@ session, completed_entries = stop_tracking_labels(
 @
 
 The launch cleanup path must unregister the labels whose tracking state
-this launch actually owns: newly started labels plus explicitly
-continued labels.  Using the freshly computed [[completed_entries]]
+this launch actually owns: newly started labels plus any labels it
+borrowed intentionally, whether through [[--continue]] or through
+[[--inherit-labels]].  Using the freshly computed [[completed_entries]]
 would miss auto-suspended cases, while using the full effective launch
 label set would wrongly unregister an unrelated implicit command label
-that [[--continue]] was not allowed to borrow.
+that launch mode was not allowed to borrow.
 
 <<unregister launched labels from tracked tmux context>>=
 if launched_labels:
@@ -9346,6 +9604,7 @@ from nytid.cli.track import (
     write_last_selected_window,
     has_tracked_window_state,
     get_current_tracked_window_id,
+    get_current_tracked_context_labels,
     install_tmux_hook_once,
     build_detached_nytid_prefix,
     build_detached_suspend_command,
