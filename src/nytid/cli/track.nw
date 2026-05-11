@@ -144,6 +144,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -810,35 +811,18 @@ def complete_workers(ctx, args, incomplete):
         return []
 
 def parse_offset(offset_str: str) -> datetime.timedelta:
+    """Parse an offset string into a timedelta.
+
+    Bare number = minutes.  Suffixes: ``s``,
+    ``m``, ``h``, ``d``.  Negative values
+    (``-30m``, ``-1h30m``) and composite values
+    (``1h30m``) are accepted.
     """
-    Parse an offset string into a timedelta.
-    
-    Supports formats:
-    - Plain number: "30" (minutes)
-    - With 'm' suffix: "30m" (minutes)
-    - With 'h' suffix: "1.5h" (hours)
-    - Negative values: "-30m", "-1.5h"
-    
-    Examples:
-        parse_offset("30") -> 30 minutes
-        parse_offset("-30m") -> -30 minutes
-        parse_offset("1.5h") -> 1.5 hours = 90 minutes
-        parse_offset("-2h") -> -2 hours = -120 minutes
-    """
-    offset_str = offset_str.strip()
-    
-    # Check for hour suffix
-    if offset_str.endswith('h'):
-        hours = float(offset_str[:-1])
-        return datetime.timedelta(hours=hours)
-    
-    # Check for minute suffix
-    if offset_str.endswith('m'):
-        minutes = float(offset_str[:-1])
-        return datetime.timedelta(minutes=minutes)
-    
-    # No suffix, assume minutes
-    minutes = float(offset_str)
+    minutes = _parse_duration(
+        offset_str.strip(),
+        {"s": 1 / 60, "m": 1,
+         "h": 60, "d": 24 * 60},
+    )
     return datetime.timedelta(minutes=minutes)
 
 def parse_at_time(at_str: str, reference_time: datetime.datetime = None) -> datetime.datetime:
@@ -902,6 +886,16 @@ def test_parse_offset():
     assert parse_offset("1.5h") == datetime.timedelta(hours=1.5)
     assert parse_offset("-2h") == datetime.timedelta(hours=-2)
     assert parse_offset("-0.5h") == datetime.timedelta(minutes=-30)
+
+    # Composite
+    assert parse_offset("1h30m") == \
+        datetime.timedelta(minutes=90)
+    assert parse_offset("-1h30m") == \
+        datetime.timedelta(minutes=-90)
+
+    # New units now also accepted
+    assert parse_offset("90s") == \
+        datetime.timedelta(seconds=90)
 
 def test_parse_at_time():
     """Test absolute time parsing"""
@@ -2530,7 +2524,8 @@ offset or time relative to its own action.
 offset_opt = typer.Option(
     "--offset", "-o",
     help="Offset current time "
-         "(e.g., '-30m', '-1.5h', '30' for minutes)")
+         "(e.g., '-30m', '-1h30m', "
+         "'90s', '30' for minutes)")
 @
 
 <<start command options>>=
@@ -4185,31 +4180,70 @@ auto_suspend_opt = typer.Option(
 Several options ([[--timeout]], [[--duration]], [[--estimate]]) accept
 duration strings with an optional unit suffix: [[s]] (seconds), [[m]]
 (minutes), [[h]] (hours), [[d]] (days).  Fractional values such as
-[[1.5h]] (90~minutes) are accepted.  The only difference between the
-options is what a bare number (no suffix) means: seconds for
-[[--timeout]], hours for [[--duration]] and [[--estimate]].
+[[1.5h]] (90~minutes) are accepted.  Composite durations such as
+[[3h15m]] (3~hours plus 15~minutes) are accepted too; the parts are
+summed.  The only difference between the options is what a bare number
+(no suffix) means: seconds for [[--timeout]], hours for [[--duration]]
+and [[--estimate]].
 
-We factor this into a shared core that maps suffixes to multipliers,
-with thin wrappers that each supply the right table:
+We factor this into a shared core that maps suffixes to multipliers.  It
+first accepts a bare number directly, then tokenises concatenated
+number-unit pairs and requires them to rebuild the input, which rejects
+leftovers such as [[3h15]].  Thin wrappers each supply the right table:
+
+<<constants>>=
+_DURATION_TOKEN = re.compile(
+    r"(\d+\.?\d*|\.\d+)([a-zA-Z]?)"
+)
+@
 
 <<helper functions>>=
 def _parse_duration(value, suffixes):
     """Apply a suffix multiplier table to a
     duration string.
 
-    If the last character of ``value`` is a key
-    in ``suffixes``, the numeric prefix is multiplied
-    by the corresponding factor.  Otherwise the entire
-    string is interpreted as a bare number.
+    Either the whole string is a bare number
+    (interpreted in the wrapper's default unit),
+    or it is a sequence of ``<number><unit>``
+    pairs that are summed (e.g. ``3h15m``).
+    An optional leading ``+``/``-`` sign applies
+    to the whole result.
 
-    Raises ``ValueError`` on empty input.
+    Raises ``ValueError`` on empty input,
+    unknown units, or a trailing unitless part.
     """
     if not value:
-        raise ValueError("Duration must not be empty")
-    if value[-1] in suffixes:
-        return float(value[:-1]) \
-            * suffixes[value[-1]]
-    return float(value)
+        raise ValueError(
+            "Duration must not be empty"
+        )
+    sign, body = 1, value
+    if body[0] in "+-":
+        sign = -1 if body[0] == "-" else 1
+        body = body[1:]
+        if not body:
+            raise ValueError(
+                f"Invalid duration: {value!r}"
+            )
+    try:
+        return sign * float(body)
+    except ValueError:
+        pass
+    tokens = _DURATION_TOKEN.findall(body)
+    if not tokens or "".join(
+        n + s for n, s in tokens
+    ) != body:
+        raise ValueError(
+            f"Invalid duration: {value!r}"
+        )
+    total = 0.0
+    for num, suf in tokens:
+        if not suf or suf not in suffixes:
+            raise ValueError(
+                f"Unknown or missing unit "
+                f"in {value!r}"
+            )
+        total += float(num) * suffixes[suf]
+    return sign * total
 @
 
 The [[--timeout]] option feeds into [[subprocess]] which wants seconds,
@@ -8008,7 +8042,7 @@ add_labels_arg = typer.Argument(
 duration_opt = typer.Option(
     "--duration", "-d",
     help="Duration (hours unless suffixed, "
-         "e.g. 1.5, 1.5h, 90m, 5400s)")
+         "e.g. 1.5, 1.5h, 90m, 1h30m)")
 add_description_opt = typer.Option(
     "--description",
     help="Description for this time entry")
@@ -10435,7 +10469,8 @@ def test_start_timeout_requires_command(
 @
 
 Let's verify both duration parsers handle common formats.
-The same value (1.5~hours) should round-trip through every suffix:
+The same value (1.5~hours) should round-trip through every suffix, and
+composite forms should sum as expected:
 
 <<test functions>>=
 def test_parse_timeout_formats():
@@ -10454,6 +10489,29 @@ def test_parse_hours_formats():
     assert parse_hours("90m") == 1.5
     assert parse_hours("5400s") == 1.5
     assert parse_hours("1d") == 24.0
+
+
+def test_parse_hours_composite():
+    """parse_hours sums composite suffixes."""
+    assert parse_hours("1h15m") == 1.25
+    assert parse_hours("3h15m") == 3.25
+    assert parse_hours("1h30m45s") == pytest.approx(
+        1 + 30 / 60 + 45 / 3600
+    )
+
+
+def test_parse_timeout_composite():
+    """parse_timeout sums composite suffixes."""
+    assert parse_timeout("1h15m") == 4500.0
+    assert parse_timeout("2m30s") == 150.0
+
+
+def test_parse_duration_rejects_trailing_bare():
+    """Trailing unitless part is rejected."""
+    with pytest.raises(ValueError):
+        parse_hours("3h15")
+    with pytest.raises(ValueError):
+        parse_timeout("1h2x")
 
 
 def test_parse_tmux_exit_status_signal():
