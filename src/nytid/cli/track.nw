@@ -136,6 +136,7 @@ tools and workflows that teachers use for time management and reporting.
 The main module structure follows nytid's standard patterns:
 
 <<[[track.py]]>>=
+import click
 import datetime
 from enum import Enum
 import fcntl
@@ -144,6 +145,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -810,35 +812,18 @@ def complete_workers(ctx, args, incomplete):
         return []
 
 def parse_offset(offset_str: str) -> datetime.timedelta:
+    """Parse an offset string into a timedelta.
+
+    Bare number = minutes.  Suffixes: ``s``,
+    ``m``, ``h``, ``d``.  Negative values
+    (``-30m``, ``-1h30m``) and composite values
+    (``1h30m``) are accepted.
     """
-    Parse an offset string into a timedelta.
-    
-    Supports formats:
-    - Plain number: "30" (minutes)
-    - With 'm' suffix: "30m" (minutes)
-    - With 'h' suffix: "1.5h" (hours)
-    - Negative values: "-30m", "-1.5h"
-    
-    Examples:
-        parse_offset("30") -> 30 minutes
-        parse_offset("-30m") -> -30 minutes
-        parse_offset("1.5h") -> 1.5 hours = 90 minutes
-        parse_offset("-2h") -> -2 hours = -120 minutes
-    """
-    offset_str = offset_str.strip()
-    
-    # Check for hour suffix
-    if offset_str.endswith('h'):
-        hours = float(offset_str[:-1])
-        return datetime.timedelta(hours=hours)
-    
-    # Check for minute suffix
-    if offset_str.endswith('m'):
-        minutes = float(offset_str[:-1])
-        return datetime.timedelta(minutes=minutes)
-    
-    # No suffix, assume minutes
-    minutes = float(offset_str)
+    minutes = _parse_duration(
+        offset_str.strip(),
+        {"s": 1 / 60, "m": 1,
+         "h": 60, "d": 24 * 60},
+    )
     return datetime.timedelta(minutes=minutes)
 
 def parse_at_time(at_str: str, reference_time: datetime.datetime = None) -> datetime.datetime:
@@ -902,6 +887,16 @@ def test_parse_offset():
     assert parse_offset("1.5h") == datetime.timedelta(hours=1.5)
     assert parse_offset("-2h") == datetime.timedelta(hours=-2)
     assert parse_offset("-0.5h") == datetime.timedelta(minutes=-30)
+
+    # Composite
+    assert parse_offset("1h30m") == \
+        datetime.timedelta(minutes=90)
+    assert parse_offset("-1h30m") == \
+        datetime.timedelta(minutes=-90)
+
+    # New units now also accepted
+    assert parse_offset("90s") == \
+        datetime.timedelta(seconds=90)
 
 def test_parse_at_time():
     """Test absolute time parsing"""
@@ -2201,10 +2196,21 @@ is organized with its documentation, implementation, and tests together.
 The start command begins tracking time with the specified labels. Labels are
 independent tags that can be started individually or in groups.
 
-For work that is tied to a subprocess, [[start]] can also launch a command
-with [[--command]] or open a tracked shell in tmux via [[--pane]] or
-[[--window]].  In those modes, the tracking session still starts first, but
-the labels are stopped automatically when the subprocess exits.
+For work that is tied to a subprocess, [[start]] can also launch a command.
+The canonical form now uses a literal [[--]] separator so the child receives
+an exact argv list:
+
+\begin{verbatim}
+nytid track start [LABELS...] [OPTIONS] -- PROG [ARG ...]
+\end{verbatim}
+
+This matters most for wrapper scripts.  A shell wrapper can forward
+[["$@"]] losslessly, but it cannot flatten the same argv back into a single
+string without destroying word boundaries.  The legacy [[--command]]/[[-c]]
+string form remains available for existing callers, but new wrappers and
+manual invocations should prefer the [[-- prog args]] form.  As before,
+[[--pane]] and [[--window]] open a tracked shell in tmux, and launch-bound
+labels stop automatically when the subprocess exits.
 
 We use noweb's chunk concatenation to build up the command's options 
 incrementally. The [[<<start command options>>]] chunk accumulates function 
@@ -2219,8 +2225,9 @@ labels_arg = typer.Argument(
 @
 
 <<start command>>=
-@cli.command()
+@cli.command(cls=PassThroughCommand)
 def start(
+    ctx: click.Context,
     labels: Annotated[list[str], labels_arg] = None,
     <<start command options>>
 ):
@@ -2235,6 +2242,7 @@ def start(
     Examples:
       nytid track start DD1310 lecture
       <<start command docstring examples>>
+      nytid track start grading -- vim path/to/file
     """
     <<start command implementation>>
 @
@@ -2246,11 +2254,31 @@ resume functionality), calculating the start time, optionally preparing a
 subprocess launch, and reporting results.
 
 <<start command implementation>>=
+<<resolve command argv>>
 <<load session and resolve labels>>
 <<calculate start time>>
 <<prepare launch mode>>
 <<start tracking and report results>>
 <<launch subprocess if requested>>
+@
+
+The new pass-through form needs parsing before we decide whether an empty
+label list means \enquote{resume the last session} or \enquote{launch only the
+implicit command label}.  We therefore resolve the command argv exactly once
+up front and let both the resume logic and the launch path reuse the same
+result.
+
+<<resolve command argv>>=
+command_args = None
+command_text = None
+try:
+    command_args, command_text = resolve_command_argv(command, ctx)
+except ValueError as exc:
+    typer.echo(f"Error parsing command: {exc}", err=True)
+    raise typer.Exit(1)
+except typer.BadParameter as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(1)
 @
 
 We load the active session first only for read-only preflight decisions
@@ -2264,7 +2292,7 @@ session = load_active_session(who)
 
 # If no labels provided, try to resume last stopped labels
 if not labels:
-    if command is not None:
+    if command_args is not None:
         labels = []
     elif session.last_stopped:
         labels = session.last_stopped
@@ -2342,15 +2370,13 @@ likely overwrite [[PS1]] during normal startup, so the tmux window name is
 the primary context indicator for pane and window launches.
 
 <<prepare launch mode>>=
-launch_requested = command is not None or pane or window
+launch_requested = command_args is not None or pane or window
 tracking_labels = list(labels)
 explicit_launch_labels = list(tracking_labels)
 inherited_context_labels = []
 borrowable_launch_labels = []
 launch_owned_labels = list(tracking_labels)
 launch_cleanup_labels = list(tracking_labels)
-command_args = None
-command_text = None
 proc_env = None
 proc_cwd = os.getcwd()
 prompt_file = None
@@ -2369,7 +2395,7 @@ if not block and not (pane or window):
     )
     raise typer.Exit(1)
 
-if timeout is not None and command is None:
+if timeout is not None and command_args is None:
     typer.echo(
         "Error: --timeout requires --command",
         err=True,
@@ -2399,16 +2425,7 @@ if launch_requested:
         )
         tracking_labels.extend(inherited_context_labels)
 
-    if command is not None:
-        try:
-            command_args = shlex.split(command)
-        except ValueError as exc:
-            typer.echo(f"Error parsing command: {exc}", err=True)
-            raise typer.Exit(1)
-        if not command_args:
-            typer.echo("Error: Command cannot be empty", err=True)
-            raise typer.Exit(1)
-        command_text = command
+    if command_args is not None:
         command_label = os.path.basename(command_args[0])
         tracking_labels.append(command_label)
 
@@ -2459,7 +2476,7 @@ if launch_requested:
         )
         raise typer.Exit(1)
 
-    if command is not None:
+    if command_args is not None:
         apply_context_prompt(launch_context, proc_env)
     elif pane or window:
         apply_context_prompt(launch_context, proc_env)
@@ -2530,7 +2547,8 @@ offset or time relative to its own action.
 offset_opt = typer.Option(
     "--offset", "-o",
     help="Offset current time "
-         "(e.g., '-30m', '-1.5h', '30' for minutes)")
+         "(e.g., '-30m', '-1h30m', "
+         "'90s', '30' for minutes)")
 @
 
 <<start command options>>=
@@ -2714,19 +2732,26 @@ mail in [[mutt]], a build in [[make]], or a shell in a dedicated tmux pane.
 Rather than keeping a separate subcommand for that workflow, we let
 [[start]] grow into it.
 
-With [[--command]], the command's basename becomes an additional implicit
-label.  For example, [[nytid track start work --command
-/usr/local/bin/neomutt]] tracks both [[work]] and [[neomutt]], while the
-full command string remains in the description so the history still records
-what was launched.  With [[--pane]] or [[--window]] but no command,
-[[start]] opens the user's default shell inside tmux through the same
-plain-shell path as [[todo start]], so normal shell startup still runs.
+With the canonical [[-- prog args]] form, Click parses the tracking labels and
+options first, then hands the remaining argv through untouched.  This is what
+makes wrappers such as [[exec nytid track start -- /usr/bin/neomutt "$@"]]
+work correctly even when one child argument contains spaces.
+
+The legacy [[--command]] string form still works by running [[shlex.split]] on
+the string.  In either form the command's basename becomes an additional
+implicit label.  For example,
+[[nytid track start work -- /usr/local/bin/neomutt -f inbox]] tracks both
+[[work]] and [[neomutt]], while the full command string remains in the
+description so the history still records what was launched.  With [[--pane]]
+or [[--window]] but no command, [[start]] opens the user's default shell inside
+tmux through the same plain-shell path as [[todo start]], so normal shell
+startup still runs.
 
 <<argument and option definitions>>=
 command_opt = typer.Option(
     "--command", "-c",
-    help="Program and arguments to run while tracking "
-         "(parsed with shlex; no shell syntax)")
+    help="Legacy single-string command form "
+         "(parsed with shlex; prefer `-- prog args`)")
 @
 
 <<start command options>>=
@@ -2736,7 +2761,8 @@ window: Annotated[bool, window_opt] = False,
 @
 
 <<start command docstring examples>>=
-nytid track start email -c "mutt"            # Track email while launching mutt
+nytid track start email -- mutt              # Track email while launching mutt
+nytid track start email -c "mutt"            # Legacy single-string form
 nytid track start grading -P                  # Open a tracked shell in tmux pane
 nytid track start admin -W                    # Open a tracked shell in tmux window
 @
@@ -2802,7 +2828,7 @@ timeout: Annotated[str | None, timeout_opt] = None,
 @
 
 <<start command docstring examples>>=
-nytid track start grading -c "vim" --timeout 2h  # Stop after 2 hours
+nytid track start grading -- vim --timeout 2h     # Stop after 2 hours
 @
 
 \subsubsection{Working Directory}
@@ -2819,7 +2845,7 @@ wd_path: Annotated[str | None,
 @
 
 <<start command docstring examples>>=
-nytid track start grading -c "vim" --wd ~/courses/DD1310
+nytid track start grading --wd ~/courses/DD1310 -- vim
 @
 
 The environment is always forwarded unconditionally to subprocesses,
@@ -3218,11 +3244,10 @@ def test_start_window_inherit_labels_ignores_untracked_active_labels(
     # work is active for the worker but not in the inherited context
     # (no tracked tmux state), so launch cleanup must not borrow it.
     on_exit_shell = call_kwargs["on_exit_shell"]
-    assert "_stop-detached weblogin\n" in on_exit_shell or (
-        "_stop-detached weblogin " in on_exit_shell
-    ) or on_exit_shell.rstrip().endswith("_stop-detached weblogin")
+    assert "_stop-detached weblogin" in on_exit_shell
     stop_segment = on_exit_shell.split("_stop-detached", 1)[1]
-    stop_labels = stop_segment.splitlines()[0].split()
+    stop_command = stop_segment.split(";", 1)[0]
+    stop_labels = stop_command.split()
     assert "work" not in stop_labels
 @
 
@@ -4185,31 +4210,70 @@ auto_suspend_opt = typer.Option(
 Several options ([[--timeout]], [[--duration]], [[--estimate]]) accept
 duration strings with an optional unit suffix: [[s]] (seconds), [[m]]
 (minutes), [[h]] (hours), [[d]] (days).  Fractional values such as
-[[1.5h]] (90~minutes) are accepted.  The only difference between the
-options is what a bare number (no suffix) means: seconds for
-[[--timeout]], hours for [[--duration]] and [[--estimate]].
+[[1.5h]] (90~minutes) are accepted.  Composite durations such as
+[[3h15m]] (3~hours plus 15~minutes) are accepted too; the parts are
+summed.  The only difference between the options is what a bare number
+(no suffix) means: seconds for [[--timeout]], hours for [[--duration]]
+and [[--estimate]].
 
-We factor this into a shared core that maps suffixes to multipliers,
-with thin wrappers that each supply the right table:
+We factor this into a shared core that maps suffixes to multipliers.  It
+first accepts a bare number directly, then tokenises concatenated
+number-unit pairs and requires them to rebuild the input, which rejects
+leftovers such as [[3h15]].  Thin wrappers each supply the right table:
+
+<<constants>>=
+_DURATION_TOKEN = re.compile(
+    r"(\d+\.?\d*|\.\d+)([a-zA-Z]?)"
+)
+@
 
 <<helper functions>>=
 def _parse_duration(value, suffixes):
     """Apply a suffix multiplier table to a
     duration string.
 
-    If the last character of ``value`` is a key
-    in ``suffixes``, the numeric prefix is multiplied
-    by the corresponding factor.  Otherwise the entire
-    string is interpreted as a bare number.
+    Either the whole string is a bare number
+    (interpreted in the wrapper's default unit),
+    or it is a sequence of ``<number><unit>``
+    pairs that are summed (e.g. ``3h15m``).
+    An optional leading ``+``/``-`` sign applies
+    to the whole result.
 
-    Raises ``ValueError`` on empty input.
+    Raises ``ValueError`` on empty input,
+    unknown units, or a trailing unitless part.
     """
     if not value:
-        raise ValueError("Duration must not be empty")
-    if value[-1] in suffixes:
-        return float(value[:-1]) \
-            * suffixes[value[-1]]
-    return float(value)
+        raise ValueError(
+            "Duration must not be empty"
+        )
+    sign, body = 1, value
+    if body[0] in "+-":
+        sign = -1 if body[0] == "-" else 1
+        body = body[1:]
+        if not body:
+            raise ValueError(
+                f"Invalid duration: {value!r}"
+            )
+    try:
+        return sign * float(body)
+    except ValueError:
+        pass
+    tokens = _DURATION_TOKEN.findall(body)
+    if not tokens or "".join(
+        n + s for n, s in tokens
+    ) != body:
+        raise ValueError(
+            f"Invalid duration: {value!r}"
+        )
+    total = 0.0
+    for num, suf in tokens:
+        if not suf or suf not in suffixes:
+            raise ValueError(
+                f"Unknown or missing unit "
+                f"in {value!r}"
+            )
+        total += float(num) * suffixes[suf]
+    return sign * total
 @
 
 The [[--timeout]] option feeds into [[subprocess]] which wants seconds,
@@ -4258,6 +4322,50 @@ def validate_tmux_options(
         raise ValueError(
             "Error: --pane/--window require an active tmux session"
         )
+@
+
+
+Track and todo now share one argv-resolution helper because both commands need
+the same compatibility rule: accept a literal [[--]] pass-through for exact
+argv forwarding, keep the legacy single-string option working for old callers,
+and reject attempts to mix the two forms in the same invocation.
+
+<<helper functions>>=
+class PassThroughCommand(typer.core.TyperCommand):
+    """Typer command that captures argv after a literal ``--``."""
+
+    def parse_args(self, ctx, args):
+        trailing = None
+        if "--" in args:
+            idx = args.index("--")
+            trailing = args[idx + 1:]
+            args = args[:idx]
+        if ctx.obj is None:
+            ctx.obj = {}
+        ctx.obj["trailing_argv"] = trailing
+        return super().parse_args(ctx, args)
+
+
+def resolve_command_argv(
+    legacy_command_string: str | None,
+    ctx: click.Context | None,
+) -> tuple[list[str] | None, str | None]:
+    """Resolve either legacy ``-c`` text or pass-through argv."""
+    trailing = (ctx.obj or {}).get("trailing_argv") if ctx else None
+    if legacy_command_string is not None and trailing is not None:
+        raise typer.BadParameter(
+            'Use either -c "string" or -- prog args, not both.'
+        )
+    if trailing is not None:
+        if not trailing:
+            raise typer.BadParameter("Command cannot be empty")
+        return list(trailing), shlex.join(trailing)
+    if legacy_command_string is not None:
+        argv = shlex.split(legacy_command_string)
+        if not argv:
+            raise typer.BadParameter("Command cannot be empty")
+        return argv, legacy_command_string
+    return None, None
 @
 
 
@@ -8008,7 +8116,7 @@ add_labels_arg = typer.Argument(
 duration_opt = typer.Option(
     "--duration", "-d",
     help="Duration (hours unless suffixed, "
-         "e.g. 1.5, 1.5h, 90m, 5400s)")
+         "e.g. 1.5, 1.5h, 90m, 1h30m)")
 add_description_opt = typer.Option(
     "--description",
     help="Description for this time entry")
@@ -9967,12 +10075,40 @@ def test_start_command_uses_command_as_label(temp_tracking_dir):
     assert "echo" in last_entry.labels
     assert last_entry.description == "echo hello world"
 
+def test_start_passthrough_command_runs_child_process(temp_tracking_dir):
+    """A literal ``--`` forwards an exact argv list."""
+    result = runner.invoke(cli, [
+        "start", "DD1310", "admin", "--", "echo", "hello world"
+    ])
+    assert result.exit_code == 0
+    assert "Running 'echo '" in result.stdout
+    assert "Command completed" in result.stdout
+
+    entries = load_tracking_data()
+    last_entry = entries[-1]
+    assert "DD1310" in last_entry.labels
+    assert "admin" in last_entry.labels
+    assert "echo" in last_entry.labels
+    assert last_entry.description == "echo 'hello world'"
+
 def test_start_command_without_labels_uses_command_label(
     temp_tracking_dir,
 ):
     """A command alone still yields its implicit command label."""
     result = runner.invoke(cli, [
         "start", "--command", "echo test"
+    ])
+    assert result.exit_code == 0
+    assert "Running 'echo test'" in result.stdout
+    assert "tracking with labels: echo" in result.stdout
+
+
+def test_start_passthrough_without_labels_uses_command_label(
+    temp_tracking_dir,
+):
+    """The pass-through form should skip resume and use the implicit label."""
+    result = runner.invoke(cli, [
+        "start", "--", "echo", "test"
     ])
     assert result.exit_code == 0
     assert "Running 'echo test'" in result.stdout
@@ -10022,6 +10158,15 @@ def test_start_command_uses_command_basename_as_label(temp_tracking_dir):
     assert "neomutt" in last_entry.labels
     assert "/usr/local/bin/neomutt" not in last_entry.labels
     assert last_entry.description == "/usr/local/bin/neomutt -f inbox"
+
+
+def test_start_rejects_mixed_command_forms(temp_tracking_dir):
+    """The legacy and pass-through command forms are mutually exclusive."""
+    result = runner.invoke(cli, [
+        "start", "work", "--command", "echo test", "--", "echo", "test"
+    ])
+    assert result.exit_code == 1
+    assert "Use either -c \"string\" or -- prog args" in result.output
 
 
 def test_start_command_exit_cleans_stale_window_labels(
@@ -10435,7 +10580,8 @@ def test_start_timeout_requires_command(
 @
 
 Let's verify both duration parsers handle common formats.
-The same value (1.5~hours) should round-trip through every suffix:
+The same value (1.5~hours) should round-trip through every suffix, and
+composite forms should sum as expected:
 
 <<test functions>>=
 def test_parse_timeout_formats():
@@ -10454,6 +10600,29 @@ def test_parse_hours_formats():
     assert parse_hours("90m") == 1.5
     assert parse_hours("5400s") == 1.5
     assert parse_hours("1d") == 24.0
+
+
+def test_parse_hours_composite():
+    """parse_hours sums composite suffixes."""
+    assert parse_hours("1h15m") == 1.25
+    assert parse_hours("3h15m") == 3.25
+    assert parse_hours("1h30m45s") == pytest.approx(
+        1 + 30 / 60 + 45 / 3600
+    )
+
+
+def test_parse_timeout_composite():
+    """parse_timeout sums composite suffixes."""
+    assert parse_timeout("1h15m") == 4500.0
+    assert parse_timeout("2m30s") == 150.0
+
+
+def test_parse_duration_rejects_trailing_bare():
+    """Trailing unitless part is rejected."""
+    with pytest.raises(ValueError):
+        parse_hours("3h15")
+    with pytest.raises(ValueError):
+        parse_timeout("1h2x")
 
 
 def test_parse_tmux_exit_status_signal():
