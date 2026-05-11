@@ -58,6 +58,7 @@ statistics---works with todo items out of the box.
 \section{Code Outline}
 
 <<[[todo.py]]>>=
+import click
 import csv
 import datetime
 import fcntl
@@ -3928,10 +3929,12 @@ helpers; we re-export it so that [[todo]]'s public API is unchanged.
 <<helpers>>=
 from nytid.cli.track import (
     parse_timeout, parse_hours,
+    PassThroughCommand,
     pane_opt, window_opt,
     block_opt, timeout_opt,
     wd_opt, env_opt, here_opt,
     auto_suspend_opt,
+    resolve_command_argv,
     should_auto_suspend,
     warn_if_focus_events_off,
 )
@@ -4085,8 +4088,9 @@ label_arg = typer.Argument(
 @
 
 <<add command>>=
-@cli.command()
+@cli.command(cls=PassThroughCommand)
 def add(
+    ctx: click.Context,
     label: Annotated[list[str] | None,
                      label_arg] = None,
     <<add command options>>
@@ -4100,6 +4104,7 @@ def add(
     Examples:
       nytid todo add tilkry26 prep -t "Grade labs" -e 3
       nytid todo add -t "Review section 2" -p 1
+      nytid todo add -t "Review section 2" -- claude
     """
     <<add command implementation>>
 @
@@ -4275,6 +4280,14 @@ resolve the parent ID, determine the priority, and finally save.
 
 <<add command implementation>>=
 next_id, todos = load_todos()
+try:
+    _, run_command = resolve_command_argv(run_command, ctx)
+except ValueError as exc:
+    typer.echo(f"Error parsing command: {exc}", err=True)
+    raise typer.Exit(1)
+except typer.BadParameter as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(1)
 
 <<validate add options>>
 
@@ -4322,6 +4335,11 @@ priority, create a single item.  We copy [[title]] into
 [[priority_title]] because the priority-resolution chunk is shared
 with the editor path, where [[title]] is not yet set; both paths
 provide the display name through [[priority_title]] instead.
+
+That same path now resolves the default command once.  A literal [[--]]
+separator contributes an exact argv list that we store back as a readable
+string with [[shlex.join]], so later [[todo start]] runs can replay the
+same command without any storage migration.
 
 The implicit parent comes from the operator's current active context,
 not from the assignee of the new todo.  That lets us add or import a
@@ -6146,8 +6164,9 @@ edit_parent_opt = typer.Option(
 @
 
 <<edit command>>=
-@cli.command()
+@cli.command(cls=PassThroughCommand)
 def edit(
+    ctx: click.Context,
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
     edit_interactive: Annotated[bool,
@@ -6176,7 +6195,18 @@ def edit(
     """Edit an existing todo item.
 
     If no ID given, edits the current active task.
+
+    The canonical command override form is
+    [[nytid todo edit 7 -- prog args]].
     """
+    try:
+        _, run_command = resolve_command_argv(run_command, ctx)
+    except ValueError as exc:
+        typer.echo(f"Error parsing command: {exc}", err=True)
+        raise typer.Exit(1)
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "edit",
@@ -8948,10 +8978,11 @@ useful when tracking stopped but the todo itself remains the current
 focus.
 
 <<start command>>=
-@cli.command()
+@cli.command(cls=PassThroughCommand)
 def start(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
+    ctx: click.Context = None,
     <<start command options>>
 ):
     """Start tracking time for a todo item.
@@ -8960,7 +8991,18 @@ def start(
 
     If the todo has a working directory, spawns a
     shell or command in that directory with tracking.
+
+    The canonical override form is
+    [[nytid todo start 7 -- prog args]].
     """
+    try:
+        run_argv, run = resolve_command_argv(run, ctx)
+    except ValueError as exc:
+        typer.echo(f"Error parsing command: {exc}", err=True)
+        raise typer.Exit(1)
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
     todo_id, item, next_id, todos, stack = activate_todo_state(
         todo_id, who=default_username
     )
@@ -9407,8 +9449,9 @@ prompt_dir = None
 @
 
 The command resolution follows a priority chain: [[--command]] overrides
-the stored [[command]], which overrides [[$SHELL]].  We parse command
-strings with [[shlex.split]] so quoted arguments survive intact.
+the stored [[command]], which overrides [[$SHELL]].  We parse legacy
+command strings with [[resolve_command_argv()]] so quoted arguments survive
+intact, while the canonical [[-- prog args]] form keeps an exact argv list.
 When the resolved launcher is [[claude]] or [[opencode]] and the user
 specified only the bare command, we append the todo's notes or
 description as a prompt argument.  If the user already supplied flags
@@ -9424,13 +9467,12 @@ the todo text evolves.
 <<determine command to run>>=
 from nytid.cli.track import build_plain_shell_command
 
-cmd_str = run or item.command
-if cmd_str:
+cmd = run_argv
+if cmd is None and item.command:
+    cmd, _ = resolve_command_argv(item.command, None)
+if cmd:
     prompt_text = item.notes or item.description
-    cmd = shlex.split(cmd_str)
-    if not cmd:
-        cmd = build_plain_shell_command(proc_env)
-    elif cmd[0] in ("claude", "opencode"):
+    if cmd[0] in ("claude", "opencode"):
         has_prompt = any(
             part in ("-p", "--prompt")
             for part in cmd[1:]
@@ -13213,6 +13255,76 @@ def test_edit_run_flag_updates_command(temp_todo_dir):
     assert todos[0].command == "opencode"
 
 
+def test_add_passthrough_command_stores_joined_string(temp_todo_dir):
+    """Add stores pass-through argv as a readable command string."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "course", "-t", "Review section",
+            "--", "claude", "hello world",
+        ],
+    )
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].command == "claude 'hello world'"
+
+
+def test_edit_passthrough_command_stores_joined_string(temp_todo_dir):
+    """Edit stores pass-through argv as a readable command string."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            command="claude",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        ["edit", "1", "--", "opencode", "hello world"],
+    )
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].command == "opencode 'hello world'"
+
+
+def test_add_rejects_mixed_command_forms(temp_todo_dir):
+    """Add rejects mixing legacy and pass-through command syntax."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Review section",
+            "--command", "claude",
+            "--", "opencode",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Use either -c \"string\" or -- prog args" in result.output
+
+
+def test_edit_rejects_mixed_command_forms(temp_todo_dir):
+    """Edit rejects mixing legacy and pass-through command syntax."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        [
+            "edit", "1",
+            "--command", "claude",
+            "--", "opencode",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Use either -c \"string\" or -- prog args" in result.output
+
+
 def test_export_vtodo(temp_todo_dir):
     """Test VTODO export."""
     save_todos(3, [
@@ -13354,6 +13466,36 @@ def test_start_special_command(temp_todo_dir):
         assert "Fix the login bug" in cmd[1]
 
 
+def test_start_passthrough_command_uses_exact_argv(temp_todo_dir):
+    """Start accepts a pass-through override without reparsing a string."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="AI task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+            notes="Fix the login bug",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1", "--", "claude", "hello world"],
+            input="n\n",
+        )
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == [
+            "claude",
+            "hello world",
+            "Fix the login bug",
+        ]
+
+
 def test_start_special_command_respects_explicit_prompt(
     temp_todo_dir,
 ):
@@ -13387,4 +13529,26 @@ def test_start_special_command_respects_explicit_prompt(
             "-p",
             "Use nytid todo to track work.",
         ]
+
+
+def test_start_rejects_mixed_command_forms(temp_todo_dir):
+    """Start rejects mixing legacy and pass-through command syntax."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="AI task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli,
+        [
+            "start", "1",
+            "--command", "claude",
+            "--", "opencode",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Use either -c \"string\" or -- prog args" in result.output
 @
