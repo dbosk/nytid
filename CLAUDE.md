@@ -25,9 +25,12 @@ poetry install
 poetry run pip install black
 
 # 5. Build source files from noweb literate programming files
-make all  # Generates Python files from .nw files using notangle, formats with black
+make all  # Generates src .py files from .nw files using notangle, formats with black.
+          # NOTE: this does NOT regenerate tests/test_*.py — those have a separate
+          # build step (see below). Edit a .nw test chunk, run `make all`, and the
+          # tangled test_*.py will NOT reflect the change.
 
-# 6. Run tests
+# 6. Run tests (this also regenerates tests/test_*.py from .nw chunks as a prerequisite)
 cd tests && make test  # Expected: 552 passing under Python 3.10+ (numbers grow as features land)
 
 # 7. Run the CLI
@@ -35,8 +38,9 @@ poetry run nytid --help
 ```
 
 **Commonly used commands:**
-- `make clean && make all` — Clean rebuild of all generated files
-- `cd tests && make test` — Run full test suite
+- `make clean && make all` — Clean rebuild of generated source files (**not test files**)
+- `make -C tests all` — Regenerate `tests/test_*.py` from `.nw` chunks without running pytest
+- `cd tests && make test` — Regenerate test files **and** run the full test suite
 - `cd tests && poetry run pytest test_courses.py -v` — Run a single test file
 - `cd tests && poetry run pytest test_courses.py::test_function_name -v` — Run a single test function
 - `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
@@ -63,12 +67,16 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 - `src/nytid/signup/hr/timesheet/__init__.py`
 - `src/nytid/httputils.py` (legacy, unused)
 
-**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish on the next `make all`, and they won't even appear in `git status` because they're gitignored. To add or modify a test:
+**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish the next time the tests Makefile runs, and they won't even appear in `git status` because they're gitignored.
+
+**CRITICAL: root `make all` does NOT regenerate `tests/test_*.py`.** The `tests/` directory has its own `Makefile` (see `tests/Makefile`) that calls `notangle` with the `-Rtest [[...]]` root chunk to extract test files. Running `make all` at the project root rebuilds source files only; tangling the test root happens via `make -C tests all` (or implicitly via `cd tests && make test`, which depends on `all`). Forgetting this leads to: you edit a test in `.nw`, rebuild with `make all`, run pytest, and see the old behavior — because the tangled test file is stale.
+
+To add or modify a test:
 
 1. Grep for the test name in `src/**/*.nw` to find the literate source — or find the `<<test functions>>=` chunk near the feature the test covers (tests are colocated with the feature they verify).
 2. Edit the `.nw` file.
-3. Run `make all` to regenerate `tests/test_*.py`.
-4. Then run `pytest`.
+3. Run `make -C tests all` (or `cd tests && make test`) to regenerate `tests/test_*.py`. **`make all` at the repo root is not enough.**
+4. Run `pytest` (or rely on `make test` to do both).
 
 ### Documentation and Source Relationship
 
@@ -191,7 +199,7 @@ def test_feature_x():
 @
 ```
 
-At build time, all `<<test functions>>=` chunks from a feature `.nw` file are concatenated and tangled into a single `tests/test_<module>.py` file (e.g. `src/nytid/cli/track.nw` → `tests/test_clitrack.py`). **That generated file is gitignored and will be overwritten by `make all`** — see "Generated vs Handwritten Files" above for the consequences.
+At build time, all `<<test functions>>=` chunks from a feature `.nw` file are concatenated and tangled into a single `tests/test_<module>.py` file (e.g. `src/nytid/cli/track.nw` → `tests/test_clitrack.py`). **That generated file is gitignored and will be overwritten by `make -C tests all`** (root `make all` does *not* touch it) — see "Generated vs Handwritten Files" above for the consequences.
 
 ### Workflow for Modifying .nw Files
 
@@ -342,6 +350,7 @@ git add src/module.py   # Generated from .nw - DO NOT COMMIT
 - Canvas/LADOK credential failures: Expected in development environments
 - AFS permission errors: Expected when AFS is not available
 - **Test edits seem to disappear after `make all`**: You were editing a generated file. `tests/test_*.py` are tangled from `<<test functions>>=` chunks in `src/**/*.nw`. Grep for the test name in `src/` to find the literate source and edit there instead. See "Generated vs Handwritten Files" above.
+- **New `.nw` test chunks don't show up in pytest output, even after `make all`**: Root `make all` does not regenerate test files. Run `make -C tests all` (or `cd tests && make test`). See "Generated vs Handwritten Files" above for why.
 
 ### CLI Warnings
 - Syntax warnings about invalid escape sequences: Non-critical
