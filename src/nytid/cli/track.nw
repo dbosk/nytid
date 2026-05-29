@@ -8726,6 +8726,50 @@ semantics differ: [[start --at]] sets a new session's start time, while
 [[edit --at]] overwrites the start of an existing entry.  Reusing the
 same constant would conflate these two meanings in the help text.
 
+As with [[todo edit]], plain [[--label]]/[[-l]] replaces every label,
+which is clumsy when you only want to add or drop one.  We add the same
+incremental [[--add-label]]/[[-a]] and [[--remove-label]]/[[-r]] flags
+here, sharing the exact merge rule via a colocated copy of
+[[apply_label_edits]].  The two copies (here and in [[todo.nw]]) tangle
+into separate modules but must stay in sync; keeping the function pure and
+identical makes that easy to verify.  Removing first and then adding lets
+us flag the same label in both lists as a contradiction rather than
+silently cancelling, while absent-removals and present-adds become
+idempotent stderr warnings:
+
+<<helper functions>>=
+def apply_label_edits(current, add, remove):
+    """Return (new_labels, warnings) after removing then adding.
+
+    Starting from ``current``, remove every label in ``remove`` and then
+    append every label in ``add`` that is not already present.  Returns the
+    resulting label list together with a list of human-readable warning
+    strings for no-op removals and additions.
+
+    Raises ``ValueError`` if a label appears in both ``add`` and ``remove``.
+    """
+    conflict = set(add) & set(remove)
+    if conflict:
+        raise ValueError(
+            "label(s) given to both --add-label and --remove-label: "
+            + ", ".join(sorted(conflict)))
+    warnings = []
+    result = list(current)
+    for lab in remove:
+        if lab in result:
+            result = [x for x in result if x != lab]
+        else:
+            warnings.append(
+                f"label '{lab}' not present; nothing to remove")
+    for lab in add:
+        if lab in result:
+            warnings.append(
+                f"label '{lab}' already present; not added")
+        else:
+            result.append(lab)
+    return result, warnings
+@
+
 <<argument and option definitions>>=
 edit_at_opt = typer.Option(
     "--at",
@@ -8742,6 +8786,14 @@ edit_duration_opt = typer.Option(
 edit_label_opt = typer.Option(
     "--label", "-l",
     help="Replace all labels",
+    autocompletion=complete_historical_labels)
+add_label_opt = typer.Option(
+    "--add-label", "-a",
+    help="Add a label (repeatable)",
+    autocompletion=complete_historical_labels)
+remove_label_opt = typer.Option(
+    "--remove-label", "-r",
+    help="Remove a label (repeatable)",
     autocompletion=complete_historical_labels)
 edit_description_opt = typer.Option(
     "--description",
@@ -8764,6 +8816,10 @@ def edit(
                        edit_duration_opt] = None,
     label: Annotated[list[str] | None,
                      edit_label_opt] = None,
+    add_label: Annotated[list[str] | None,
+                         add_label_opt] = None,
+    remove_label: Annotated[list[str] | None,
+                            remove_label_opt] = None,
     description: Annotated[str | None,
                            edit_description_opt] = None,
     who: Annotated[str | None,
@@ -8780,7 +8836,10 @@ def edit(
       nytid track edit a1b2c3 --description "Weekly planning meeting"
       nytid track edit a1b2c3 --at 14:00 --end-at 15:30
       nytid track edit a1b2c3 -l DD1310 -l grading
+      nytid track edit a1b2c3 -a urgent -r draft
     """
+    <<reject mixing absolute and relative label edits>>
+    label_warnings = []
     def update_history(entries):
         if not entries:
             raise ValueError("No tracking data available")
@@ -8800,10 +8859,11 @@ def edit(
         if end_time <= start_time:
             raise ValueError("End time must be after start time")
 
+        <<compute edited labels>>
         updated = TrackingEntry(
             start_time=start_time,
             end_time=end_time,
-            labels=(label if label is not None else original.labels),
+            labels=new_labels,
             description=(
                 description if description is not None
                 else original.description
@@ -8819,10 +8879,49 @@ def edit(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
 
+    for warning in label_warnings:
+        typer.echo(f"Warning: {warning}", err=True)
     typer.echo(
         f"Updated {original.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]} -> "
         f"{updated.content_hash()[:TRACKING_HASH_PREFIX_MIN_LENGTH]}"
     )
+@
+
+All three label flags are known before we touch history, so we reject the
+contradictory absolute-plus-relative combination at the very top --- there
+is no point loading and mutating history only to discover the request was
+malformed:
+
+<<reject mixing absolute and relative label edits>>=
+if label is not None and (add_label or remove_label):
+    typer.echo(
+        "Error: --label cannot be combined with "
+        "--add-label/--remove-label",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Inside [[update_history]] we know the entry's [[original.labels]], so this
+is where the relative merge happens.  [[apply_label_edits]] may raise
+[[ValueError]] for the same-label-in-both case; that propagates out of
+[[mutate_tracking_history]] and is caught by the existing error handler
+below, giving a non-zero exit.  No-op warnings are stashed in the
+[[label_warnings]] list declared in the enclosing scope (via [[nonlocal]])
+and echoed only after the update succeeds, so a failed edit prints no
+misleading warnings.  [[TrackingEntry]] re-sorts and de-duplicates labels
+on construction, which is consistent with the merged result:
+
+<<compute edited labels>>=
+nonlocal label_warnings
+if label is not None:
+    new_labels = list(label)
+elif add_label or remove_label:
+    new_labels, label_warnings = apply_label_edits(
+        original.labels, add_label or [], remove_label or [],
+    )
+else:
+    new_labels = original.labels
 @
 
 <<argument and option definitions>>=
@@ -8976,6 +9075,151 @@ def test_edit_tracking_entry_rejects_invalid_interval(temp_tracking_dir):
     assert result.exit_code == 1
     assert "End time must be after start time" in result.output
 
+@
+
+The incremental label flags behave the same as on [[todo edit]], but here
+the resulting [[TrackingEntry.labels]] always come back sorted and
+de-duplicated because [[TrackingEntry]] normalizes on construction.  We
+seed an entry with two labels and check that [[-a]] grows the set, [[-r]]
+shrinks it, and the two combine.  An [[add]] command given [[nytid work]]
+stores labels [[["nytid", "work"]]] (already sorted):
+
+<<test functions>>=
+def test_edit_add_label_appends(temp_tracking_dir):
+    """`-a` adds a label to an entry, keeping the rest."""
+    runner.invoke(cli, [
+        "add", "nytid", "work",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8], "-a", "urgent"
+    ])
+
+    assert result.exit_code == 0
+    assert load_tracking_data()[0].labels == [
+        "nytid", "urgent", "work"
+    ]
+
+
+def test_edit_remove_label_drops_one(temp_tracking_dir):
+    """`-r` removes one label, leaving the rest."""
+    runner.invoke(cli, [
+        "add", "nytid", "work",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8], "-r", "work"
+    ])
+
+    assert result.exit_code == 0
+    assert load_tracking_data()[0].labels == ["nytid"]
+
+
+def test_edit_add_and_remove_together(temp_tracking_dir):
+    """`-a` and `-r` combine in a single edit."""
+    runner.invoke(cli, [
+        "add", "nytid", "draft",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8],
+        "-a", "urgent", "-r", "draft"
+    ])
+
+    assert result.exit_code == 0
+    assert load_tracking_data()[0].labels == ["nytid", "urgent"]
+
+@
+
+The error and no-op cases mirror [[todo edit]]: mixing [[-l]] with a
+relative flag and adding-plus-removing the same label both fail before any
+write, while a no-op remove or add warns but succeeds:
+
+<<test functions>>=
+def test_edit_label_with_add_label_errors(temp_tracking_dir):
+    """`-l` cannot be combined with `-a`/`-r`."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8],
+        "-l", "x", "-a", "y"
+    ])
+
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+    assert load_tracking_data()[0].labels == ["nytid"]
+
+
+def test_edit_same_label_add_and_remove_errors(temp_tracking_dir):
+    """The same label in `-a` and `-r` is rejected."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8],
+        "-a", "z", "-r", "z"
+    ])
+
+    assert result.exit_code != 0
+    assert load_tracking_data()[0].labels == ["nytid"]
+
+
+def test_edit_remove_absent_label_warns(temp_tracking_dir):
+    """Removing an absent label warns but succeeds."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8], "-r", "absent"
+    ])
+
+    assert result.exit_code == 0
+    assert "nothing to remove" in result.output
+    assert load_tracking_data()[0].labels == ["nytid"]
+
+
+def test_edit_add_present_label_warns(temp_tracking_dir):
+    """Adding a present label warns but succeeds."""
+    runner.invoke(cli, [
+        "add", "nytid",
+        "--duration", "1",
+        "--at", "2026-03-12 10:00"
+    ])
+    original = load_tracking_data()[0]
+
+    result = runner.invoke(cli, [
+        "edit", original.content_hash()[:8], "-a", "nytid"
+    ])
+
+    assert result.exit_code == 0
+    assert "already present" in result.output
+    assert load_tracking_data()[0].labels == ["nytid"]
+
+@
+
+<<test functions>>=
 def test_rm_tracking_entry_by_hash(temp_tracking_dir):
     """rm removes one historical entry by hash."""
     runner.invoke(cli, [

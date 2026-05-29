@@ -363,6 +363,8 @@ class TodoItem:
                     return default
         return object.__getattribute__(self, name)
 
+    <<normalize labels on assignment>>
+
     @classmethod
     def from_dict(cls, data: dict) -> "TodoItem":
         """Create from dictionary (JSON deserialization).
@@ -375,6 +377,34 @@ class TodoItem:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
         return cls(**filtered)
+@
+
+\subsection{Labels Are a Set, Not a List}
+
+Conceptually a todo's labels form a \emph{set}: applying the label
+[[grading]] twice means the same thing as applying it once, and the order
+in which labels were attached carries no meaning.  Storing them as a plain
+[[list[str]]] lets duplicates accumulate --- for example when a child
+inherits an ancestor's labels and then is given one of those same labels
+again --- and a doubled label renders twice wherever labels are displayed.
+
+We normalize on \emph{assignment} rather than in [[__post_init__]] because
+labels are mutated in place after construction (the CLI-flags path and the
+interactive editor both rebind [[item.labels]] directly).  A
+[[__post_init__]] hook runs only once, at construction, so it would miss
+those later writes.  Routing every write through [[__setattr__]] guarantees
+construction, deserialization, inheritance, and edits all funnel through
+one normalization point.  This mirrors what [[TrackingEntry]] already does
+with [[sorted(list(set(labels)))]].  The visible consequence is that todo
+labels now display in alphabetical order instead of insertion order, which
+matches the [[track]] command.
+
+<<normalize labels on assignment>>=
+def __setattr__(self, name, value):
+    """Keep [[labels]] a sorted, duplicate-free list."""
+    if name == "labels" and value is not None:
+        value = sorted(set(value))
+    object.__setattr__(self, name, value)
 @
 
 \subsection{Testing the Data Model}
@@ -6120,6 +6150,55 @@ def test_view_shows_unset_priority_and_mixed_child_order(
     )
 @
 
+\subsection{Merging Incremental Label Edits}
+
+The [[--add-label]]/[[--remove-label]] flags need a single, well-defined
+merge rule, and the same rule serves [[track edit]].  We factor it into a
+pure helper so both commands share identical behavior and so the rule can
+be tested without a CLI harness.  The order of operations matters: we
+remove first, then add, so that a request to drop and re-add the same label
+is caught as a contradiction up front rather than silently cancelling out.
+
+A label appearing in both [[add]] and [[remove]] is a genuine
+contradiction --- the caller cannot mean both --- so we raise
+[[ValueError]] for the command layer to turn into a non-zero exit.  By
+contrast, removing an absent label or adding a present one is harmless and
+idempotent; we record a warning but carry on, returning the warnings so the
+caller can surface them on stderr while still succeeding.
+
+<<helpers>>=
+def apply_label_edits(current, add, remove):
+    """Return (new_labels, warnings) after removing then adding.
+
+    Starting from ``current``, remove every label in ``remove`` and then
+    append every label in ``add`` that is not already present.  Returns the
+    resulting label list together with a list of human-readable warning
+    strings for no-op removals and additions.
+
+    Raises ``ValueError`` if a label appears in both ``add`` and ``remove``.
+    """
+    conflict = set(add) & set(remove)
+    if conflict:
+        raise ValueError(
+            "label(s) given to both --add-label and --remove-label: "
+            + ", ".join(sorted(conflict)))
+    warnings = []
+    result = list(current)
+    for lab in remove:
+        if lab in result:
+            result = [x for x in result if x != lab]
+        else:
+            warnings.append(
+                f"label '{lab}' not present; nothing to remove")
+    for lab in add:
+        if lab in result:
+            warnings.append(
+                f"label '{lab}' already present; not added")
+        else:
+            result.append(lab)
+    return result, warnings
+@
+
 \subsection{The [[edit]] Command}
 
 Editing updates specific fields of an existing todo. The [[--edit]]
@@ -6149,10 +6228,30 @@ still checks [[todo.worker.<worker>.wd]],
 [[todo.worker.<worker>.env]], and
 [[todo.worker.<worker>.command]].
 
+Labels deserve a finer instrument than [[--label]].  [[--label]]/[[-l]]
+\emph{replaces} the whole set, so adding one label to an item that already
+has five means re-typing all six.  For incremental edits we add
+[[--add-label]]/[[-a]] and [[--remove-label]]/[[-r]], each repeatable.
+These are \emph{relative} to the item's current labels, so scripts can add
+or drop a single label without knowing the rest.  Because [[-l]] is
+absolute and [[-a]]/[[-r]] are relative, combining them is contradictory
+and we reject it; [[-a]] and [[-r]] may be combined as long as no label
+appears in both.  Adding a label already present or removing one that is
+absent is treated as an idempotent no-op that warns on stderr but still
+succeeds, which keeps the flags safe to run repeatedly from automation.
+
 <<argument and option definitions>>=
 edit_label_opt = typer.Option(
     "--label", "-l",
     help="Replace all labels",
+    autocompletion=complete_labels)
+add_label_opt = typer.Option(
+    "--add-label", "-a",
+    help="Add a label (repeatable)",
+    autocompletion=complete_labels)
+remove_label_opt = typer.Option(
+    "--remove-label", "-r",
+    help="Remove a label (repeatable)",
     autocompletion=complete_labels)
 edit_who_opt = typer.Option(
     "--who", "-w",
@@ -6179,6 +6278,10 @@ def edit(
                         estimate_opt] = None,
     label: Annotated[list[str] | None,
                      edit_label_opt] = None,
+    add_label: Annotated[list[str] | None,
+                         add_label_opt] = None,
+    remove_label: Annotated[list[str] | None,
+                            remove_label_opt] = None,
     description: Annotated[str | None,
                            description_opt] = None,
     who: Annotated[str | None,
@@ -6241,8 +6344,7 @@ if deadline is not None:
     item.deadline = deadline
 if estimate is not None:
     item.estimated = parse_hours(estimate)
-if label is not None:
-    item.labels = list(label)
+<<apply label edits>>
 if description is not None:
     item.description = description
 if who is not None:
@@ -6257,6 +6359,37 @@ else:
         item.env = dict(os.environ)
 if run_command is not None:
     item.command = run_command
+@
+
+Labels accept three flags whose interaction we resolved earlier:
+[[--label]] replaces, [[--add-label]]/[[--remove-label]] adjust relative to
+the current set.  We reject the contradictory [[-l]]-with-[[-a]]/[[-r]]
+combination before touching anything, delegate the relative merge to
+[[apply_label_edits]], and translate its [[ValueError]] (same label added
+and removed) into a non-zero exit.  No-op warnings from the helper are
+echoed to stderr but do not fail the command:
+
+<<apply label edits>>=
+if label is not None and (add_label or remove_label):
+    typer.echo(
+        "Error: --label cannot be combined with "
+        "--add-label/--remove-label",
+        err=True,
+    )
+    raise typer.Exit(1)
+if label is not None:
+    item.labels = list(label)
+elif add_label or remove_label:
+    try:
+        new_labels, warnings = apply_label_edits(
+            item.labels, add_label or [], remove_label or [],
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    for warning in warnings:
+        typer.echo(f"Warning: {warning}", err=True)
+    item.labels = new_labels
 @
 
 The [[--parent]] flag moves an item in the hierarchy.  Items are
@@ -12910,8 +13043,160 @@ def test_edit_command(temp_todo_dir):
 
     _, todos = load_todos()
     assert todos[0].title == "Updated"
+@
+
+The incremental label flags need their own coverage.  We start each case
+from an item that already carries labels so that the \emph{relative} nature
+of [[-a]]/[[-r]] is visible: a successful [[-a]] leaves the existing labels
+intact and adds one (alphabetically sorted by [[TodoItem]]), and [[-r]]
+drops exactly one.  Combining them in a single call exercises the
+remove-then-add ordering:
+
+<<integration tests>>=
+def test_edit_add_label_appends(temp_todo_dir):
+    """`-a` adds a label without disturbing existing ones."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["edit", "1", "-a", "grading"])
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310", "grading"]
 
 
+def test_edit_remove_label_drops_one(temp_todo_dir):
+    """`-r` removes one label, leaving the rest."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310", "grading"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["edit", "1", "-r", "grading"])
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310"]
+
+
+def test_edit_add_and_remove_together(temp_todo_dir):
+    """`-a` and `-r` may be combined in one call."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["draft", "DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "1", "-a", "urgent", "-r", "draft"],
+    )
+    assert result.exit_code == 0
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310", "urgent"]
+@
+
+Combining the absolute [[-l]] with a relative flag is contradictory, and
+asking to both add and remove the same label cannot be satisfied; both must
+fail with a non-zero exit:
+
+<<integration tests>>=
+def test_edit_label_with_add_label_errors(temp_todo_dir):
+    """`-l` cannot be combined with `-a`/`-r`."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "1", "-l", "x", "-a", "y"],
+    )
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310"]
+
+
+def test_edit_same_label_add_and_remove_errors(temp_todo_dir):
+    """The same label in `-a` and `-r` is a contradiction."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "1", "-a", "z", "-r", "z"],
+    )
+    assert result.exit_code != 0
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310"]
+@
+
+No-op edits stay scriptable: removing an absent label or adding a present
+one warns on stderr but exits zero and leaves the labels unchanged:
+
+<<integration tests>>=
+def test_edit_remove_absent_label_warns(temp_todo_dir):
+    """Removing an absent label warns but succeeds."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["edit", "1", "-r", "absent"])
+    assert result.exit_code == 0
+    assert "nothing to remove" in result.output
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310"]
+
+
+def test_edit_add_present_label_warns(temp_todo_dir):
+    """Adding a label already present warns but succeeds."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original", labels=["DD1310"],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["edit", "1", "-a", "DD1310"])
+    assert result.exit_code == 0
+    assert "already present" in result.output
+
+    _, todos = load_todos()
+    assert todos[0].labels == ["DD1310"]
+@
+
+Finally, the [[__setattr__]] normalization should make duplicate or
+unsorted labels impossible regardless of how they are supplied --- at
+construction or by later assignment:
+
+<<integration tests>>=
+def test_todo_item_labels_normalized():
+    """Labels are stored sorted and de-duplicated."""
+    item = TodoItem(id=1, title="x", labels=["b", "a", "a"])
+    assert item.labels == ["a", "b"]
+    item.labels = ["z", "z", "m"]
+    assert item.labels == ["m", "z"]
+@
+
+<<integration tests>>=
 def test_edit_who_flag(temp_todo_dir):
     """Edit uses --who for assignee updates."""
     save_todos(2, [
