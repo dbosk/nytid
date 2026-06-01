@@ -64,7 +64,6 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 **Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`) **and all `tests/test_*.py` files**. The `.gitignore` (both root and `tests/.gitignore`) lists all generated paths. The only handwritten Python files are:
 - `src/nytid/__init__.py` (empty package marker)
 - `src/nytid/signup/__init__.py`
-- `src/nytid/signup/hr/timesheet/__init__.py`
 - `src/nytid/httputils.py` (legacy, unused)
 
 **Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish the next time the tests Makefile runs, and they won't even appear in `git status` because they're gitignored.
