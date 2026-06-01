@@ -3,6 +3,7 @@ SUBDIR_GOALS=	all clean distclean
 MODULES+=	__init__.py
 MODULES+=	defaults.py
 MODULES+=	rooms.py
+MODULES+=	labels.py
 
 .PHONY: all
 all: ${MODULES}

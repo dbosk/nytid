@@ -1,0 +1,134 @@
+\chapter{Incremental label edits, the \texttt{cli.utils.labels}
+module}%
+\label{cli.utils.labels}
+
+Both [[nytid todo edit]] and [[nytid track edit]] let the user adjust an
+item's labels.  The blunt instrument is [[--label]]/[[-l]], which
+\emph{replaces} the entire set; adding one label to an item that already
+has five then means re-typing all six.  The finer instruments are
+[[--add-label]]/[[-a]] and [[--remove-label]]/[[-r]], which adjust the
+label set \emph{relative} to its current contents.
+
+Both commands need the exact same merge rule, and the rule has enough
+edge cases---contradictory requests, idempotent no-ops---that duplicating
+it invites drift.  We therefore factor it into this single pure helper.
+Keeping it free of any CLI or storage dependency lets both commands import
+it and lets us test the rule without a CLI harness.
+
+\section{Module structure}
+
+<<[[labels.py]]>>=
+"""Merge incremental label edits for the ``edit`` subcommands.
+
+Both ``nytid todo edit`` and ``nytid track edit`` import
+``apply_label_edits`` to implement their ``--add-label``/``--remove-label``
+flags. See the ``cli.utils.labels`` chapter in the manual for the design
+rationale.
+"""
+<<the apply_label_edits function>>
+@
+
+\section{The [[apply_label_edits]] function}
+
+The merge has one deliberate ordering decision: we remove first, then add.
+The alternative---adding first---would let a request to both drop and
+re-add the same label silently cancel out, hiding a likely mistake.  By
+removing first we can instead detect that the same label appears in both
+lists and reject the whole edit as a contradiction: the caller cannot
+coherently mean both \enquote{drop this} and \enquote{keep this}.
+
+A label that appears in both [[add]] and [[remove]] is therefore a hard
+error ([[ValueError]]) for the command layer to turn into a non-zero exit.
+The two softer cases---removing a label that is absent, or adding one that
+is already present---are harmless and idempotent.  Failing on those would
+make the flags unsafe to run repeatedly from automation, so instead we
+record a warning and carry on, returning the warnings so the caller can
+surface them on stderr while still succeeding.
+
+<<the apply_label_edits function>>=
+def apply_label_edits(current, add, remove):
+    """Return (new_labels, warnings) after removing then adding.
+
+    Starting from `current`, remove every label in `remove` and then
+    append every label in `add` that is not already present.  Returns the
+    resulting label list together with a list of human-readable warning
+    strings for no-op removals and additions.
+
+    Raises `ValueError` if a label appears in both `add` and `remove`.
+    """
+    conflict = set(add) & set(remove)
+    if conflict:
+        raise ValueError(
+            "label(s) given to both --add-label and --remove-label: "
+            + ", ".join(sorted(conflict)))
+    warnings = []
+    result = list(current)
+    for lab in remove:
+        if lab in result:
+            result = [x for x in result if x != lab]
+        else:
+            warnings.append(
+                f"label '{lab}' not present; nothing to remove")
+    for lab in add:
+        if lab in result:
+            warnings.append(
+                f"label '{lab}' already present; not added")
+        else:
+            result.append(lab)
+    return result, warnings
+@
+
+\section{Tests}
+
+Tests are tangled into [[tests/test_cliutilslabels.py]].  The function is
+pure, so the tests need no fixtures: they pass label lists in and assert on
+the returned list and warnings.
+
+<<test [[cliutilslabels.py]]>>=
+import sys
+sys.path.insert(0, "../src")
+
+import pytest
+
+from nytid.cli.utils.labels import apply_label_edits
+
+<<test functions>>
+@
+
+A successful edit removes first and then appends, so the kept labels stay
+in their original order and the added one lands at the end.  (Both callers
+normalize their own labels---[[TodoItem]] on assignment, [[TrackingEntry]] on
+construction---so this helper does not sort.)
+
+<<test functions>>=
+def test_apply_label_edits_remove_then_add():
+  result, warnings = apply_label_edits(
+    ["draft", "DD1310"], ["urgent"], ["draft"])
+  assert result == ["DD1310", "urgent"]
+  assert warnings == []
+@
+
+Adding a label that is already present, or removing one that is absent, is
+an idempotent no-op: the label set is unchanged and a warning explains why.
+<<test functions>>=
+def test_apply_label_edits_present_add_warns():
+  result, warnings = apply_label_edits(
+    ["DD1310"], ["DD1310"], [])
+  assert result == ["DD1310"]
+  assert any("already present" in w for w in warnings)
+
+
+def test_apply_label_edits_absent_remove_warns():
+  result, warnings = apply_label_edits(
+    ["DD1310"], [], ["absent"])
+  assert result == ["DD1310"]
+  assert any("nothing to remove" in w for w in warnings)
+@
+
+A label requested in both [[add]] and [[remove]] is contradictory and
+raises before any change is computed.
+<<test functions>>=
+def test_apply_label_edits_conflict_raises():
+  with pytest.raises(ValueError):
+    apply_label_edits(["DD1310"], ["x"], ["x"])
+@
