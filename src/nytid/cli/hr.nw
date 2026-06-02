@@ -920,8 +920,15 @@ csvout.writerow(row)
 
 
 When the [[--xlsx]] option is set, we also emit a planning spreadsheet for the
-user.  We resolve the user to their most detailed identity (so the sheet shows
-a real name and email), build the per-course rows, and write the file named
+user.  The sheet only needs a human-readable name and email, both of which
+Canvas supplies, so we resolve the user against \emph{Canvas alone} --- we
+deliberately do not consult LADOK here.  This is the key difference from the
+printed summary: the summary's detailed mode looks the user up in LADOK to
+obtain the personnummer, but the planning sheet never shows a personnummer, so
+that lookup would be wasted work (and would make the spreadsheet depend on a
+[[ladok login]] it does not need).  For the same reason the sheet ignores
+[[--no-detailed]]: that flag exists to skip the expensive LADOK lookup, and this
+path has none to skip.  We build the per-course rows and write the file named
 after the user and the current time.  The chunk body sits at the loop-body
 level so [[notangle]] places it as a sibling of the summary print, not nested
 inside it.
@@ -941,18 +948,34 @@ expose [[.date()]], which yields a plain [[datetime.date]] the cell accepts ---
 the same conversion the printed summary already uses.
 <<write [[user]]'s planning spreadsheet>>=
 if xlsx:
-  <<set [[user_obj]] to most detailed version possible of [[user]]>>
+  <<resolve [[user]] to a Canvas display name>>
   course_rows = amanuensis_course_rows(user, booked, courses,
                                        default_course_responsible)
   output = f"{user}-{datetime.datetime.now():%Y-%m-%dT%H%M%S}.xlsx"
   timesheet.make_amanuensis_xlsx(
-      name=str(user_obj),
-      email=getattr(user_obj, "email", "") or "",
+      name=str(sheet_user),
+      email=getattr(sheet_user, "email", "") or "",
       start=start.date(),
       end=end.date(),
       course_rows=course_rows,
       responsible=(default_course_responsible, default_email),
       output=output)
+@
+
+The Canvas lookup goes through [[get_canvas_user]], which is backed by the
+cached [[get_canvas_users]]; so even when the detailed summary already resolved
+this same user earlier in the loop, this second call just re-filters the cache
+rather than hitting the network.  If Canvas is unavailable we fall back to the
+bare username, mirroring the summary's own fallback --- a sheet headed by the
+login is still useful, and we would rather emit it than abort.  We keep this in
+its own variable [[sheet_user]] so it does not clobber the [[user_obj]] the
+summary path resolved (which, under [[--detailed]], holds the LADOK student).
+<<resolve [[user]] to a Canvas display name>>=
+try:
+  sheet_user = get_canvas_user(user, course_regex)
+except Exception as err:
+  logging.warning(f"Can't look up {user} in Canvas: {err}")
+  sheet_user = user
 @
 
 \subsubsection{Modifying the contract dates}\label{sec:modify-contract-dates}
@@ -2935,6 +2958,62 @@ def test_cli_amanuens_create_xlsx_uses_pushed_dates(tmp_path, monkeypatch):
   written = ws["D10"].value
   written = written.date() if hasattr(written, "date") else written
   assert written == datetime.date(2024, 10, 1)
+@
+
+The other wiring risk is the lookup discipline: the planning sheet must take its
+name from Canvas and must never reach for LADOK, even though the printed summary
+does under [[--detailed]].  We pin this with [[--no-detailed]], which makes the
+summary skip its own lookup entirely --- so any LADOK call that survives must
+come from the xlsx path.  We stub [[get_canvas_user]] to return a known name and
+fail the test outright if [[get_ladok_user]] is invoked, then confirm the name
+reached the sheet.
+<<test functions>>=
+def test_cli_amanuens_create_xlsx_no_details_skips_ladok(tmp_path, monkeypatch):
+  """--xlsx resolves the name via Canvas only, never LADOK."""
+  import arrow
+  import typerconf
+  from openpyxl import load_workbook
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+
+  booked = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
+                             "code": "DD1310"})
+
+  class _CanvasUser:
+    email = "alice@kth.se"
+    def __str__(self):
+      return "Alice Anteater"
+
+  def _no_ladok(*args, **kwargs):
+    raise AssertionError("the planning sheet must not look up LADOK")
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *a, **k: {("DD1310", "reg"): config})
+  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+                      lambda url: booked)
+  monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: _CanvasUser())
+  monkeypatch.setattr(hrcli, "get_ladok_user", _no_ladok)
+  monkeypatch.setattr(hrcli.hr, "compute_amanuensis_data",
+                      lambda *a, **k: {"alice": (arrow.get("2024-09-01"),
+                                                 arrow.get("2024-12-01"),
+                                                 100.0)})
+
+  monkeypatch.chdir(tmp_path)
+  result = CliRunner().invoke(
+    hrcli.cli,
+    ["amanuensis", "create", "--draft", "--xlsx", "--no-detailed"])
+
+  assert result.exit_code == 0, result.output
+
+  produced = list(tmp_path.glob("alice-*.xlsx"))
+  assert len(produced) == 1
+
+  ws = load_workbook(produced[0])["EXEMPEL"]
+  assert ws["D6"].value == "Alice Anteater"
 @
 
 We can simply compute [[hours]] using the [[hours_per_TA]] function.
