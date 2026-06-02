@@ -44,6 +44,16 @@ poetry run nytid --help
 - `cd tests && poetry run pytest test_courses.py -v` — Run a single test file
 - `cd tests && poetry run pytest test_courses.py::test_function_name -v` — Run a single test function
 - `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
+- `make clean all` — Clean rebuild of everything (source **and** docs). `make -C <dir> clean all` scopes a clean rebuild to one subdirectory, e.g. `make -C doc clean all` rebuilds only the documentation PDF.
+
+**`make all` does NOT re-weave existing `.tex` files.** Like the test-file
+situation below, `all` only (re)builds the `.py` MODULES and any *missing*
+`.tex`; it will **not** re-weave a `.tex` that already exists. A change to the
+prose/LaTeX in a `.nw` file (documentation chunks, chunk names, `\cref`s) will
+therefore not appear in the built docs after a plain `make all` — the stale
+`.tex` is reused. Use a **clean** rebuild to force re-weaving:
+`make -C doc clean all` (docs only) or `make clean all` (everything). This is
+the LaTeX/`.tex` analogue of the test-file gotcha described below.
 
 ## Architecture
 
