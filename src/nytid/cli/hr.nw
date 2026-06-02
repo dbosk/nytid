@@ -919,20 +919,26 @@ csvout.writerow(row)
 @
 
 
+When the [[--xlsx]] option is set, we also emit a planning spreadsheet for the
+user.  We resolve the user to their most detailed identity (so the sheet shows
+a real name and email), build the per-course rows, and write the file named
+after the user and the current time.  The chunk body sits at the loop-body
+level so [[notangle]] places it as a sibling of the summary print, not nested
+inside it.
 <<write [[user]]'s planning spreadsheet>>=
-    if xlsx:
-        <<set [[user_obj]] to most detailed version possible of [[user]]>>
-        course_rows = amanuensis_course_rows(user, booked, courses)
-        output = f"{user}-{datetime.datetime.now():%Y-%m-%dT%H%M%S}.xlsx"
-        timesheet.make_amanuensis_xlsx(
-            name=str(user_obj) if "@" in str(user_obj) else user_obj.name,
-            email=user_obj.email if hasattr(user_obj, "email") else "",
-            start=data[0],
-            end=data[1],
-            course_rows=course_rows,
-            responsible=(default_course_responsible, default_email),
-            output=output
-        )
+if xlsx:
+  <<set [[user_obj]] to most detailed version possible of [[user]]>>
+  course_rows = amanuensis_course_rows(user, booked, courses,
+                                       default_course_responsible)
+  output = f"{user}-{datetime.datetime.now():%Y-%m-%dT%H%M%S}.xlsx"
+  timesheet.make_amanuensis_xlsx(
+      name=str(user_obj),
+      email=getattr(user_obj, "email", "") or "",
+      start=data[0],
+      end=data[1],
+      course_rows=course_rows,
+      responsible=(default_course_responsible, default_email),
+      output=output)
 @
 
 \subsubsection{Modifying the contract dates}
@@ -2644,131 +2650,211 @@ def summarize_user(user, course_events,
 
 \subsection{Build course rows for amanuensis planning spreadsheet}
 
-The [[amanuensis_course_rows]] function transforms summarized user events into
-course rows suitable for the amanuensis planning spreadsheet template.
-Each row represents one course and aggregates all events for that course.
-<<helper functions>>=
+The planning sheet wants one row per course, with hours split into the
+template's fixed categories.  Our sign-up data instead records individual
+events tagged with a free-form type, so [[amanuensis_course_rows]] bridges the
+two: it summarises the user's events, groups them by course, folds each
+course's events into the template's columns, and annotates each row with the
+course's division and study period from configuration.
 
-def amanuensis_course_rows(user, booked, courses_configs):
-    """
-    Build course rows for amanuensis planning spreadsheet.
-    
-    Transforms summarized user events into per-course dicts with all fields
-    needed by the planning template. Preserves the formula-invariant property:
-    each row's Q (Summa timmar) equals that course's total omr_tid.
-    
-    Args:
-        user: TA username
-        booked: List of all booked events
-        courses_configs: List of ((course, register), config) pairs
-        
-    Returns:
-        List of per-course dicts with keys:
-            kurskod, avdelning, period, ovn_koeff, ovn_tim,
-            gruppansvar, labb_koeff, labb_tim, mote, rattning, ovrigt
-    """
-    <<amanuensis course rows: summarize and group>>
-    
-    <<amanuensis course rows: classify event types>>
-    
-    <<amanuensis course rows: derive values>>
-    
-    <<amanuensis course rows: lookup config>>
-    
-    return course_rows
+The bridge must preserve one invariant: the template computes each row's
+\enquote{\foreignlanguage{swedish}{Summa timmar}} as
+$\mathit{koeff}\cdot\mathit{tim}+\dotsb$, and that must equal the course's
+total \enquote{\foreignlanguage{swedish}{omräknad tid}} as our own functions
+compute it.  Each step below is written to maintain it.
+<<helper functions>>=
+def amanuensis_course_rows(user, booked, courses_configs,
+                           responsible_name=""):
+  """
+  Build course rows for an amanuensis planning spreadsheet.
+
+  Transforms a user's summarized events into per-course dicts holding the
+  fields the planning template needs. Preserves the invariant that each
+  row's Summa timmar equals that course's total omraknad tid.
+
+  Args:
+      user: TA username.
+      booked: list of all booked sign-up sheet rows.
+      courses_configs: dict {(course, register): config} as returned by
+          get_courses_configs, used to look up division and period.
+      responsible_name: name for each row's responsible-teacher column.
+
+  Returns:
+      list of per-course dicts with keys: kurskod, avdelning, period,
+      ovn_koeff, ovn_tim, gruppansvar, labb_koeff, labb_tim, mote,
+      rattning, ovrigt, responsible.
+  """
+  <<amanuensis course rows: summarize and group>>
+  <<amanuensis course rows: classify event types>>
+  <<amanuensis course rows: derive values>>
+  <<amanuensis course rows: lookup config>>
+  return course_rows
 @
 
-
+We start from [[summarize_user]], which already tags every event with the
+course code (parsed from the event title) and its prep-time coefficient.
+Grouping by [[kurskod]] gives one bucket of events per course.
 <<amanuensis course rows: summarize and group>>=
 events = summarize_user(user, booked)
 
 course_events = {}
 for event in events:
-    kurskod = event["kurskod"]
-    if kurskod not in course_events:
-        course_events[kurskod] = []
-    course_events[kurskod].append(event)
+  course_events.setdefault(event["kurskod"], []).append(event)
 @
 
-
+The template's columns are fixed (exercises, labs, meetings, grading, other)
+while our event types are free text.  We map a type to a column by the same
+keywords [[prep_factor]] keys off, so the classification agrees with how the
+coefficient was assigned.  An unrecognised type falls into
+\enquote{\foreignlanguage{swedish}{övrigt}} rather than being dropped, so the
+total survives an imperfect mapping.
 <<amanuensis course rows: classify event types>>=
 category_map = {
-    "ovning": "ovning",
-    "exercise": "ovning",
-    "laboration": "labb",
-    "seminar": "labb",
-    "redovisning": "labb",
-    "presentation": "labb",
-    "fragestund": "labb",
-    "question": "labb",
-    "lab": "labb",
-    "mote": "mote",
-    "meeting": "mote",
-    "rattning": "rattning",
-    "grading": "rattning",
-    "correction": "rattning"
+  "övning": "ovn", "exercise": "ovn",
+  "laboration": "labb", "labb": "labb", "lab": "labb",
+  "seminar": "labb", "redovisning": "labb", "presentation": "labb",
+  "frågestund": "labb", "question": "labb",
+  "möte": "mote", "meeting": "mote",
+  "rättning": "rattning", "grading": "rattning", "correction": "rattning",
 }
 
 for kurskod, events in course_events.items():
-    categorized = {"ovning": [], "labb": [], "mote": [], 
-                  "rattning": [], "ovrigt": [], "gruppansvar": []}
-    for event in events:
-        typ = event["typ"].lower()
-        category = "ovrigt"
-        for key, value in category_map.items():
-            if key in typ:
-                category = value
-                break
-        categorized[category].append(event)
-    course_events[kurskod] = categorized
+  categorized = {"ovn": [], "labb": [], "mote": [],
+                 "rattning": [], "ovrigt": [], "gruppansvar": []}
+  for event in events:
+    typ = event["typ"].lower()
+    category = "ovrigt"
+    for key, value in category_map.items():
+      if key in typ:
+        category = value
+        break
+    categorized[category].append(event)
+  course_events[kurskod] = categorized
 @
 
-
+Now we fold each category into the template's input cells.  The two
+coefficient-bearing columns store raw clock hours times a coefficient, so we
+write the summed clock hours and an \emph{effective} coefficient
+$\sum\mathit{omr\_tid}/\sum\mathit{tim}$ --- which makes
+$\mathit{koeff}\cdot\mathit{tim}$ reproduce the summed prep-included hours
+exactly.  The flat columns have no coefficient, so we write the prep-included
+hours directly.  Either way the column contributes its share of
+\enquote{\foreignlanguage{swedish}{omräknad tid}}, so the row total matches.
 <<amanuensis course rows: derive values>>=
 course_rows = []
 
 for kurskod, categorized in course_events.items():
-    row = {
-        "kurskod": kurskod,
-        "avdelning": "",
-        "period": "",
-        "ovn_koeff": 0,
-        "ovn_tim": 0,
-        "gruppansvar": 0,
-        "labb_koeff": 0,
-        "labb_tim": 0,
-        "mote": 0,
-        "rattning": 0,
-        "ovrigt": 0,
-        "responsible": ""
-    }
-    
-    for category, events in categorized.items():
-        if category in ["ovning", "labb"]:
-            total_timmar = sum(e["timmar"] for e in events)
-            total_omr_tid = sum(e["omr_tid"] for e in events)
-            if total_timmar > 0:
-                row[f"{category}_koeff"] = total_omr_tid / total_timmar
-                row[f"{category}_tim"] = total_timmar
-            else:
-                row[f"{category}_koeff"] = 0
-                row[f"{category}_tim"] = 0
-        else:
-            row[category] = sum(e["omr_tid"] for e in events)
-    
-    course_rows.append(row)
+  row = {
+    "kurskod": kurskod, "avdelning": "", "period": "",
+    "ovn_koeff": 0, "ovn_tim": 0, "gruppansvar": 0,
+    "labb_koeff": 0, "labb_tim": 0, "mote": 0,
+    "rattning": 0, "ovrigt": 0, "responsible": responsible_name,
+  }
+
+  for category, events in categorized.items():
+    if category in ("ovn", "labb"):
+      total_timmar = sum(e["timmar"] for e in events)
+      total_omr_tid = sum(e["omr_tid"] for e in events)
+      if total_timmar > 0:
+        row[f"{category}_koeff"] = total_omr_tid / total_timmar
+        row[f"{category}_tim"] = total_timmar
+    else:
+      row[category] = sum(e["omr_tid"] for e in events)
+
+  course_rows.append(row)
 @
 
-
+Finally we annotate each row with the course's division and study period.
+These live in the course configuration under [[hr.division]] and
+[[hr.period]]; we match a configuration to a row by its [[code]].  Course
+configurations use dotted keys and raise [[KeyError]] when a key is unset, so
+we read them defensively and leave the cell blank when absent.
 <<amanuensis course rows: lookup config>>=
 for row in course_rows:
-    kurskod = row["kurskod"]
-    for (course, register), config in courses_configs:
-        if config.get("code") == kurskod:
-            row["avdelning"] = config.get("hr", {}).get("division", "")
-            row["period"] = config.get("hr", {}).get("period", "")
-            row["responsible"] = config.get("hr", {}).get("manager", "")
-            break
+  for (course, register), config in courses_configs.items():
+    if course_config_get(config, "code") == row["kurskod"]:
+      row["avdelning"] = course_config_get(config, "hr.division", "")
+      row["period"] = course_config_get(config, "hr.period", "")
+      break
+@
+
+The accessor reads a dotted configuration key, returning a default instead of
+raising when the key is unset.
+<<helper functions>>=
+def course_config_get(config, key, default=None):
+  """Return the value at dotted `key` in `config`, or `default` if unset."""
+  try:
+    return config.get(key)
+  except KeyError:
+    return default
+@
+
+The invariant we care about is that the spreadsheet, fed our numbers, computes
+the same totals we do.  We pin it with a test: we build a couple of courses'
+worth of events, run them through [[amanuensis_course_rows]], evaluate the
+template's hour formula ($\mathit{koeff}\cdot\mathit{tim}+\dotsb$) in Python,
+and check it equals the total \enquote{\foreignlanguage{swedish}{omräknad tid}}
+that [[summarize_user]] reports for each course.  We also confirm that one
+course yields one row and that exercise and lab hours land in their own
+columns.
+<<test functions>>=
+def _amanuensis_signup_row(event, start, end, tas, needed="1"):
+  return [event, start, end, "D1", needed] + tas
+
+def test_amanuensis_course_rows_total_matches():
+  rows = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+    _amanuensis_signup_row("DD1310 Laboration",
+                           "2024-09-03 10:00", "2024-09-03 13:00", ["alice"]),
+    _amanuensis_signup_row("DD1317 Möte",
+                           "2024-09-04 10:00", "2024-09-04 11:00", ["alice"]),
+  ]
+  course_rows = amanuensis_course_rows("alice", rows, {})
+
+  assert {r["kurskod"] for r in course_rows} == {"DD1310", "DD1317"}
+
+  expected = {}
+  for e in summarize_user("alice", rows):
+    expected[e["kurskod"]] = expected.get(e["kurskod"], 0) + e["omr_tid"]
+
+  for r in course_rows:
+    sheet_total = (r["ovn_koeff"] * r["ovn_tim"]
+                   + r["gruppansvar"]
+                   + r["labb_koeff"] * r["labb_tim"]
+                   + r["mote"] + r["rattning"] + r["ovrigt"])
+    assert sheet_total == pytest.approx(expected[r["kurskod"]])
+
+  dd1310 = next(r for r in course_rows if r["kurskod"] == "DD1310")
+  assert dd1310["ovn_tim"] == 2    # the Övning clock hours
+  assert dd1310["labb_tim"] == 3   # the Laboration clock hours
+
+def test_amanuensis_course_rows_looks_up_config():
+  import typerconf
+  rows = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  config = typerconf.Config({"code": "DD1310",
+                             "hr": {"division": "TCS", "period": "1"}})
+  course_rows = amanuensis_course_rows(
+    "alice", rows, {("DD1310", "reg"): config},
+    responsible_name="Teacher")
+
+  row = course_rows[0]
+  assert row["avdelning"] == "TCS"
+  assert row["period"] == "1"
+  assert row["responsible"] == "Teacher"
+
+def test_amanuensis_course_rows_missing_config_is_blank():
+  rows = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  # No matching config: division/period stay blank, no crash.
+  course_rows = amanuensis_course_rows("alice", rows, {})
+  assert course_rows[0]["avdelning"] == ""
+  assert course_rows[0]["period"] == ""
 @
 
 We can simply compute [[hours]] using the [[hours_per_TA]] function.
