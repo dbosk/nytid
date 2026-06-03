@@ -1,9 +1,9 @@
 SUBDIR_GOALS=	all clean distclean
 
-MODULES+=	__init__.py
-MODULES+=	defaults.py
-MODULES+=	rooms.py
-MODULES+=	labels.py
+MODULES+=	__init__.py init.tex
+MODULES+=	defaults.py defaults.tex
+MODULES+=	rooms.py rooms.tex
+MODULES+=	labels.py labels.tex
 
 .PHONY: all
 all: ${MODULES}
