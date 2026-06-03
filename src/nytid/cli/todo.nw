@@ -80,6 +80,7 @@ from nytid.cli.utils.defaults import default
 from nytid.cli.utils.labels import apply_label_edits
 from typing import Annotated
 from dataclasses import dataclass, field
+from enum import Enum
 
 from nytid import storage
 
@@ -2554,10 +2555,10 @@ def test_assign_priority_between():
 \section{Shell Autocompletion}
 
 Following the patterns established in [[track.nw]], we provide
-completion functions for labels, worker names, and todo IDs. We
-import [[complete_workers]] and [[complete_historical_labels]] from
-the track module where possible, and extend them with todo-specific
-data.
+completion functions for labels, worker names, todo IDs, and the
+repositories of imported items. We import [[complete_workers]] and
+[[complete_historical_labels]] from the track module where possible,
+and extend them with todo-specific data.
 
 <<autocompletion functions>>=
 def complete_labels(ctx, args, incomplete):
@@ -2637,6 +2638,61 @@ def complete_todo_workers(ctx, args, incomplete):
         )
     except Exception:
         return []
+@
+
+Both [[sync --repo]] and the [[import]] repository argument benefit
+from knowing which repositories the user has already worked with: the
+[[sync]] filter only makes sense for an imported repository, and
+[[import]] is most often used to pull \emph{more} items from a repo
+already in play.  We therefore draw candidates from the [[github]]
+metadata already stored on local items rather than querying GitHub.
+This keeps completion instant and offline.  A repository never
+imported before will not be suggested, but that is acceptable---the
+user types the new [[owner/repo]] once and it becomes a candidate
+thereafter.
+
+<<autocompletion functions>>=
+def complete_known_repos(ctx, args, incomplete):
+    """Complete repo names from imported todos."""
+    try:
+        _, todos = load_todos()
+        repos = {
+            t.github["repo"]
+            for t in todos
+            if t.github
+        }
+        return sorted(
+            r for r in repos
+            if r.startswith(incomplete)
+        )
+    except Exception:
+        return []
+@
+
+Let's verify that completion offers only the repositories actually
+imported, and respects the typed prefix.  The locally created item
+(with no [[github]] metadata) must not appear:
+
+<<test functions>>=
+def test_complete_known_repos(temp_todo_dir):
+  """Completion lists imported repos, filtered by prefix."""
+  save_todos(4, [
+    TodoItem(id=1, title="From alpha",
+             created="2026-02-20T10:00:00",
+             github={"repo": "owner/alpha", "number": "1"}),
+    TodoItem(id=2, title="From beta",
+             created="2026-02-20T10:00:00",
+             github={"repo": "owner/beta", "number": "2"}),
+    TodoItem(id=3, title="Local only",
+             created="2026-02-20T10:00:00"),
+  ])
+  assert complete_known_repos(None, None, "") == [
+    "owner/alpha", "owner/beta",
+  ]
+  assert complete_known_repos(None, None, "owner/a") == [
+    "owner/alpha",
+  ]
+  assert complete_known_repos(None, None, "zzz") == []
 @
 
 \section{GitHub Integration}
@@ -4961,6 +5017,21 @@ Label filters are positional arguments, matching the [[add]] command's
 convention ([[todo ls tilkry26 prep]] filters to items with either
 label).
 
+The output format is one of a closed set of choices, so we model it
+as an enumeration.  Typing the [[--format]] option as this enum lets
+Typer validate the input and complete the four values, instead of
+accepting any string and silently auto-detecting when it does not
+match a known format.
+
+<<constants>>=
+class LsFormat(str, Enum):
+    """Output formats for ``todo ls``."""
+    table = "table"
+    rich = "rich"
+    csv = "csv"
+    json = "json"
+@
+
 Three defaults on [[ls]] are worth making configurable so a user does
 not have to retype the same flag on every invocation: the row cap
 [[-n]], the output format, and the assignee filter.
@@ -4969,16 +5040,42 @@ We read each from [[typerconf]] once at module import via the shared
 resolved value to display in [[--help]].
 The [[--who]] fallback is [[default_username]] (that is, [[\$USER]]),
 matching the pre-existing behaviour.
+
+The format default needs care: it comes from configuration as a bare
+string, but the option is now typed as [[LsFormat]].  We coerce the
+configured value into the enum, falling back to [[table]] if a stale
+or hand-edited config holds a value outside the set---an invalid
+default must not crash every [[ls]] invocation at import time.
 <<configuration>>=
 TODO_LS_COUNT_CONFIG = "todo.ls.count"
 TODO_LS_FORMAT_CONFIG = "todo.ls.format"
 TODO_LS_WHO_CONFIG = "todo.ls.who"
 
+
+def coerce_ls_format(value):
+    """Return `value` as an `LsFormat`, or `table` if unknown."""
+    try:
+        return LsFormat(value)
+    except ValueError:
+        return LsFormat.table
+
+
 DEFAULT_LS_COUNT = default(TODO_LS_COUNT_CONFIG, 10, int)
-DEFAULT_LS_FORMAT = default(TODO_LS_FORMAT_CONFIG,
-                            "table", str)
+DEFAULT_LS_FORMAT = coerce_ls_format(
+    default(TODO_LS_FORMAT_CONFIG, "table", str))
 DEFAULT_LS_WHO = default(TODO_LS_WHO_CONFIG,
                          default_username, str)
+@
+
+A valid configured format resolves to its member; anything outside
+the set falls back to [[table]] rather than raising:
+
+<<test functions>>=
+def test_coerce_ls_format():
+  """Known values map to members; unknown values fall back."""
+  assert coerce_ls_format("rich") == LsFormat.rich
+  assert coerce_ls_format("table") == LsFormat.table
+  assert coerce_ls_format("bogus") == LsFormat.table
 @
 
 <<argument and option definitions>>=
@@ -5034,9 +5131,9 @@ def ls(
     who_filter: Annotated[str | None,
                           ls_who_opt] = DEFAULT_LS_WHO,
     flat: Annotated[bool, ls_flat_opt] = False,
-    output_format: Annotated[str,
+    output_format: Annotated[LsFormat,
                              ls_format_opt] = DEFAULT_LS_FORMAT,
-    status_filter: Annotated[str | None,
+    status_filter: Annotated[TodoStatus | None,
                              ls_status_opt] = None,
     show_prio: Annotated[bool, ls_prio_opt] = False,
     output: Annotated[str | None,
@@ -5046,14 +5143,14 @@ def ls(
 
     Ranked items are shown first by effective priority; unranked
     items follow in deadline order. By default shows only top-level
-    items assigned to the current user. Pass [[--all]] to see the
-    full tree including subtasks, or [[-n N]] to cap the output at
+    items assigned to the current user. Pass `--all` to see the
+    full tree including subtasks, or `-n N` to cap the output at
     N items.
 
-    [[--who]] defaults to [[\\$USER]]; pass an empty string
-    ([[--who '']]) to show all assignees.
+    `--who` defaults to $USER; pass an empty string
+    (`--who ''`) to show all assignees.
 
-    Output format defaults to [[table]], which auto-detects the
+    Output format defaults to `table`, which auto-detects the
     terminal: rich-formatted when stdout is a TTY, plain CSV
     otherwise (suitable for piping).
     """
@@ -5078,6 +5175,32 @@ agent workflow needs to query only pending tasks without fragile
 [[awk]] filtering in shell scripts.  When [[--status]] is given, it
 takes precedence over [[--done]] since the user has expressed a
 more specific intent.
+
+A todo is always in one of three lifecycle states, so [[--status]] is
+another closed-choice option.  Modelling it as an enum stops a typo
+like [[--status in_progress]] from silently matching nothing---Typer
+rejects the unknown value outright.  The member name [[in_progress]]
+must use an underscore (a hyphen is not a valid identifier), but its
+\emph{value} keeps the hyphen so it matches the stored status string.
+
+<<constants>>=
+class TodoStatus(str, Enum):
+    """The lifecycle states a todo item can be in."""
+    pending = "pending"
+    in_progress = "in-progress"
+    done = "done"
+@
+
+The underscore-versus-hyphen split is exactly the property the filter
+relies on, so we pin it down:
+
+<<test functions>>=
+def test_todo_status_values():
+  """The in-progress member keeps its hyphenated value."""
+  assert TodoStatus.in_progress == "in-progress"
+  assert TodoStatus.pending == "pending"
+  assert TodoStatus.done == "done"
+@
 
 <<filter todos>>=
 filtered = todos
@@ -10768,6 +10891,16 @@ in a separate task list.
 
 \subsection{The [[export]] Command}
 
+As with [[todo ls]], the export format is a closed set of meaningful
+choices.  Modeling it as an enum lets Typer validate and complete the
+accepted values instead of treating [[--format]] as arbitrary text.
+
+<<constants>>=
+class TodoExportFormat(str, Enum):
+    """Export formats for `todo export`."""
+    vtodo = "vtodo"
+@
+
 <<argument and option definitions>>=
 export_output_opt = typer.Option(
     "--output", "-o",
@@ -10787,8 +10920,8 @@ def export(
                       export_output_opt] = None,
     all_items: Annotated[bool,
                          export_all_opt] = False,
-    format: Annotated[str,
-                      export_format_opt] = "vtodo",
+    format: Annotated[TodoExportFormat,
+                      export_format_opt] = TodoExportFormat.vtodo,
 ):
     """Export todos as ICS (VTODO)."""
     _, todos = load_todos()
@@ -10800,7 +10933,7 @@ def export(
         typer.echo("No todos to export.", err=True)
         return
 
-    if format == "vtodo":
+    if format == TodoExportFormat.vtodo:
         ics_data = export_vtodo(todos)
     else:
         typer.echo(
@@ -10948,9 +11081,39 @@ and capture the working context in which we discovered them.
 <<note command>>
 @
 
+The [[--type]] flag accepts exactly three values.  Modelling it as an
+enumeration rather than a free string gives us two things for free:
+Typer rejects a misspelled value with a helpful message instead of
+silently importing nothing, and the shell completes the valid values.
+Because the members subclass [[str]], the existing comparisons against
+literal strings ([[item_type in ("all", "issue")]]) keep working
+unchanged.
+
+<<constants>>=
+class ImportType(str, Enum):
+    """Which GitHub item kinds ``todo import`` fetches."""
+    issue = "issue"
+    pr = "pr"
+    all = "all"
+@
+
+The compatibility we rely on is that each member equals its string
+value and participates in membership tests, so the import command's
+existing string comparisons need no change:
+
+<<test functions>>=
+def test_import_type_enum_values():
+  """Members equal their string values for back-compat."""
+  assert ImportType.issue == "issue"
+  assert ImportType.pr == "pr"
+  assert ImportType.all == "all"
+  assert ImportType.all in ("all", "issue")
+@
+
 <<argument and option definitions>>=
 import_repo_arg = typer.Argument(
-    help="GitHub repo (owner/repo)")
+    help="GitHub repo (owner/repo)",
+    autocompletion=complete_known_repos)
 import_number_opt = typer.Option(
     "--number", "-n",
     help="Import only this issue/PR number")
@@ -10977,8 +11140,8 @@ def import_github(
     label: Annotated[list[str] | None,
                      import_label_opt] = None,
     <<import metadata options>>
-    item_type: Annotated[str,
-                         import_type_opt] = "all",
+    item_type: Annotated[ImportType,
+                         import_type_opt] = ImportType.all,
     skip_priority: Annotated[bool,
                              import_skip_prio_opt] = False,
     github_labels: Annotated[bool,
@@ -11994,7 +12157,8 @@ network blip for one issue should not prevent syncing the rest.
 <<argument and option definitions>>=
 sync_repo_opt = typer.Option(
     "--repo", "-r",
-    help="Only sync items from this repo")
+    help="Only sync items from this repo",
+    autocompletion=complete_known_repos)
 @
 
 <<sync command>>=
@@ -12411,6 +12575,11 @@ from nytid.cli.todo import (
     append_note_to_item,
     NotInTmuxError,
     resolve_todo_from_tmux_context,
+    complete_known_repos,
+    ImportType,
+    TodoStatus,
+    LsFormat,
+    coerce_ls_format,
 )
 
 runner = CliRunner()
