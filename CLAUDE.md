@@ -44,6 +44,16 @@ poetry run nytid --help
 - `cd tests && poetry run pytest test_courses.py -v` — Run a single test file
 - `cd tests && poetry run pytest test_courses.py::test_function_name -v` — Run a single test function
 - `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
+- `make clean all` — Clean rebuild of everything (source **and** docs). `make -C <dir> clean all` scopes a clean rebuild to one subdirectory, e.g. `make -C doc clean all` rebuilds only the documentation PDF.
+
+**`make all` does NOT re-weave existing `.tex` files.** Like the test-file
+situation below, `all` only (re)builds the `.py` MODULES and any *missing*
+`.tex`; it will **not** re-weave a `.tex` that already exists. A change to the
+prose/LaTeX in a `.nw` file (documentation chunks, chunk names, `\cref`s) will
+therefore not appear in the built docs after a plain `make all` — the stale
+`.tex` is reused. Use a **clean** rebuild to force re-weaving:
+`make -C doc clean all` (docs only) or `make clean all` (everything). This is
+the LaTeX/`.tex` analogue of the test-file gotcha described below.
 
 ## Architecture
 
@@ -64,7 +74,6 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 **Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`) **and all `tests/test_*.py` files**. The `.gitignore` (both root and `tests/.gitignore`) lists all generated paths. The only handwritten Python files are:
 - `src/nytid/__init__.py` (empty package marker)
 - `src/nytid/signup/__init__.py`
-- `src/nytid/signup/hr/timesheet/__init__.py`
 - `src/nytid/httputils.py` (legacy, unused)
 
 **Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish the next time the tests Makefile runs, and they won't even appear in `git status` because they're gitignored.

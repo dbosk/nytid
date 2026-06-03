@@ -29,6 +29,7 @@ from typing import Annotated
 
 from nytid.signup import hr
 from nytid.signup import sheets
+from nytid.signup.hr import timesheet
 import operator
 
 from nytid.cli import courses as coursescli
@@ -344,6 +345,22 @@ for (course, register), config in courses.items():
   <<add to [[booked]] from [[course]] in [[register]] using [[config]]>>
 @
 
+The amanuensis planning sheet needs one row per course, so it cannot work from
+the flattened [[booked]] alone --- once the courses' sheets are concatenated,
+nothing records which course an event came from.  The create command therefore
+builds the bookings a second way: the same flat [[booked]] (so the contract
+percentage is unchanged) plus [[booked_by_course]], keeping each course's
+bookings under its [[(course, register)]] key.  Both are filled from the one
+read per course, so this costs no extra network traffic.
+<<let [[booked]] and [[booked_by_course]] be all bookings from [[courses]]>>=
+booked = []
+booked_by_course = {}
+for (course, register), config in courses.items():
+  <<read [[course]]'s bookings into [[course_bookings]]>>
+  booked_by_course[(course, register)] = course_bookings
+  booked += course_bookings
+@
+
 We'll return to
 [[<<set list [[courses]] to ((course, register), config)-pairs>>]] and
 [[<<add to [[booked]] from [[course]] in [[register]] using [[config]]>>]]
@@ -412,17 +429,29 @@ def time(<<argument for matching courses>>,
   <<print summary of [[booked]]>>
 @
 
-To add the bookings of a course to [[booked]], we simply get the URL of the 
-sign-up sheet and read the bookings.
+To add the bookings of a course to [[booked]], we read that one course's
+bookings and append them.
 <<add to [[booked]] from [[course]] in [[register]] using [[config]]>>=
+<<read [[course]]'s bookings into [[course_bookings]]>>
+booked += course_bookings
+@
+
+Reading a single course's bookings is its own step because two callers need it:
+the flat accumulator above, and the planning sheet, which must keep each
+course's bookings separate (see \cref{sec:amanuensis-course-rows}).  A course
+without a configured sign-up sheet contributes no bookings rather than aborting
+the loop --- we log it and leave [[course_bookings]] empty, so one
+misconfigured course never hides the others.
+<<read [[course]]'s bookings into [[course_bookings]]>>=
+course_bookings = []
 try:
   url = config.get(SIGNUPSHEET_URL_PATH)
 except KeyError as err:
   logging.warning(f"Can't find sign-up sheet URL for {course} in {register}: "
                   f"{err}")
-  continue
-<<convert [[url]] to Google Sheet CSV-export URL if necessary>>
-booked += sheets.read_signup_sheet_from_url(url)
+else:
+  <<convert [[url]] to Google Sheet CSV-export URL if necessary>>
+  course_bookings = sheets.read_signup_sheet_from_url(url)
 <<imports>>=
 from nytid.signup import sheets
 @
@@ -718,15 +747,17 @@ def cli_amanuens_create(<<option for TAs to filter for>>,
                         <<option to output detailed user data>> = True,
                         <<option to include event summary>> = False,
                         <<option [[draft]] to not store contract>>,
+                        <<option [[xlsx]] to export the planning spreadsheet>>,
                         <<option for CSV delimiter>>):
   """
   Computes amanuensis data for a TA.
   """
   <<make all dates timezone aware>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
-  <<let [[booked]] be all bookings from [[courses]]>>
+  <<let [[booked]] and [[booked_by_course]] be all bookings from [[courses]]>>
   <<set up dates based on period>>
   <<filter events from [[booked]] based on start, end dates>>
+  <<filter [[booked_by_course]] based on start, end dates>>
 
   amanuensis = hr.compute_amanuensis_data(booked,
                                           begin_date=start,
@@ -736,13 +767,18 @@ def cli_amanuens_create(<<option for TAs to filter for>>,
   for user in amanuensis:
     <<skip if [[user_regex]] doesn't match [[user]]>>
     <<print [[amanuensis]] data for [[user]]>>
+    <<write [[user]]'s planning spreadsheet>>
     if not draft:
       <<store [[user_events]] in CSV format>>
 <<option [[draft]] to not store contract>>=
 draft: Annotated[bool, draft_opt] = False
+<<option [[xlsx]] to export the planning spreadsheet>>=
+xlsx: Annotated[bool, xlsx_opt] = False
 <<argument and option definitions>>=
 draft_opt = typer.Option(help="Create a draft, "
                               "don't store the generated contract.")
+xlsx_opt = typer.Option(help="Export planning spreadsheet for each amanuensis. "
+                             "Generates <username>-<timestamp>.xlsx files.")
 @
 
 \subsection{Default arguments for user regex}
@@ -834,6 +870,15 @@ we can use them to filter the events for the TA.
 booked = sheets.filter_events_by_date(booked, start, end)
 @
 
+The per-course bookings must be cut to the same window, course by course, so the
+planning sheet counts the same events the contract percentage was computed from.
+<<filter [[booked_by_course]] based on start, end dates>>=
+booked_by_course = {
+    key: sheets.filter_events_by_date(events, start, end)
+    for key, events in booked_by_course.items()
+}
+@
+
 \subsection{Print the amanuensis data for a TA}
 
 We may want to print for several users.
@@ -915,7 +960,67 @@ if event_summary:
 csvout.writerow(row)
 @
 
-\subsubsection{Modifying the contract dates}
+
+When the [[--xlsx]] option is set, we also emit a planning spreadsheet for the
+user.  The sheet only needs a human-readable name and email, both of which
+Canvas supplies, so we resolve the user against \emph{Canvas alone} --- we
+deliberately do not consult LADOK here.  This is the key difference from the
+printed summary: the summary's detailed mode looks the user up in LADOK to
+obtain the personnummer, but the planning sheet never shows a personnummer, so
+that lookup would be wasted work (and would make the spreadsheet depend on a
+[[ladok login]] it does not need).  For the same reason the sheet ignores
+[[--no-detailed]]: that flag exists to skip the expensive LADOK lookup, and this
+path has none to skip.  We build the per-course rows and write the file named
+after the user and the current time.  The chunk body sits at the loop-body
+level so [[notangle]] places it as a sibling of the summary print, not nested
+inside it.
+
+We write the resolved [[start]] and [[end]], not [[data[0]]] and [[data[1]]].
+The two differ under [[--push-start]]: pushing keeps the percentage, so it
+shifts [[start]] and [[end]] but deliberately leaves [[data]] untouched (see
+\cref{sec:modify-contract-dates}).  The planning sheet must show the contract's
+\emph{actual} employment period --- the same dates we just printed --- so it
+reads the resolved variables.
+
+We pass [[start.date()]] and [[end.date()]] rather than the dates themselves.
+These dates are [[arrow.Arrow]] objects (or, under [[--set-start]],
+[[datetime.datetime]]), and [[openpyxl]] rejects both an [[arrow.Arrow]] and a
+timezone-aware datetime with \enquote{Cannot convert to Excel}.  Both types
+expose [[.date()]], which yields a plain [[datetime.date]] the cell accepts ---
+the same conversion the printed summary already uses.
+<<write [[user]]'s planning spreadsheet>>=
+if xlsx:
+  <<resolve [[user]] to a Canvas display name>>
+  course_rows = amanuensis_course_rows(user, booked_by_course, courses,
+                                       default_course_responsible)
+  output = f"{user}-{datetime.datetime.now():%Y-%m-%dT%H%M%S}.xlsx"
+  timesheet.make_amanuensis_xlsx(
+      name=str(sheet_user),
+      email=getattr(sheet_user, "email", "") or "",
+      start=start.date(),
+      end=end.date(),
+      course_rows=course_rows,
+      responsible=(default_course_responsible, default_email),
+      output=output)
+@
+
+The Canvas lookup goes through [[get_canvas_user]], which is backed by the
+cached [[get_canvas_users]]; so even when the detailed summary already resolved
+this same user earlier in the loop, this second call just re-filters the cache
+rather than hitting the network.  If Canvas is unavailable we fall back to the
+bare username, mirroring the summary's own fallback --- a sheet headed by the
+login is still useful, and we would rather emit it than abort.  We keep this in
+its own variable [[sheet_user]] so it does not clobber the [[user_obj]] the
+summary path resolved (which, under [[--detailed]], holds the LADOK student).
+<<resolve [[user]] to a Canvas display name>>=
+try:
+  sheet_user = get_canvas_user(user, course_regex)
+except Exception as err:
+  logging.warning(f"Can't look up {user} in Canvas: {err}")
+  sheet_user = user
+@
+
+\subsubsection{Modifying the contract dates}\label{sec:modify-contract-dates}
 
 Sometimes the start date is too early, so we want to push it forward together 
 with the end date.
@@ -2620,6 +2725,386 @@ def summarize_user(user, course_events,
         })
 
   return xl_events
+@
+
+
+\subsection{Build course rows for amanuensis planning spreadsheet}%
+\label{sec:amanuensis-course-rows}
+
+The planning sheet wants one row per course, with hours split into the
+template's fixed categories.  Because [[booked_by_course]] already keeps each
+course's bookings separate, [[amanuensis_course_rows]] can walk the courses one
+at a time: for each it summarises the user's events, folds them into the
+template's columns, and labels the row with the course's official code,
+division, and study period from configuration.
+
+Taking the course code from configuration --- rather than parsing it out of the
+event title --- is what makes this correct for every course.  The title is free
+text and often carries no recognisable code: a course whose events are merely
+named \enquote{\foreignlanguage{swedish}{Övning}} has nothing to parse, so a
+title-based grouping would drop every such course into one blank-coded row (the
+bug this design replaces).  The configured [[code]] is instead the exact
+identifier the official sheet expects, and grouping by source course keeps
+distinct courses on distinct rows even when their titles look alike.
+
+The fold must preserve one invariant: the template computes each row's
+\enquote{\foreignlanguage{swedish}{Summa timmar}} as
+$\mathit{koeff}\cdot\mathit{tim}+\dotsb$, and that must equal the course's
+total \enquote{\foreignlanguage{swedish}{omräknad tid}} as our own functions
+compute it.  Each step below is written to maintain it.
+<<helper functions>>=
+def amanuensis_course_rows(user, booked_by_course, courses_configs,
+                           responsible_name=""):
+  """
+  Build course rows for an amanuensis planning spreadsheet.
+
+  Produces one per-course dict for each course the user worked on, holding
+  the fields the planning template needs. Preserves the invariant that each
+  row's Summa timmar equals that course's total omraknad tid.
+
+  Args:
+      user: TA username.
+      booked_by_course: dict {(course, register): rows} of booked sign-up
+          sheet rows, grouped by the course they came from.
+      courses_configs: dict {(course, register): config} as returned by
+          get_courses_configs, used for the course code, division and period.
+      responsible_name: name for each row's responsible-teacher column.
+
+  Returns:
+      list of per-course dicts with keys: kurskod, avdelning, period,
+      ovn_koeff, ovn_tim, gruppansvar, labb_koeff, labb_tim, mote,
+      rattning, ovrigt, responsible.
+  """
+  <<map from event-type keyword to template column>>
+  course_rows = []
+  for (course, register), course_bookings in booked_by_course.items():
+    <<summarise [[user]]'s events in this course, skip if none>>
+    <<classify the course's events into template columns>>
+    <<fold the columns into one course row>>
+    <<label the row with code, division and period>>
+    course_rows.append(row)
+  return course_rows
+@
+
+The template's columns are fixed (exercises, labs, group responsibility,
+meetings, grading, other) while our event types are free text.  We map a type
+to a column by the same keywords [[prep_factor]] keys off, so the classification
+agrees with how the coefficient was assigned.
+
+\enquote{\foreignlanguage{swedish}{Gruppansvar}} has no prep-time coefficient
+of its own, so it is a flat column like meetings and grading: an event whose
+type names it contributes its hours directly.  Without an explicit keyword it
+would silently fall into \enquote{\foreignlanguage{swedish}{övrigt}} (its hours
+would still count toward the row total, just in the wrong column), so we map it
+by name.
+<<map from event-type keyword to template column>>=
+category_map = {
+  "övning": "ovn", "exercise": "ovn",
+  "laboration": "labb", "labb": "labb", "lab": "labb",
+  "seminar": "labb", "redovisning": "labb", "presentation": "labb",
+  "frågestund": "labb", "question": "labb",
+  "gruppansvar": "gruppansvar", "group responsib": "gruppansvar",
+  "möte": "mote", "meeting": "mote",
+  "rättning": "rattning", "grading": "rattning", "correction": "rattning",
+}
+@
+
+We reuse [[summarize_user]], which keeps only the events this TA was booked
+(not reserve) for and tags each with its clock hours and prep-included hours.
+A course the TA never actually worked yields no events, so we skip it rather
+than emit an empty row.
+<<summarise [[user]]'s events in this course, skip if none>>=
+events = summarize_user(user, course_bookings)
+if not events:
+  continue
+@
+
+We then sort each event into a template column.  An unrecognised type falls
+into \enquote{\foreignlanguage{swedish}{övrigt}} rather than being dropped, so
+the total survives an imperfect mapping.
+<<classify the course's events into template columns>>=
+categorized = {"ovn": [], "labb": [], "mote": [],
+               "rattning": [], "ovrigt": [], "gruppansvar": []}
+for event in events:
+  typ = event["typ"].lower()
+  category = "ovrigt"
+  for key, value in category_map.items():
+    if key in typ:
+      category = value
+      break
+  categorized[category].append(event)
+@
+
+Now we fold each category into the template's input cells.  The two
+coefficient-bearing columns store raw clock hours times a coefficient, so we
+write the summed clock hours and an \emph{effective} coefficient
+$\sum\mathit{omr\_tid}/\sum\mathit{tim}$ --- which makes
+$\mathit{koeff}\cdot\mathit{tim}$ reproduce the summed prep-included hours
+exactly.  The flat columns have no coefficient, so we write the prep-included
+hours directly.  Either way the column contributes its share of
+\enquote{\foreignlanguage{swedish}{omräknad tid}}, so the row total matches.
+<<fold the columns into one course row>>=
+row = {
+  "kurskod": "", "avdelning": "", "period": "",
+  "ovn_koeff": 0, "ovn_tim": 0, "gruppansvar": 0,
+  "labb_koeff": 0, "labb_tim": 0, "mote": 0,
+  "rattning": 0, "ovrigt": 0, "responsible": responsible_name,
+}
+
+for category, cat_events in categorized.items():
+  if category in ("ovn", "labb"):
+    total_timmar = sum(e["timmar"] for e in cat_events)
+    total_omr_tid = sum(e["omr_tid"] for e in cat_events)
+    if total_timmar > 0:
+      row[f"{category}_koeff"] = total_omr_tid / total_timmar
+      row[f"{category}_tim"] = total_timmar
+  else:
+    row[category] = sum(e["omr_tid"] for e in cat_events)
+@
+
+Finally we label the row from this course's own configuration: the official
+[[code]], plus the division and study period under [[hr.division]] and
+[[hr.period]].  When [[code]] is unset we fall back to the course's own
+identifier, so the row is still labelled with something recognisable rather
+than left blank.  Course configurations use dotted keys and raise [[KeyError]]
+when a key is unset, so we read them defensively through [[course_config_get]].
+<<label the row with code, division and period>>=
+config = courses_configs.get((course, register))
+row["kurskod"] = course_config_get(config, "code", "") or course
+row["avdelning"] = course_config_get(config, "hr.division", "")
+row["period"] = course_config_get(config, "hr.period", "")
+@
+
+The accessor reads a dotted configuration key, returning a default instead of
+raising when the key is unset --- and treats a missing configuration ([[None]])
+as all-unset, so a course absent from [[courses_configs]] yields defaults rather
+than an [[AttributeError]].
+<<helper functions>>=
+def course_config_get(config, key, default=None):
+  """Return the value at dotted `key` in `config`, or `default` if unset."""
+  if config is None:
+    return default
+  try:
+    return config.get(key)
+  except KeyError:
+    return default
+@
+
+The invariant we care about is that the spreadsheet, fed our numbers, computes
+the same totals we do.  We pin it with a test: we build a couple of courses'
+worth of events, grouped by course the way the command supplies them, run them
+through [[amanuensis_course_rows]], evaluate the template's hour formula
+($\mathit{koeff}\cdot\mathit{tim}+\dotsb$) in Python, and check it equals the
+total \enquote{\foreignlanguage{swedish}{omräknad tid}} that [[summarize_user]]
+reports for each course.  We also confirm that each course yields its own row
+and that exercise and lab hours land in their own columns.
+<<test functions>>=
+def _amanuensis_signup_row(event, start, end, tas, needed="1"):
+  return [event, start, end, "D1", needed] + tas
+
+def test_amanuensis_course_rows_total_matches():
+  dd1310 = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+    _amanuensis_signup_row("DD1310 Laboration",
+                           "2024-09-03 10:00", "2024-09-03 13:00", ["alice"]),
+  ]
+  dd1317 = [
+    _amanuensis_signup_row("DD1317 Möte",
+                           "2024-09-04 10:00", "2024-09-04 11:00", ["alice"]),
+  ]
+  booked_by_course = {("DD1310", "reg"): dd1310, ("DD1317", "reg"): dd1317}
+  course_rows = amanuensis_course_rows("alice", booked_by_course, {})
+
+  # With no config the kurskod falls back to the course identifier.
+  assert {r["kurskod"] for r in course_rows} == {"DD1310", "DD1317"}
+
+  expected = {
+    "DD1310": sum(e["omr_tid"] for e in summarize_user("alice", dd1310)),
+    "DD1317": sum(e["omr_tid"] for e in summarize_user("alice", dd1317)),
+  }
+
+  for r in course_rows:
+    sheet_total = (r["ovn_koeff"] * r["ovn_tim"]
+                   + r["gruppansvar"]
+                   + r["labb_koeff"] * r["labb_tim"]
+                   + r["mote"] + r["rattning"] + r["ovrigt"])
+    assert sheet_total == pytest.approx(expected[r["kurskod"]])
+
+  row1310 = next(r for r in course_rows if r["kurskod"] == "DD1310")
+  assert row1310["ovn_tim"] == 2    # the Övning clock hours
+  assert row1310["labb_tim"] == 3   # the Laboration clock hours
+
+def test_amanuensis_course_rows_code_comes_from_config():
+  import typerconf
+  # The title carries no course code and the course key is a local alias ---
+  # exactly the case the title-parsing approach mishandled.  The kurskod must
+  # still come out right, sourced from the configured code.
+  rows = [
+    _amanuensis_signup_row("Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  config = typerconf.Config({"code": "DD2520",
+                             "hr": {"division": "TCS", "period": "1"}})
+  course_rows = amanuensis_course_rows(
+    "alice", {("tilkry26", "reg"): rows}, {("tilkry26", "reg"): config},
+    responsible_name="Teacher")
+
+  row = course_rows[0]
+  assert row["kurskod"] == "DD2520"
+  assert row["avdelning"] == "TCS"
+  assert row["period"] == "1"
+  assert row["responsible"] == "Teacher"
+
+def test_amanuensis_course_rows_keeps_aliased_courses_apart():
+  # Two courses whose event titles look identical must stay on separate rows,
+  # because they are grouped by source course, not by parsed title.
+  va = [_amanuensis_signup_row("Laboration",
+                               "2024-09-02 10:00", "2024-09-02 12:00",
+                               ["alice"])]
+  vb = [_amanuensis_signup_row("Laboration",
+                               "2024-09-03 10:00", "2024-09-03 12:00",
+                               ["alice"])]
+  booked_by_course = {("vetcyb26v", "reg"): va, ("tilkry26", "reg"): vb}
+  course_rows = amanuensis_course_rows("alice", booked_by_course, {})
+
+  assert {r["kurskod"] for r in course_rows} == {"vetcyb26v", "tilkry26"}
+
+def test_amanuensis_course_rows_skips_courses_without_events():
+  # alice is a reserve here (needs 0 TAs), so she has no booked events and the
+  # course produces no row at all.
+  rows = [
+    _amanuensis_signup_row("Övning", "2024-09-02 10:00", "2024-09-02 12:00",
+                           ["alice"], needed="0"),
+  ]
+  course_rows = amanuensis_course_rows("alice", {("tilkry26", "reg"): rows}, {})
+  assert course_rows == []
+
+def test_amanuensis_course_rows_missing_config_falls_back():
+  rows = [
+    _amanuensis_signup_row("Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  # No config at all: division/period stay blank, kurskod falls back to the
+  # course identifier, and we don't crash.
+  course_rows = amanuensis_course_rows("alice", {("tilkry26", "reg"): rows}, {})
+  assert course_rows[0]["kurskod"] == "tilkry26"
+  assert course_rows[0]["avdelning"] == ""
+  assert course_rows[0]["period"] == ""
+@
+
+The unit tests above exercise the row-building and template-filling in
+isolation.  The remaining risk is in the wiring: the [[--xlsx]] chunk must feed
+[[make_amanuensis_xlsx]] the \emph{resolved} dates (so [[--push-start]] is
+honoured) and must hand it dates [[openpyxl]] accepts (the contract dates
+arrive as [[arrow.Arrow]], which [[openpyxl]] refuses).  We pin both by driving
+the [[create]] command end to end: we stub out the network-bound pieces
+(course configs, the sign-up sheet, Canvas lookup) and the contract
+computation, run with [[--push-start]], and read the written period start back
+from the produced workbook.
+<<test functions>>=
+def test_cli_amanuens_create_xlsx_uses_pushed_dates(tmp_path, monkeypatch):
+  """--xlsx must write the pushed contract dates, serialised for openpyxl."""
+  import arrow
+  import typerconf
+  from openpyxl import load_workbook
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+
+  booked = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
+                             "code": "DD1310"})
+
+  def _no_canvas(*args, **kwargs):
+    raise Exception("no Canvas in tests")
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *a, **k: {("DD1310", "reg"): config})
+  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+                      lambda url: booked)
+  monkeypatch.setattr(hrcli, "get_canvas_user", _no_canvas)
+  # Pin the contract to known dates so the date assertion is deterministic.
+  monkeypatch.setattr(hrcli.hr, "compute_amanuensis_data",
+                      lambda *a, **k: {"alice": (arrow.get("2024-09-01"),
+                                                 arrow.get("2024-12-01"),
+                                                 100.0)})
+
+  monkeypatch.chdir(tmp_path)
+  result = CliRunner().invoke(
+    hrcli.cli,
+    ["amanuensis", "create", "--draft", "--xlsx",
+     "--push-start", "2024-10-01"])
+
+  assert result.exit_code == 0, result.output
+
+  produced = list(tmp_path.glob("alice-*.xlsx"))
+  assert len(produced) == 1
+
+  ws = load_workbook(produced[0])["EXEMPEL"]
+  # Pushing the start to 2024-10-01 shifts the whole period; the sheet must
+  # show the pushed start, not the original 2024-09-01.
+  written = ws["D10"].value
+  written = written.date() if hasattr(written, "date") else written
+  assert written == datetime.date(2024, 10, 1)
+@
+
+The other wiring risk is the lookup discipline: the planning sheet must take its
+name from Canvas and must never reach for LADOK, even though the printed summary
+does under [[--detailed]].  We pin this with [[--no-detailed]], which makes the
+summary skip its own lookup entirely --- so any LADOK call that survives must
+come from the xlsx path.  We stub [[get_canvas_user]] to return a known name and
+fail the test outright if [[get_ladok_user]] is invoked, then confirm the name
+reached the sheet.
+<<test functions>>=
+def test_cli_amanuens_create_xlsx_no_details_skips_ladok(tmp_path, monkeypatch):
+  """--xlsx resolves the name via Canvas only, never LADOK."""
+  import arrow
+  import typerconf
+  from openpyxl import load_workbook
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+
+  booked = [
+    _amanuensis_signup_row("DD1310 Övning",
+                           "2024-09-02 10:00", "2024-09-02 12:00", ["alice"]),
+  ]
+  config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
+                             "code": "DD1310"})
+
+  class _CanvasUser:
+    email = "alice@kth.se"
+    def __str__(self):
+      return "Alice Anteater"
+
+  def _no_ladok(*args, **kwargs):
+    raise AssertionError("the planning sheet must not look up LADOK")
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *a, **k: {("DD1310", "reg"): config})
+  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+                      lambda url: booked)
+  monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: _CanvasUser())
+  monkeypatch.setattr(hrcli, "get_ladok_user", _no_ladok)
+  monkeypatch.setattr(hrcli.hr, "compute_amanuensis_data",
+                      lambda *a, **k: {"alice": (arrow.get("2024-09-01"),
+                                                 arrow.get("2024-12-01"),
+                                                 100.0)})
+
+  monkeypatch.chdir(tmp_path)
+  result = CliRunner().invoke(
+    hrcli.cli,
+    ["amanuensis", "create", "--draft", "--xlsx", "--no-detailed"])
+
+  assert result.exit_code == 0, result.output
+
+  produced = list(tmp_path.glob("alice-*.xlsx"))
+  assert len(produced) == 1
+
+  ws = load_workbook(produced[0])["EXEMPEL"]
+  assert ws["D6"].value == "Alice Anteater"
 @
 
 We can simply compute [[hours]] using the [[hours_per_TA]] function.
