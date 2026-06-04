@@ -457,7 +457,7 @@ def external_rm(
 To support scripts and one-off runs, [[schedule show]] can include additional
 external sources directly from the command line.
 <<options for external calendar sources>>=
-external: Annotated[list[str], external_opt] = None
+external: Annotated[list[str], external_opt] = None,
 <<argument and option definitions>>=
 external_source_arg = typer.Argument(
     ..., help="External ICS source to remove",
@@ -465,6 +465,125 @@ external_source_arg = typer.Argument(
 external_opt = typer.Option("--external", "-x",
                             help="Additional ICS URL or file path",
                             autocompletion=complete_external_sources)
+@
+
+\paragraph{Caching external calendars}
+\label{cli.schedule.caching}
+
+Fetching the external feeds is what makes [[schedule show]] slow:
+each HTTP source costs a network round trip---and possibly a KTH SSO
+handshake---on every run.
+We therefore pass a caching policy ([[schedutils.CalendarCache]]) to
+the library, which then reuses fetched feeds from disk while they are
+younger than a time-to-live (TTL).
+How fresh is fresh enough is the kind of preference a user settles on
+once, so the TTL lives in the configuration; setting it to [[0]]
+disables caching entirely---no reads, no writes.
+<<constants>>=
+SCHEDULE_CACHE_TTL_CONFIG = "schedule.external_ics_cache_ttl"
+DEFAULT_CACHE_TTL = default(SCHEDULE_CACHE_TTL_CONFIG, 3600, float)
+@
+
+For a one-off forced refresh---say, right after a course was
+rescheduled---the [[--no-cache]] flag skips \emph{reading} the cache
+for this run.
+It still refreshes the cache with what it fetches, so later runs
+benefit from the forced fetch.
+<<options for external calendar sources>>=
+no_cache: Annotated[bool, no_cache_opt] = False
+<<argument and option definitions>>=
+no_cache_opt = typer.Option(
+    "--no-cache",
+    help="Ignore cached external calendars for this run; "
+         "still refreshes the cache. "
+         "[config: schedule.external_ics_cache_ttl]")
+@
+
+The library is config-free, so translating configuration and flag
+into the policy object is the CLI's job:
+<<helper functions>>=
+def build_calendar_cache(no_cache):
+  """
+  Builds the CalendarCache policy from the configured TTL and the
+  --no-cache flag. Returns None when caching is disabled (TTL <= 0).
+  """
+  if DEFAULT_CACHE_TTL <= 0:
+    return None
+  return schedutils.CalendarCache(ttl=DEFAULT_CACHE_TTL,
+                                  read=not no_cache)
+@
+
+When the user knows the cached copies are wrong---a feed changed and
+waiting out the TTL is not an option---they can drop all cached
+copies at once.
+We report the number of removed files so the user can tell the
+command did something (or that the cache was already empty).
+<<external calendar commands>>=
+@externalcli.command(name="clear-cache")
+def external_clear_cache():
+  """
+  Deletes all cached external ICS calendar files.
+  """
+  removed = schedutils.clear_cache()
+  print(f"Removed {removed} cached calendar file(s).")
+@
+
+Let's verify the option is wired into [[show]] and that the policy
+helper translates flag and configuration correctly.
+For the config-dependent cases---a TTL of zero disables caching, an
+unset TTL falls back to one hour---we reload the module under a fake
+config, the same technique as for the output-format fallback
+(\cref{cli.schedule.test-setup}).
+<<test functions>>=
+def test_no_cache_option_in_show():
+  import inspect
+  params = inspect.signature(show).parameters
+  assert "no_cache" in params
+  assert params["no_cache"].default is False
+
+def test_build_calendar_cache_from_config():
+  cache = build_calendar_cache(False)
+  assert cache.read is True
+  assert cache.ttl == DEFAULT_CACHE_TTL
+
+def test_build_calendar_cache_no_cache_flag():
+  cache = build_calendar_cache(True)
+  assert cache.read is False
+
+def test_build_calendar_cache_zero_ttl_disables(monkeypatch):
+  def fake_get(key):
+    if key == SCHEDULE_CACHE_TTL_CONFIG:
+      return 0
+    raise KeyError(key)
+  fake = MagicMock()
+  fake.get.side_effect = fake_get
+  monkeypatch.setattr(defaults.typerconf, "Config", lambda: fake)
+  defaults._reset_cache()
+  reloaded = importlib.reload(schedule_module)
+  try:
+    assert reloaded.DEFAULT_CACHE_TTL == 0
+    assert reloaded.build_calendar_cache(False) is None
+  finally:
+    defaults._reset_cache()
+    importlib.reload(schedule_module)
+
+def test_default_cache_ttl_is_one_hour(monkeypatch):
+  fake = MagicMock()
+  fake.get.side_effect = KeyError
+  monkeypatch.setattr(defaults.typerconf, "Config", lambda: fake)
+  defaults._reset_cache()
+  reloaded = importlib.reload(schedule_module)
+  try:
+    assert reloaded.DEFAULT_CACHE_TTL == 3600
+  finally:
+    defaults._reset_cache()
+    importlib.reload(schedule_module)
+
+def test_external_clear_cache_reports_count(monkeypatch, capsys):
+  monkeypatch.setattr(schedule_module.schedutils, "clear_cache",
+                      lambda: 3)
+  external_clear_cache()
+  assert "3" in capsys.readouterr().out
 @
 
 The configured path is a list value in config, but we also accept a single
@@ -1029,10 +1148,15 @@ When [[--user]] is set to a different username (e.g.\ a TA checking a
 colleague's sign-up schedule), including your own personal calendar
 events would be misleading.
 We therefore only merge external calendars when showing your own schedule.
+The cache policy (\cref{cli.schedule.caching}) is built here, from
+the configured TTL and the [[--no-cache]] flag, because this is the
+only place where the CLI fetches external calendars.
 <<add external calendar events to [[schedule]]>>=
 if not user or user == default_username:
   external_sources = get_external_sources(external)
-  external_calendar = schedutils.read_calendars(external_sources)
+  cache = build_calendar_cache(no_cache)
+  external_calendar = schedutils.read_calendars(external_sources,
+                                                cache=cache)
   schedule.events.update(external_calendar.events)
 @
 
