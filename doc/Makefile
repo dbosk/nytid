@@ -25,6 +25,7 @@ nytid.pdf: ../src/nytid/courses/registry.tex
 
 nytid.pdf: ../src/nytid/schedules.tex
 nytid.pdf: ../src/nytid/signup/hr/hr.tex
+nytid.pdf: ../src/nytid/signup/hr/timesheet/init.tex
 nytid.pdf: ../src/nytid/signup/sheets.tex
 nytid.pdf: ../src/nytid/signup/utils.tex
 
