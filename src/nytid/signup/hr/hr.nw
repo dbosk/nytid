@@ -6,7 +6,7 @@ The module is constructed as follows.
 import arrow
 import datetime
 from nytid.signup import sheets
-from nytid.signup.sheets import SIGNUP_SHEET_HEADER
+from nytid.signup.sheets import SIGNUP_SHEET_HEADER, STRPTIME_FORMAT
 import typerconf as config
 
 <<constants>>
@@ -286,10 +286,16 @@ def test_prep_factor_case_insensitive():
 
 \section{How many hours are spent on the course?}
 
-For this, we just want to go through all the events and multiply the time for 
+For this, we just want to go through all the events and multiply the time for
 the event with the number of TAs.
-We also apply correct rounding and add the standard preparation times that the 
+We also apply correct rounding and add the standard preparation times that the
 TAs are paid.
+
+The rows come from the sign-up sheet, which writes its times using
+[[sheets.STRPTIME_FORMAT]].
+We parse with that same constant rather than a local copy of the format
+string, so that a change to the sheet format cannot silently desynchronize
+the writer and this reader.
 
 We start with a function to compute the number of hours spent per student.
 <<functions>>=
@@ -308,8 +314,9 @@ def hours_per_student(csv_rows, round_time=round_time):
   event_hours = dict()
 
   for row in csv_rows:
-    time = round_time(arrow.get(row[end_index], "YYYY-MM-DD HH:mm") - \
-      arrow.get(row[start_index], "YYYY-MM-DD HH:mm"))
+    time = round_time(
+      datetime.datetime.strptime(row[end_index], STRPTIME_FORMAT)
+      - datetime.datetime.strptime(row[start_index], STRPTIME_FORMAT))
     event_type = row[event_index]
 
     if event_type not in event_hours:
@@ -369,8 +376,10 @@ def hours_per_TA(csv_rows, add_prep_time=add_prep_time, round_time=round_time):
   event_index = SIGNUP_SHEET_HEADER.index("Event")
 
   for row in csv_rows:
-    start_date = arrow.get(row[start_index], "YYYY-MM-DD HH:mm")
-    time = arrow.get(row[end_index], "YYYY-MM-DD HH:mm") - start_date
+    start_date = datetime.datetime.strptime(row[start_index],
+                                            STRPTIME_FORMAT)
+    time = datetime.datetime.strptime(row[end_index],
+                                      STRPTIME_FORMAT) - start_date
 
     time = round_time(time)
     time = add_prep_time(time, row[event_index], start_date)
@@ -457,8 +466,10 @@ def max_hours(csv_rows, add_prep_time=add_prep_time, round_time=round_time):
   max_hours = datetime.timedelta()
 
   for row in csv_rows:
-    start_date = arrow.get(row[start_index], "YYYY-MM-DD HH:mm")
-    time = arrow.get(row[end_index], "YYYY-MM-DD HH:mm") - start_date
+    start_date = datetime.datetime.strptime(row[start_index],
+                                            STRPTIME_FORMAT)
+    time = datetime.datetime.strptime(row[end_index],
+                                      STRPTIME_FORMAT) - start_date
 
     time = round_time(time)
     time = add_prep_time(time, row[event_index], start_date)
@@ -492,8 +503,9 @@ def hours_per_event(csv_rows, round_time=round_time):
   event_index = SIGNUP_SHEET_HEADER.index("Event")
 
   for row in csv_rows:
-    time = round_time(arrow.get(row[end_index], "YYYY-MM-DD HH:mm") - \
-      arrow.get(row[start_index], "YYYY-MM-DD HH:mm"))
+    time = round_time(
+      datetime.datetime.strptime(row[end_index], STRPTIME_FORMAT)
+      - datetime.datetime.strptime(row[start_index], STRPTIME_FORMAT))
 
     if row[event_index] in event_hours:
       event_hours[row[event_index]] += time
@@ -668,15 +680,49 @@ amanuensis_prep_time = lambda time, event_type, date: \
 
 \subsection{Compute the earliest and latest dates}
 
+The contract dates only have day resolution: an employment starts and
+ends on a date, not at an hour.
+So we parse only the date part of the sheet's time values.
+The sheet writes [["2024-09-02 10:00"]]; we take the part before the
+space and parse it as a date.
+
+We make the parsed dates timezone aware, in the local timezone.
+The caller can force the period via [[begin_date]] and [[end_date]],
+and the CLI passes those as timezone-aware local datetimes---comparing
+them against naive datetimes would raise [[TypeError]].
+Local midnight is the right interpretation: the sheet's dates are local
+dates.
+(Interpreting them as UTC midnight, as an earlier version of this code
+did, skews every boundary comparison by the UTC offset.)
+<<functions>>=
+def sheet_date(value):
+  """
+  Parses the date part of a sign-up sheet time value, e.g.
+  '2024-09-02 10:00', and returns a timezone-aware datetime at local
+  midnight of that date.
+  """
+  date = datetime.datetime.strptime(value.split()[0], "%Y-%m-%d")
+  return date.astimezone()
+@
+
+Let's verify that the time part is ignored and the result is aware:
+<<test functions>>=
+def test_sheet_date():
+  date = sheet_date("2024-09-02 10:00")
+  assert date.tzinfo is not None
+  assert date.date() == datetime.date(2024, 9, 2)
+  assert date.hour == 0 and date.minute == 0
+@
+
 We start by finding all start and end dates for every TA.
 <<compute the earliest and latest dates for each TA>>=
 for ta in ta_hours.keys():
-  earliest_date = arrow.get(csv_rows[0][start_index], "YYYY-MM-DD")
-  latest_date = arrow.get(csv_rows[0][end_index], "YYYY-MM-DD")
+  earliest_date = sheet_date(csv_rows[0][start_index])
+  latest_date = sheet_date(csv_rows[0][end_index])
 
   for row in csv_rows:
-    start_date = arrow.get(row[start_index], "YYYY-MM-DD")
-    end_date = arrow.get(row[end_index], "YYYY-MM-DD")
+    start_date = sheet_date(row[start_index])
+    end_date = sheet_date(row[end_index])
 
     if start_date < earliest_date:
       earliest_date = start_date
@@ -700,21 +746,64 @@ first and last of the months, finally the exact dates.
 For the start date, we also take today's date into consideration.
 If we're far into the semester we don't take the start of the semester into 
 account, then we use the actual start month instead.
-If we can't get above the [[low_percentage]] threshold, we continue to the next 
+If we can't get above the [[low_percentage]] threshold, we continue to the next
 TA.
+
+Rounding the end of the period to the month means the last instant of
+the month, so that the whole last day is included.
+The standard library has no month arithmetic ([[timedelta]] only knows
+days), so we provide a helper: the first instant of the \emph{next}
+month, minus one second.
+[[replace]] preserves the timezone, so the result stays comparable to
+the other dates.
+<<functions>>=
+def end_of_month(date):
+  """
+  Returns the last second (23:59:59) of the month of `date`, preserving
+  the timezone of `date`.
+  """
+  if date.month == 12:
+    next_month = date.replace(year=date.year+1, month=1, day=1,
+                              hour=0, minute=0, second=0, microsecond=0)
+  else:
+    next_month = date.replace(month=date.month+1, day=1,
+                              hour=0, minute=0, second=0, microsecond=0)
+  return next_month - datetime.timedelta(seconds=1)
+@
+
+The December case is the interesting one, since the month rollover must
+carry into the next year:
+<<test functions>>=
+def test_end_of_month():
+  date = datetime.datetime(2024, 9, 15, 10, 30).astimezone()
+  end = end_of_month(date)
+  assert end.date() == datetime.date(2024, 9, 30)
+  assert (end.hour, end.minute, end.second) == (23, 59, 59)
+  assert end.tzinfo is not None
+
+def test_end_of_month_december():
+  date = datetime.datetime(2024, 12, 1).astimezone()
+  end = end_of_month(date)
+  assert end.date() == datetime.date(2024, 12, 31)
+@
+
+The semester bounds are constructed as naive datetimes and made aware
+with [[astimezone]], so they compare cleanly with the dates from
+[[sheet_date]] and with a forced [[begin_date]]/[[end_date]].
+Since [[earliest_date]] is already at local midnight, the first of its
+month is just [[replace(day=1)]].
 <<expand earliest and latest dates if beneficial>>=
-july = arrow.get(earliest_date.year, 7, 1)
+july = datetime.datetime(earliest_date.year, 7, 1).astimezone()
 
 if earliest_date < july:
-  semester_start = arrow.get(earliest_date.year, 1, 1)
-  semester_end = arrow.get(earliest_date.year, 6, 30)
+  semester_start = datetime.datetime(earliest_date.year, 1, 1).astimezone()
+  semester_end = datetime.datetime(earliest_date.year, 6, 30).astimezone()
 else:
-  semester_start = arrow.get(earliest_date.year, 8, 1)
-  semester_end = arrow.get(earliest_date.year+1, 1, 31)
+  semester_start = datetime.datetime(earliest_date.year, 8, 1).astimezone()
+  semester_end = datetime.datetime(earliest_date.year+1, 1, 31).astimezone()
 
-earliest_month = arrow.get(earliest_date.year, earliest_date.month, 1)
-latest_month = arrow.get(
-  latest_date.year, latest_date.month, 1).shift(months=1, seconds=-1)
+earliest_month = earliest_date.replace(day=1)
+latest_month = end_of_month(latest_date)
 
 if begin_date:
   semester_start = earliest_date = earliest_month = begin_date
@@ -748,7 +837,7 @@ The [[compute_percentage]] function simply computes the average working time.
 <<functions>>=
 def compute_percentage(start, end, hours):
   """
-  Input: start and end as arrow.arrow.Arrow or datetime.date objects,
+  Input: start and end as datetime.datetime or datetime.date objects,
     hours as a float.
 
   Output: a float in the interval [0, 1], which is the percentage of full time.
@@ -763,8 +852,8 @@ The percentage formula is [[(hours / 1600) * (365 / days)]].
 For 160 hours over 365 days: [[(160/1600) * (365/365) = 0.1]].
 <<test functions>>=
 def test_compute_percentage():
-  start = arrow.get("2024-01-01")
-  end = arrow.get("2025-01-01")
+  start = datetime.datetime(2024, 1, 1)
+  end = datetime.datetime(2025, 1, 1)
   hours = 160
   result = compute_percentage(start, end, hours)
   expected = (160 / 1600) * (365 / 366)
