@@ -554,6 +554,16 @@ a stale schedule is more useful than no schedule.
 Only when there is no cached copy at all do we re-raise, which
 preserves the failure behaviour that [[read_calendars]] relies on to
 skip dead sources.
+
+We parse the fetched text \emph{before} writing it to the cache, so
+the cache only ever holds text that has proven to parse as ICS.
+The order matters because a failed fetch does not always raise: an
+expired SSO session can yield a 200 response whose body is a login
+page, not a calendar.
+Cached before parsing, that page would be served---and fail to
+parse---on every run for a whole TTL, without a refetch ever being
+attempted; parsed first, the bad response raises and leaves any
+previously cached copy intact.
 <<return calendar fetched over HTTP, honouring [[cache]]>>=
 if cache is None:
   return ics.icalendar.Calendar(imports=fetch_ics(source))
@@ -574,8 +584,9 @@ except Exception as err:
                   f"using stale cached copy: {err}")
   return ics.icalendar.Calendar(imports=stale)
 
+calendar = ics.icalendar.Calendar(imports=text)
 _write_cache(path, text)
-return ics.icalendar.Calendar(imports=text)
+return calendar
 @
 
 The cache lives in [[~/.nytid/ics_cache]], following the same
@@ -620,12 +631,11 @@ decide what to do next.
 <<functions>>=
 def _read_cache(path, ttl):
   try:
-    age = time.time() - path.stat().st_mtime
+    if time.time() - path.stat().st_mtime > ttl:
+      return None
+    return path.read_text()
   except OSError:
     return None
-  if age > ttl:
-    return None
-  return path.read_text()
 
 def _read_cache_stale(path):
   try:
@@ -651,8 +661,9 @@ def _write_cache(path, text):
 
 We verify the cache behaviour matrix: a fresh copy avoids the
 network, a miss populates the cache, an expired copy and
-[[read=False]] both force a refetch, and a failed fetch falls back to
-a stale copy only when one exists.
+[[read=False]] both force a refetch, an unparseable response is
+never written to the cache, and a failed fetch falls back to a stale
+copy only when one exists.
 Every test monkeypatches [[cache_dir]] to a temporary directory so it
 never touches the user's real cache.
 The cached and fetched calendars carry different event names so the
@@ -701,6 +712,24 @@ def test_cache_expired_refetches(tmp_path, monkeypatch):
     mock_ladok.session.session.get.return_value = mock_response
     cal = read_calendar(url, cache=CalendarCache(ttl=3600))
   assert any(event.name == "New Event" for event in cal.events)
+@
+
+A 200 response that is not ICS---the SSO login page case---must not
+poison the cache: the parse error propagates and no cache file is
+written.
+<<test functions>>=
+def test_unparseable_response_not_cached(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  mock_response = MagicMock()
+  mock_response.status_code = 200
+  mock_response.text = "<html>Please log in</html>"
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    with pytest.raises(Exception):
+      read_calendar(url, cache=CalendarCache())
+  assert not nytid.schedules._cache_path(url).exists()
 @
 
 The [[--no-cache]] flag maps to [[read=False]]: the fresh cached copy
