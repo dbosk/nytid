@@ -7,9 +7,7 @@ it's the [[cli.schedule]] module.
 <<[[schedule.py]]>>=
 import datetime
 from enum import Enum
-import arrow as arrowlib
-import dateutil.tz
-import ics.event
+import icalendar
 import logging
 import typer
 import typerconf as config
@@ -87,11 +85,11 @@ def ics_cmd(<<argument for matching courses>> = ".*",
   ~/public_html, and add it to your calendar.
   """
   <<generate [[schedule]] from sign-up sheets for matching courses>>
-  print(schedule.serialize())
+  print(schedule.to_ical().decode())
 <<generate [[schedule]] from sign-up sheets for matching courses>>=
 <<set list [[courses]] to ((course, register), config)-pairs>>
 
-schedule = ics.icalendar.Calendar()
+schedule = icalendar.Calendar()
 <<set refresh rate for [[schedule]]>>
 <<set refresh rate for [[schedule]], same as TimeEdit>>
 
@@ -147,7 +145,8 @@ For instance, we don't want to include events like holidays, exam weeks or
 fairs like KTH Global.
 <<read schedule from [[config]], add to [[schedule]]>>=
 course_schedule = schedutils.read_calendar(config.get("ics"))
-schedule.events.update(schedutils.event_filter(course_schedule.events))
+for event in schedutils.event_filter(course_schedule.events):
+  schedule.add_component(event)
 @
 
 We need a username.
@@ -178,10 +177,10 @@ if user:
   booked = sheets.filter_events_by_TA(user, booked)
   booked = map(functools.partial(add_reserve_to_title, user), booked)
 
-schedule.events.update(set(map_drop_exceptions(sheets.EventFromCSV, booked)))
+for event in map_drop_exceptions(sheets.EventFromCSV, booked):
+  schedule.add_component(event)
 <<imports>>=
 import functools
-import ics.icalendar
 <<helper functions>>=
 def map_drop_exceptions(func, iterable):
   """
@@ -264,40 +263,47 @@ ICS supports specifying the refresh interval for a calendar\footnote{%
   See also
   \url{https://lauren-c-stephen.medium.com/subscribe-to-an-icalendar-feed-in-google-calendar-and-solve-update-issues-79b4e84b3c64}.
 }.
-However, the ICS library we're using doesn't, but it supports custom properties 
-that we can use.
-We can set custom properties by using the [[.extra]] attribute.
+The [[icalendar]] package lets us add any property---standard or
+vendor extension---through [[Calendar.add]], encoding a
+[[datetime.timedelta]] as an ICS duration ([[PT20M]]).
 
 There are seemingly two ways to do this, and we use both for maximum
 client compatibility.
-The standards-track approach is the [[REFRESH-INTERVAL]] property.
+The standards-track approach is the [[REFRESH-INTERVAL]] property;
+RFC~7986 requires its [[VALUE=DURATION]] parameter, which we pass
+explicitly since [[add]] does not infer parameters.
 A complementary method, found by inspecting TimeEdit exports, is to set
 method to [[PUBLISH]] and add a property [[X-PUBLISHED-TTL]]; some older
 calendar clients only honour this vendor extension.
+For the vendor property we must wrap the value in [[vDuration]]
+ourselves: [[add]] only knows the value types of \emph{standard}
+properties, and would encode the timedelta of an unknown [[X-]]
+property as text.
 <<set refresh rate for [[schedule]]>>=
-schedule.extra += [ContentLine("REFRESH-INTERVAL",
-                               {"VALUE": ["DURATION"]},
-                               "PT20M")]
+schedule.add("REFRESH-INTERVAL", datetime.timedelta(minutes=20),
+             parameters={"VALUE": "DURATION"})
 <<set refresh rate for [[schedule]], same as TimeEdit>>=
-schedule.method = "PUBLISH"
-schedule.extra += [ContentLine("X-PUBLISHED-TTL", {}, "PT20M")]
-<<imports>>=
-from ics.grammar.parse import ContentLine
+schedule.add("METHOD", "PUBLISH")
+schedule.add("X-PUBLISHED-TTL",
+             icalendar.vDuration(datetime.timedelta(minutes=20)))
 @
 
 \subsection{Other metadata for ICS export}
 
-Based on our observations from the TimeEdit exports, we can set other metadata 
+Based on our observations from the TimeEdit exports, we can set other metadata
 in the calendar export.
+The name and description go into the [[X-WR-CALNAME]] and
+[[X-WR-CALDESC]] vendor properties, which is what TimeEdit emits and
+what Google Calendar reads.
 <<set meta data for [[schedule]]>>=
-schedule.name = "Nytid"
+name = "Nytid"
 if user:
-  schedule.name = f"{user}'s nytid"
-schedule.extra += [ContentLine("X-WR-CALNAME", {}, schedule.name)]
-schedule.description = "Nytid export"
+  name = f"{user}'s nytid"
+schedule.add("X-WR-CALNAME", name)
+description = "Nytid export"
 if user:
-  schedule.description = f"Nytid export for {user}"
-schedule.extra += [ContentLine("X-WR-CALDESC", {}, schedule.description)]
+  description = f"Nytid export for {user}"
+schedule.add("X-WR-CALDESC", description)
 @
 
 
@@ -657,8 +663,8 @@ the remaining work-hour slots.
 
 \paragraph{Stripping timezone information}
 
-ICS events carry timezone-aware Arrow timestamps, but the free-slot
-algorithm uses plain Python [[datetime]] comparisons.
+Calendar events carry timezone-aware datetimes, but the free-slot
+algorithm uses plain naive [[datetime]] comparisons.
 Rather than repeat the [[astimezone().replace(tzinfo=None)]] conversion
 at every call site, we factor it into [[local_naive]].
 <<helper functions>>=
@@ -669,12 +675,6 @@ def local_naive(dt):
   if dt.tzinfo:
     return dt.astimezone().replace(tzinfo=None)
   return dt
-@
-
-We also need the reverse: stamping a naive local datetime with the
-system timezone so the [[ics]] library does not default to UTC\@.
-<<constants>>=
-local_tz = dateutil.tz.tzlocal()
 @
 
 The function must handle both timezone-aware and naive datetimes, since
@@ -692,20 +692,21 @@ def test_local_naive_with_aware_datetime():
   assert result.tzinfo is None
 @
 
-When creating ICS events from naive local datetimes, the [[ics]]
-library (Arrow-backed) treats them as UTC, so
-[[.to(dateutil.tz.tzlocal())]] shifts the displayed time.
-This test verifies that wrapping with [[arrowlib.get]] and
-[[local_tz]] preserves the intended hour after the round-trip.
+Going the other way---from the scheduler's naive local datetimes to
+event timestamps---we attach the local timezone with the no-argument
+[[astimezone()]], which interprets a naive datetime as local time.
+(The [[ics]] library this module previously used interpreted naive
+datetimes as UTC, which shifted every displayed todo by the UTC
+offset; [[icalendar]] stores exactly the tzinfo we attach, so the
+round-trip is a no-op.)
+This test pins that property.
 <<test functions>>=
 def test_todo_event_preserves_local_time():
-  """Naive local datetimes must survive ICS round-trip."""
-  import arrow as arrowlib
-  import dateutil.tz
+  """Naive local datetimes must survive the calendar round-trip."""
   naive_dt = datetime.datetime(2026, 3, 2, 12, 0)
-  event = ics.event.Event()
-  event.begin = arrowlib.get(naive_dt, dateutil.tz.tzlocal())
-  displayed = event.begin.to(dateutil.tz.tzlocal())
+  event = icalendar.Event()
+  event.start = naive_dt.astimezone()
+  displayed = event.start.astimezone()
   assert displayed.hour == 12, (
     f"expected 12:00 local, got {displayed.hour}:00"
   )
@@ -714,11 +715,16 @@ def test_todo_event_preserves_local_time():
 \paragraph{Extracting busy intervals}
 
 The free-slot algorithm works with plain [[datetime]] pairs rather than
-ICS event objects, because it needs to merge and compare intervals
+calendar event objects, because it needs to merge and compare intervals
 without depending on the calendar library.
 [[event_bounds]] converts events to those pairs, silently skipping
-events that lack either endpoint---all-day events in some calendar
-clients set [[begin]] but leave [[end]] unset.
+events that lack a start time.
+The skip must be a try/except: [[icalendar]] \emph{raises}
+[[IncompleteComponent]] on [[.start]] access for an event without
+[[DTSTART]], rather than returning [[None]].
+An event with a start but no end gets [[.end]] equal to its start
+(zero duration, per RFC~5545), so the [[end > begin]] test below
+drops it without any special case.
 <<helper functions>>=
 def event_bounds(events):
   """
@@ -726,10 +732,11 @@ def event_bounds(events):
   """
   bounds = []
   for event in events:
-    if not event.begin or not event.end:
+    try:
+      begin = local_naive(event.start)
+      end = local_naive(event.end)
+    except icalendar.error.IncompleteComponent:
       continue
-    begin = local_naive(event.begin.datetime)
-    end = local_naive(event.end.datetime)
     if end > begin:
       bounds.append((begin, end))
 
@@ -738,25 +745,14 @@ def event_bounds(events):
 
 <<test functions>>=
 def test_event_bounds_skips_missing_times():
-  class FakeEvent:
-    def __init__(self, begin, end):
-      self.begin = begin
-      self.end = end
+  timed = icalendar.Event()
+  timed.start = datetime.datetime(2024, 1, 1, 9, 0)
+  timed.end = datetime.datetime(2024, 1, 1, 10, 0)
 
-  class FakeArrow:
-    def __init__(self, dt):
-      self._dt = dt
-    @property
-    def datetime(self):
-      return self._dt
+  endless = icalendar.Event()  # no DTSTART
+  endless.end = datetime.datetime(2024, 1, 1, 11, 0)
 
-  e1 = FakeEvent(
-    FakeArrow(datetime.datetime(2024, 1, 1, 9, 0)),
-    FakeArrow(datetime.datetime(2024, 1, 1, 10, 0)),
-  )
-  e2 = FakeEvent(None, FakeArrow(datetime.datetime(2024, 1, 1, 11, 0)))
-
-  result = event_bounds([e1, e2])
+  result = event_bounds([timed, endless])
   assert len(result) == 1
   assert result[0] == (
     datetime.datetime(2024, 1, 1, 9, 0),
@@ -1026,17 +1022,15 @@ We greedily consume slots until the todo's estimated hours are
 satisfied, splitting a slot if the todo needs less than the full slot.
 
 The slot times from [[compute_free_slots]] are naive datetimes in
-local time.
-When assigned directly to [[event.begin]] and [[event.end]], the
-[[ics]] library (which uses Arrow internally) interprets them as
-UTC\@.
-Later, display functions like [[format_event_csv]] convert to
-local time with [[.to(dateutil.tz.tzlocal())]],
-which adds the UTC offset \emph{again}---shifting every event
-by one hour in CET or two hours in CEST\@.
-We avoid this by wrapping the naive datetimes as timezone-aware
-Arrow objects in the local timezone, so the subsequent
-[[.to(tzlocal())]] conversion is a no-op.
+local time, but the module-wide invariant is that event times are
+timezone aware (\cref{ParsingCalendars} in the schedules chapter), so
+we attach the local timezone with the no-argument [[astimezone()]].
+(This module previously used the [[ics]] library, which interpreted
+naive datetimes as UTC; display code then converted to local time,
+adding the UTC offset \emph{again} and shifting every todo by one hour
+in CET or two in CEST\@.
+With [[icalendar]] the event stores exactly the aware datetime we give
+it, so the display conversion is a no-op.)
 <<assign todo to slots>>=
 hours_needed = item.estimated or DEFAULT_ESTIMATED_HOURS
 while hours_needed > 0 and remaining_slots:
@@ -1055,10 +1049,10 @@ while hours_needed > 0 and remaining_slots:
     remaining_slots[0] = (event_end, slot_end)
     hours_needed = 0
 
-  event = ics.event.Event()
-  event.name = f"[TODO] {item.title}"
-  event.begin = arrowlib.get(slot_start, local_tz)
-  event.end = arrowlib.get(event_end, local_tz)
+  event = icalendar.Event()
+  event.summary = f"[TODO] {item.title}"
+  event.start = slot_start.astimezone()
+  event.end = event_end.astimezone()
   event.location = "TODO"
   if item.description:
     event.description = item.description
@@ -1137,7 +1131,7 @@ def test_schedule_todo_events_starts_from_now(monkeypatch):
   end = datetime.datetime(2024, 1, 15, 23, 59)
   events = schedule_todo_events(None, end, [])
   assert len(events) == 1
-  assert events[0].begin == arrowlib.get(now, local_tz)
+  assert events[0].start == now.astimezone()
 @
 
 Once we have the course schedule, we merge external calendars and then
@@ -1163,7 +1157,8 @@ if not user or user == default_username:
   cache = build_calendar_cache(no_cache)
   external_calendar = schedutils.read_calendars(external_sources,
                                                 cache=cache)
-  schedule.events.update(external_calendar.events)
+  for event in external_calendar.events:
+    schedule.add_component(event)
 @
 
 \paragraph{Opting out of todo scheduling}
@@ -1223,9 +1218,8 @@ intervals between now and a future [[end]] are all known here.
 <<add scheduled todo events to [[schedule]]>>=
 if todo:
   occupied = event_bounds(schedule.events)
-  schedule.events.update(schedule_todo_events(user,
-                                              end,
-                                              occupied))
+  for event in schedule_todo_events(user, end, occupied):
+    schedule.add_component(event)
 @
 
 \subsection{Filter events based on start--end time}
@@ -1234,10 +1228,10 @@ if todo:
 Before output, we keep only events overlapping the chosen interval.
 <<set [[events]] to filtered timeline>>=
 events = []
-for event in schedule.timeline:
+for event in schedutils.timeline(schedule):
   if event.end.date() < start.date():
     continue
-  if event.begin.date() > end.date():
+  if event.start.date() > end.date():
     continue
   events.append(event)
 @
@@ -1434,6 +1428,7 @@ The helper functions, however, contain important logic worth verifying.
 <<test [[clischedule.py]]>>=
 import importlib
 import datetime
+import icalendar
 from unittest.mock import MagicMock
 
 import nytid.cli.schedule as schedule_module

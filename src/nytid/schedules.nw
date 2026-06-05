@@ -1,13 +1,40 @@
 \chapter{Working with schedules}
 
-In this chapter we describe the module [[nytid.schedules]] that we provide for 
+In this chapter we describe the module [[nytid.schedules]] that we provide for
 working with schedules, indirectly TimeEdit.
-We want to be able to use the course schedule and the personal schedules 
+We want to be able to use the course schedule and the personal schedules
 provided by TimeEdit.
 
 The idea is as follows.
-We'll use the [[ics]] package to handle events and schedules (calendars).
+We'll use the [[icalendar]] package to handle events and schedules
+(calendars).
 This means that we can use the ICS exports from TimeEdit, Google Calendar etc.
+
+\paragraph{Why \texttt{icalendar} and not \texttt{ics}}
+
+Earlier versions of nytid used the [[ics]] package (version 0.7).
+Its parser turned out to be the single dominant cost of
+[[nytid schedule show]]: parsing a real external feed of 2\,194\,963
+characters (2.2\,MB, 3709 events) took \emph{26.33 seconds}, of which
+about 95 percent was spent inside [[ics.grammar]]'s generated TatSu
+PEG parser tokenizing the 48\,000 content lines---roughly 1.5
+milliseconds per line.
+The effect was that a calendar-cache hit and a network fetch were
+indistinguishable to the user: the parse dominated both.
+The [[icalendar]] package parses the same feed in \emph{1.17 seconds},
+22 times faster, which makes the on-disk text cache
+(\cref{CachingExternalCalendars}) actually pay off.
+
+Speed is not the only reason.
+The [[ics]] package cannot expand recurring events ([[RRULE]]), so a
+weekly meeting in an external feed appeared only once, at its first
+occurrence---the same real feed above contains 227 [[RRULE]]s.
+The [[icalendar]] package has the actively maintained companion
+package [[recurring-ical-events]] for exactly this.
+Finally, [[ics]] 0.7 is effectively unmaintained and forced two extra
+dependencies on us: [[arrow]] (its timestamp type) and [[tatsu]] (its
+parser generator); with [[icalendar]] we use plain
+[[datetime.datetime]] from the standard library.
 
 
 \section{Outline}
@@ -23,18 +50,20 @@ The module consists only of the file [[schedules.py]].
 \section{Representing events}
 
 We will use the ICS calendar format to represent events.
-For this we will use the [[ics]] package.
-We will use the [[arrow]] package instead of [[datetime]], as this is suggested 
-by the [[ics]] package.
+For this we will use the [[icalendar]] package.
+Events are [[icalendar.Event]] objects; their start and end times are
+plain [[datetime.datetime]] objects, exposed through the [[.start]]
+and [[.end]] properties.
+We keep all event datetimes timezone aware (\cref{ParsingCalendars}
+establishes this invariant at parse time), so events from different
+sources can always be compared and sorted.
 <<imports>>=
-import arrow.arrow as arrow
 import calendar
-import dateutil
-import ics.event
-import ics.icalendar
-@ Using the [[ics]] package allows us to work with calendar related things in a 
-standard way, so that we later can just import calendars through [[.ics]] 
-files.
+import datetime
+import icalendar
+@ Using the [[icalendar]] package allows us to work with calendar related
+things in a standard way, so that we later can just import calendars through
+[[.ics]] files.
 
 When we print such an object, it will print the ICS formatted version.
 This is useful for creating [[.ics]] files, but not for pretty-printing the 
@@ -54,21 +83,21 @@ format defaults to including it (more context for reading a full event).
 <<functions>>=
 def format_header(event, week=True):
     """
-    Formats the event header, a one-line representation (week, date, time, 
+    Formats the event header, a one-line representation (week, date, time,
     event title)
 
-    If the `week` parameter is `True` (default), the week number and weekday 
+    If the `week` parameter is `True` (default), the week number and weekday
     will be included in the header.
     """
     header = ""
 
     if week:
-      header += f"Week {event.begin.isocalendar()[1]} " \
-                + calendar.day_name[event.begin.weekday()] + " "
+      header += f"Week {event.start.isocalendar()[1]} " \
+                + calendar.day_name[event.start.weekday()] + " "
 
-    header += event.begin.to(dateutil.tz.tzlocal()).format('DD/MM HH:mm')
+    header += event.start.astimezone().strftime('%d/%m %H:%M')
 
-    header += f" {event.name}"
+    header += f" {event.summary}"
 
     return header
 @
@@ -86,14 +115,14 @@ def test_format_header_with_week():
   header = format_header(event, week=True)
   assert "Week 3" in header
   assert "Monday" in header
-  assert event.name in header
+  assert event.summary in header
 
 def test_format_header_without_week():
   event = make_event()
   header = format_header(event, week=False)
   assert "Week" not in header
   assert "Monday" not in header
-  assert event.name in header
+  assert event.summary in header
   assert "15/01" in header
 @
 
@@ -108,8 +137,8 @@ human reader.
 <<functions>>=
 def format_event(event, week=True):
     """
-    Takes event (ics.event.Event) object,
-    returns long string representation (header, location, description over 
+    Takes event (icalendar.Event) object,
+    returns long string representation (header, location, description over
     several lines)
 
     The `week` parameter is passed to the `format_header` function, it results 
@@ -239,7 +268,7 @@ column width matters.
 <<functions>>=
 def format_event_short(event, week=False):
     """
-    Takes event (ics.event.Event) object,
+    Takes event (icalendar.Event) object,
     returns a short string representation (one line)
 
     The `week` parameter is passed to the `format_header` function, it results 
@@ -260,7 +289,7 @@ def test_format_event_short_default():
   event = make_event(description="Notes here")
   result = format_event_short(event)
   assert "Notes here" in result
-  assert event.name in result
+  assert event.summary in result
 
 def test_format_event_short_with_week():
   event = make_event()
@@ -275,7 +304,7 @@ events, so we fall back to an empty string to keep the CSV row well-formed.
 <<functions>>=
 def format_event_csv(event, week=False, location=False):
     """
-    Takes event (ics.event.Event) object,
+    Takes event (icalendar.Event) object,
     returns a list of strings, which can be used as a row in a CSV file.
 
       [0] Week number and day (if week is True)
@@ -293,11 +322,11 @@ def format_event_csv(event, week=False, location=False):
     row = []
 
     if week:
-      row.append(f"Week {event.begin.isocalendar()[1]} " \
-                  + calendar.day_name[event.begin.weekday()])
+      row.append(f"Week {event.start.isocalendar()[1]} " \
+                  + calendar.day_name[event.start.weekday()])
 
-    row.append(event.begin.to(dateutil.tz.tzlocal()).format('DD/MM HH:mm'))
-    row.append(event.name)
+    row.append(event.start.astimezone().strftime('%d/%m %H:%M'))
+    row.append(event.summary)
 
     if location:
       row.append(event.location or "")
@@ -319,7 +348,7 @@ def test_format_event_csv_default():
   event = make_event(description="Notes")
   row = format_event_csv(event)
   assert len(row) == 3
-  assert row[1] == event.name
+  assert row[1] == event.summary
 
 def test_format_event_csv_with_week():
   event = make_event()
@@ -341,6 +370,108 @@ def test_format_event_csv_with_week_and_location():
 
 
 \section{Handling calendars from URLs and files}
+
+\subsection{Parsing ICS text}
+\label{ParsingCalendars}
+
+All ICS text---fetched, cached or read from file---is parsed through
+one function, so that the parser is also the single place where we can
+establish an invariant about the resulting events: \emph{every parsed
+event has timezone-aware [[datetime.datetime]] start and end values}.
+
+The ICS format does not guarantee this by itself.
+All-day events carry date values ([[DTSTART;VALUE=DATE:20240115]]),
+which [[icalendar]] faithfully returns as [[datetime.date]]; and
+\enquote{floating} times (no [[Z]] suffix, no [[TZID]]) come back as
+naive datetimes.
+Both would poison every comparison downstream: sorting a mix of dates
+and datetimes raises [[TypeError]], as does comparing naive against
+aware datetimes.
+Rather than teaching every consumer to handle three kinds of values,
+we normalize here: dates become local midnight, naive times are
+interpreted as local time.
+Local is the right reading for both---an all-day event on the 15th
+means the 15th in the user's calendar, not in UTC.
+<<functions>>=
+def parse_calendar(text):
+  """
+  Parses ICS text into an `icalendar.Calendar`.
+
+  Normalizes all events so that their start and end values are
+  timezone-aware `datetime.datetime` objects: all-day events (date
+  values) become local midnight, naive times are interpreted as local
+  time. Raises ValueError if `text` is not valid ICS.
+  """
+  cal = icalendar.Calendar.from_ical(text)
+  for event in cal.events:
+    for name in ("DTSTART", "DTEND"):
+      <<normalize the [[name]] property of [[event]]>>
+  return cal
+@
+
+The normalization rewrites the property through [[Event.add]], since
+[[icalendar]] components store encoded property objects rather than
+bare datetimes.
+The [[datetime]]-before-[[date]] test order matters:
+[[datetime.datetime]] is a subclass of [[datetime.date]], so testing
+[[date]] first would match everything.
+<<normalize the [[name]] property of [[event]]>>=
+value = event.get(name)
+if value is None:
+  continue
+if isinstance(value.dt, datetime.datetime):
+  if value.dt.tzinfo is None:
+    del event[name]
+    event.add(name, value.dt.astimezone())
+elif isinstance(value.dt, datetime.date):
+  midnight = datetime.datetime(value.dt.year, value.dt.month,
+                               value.dt.day).astimezone()
+  del event[name]
+  event.add(name, midnight)
+@
+
+Let's verify the invariant for the three cases: aware values pass
+through, all-day dates become aware local midnight, and naive times
+become aware:
+<<test functions>>=
+def test_parse_calendar_all_day_event():
+  text = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:All day
+DTSTART;VALUE=DATE:20240115
+DTEND;VALUE=DATE:20240116
+END:VEVENT
+END:VCALENDAR"""
+  cal = parse_calendar(text)
+  event = cal.events[0]
+  assert isinstance(event.start, datetime.datetime)
+  assert event.start.tzinfo is not None
+  assert event.start.date() == datetime.date(2024, 1, 15)
+
+def test_parse_calendar_naive_time():
+  text = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Floating
+DTSTART:20240115T100000
+DTEND:20240115T120000
+END:VEVENT
+END:VCALENDAR"""
+  cal = parse_calendar(text)
+  event = cal.events[0]
+  assert event.start.tzinfo is not None
+  assert event.start.hour == 10
+
+def test_parse_calendar_aware_time():
+  cal = parse_calendar(make_ics("Aware"))
+  event = cal.events[0]
+  assert event.start.tzinfo is not None
+@
+
+\subsection{Reading calendars}
 
 Calendars may come from remote URLs (for subscribed feeds) or local
 [[.ics]] files.
@@ -366,13 +497,13 @@ def read_calendar(source, cache=None):
   Reads an ICS-formatted calendar from `source`, a URL or file path.
   `cache` is an optional `CalendarCache` policy controlling on-disk
   caching of HTTP(S) sources; `None` (the default) disables caching.
-  Returns an `ics.icalendar.Calendar` object.
+  Returns an `icalendar.Calendar` object.
   """
   if source.startswith(("http://", "https://")):
     <<return calendar fetched over HTTP, honouring [[cache]]>>
 
   with open(source, "r") as icsfile:
-    return ics.icalendar.Calendar(imports=icsfile.read())
+    return parse_calendar(icsfile.read())
 @
 
 The HTTP GET itself is factored into [[fetch_ics]].
@@ -412,17 +543,70 @@ def read_calendars(sources, cache=None):
   `cache` is passed on to `read_calendar` for each source.
   Sources that cannot be read are skipped with a warning.
   """
-  calendar = ics.icalendar.Calendar()
+  merged = icalendar.Calendar()
   for source in sources:
     try:
       source_calendar = read_calendar(source, cache=cache)
-      calendar.events.update(source_calendar.events)
+      for event in source_calendar.events:
+        merged.add_component(event)
     except Exception as err:
       logging.warning(f"Can't read calendar source {source}: {err}")
 
-  return calendar
+  return merged
 <<imports>>=
 import logging
+@
+
+\subsection{Iterating events in chronological order}
+
+The [[ics]] package offered a [[timeline]] attribute on its calendars;
+[[icalendar]] has no equivalent, so we provide the function ourselves.
+Centralizing it here also centralizes the one subtlety: an event
+without a [[DTSTART]] cannot be placed on a timeline, and
+[[icalendar]] \emph{raises} [[IncompleteComponent]] on [[.start]]
+access rather than returning [[None]], so the skip must be a
+try/except.
+We sort by a key function rather than sorting [[(start, event)]]
+tuples: with equal start times a tuple sort would fall through to
+comparing the events themselves, which are dict-like and unorderable.
+<<functions>>=
+def timeline(calendar):
+  """
+  Returns the events of `calendar` as a list sorted by start time.
+  Events lacking a start time are skipped.
+  """
+  events = []
+  for event in calendar.events:
+    try:
+      event.start
+    except icalendar.error.IncompleteComponent:
+      continue
+    events.append(event)
+  events.sort(key=lambda event: event.start)
+  return events
+@
+
+Let's verify the ordering and that a start-less event is dropped
+rather than crashing the sort:
+<<test functions>>=
+def test_timeline_sorted():
+  cal = icalendar.Calendar()
+  late = make_event(name="Late", begin="2024-01-16T10:00:00+01:00",
+                    end="2024-01-16T11:00:00+01:00")
+  early = make_event(name="Early")
+  cal.add_component(late)
+  cal.add_component(early)
+  ordered = timeline(cal)
+  assert [event.summary for event in ordered] == ["Early", "Late"]
+
+def test_timeline_skips_missing_start():
+  cal = icalendar.Calendar()
+  empty = icalendar.Event()
+  empty.add("SUMMARY", "No times")
+  cal.add_component(empty)
+  cal.add_component(make_event(name="Timed"))
+  ordered = timeline(cal)
+  assert [event.summary for event in ordered] == ["Timed"]
 @
 
 \subsection{Testing [[read_calendar]]}
@@ -484,8 +668,7 @@ END:VCALENDAR"""
   assert len(cal.events) == 1
 
 def test_read_calendars_skips_failures():
-  ok = ics.icalendar.Calendar(
-    imports="""BEGIN:VCALENDAR
+  ok = parse_calendar("""BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Test//Test//EN
 BEGIN:VEVENT
@@ -493,8 +676,7 @@ SUMMARY:Merged Event
 DTSTART:20240115T100000Z
 DTEND:20240115T120000Z
 END:VEVENT
-END:VCALENDAR"""
-  )
+END:VCALENDAR""")
 
   with patch("nytid.schedules.read_calendar") as mock_read:
     mock_read.side_effect = [ok, Exception("boom")]
@@ -520,8 +702,11 @@ time-to-live (TTL).
 
 We cache the raw text rather than parsed calendar objects: the cache
 files are then ordinary [[.ics]] files that the user can inspect with
-a text editor, and the cache format stays independent of the [[ics]]
+a text editor, and the cache format stays independent of the calendar
 library's internals.
+(This means we re-parse on every run, but with [[icalendar]] that
+costs on the order of a second even for the largest feeds we have
+seen---see the parser comparison in the chapter introduction.)
 
 The mechanics live here in the library, but the policy---how long a
 copy stays fresh, and whether to consult the cache at all---belongs to
@@ -572,14 +757,14 @@ with [[-v]] then shows which sources hit the network, which is the
 first thing to check when a schedule looks stale or a run is slow.
 <<return calendar fetched over HTTP, honouring [[cache]]>>=
 if cache is None:
-  return ics.icalendar.Calendar(imports=fetch_ics(source))
+  return parse_calendar(fetch_ics(source))
 
 path = _cache_path(source)
 if cache.read:
   cached = _read_cache(path, cache.ttl)
   if cached is not None:
     logging.info(f"Using cached calendar for {source}")
-    return ics.icalendar.Calendar(imports=cached)
+    return parse_calendar(cached)
 
 try:
   text = fetch_ics(source)
@@ -589,9 +774,9 @@ except Exception as err:
     raise
   logging.warning(f"Can't fetch {source}, "
                   f"using stale cached copy: {err}")
-  return ics.icalendar.Calendar(imports=stale)
+  return parse_calendar(stale)
 
-calendar = ics.icalendar.Calendar(imports=text)
+calendar = parse_calendar(text)
 _write_cache(path, text)
 logging.info(f"Cached calendar for {source}")
 return calendar
@@ -692,7 +877,7 @@ def test_cache_hit_skips_fetch(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
       cal = read_calendar(url, cache=CalendarCache())
     mock_ladok.session.session.get.assert_not_called()
-  assert any(event.name == "Cached Event" for event in cal.events)
+  assert any(event.summary == "Cached Event" for event in cal.events)
   assert "Using cached calendar" in caplog.text
 
 def test_cache_miss_fetches_and_writes(tmp_path, monkeypatch, caplog):
@@ -706,7 +891,7 @@ def test_cache_miss_fetches_and_writes(tmp_path, monkeypatch, caplog):
     mock_ladok.session.session.get.return_value = mock_response
     with caplog.at_level(logging.INFO):
       cal = read_calendar(url, cache=CalendarCache())
-  assert any(event.name == "Fetched Event" for event in cal.events)
+  assert any(event.summary == "Fetched Event" for event in cal.events)
   cached = nytid.schedules._cache_path(url)
   assert cached.read_text() == make_ics("Fetched Event")
   assert "Fetched ICS" in caplog.text
@@ -727,7 +912,7 @@ def test_cache_expired_refetches(tmp_path, monkeypatch):
   with patch("nytid.schedules.ladok3") as mock_ladok:
     mock_ladok.session.session.get.return_value = mock_response
     cal = read_calendar(url, cache=CalendarCache(ttl=3600))
-  assert any(event.name == "Fetched Event" for event in cal.events)
+  assert any(event.summary == "Fetched Event" for event in cal.events)
 @
 
 A 200 response that is not ICS---the SSO login page case---must not
@@ -765,7 +950,7 @@ def test_no_cache_read_bypasses_but_writes(tmp_path, monkeypatch):
   with patch("nytid.schedules.ladok3") as mock_ladok:
     mock_ladok.session.session.get.return_value = mock_response
     cal = read_calendar(url, cache=CalendarCache(read=False))
-  assert any(event.name == "Fetched Event" for event in cal.events)
+  assert any(event.summary == "Fetched Event" for event in cal.events)
   assert cache_file.read_text() == make_ics("Fetched Event")
 @
 
@@ -790,7 +975,7 @@ def test_stale_fallback_on_fetch_failure(tmp_path, monkeypatch,
   with patch("nytid.schedules.ladok3") as mock_ladok:
     mock_ladok.session.session.get.return_value = mock_response
     cal = read_calendar(url, cache=CalendarCache(ttl=3600))
-  assert any(event.name == "Cached Event" for event in cal.events)
+  assert any(event.summary == "Cached Event" for event in cal.events)
   assert "stale" in caplog.text
 
 def test_fetch_failure_without_cache_raises(tmp_path, monkeypatch):
@@ -881,16 +1066,16 @@ TimeEdit uses when appending course codes to activity names.
 <<functions>>=
 def event_filter(events, whitelisted=TIMEEDIT_EVENTS):
   """
-  Takes a list of events (ics.event.Event), returns a filtered list of events 
+  Takes a list of events (icalendar.Event), returns a filtered list of events
   (generator). The events to include are the teaching events.
 
   It covers the following events:
-  
+
     <<whitelisted events>>
   """
   for event in events:
     for event_type in whitelisted:
-      if re.match(f"^{event_type}(,|\\s|$)", event.name):
+      if re.match(f"^{event_type}(,|\\s|$)", event.summary):
         yield event
         break
 <<imports>>=
@@ -960,7 +1145,7 @@ def test_event_filter_substring_boundary():
             make_event(name="Examinationsdag")]
   result = list(event_filter(events))
   assert len(result) == 1
-  assert result[0].name == "Exam"
+  assert result[0].summary == "Exam"
 
 def test_event_filter_custom_whitelist():
   events = [make_event(name="CustomEvent"),
@@ -968,7 +1153,7 @@ def test_event_filter_custom_whitelist():
   result = list(event_filter(events,
                              whitelisted=["CustomEvent"]))
   assert len(result) == 1
-  assert result[0].name == "CustomEvent"
+  assert result[0].summary == "CustomEvent"
 
 def test_event_filter_empty():
   result = list(event_filter([]))
@@ -979,16 +1164,13 @@ def test_event_filter_empty():
 \section{Test setup}
 
 We set up the test file.
-The key challenge is creating mock events: [[ics.event.Event]] objects have
-[[arrow.Arrow]] timestamps.
 We use a fixed date so that week numbers and weekday names are deterministic.
 <<test [[schedules.py]]>>=
-import arrow as arrowlib
 import datetime
 import logging
 import os
 import time
-import ics.event
+import icalendar
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -1008,18 +1190,19 @@ To avoid duplicating event creation logic across tests, we provide a
 factory function.
 The date defaults to a Monday (2024-01-15) so that the weekday name is
 predictable in formatting tests.
-We import [[arrow]] as [[arrowlib]] to avoid conflict with the
-module-level [[import arrow.arrow as arrow]] in [[schedules.py]].
+The factory keeps the [[name]] parameter (rather than renaming it
+[[summary]]) so the tests read naturally; it sets the event's
+[[summary]] property.
 <<test helper: make event>>=
 def make_event(name="Laboration",
                begin="2024-01-15T10:00:00+01:00",
                end="2024-01-15T12:00:00+01:00",
                location="D1",
                description="grupp 1\ngrupp 2"):
-  event = ics.event.Event()
-  event.name = name
-  event.begin = arrowlib.get(begin)
-  event.end = arrowlib.get(end)
+  event = icalendar.Event()
+  event.summary = name
+  event.start = datetime.datetime.fromisoformat(begin)
+  event.end = datetime.datetime.fromisoformat(end)
   event.location = location
   event.description = description
   return event
