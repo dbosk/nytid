@@ -491,14 +491,29 @@ The default [[cache=None]] keeps the old always-fetch behaviour, so
 existing callers are unaffected.
 Local files are never cached: reading them is already cheap, and
 caching them would only risk staleness.
+
+The optional [[window]] expands recurring events
+(\cref{ExpandingRecurrences}); reading the raw calendar is factored
+into [[_read_calendar]] so that the cache logic can keep its early
+returns while the expansion applies uniformly to every path---file,
+cache hit, stale fallback and fresh fetch.
 <<functions>>=
-def read_calendar(source, cache=None):
+def read_calendar(source, cache=None, window=None):
   """
   Reads an ICS-formatted calendar from `source`, a URL or file path.
   `cache` is an optional `CalendarCache` policy controlling on-disk
   caching of HTTP(S) sources; `None` (the default) disables caching.
+  `window` is an optional (start, end) pair of datetimes; when given,
+  recurring events are expanded into their occurrences within the
+  window and events outside the window are dropped.
   Returns an `icalendar.Calendar` object.
   """
+  calendar = _read_calendar(source, cache)
+  if window is None:
+    return calendar
+  return expand_recurrences(calendar, window)
+
+def _read_calendar(source, cache):
   if source.startswith(("http://", "https://")):
     <<return calendar fetched over HTTP, honouring [[cache]]>>
 
@@ -537,16 +552,18 @@ With caching enabled, this skip is the last resort:
 (\cref{CachingExternalCalendars}), so only sources that fail
 \emph{and} have never been cached end up here.
 <<functions>>=
-def read_calendars(sources, cache=None):
+def read_calendars(sources, cache=None, window=None):
   """
   Reads and merges several calendar sources.
-  `cache` is passed on to `read_calendar` for each source.
+  `cache` and `window` are passed on to `read_calendar` for each
+  source.
   Sources that cannot be read are skipped with a warning.
   """
   merged = icalendar.Calendar()
   for source in sources:
     try:
-      source_calendar = read_calendar(source, cache=cache)
+      source_calendar = read_calendar(source, cache=cache,
+                                      window=window)
       for event in source_calendar.events:
         merged.add_component(event)
     except Exception as err:
@@ -555,6 +572,85 @@ def read_calendars(sources, cache=None):
   return merged
 <<imports>>=
 import logging
+@
+
+\subsection{Expanding recurring events}
+\label{ExpandingRecurrences}
+
+A recurring event appears in the ICS data once, as a single
+[[VEVENT]] carrying an [[RRULE]]; the individual occurrences are
+implicit.
+A calendar that merely stores events can leave them implicit, but
+anything that \emph{displays} a date range, or computes occupied time
+within one, needs the occurrences made explicit---otherwise a weekly
+meeting shows up only at its first occurrence.
+(This was a real defect: the [[ics]] package could not expand
+recurrences at all, so external feeds---one real feed carries 227
+[[RRULE]]s---lost all but the first occurrence of every recurring
+event.)
+
+Expansion must be bounded: an [[RRULE]] without an end recurs
+forever, so \enquote{expand everything} does not terminate.
+That is why the window is a parameter of the \emph{read} functions
+rather than a post-processing step the caller might forget: the
+caller that knows its date range gets correct recurrences for it, and
+a caller without a range ([[window=None]]) gets the raw calendar
+unchanged, never a truncated one.
+The [[recurring-ical-events]] package does the actual computation;
+its [[between]] returns each occurrence as a separate event (with the
+occurrence's own start and end), plus the non-recurring events in
+range.
+<<functions>>=
+def expand_recurrences(calendar, window):
+  """
+  Returns a new `icalendar.Calendar` with the recurring events of
+  `calendar` expanded into individual occurrences within `window`, a
+  (start, end) pair of datetimes. Non-recurring events within the
+  window are included as they are; events outside the window are
+  dropped.
+  """
+  start, end = window
+  expanded = icalendar.Calendar()
+  for event in recurring_ical_events.of(calendar).between(start, end):
+    expanded.add_component(event)
+  return expanded
+<<imports>>=
+import recurring_ical_events
+@
+
+Let's verify both behaviours with a weekly event: a window covering
+three occurrences yields three events, while no window preserves the
+single master event.
+<<test functions>>=
+def make_recurring_ics():
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Weekly meeting
+DTSTART:20240115T100000Z
+DTEND:20240115T110000Z
+RRULE:FREQ=WEEKLY;COUNT=10
+END:VEVENT
+END:VCALENDAR"""
+
+def test_window_expands_recurrences(tmp_path):
+  path = tmp_path / "recurring.ics"
+  path.write_text(make_recurring_ics())
+  window = (datetime.datetime(2024, 1, 15).astimezone(),
+            datetime.datetime(2024, 1, 29, 23, 59).astimezone())
+  cal = read_calendar(str(path), window=window)
+  assert len(cal.events) == 3
+  starts = sorted(event.start.date() for event in cal.events)
+  assert starts == [datetime.date(2024, 1, 15),
+                    datetime.date(2024, 1, 22),
+                    datetime.date(2024, 1, 29)]
+
+def test_no_window_keeps_master_event(tmp_path):
+  path = tmp_path / "recurring.ics"
+  path.write_text(make_recurring_ics())
+  cal = read_calendar(str(path))
+  assert len(cal.events) == 1
 @
 
 \subsection{Iterating events in chronological order}
