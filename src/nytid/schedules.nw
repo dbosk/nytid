@@ -348,20 +348,48 @@ We support both using one function so the rest of the system can work with a
 uniform calendar representation.
 For HTTP requests we use the authenticated session from [[ladok3]], since
 some calendar URLs (notably TimeEdit) require KTH SSO authentication.
+
+That authenticated session is also why the HTTP path is slow: every
+fetch may involve a full SSO handshake on top of the network round
+trip.
+Callers that read the same feeds repeatedly---most notably
+[[nytid schedule show]]---can therefore pass a [[CalendarCache]]
+policy object (\cref{CachingExternalCalendars}) to reuse recently
+fetched data from disk.
+The default [[cache=None]] keeps the old always-fetch behaviour, so
+existing callers are unaffected.
+Local files are never cached: reading them is already cheap, and
+caching them would only risk staleness.
 <<functions>>=
-def read_calendar(source):
+def read_calendar(source, cache=None):
   """
-  Input: source is a URL or file path to an ICS-formatted calendar.
-  Output: an [[ics.icalendar.Calendar]] object.
+  Reads an ICS-formatted calendar from `source`, a URL or file path.
+  `cache` is an optional `CalendarCache` policy controlling on-disk
+  caching of HTTP(S) sources; `None` (the default) disables caching.
+  Returns an `ics.icalendar.Calendar` object.
   """
   if source.startswith(("http://", "https://")):
-    response = ladok3.session.session.get(source)
-    if response.status_code == requests.codes.ok:
-      return ics.icalendar.Calendar(imports=response.text)
-    raise Exception(response.text)
+    <<return calendar fetched over HTTP, honouring [[cache]]>>
 
   with open(source, "r") as icsfile:
     return ics.icalendar.Calendar(imports=icsfile.read())
+@
+
+The HTTP GET itself is factored into [[fetch_ics]].
+The cache logic in \cref{CachingExternalCalendars} must distinguish
+\enquote{fetch failed} (fall back to a stale copy) from other errors;
+that test is easiest when fetching is a single function whose only
+failure mode is raising.
+<<functions>>=
+def fetch_ics(source):
+  """
+  Fetches ICS text from the HTTP(S) URL `source`.
+  Returns the response body; raises on any failure.
+  """
+  response = ladok3.session.session.get(source)
+  if response.status_code == requests.codes.ok:
+    return response.text
+  raise Exception(response.text)
 <<imports>>=
 import requests
 import ladok3
@@ -372,16 +400,21 @@ schedule plus several teaching assistants' personal calendars---a single
 unreachable URL should not abort the entire operation.
 We therefore skip failing sources and emit a warning, so the caller gets the
 best available picture rather than nothing.
+With caching enabled, this skip is the last resort:
+[[read_calendar]] first falls back to a stale cached copy
+(\cref{CachingExternalCalendars}), so only sources that fail
+\emph{and} have never been cached end up here.
 <<functions>>=
-def read_calendars(sources):
+def read_calendars(sources, cache=None):
   """
   Reads and merges several calendar sources.
+  `cache` is passed on to `read_calendar` for each source.
   Sources that cannot be read are skipped with a warning.
   """
   calendar = ics.icalendar.Calendar()
   for source in sources:
     try:
-      source_calendar = read_calendar(source)
+      source_calendar = read_calendar(source, cache=cache)
       calendar.events.update(source_calendar.events)
     except Exception as err:
       logging.warning(f"Can't read calendar source {source}: {err}")
@@ -466,6 +499,351 @@ END:VCALENDAR"""
     mock_read.side_effect = [ok, Exception("boom")]
     merged = read_calendars(["one", "two"])
     assert len(merged.events) == 1
+@
+
+These tests call [[read_calendar]] without a [[cache]] argument, so
+they double as regression tests that the default behaviour---always
+fetch, never touch the disk cache---survives the caching additions
+below.
+
+
+\subsection{Caching external calendars on disk}
+\label{CachingExternalCalendars}
+
+External calendar feeds change on the scale of days, but
+[[nytid schedule show]] is run many times per day.
+Refetching every feed on every run---each fetch potentially paying for
+an SSO handshake---makes the command noticeably slow, so we cache the
+fetched ICS text on disk and reuse it while it is younger than a
+time-to-live (TTL).
+
+We cache the raw text rather than parsed calendar objects: the cache
+files are then ordinary [[.ics]] files that the user can inspect with
+a text editor, and the cache format stays independent of the [[ics]]
+library's internals.
+
+The mechanics live here in the library, but the policy---how long a
+copy stays fresh, and whether to consult the cache at all---belongs to
+the caller: the CLI reads the TTL from the user's configuration, which
+this config-free library cannot do.
+The policy travels as a small value object.
+The [[read]] flag exists for the CLI's [[--no-cache]] option: it
+suppresses \emph{reading} the cache but not writing it, so a forced
+refresh still benefits later runs.
+<<functions>>=
+@dataclasses.dataclass
+class CalendarCache:
+  """
+  Caching policy for `read_calendar` and `read_calendars`.
+
+  ttl: maximum age in seconds before a cached copy is stale.
+  read: if False, ignore cached copies when reading, but still
+    write fetched data back to the cache.
+  """
+  ttl: float = 3600.0
+  read: bool = True
+<<imports>>=
+import dataclasses
+@
+
+With the policy in place, the HTTP path of [[read_calendar]] reads:
+try a fresh cached copy, otherwise fetch and cache.
+If the fetch fails and any cached copy exists---even one older than
+the TTL---we use it with a warning: when the network or SSO is down,
+a stale schedule is more useful than no schedule.
+Only when there is no cached copy at all do we re-raise, which
+preserves the failure behaviour that [[read_calendars]] relies on to
+skip dead sources.
+
+We parse the fetched text \emph{before} writing it to the cache, so
+the cache only ever holds text that has proven to parse as ICS.
+The order matters because a failed fetch does not always raise: an
+expired SSO session can yield a 200 response whose body is a login
+page, not a calendar.
+Cached before parsing, that page would be served---and fail to
+parse---on every run for a whole TTL, without a refetch ever being
+attempted; parsed first, the bad response raises and leaves any
+previously cached copy intact.
+<<return calendar fetched over HTTP, honouring [[cache]]>>=
+if cache is None:
+  return ics.icalendar.Calendar(imports=fetch_ics(source))
+
+path = _cache_path(source)
+if cache.read:
+  cached = _read_cache(path, cache.ttl)
+  if cached is not None:
+    return ics.icalendar.Calendar(imports=cached)
+
+try:
+  text = fetch_ics(source)
+except Exception as err:
+  stale = _read_cache_stale(path)
+  if stale is None:
+    raise
+  logging.warning(f"Can't fetch {source}, "
+                  f"using stale cached copy: {err}")
+  return ics.icalendar.Calendar(imports=stale)
+
+calendar = ics.icalendar.Calendar(imports=text)
+_write_cache(path, text)
+return calendar
+@
+
+The cache lives in [[~/.nytid/ics_cache]], following the same
+convention as [[~/.nytid/todos]] and [[~/.nytid/tracking]].
+We expose the location as a function rather than a module constant so
+that tests can monkeypatch it to a temporary directory without
+touching the user's real cache.
+<<functions>>=
+def cache_dir():
+  """
+  Returns the directory (a `pathlib.Path`) holding cached external
+  ICS files.
+  """
+  return pathlib.Path.home() / ".nytid" / "ics_cache"
+<<imports>>=
+import pathlib
+@
+
+Cache files are named by the SHA-256 digest of the source URL.
+URLs contain characters that are unsafe in file names ([[/]], [[?]],
+[[&]]); hashing gives a fixed-length, collision-resistant name
+without any escaping scheme.
+The [[.ics]] suffix keeps the files recognizable and lets
+[[clear_cache]] (\cref{ClearingTheCache}) glob for exactly the files
+we created.
+<<functions>>=
+def _cache_path(source):
+  digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+  return cache_dir() / f"{digest}.ics"
+<<imports>>=
+import hashlib
+@
+
+Freshness is judged by the cache file's modification time, so we need
+no sidecar metadata: the file system already records when we wrote
+the file.
+[[_read_cache]] enforces the TTL; [[_read_cache_stale]] ignores it,
+serving the fallback path above.
+Both return [[None]] when there is no usable copy---a missing or
+unreadable file is a cache miss, never an error---letting the caller
+decide what to do next.
+<<functions>>=
+def _read_cache(path, ttl):
+  try:
+    if time.time() - path.stat().st_mtime > ttl:
+      return None
+    return path.read_text()
+  except OSError:
+    return None
+
+def _read_cache_stale(path):
+  try:
+    return path.read_text()
+  except OSError:
+    return None
+<<imports>>=
+import time
+@
+
+Writing the cache is best-effort: a read-only home directory or a
+full disk should cost us the speedup, not break [[schedule show]].
+<<functions>>=
+def _write_cache(path, text):
+  try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+  except OSError as err:
+    logging.warning(f"Can't write ICS cache {path}: {err}")
+@
+
+\subsection{Testing the calendar cache}
+
+We verify the cache behaviour matrix: a fresh copy avoids the
+network, a miss populates the cache, an expired copy and
+[[read=False]] both force a refetch, an unparseable response is
+never written to the cache, and a failed fetch falls back to a stale
+copy only when one exists.
+Every test monkeypatches [[cache_dir]] to a temporary directory so it
+never touches the user's real cache.
+The disk copy is always named [[Cached Event]] and the network copy
+[[Fetched Event]], so the assertions can tell which copy was used,
+and the only thing that differs between tests is the scenario.
+<<test functions>>=
+def test_cache_hit_skips_fetch(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  cache_file = nytid.schedules._cache_path(url)
+  cache_file.parent.mkdir(parents=True, exist_ok=True)
+  cache_file.write_text(make_ics("Cached Event"))
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    cal = read_calendar(url, cache=CalendarCache())
+    mock_ladok.session.session.get.assert_not_called()
+  assert any(event.name == "Cached Event" for event in cal.events)
+
+def test_cache_miss_fetches_and_writes(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  mock_response = MagicMock()
+  mock_response.status_code = 200
+  mock_response.text = make_ics("Fetched Event")
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    cal = read_calendar(url, cache=CalendarCache())
+  assert any(event.name == "Fetched Event" for event in cal.events)
+  cached = nytid.schedules._cache_path(url)
+  assert cached.read_text() == make_ics("Fetched Event")
+
+def test_cache_expired_refetches(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  cache_file = nytid.schedules._cache_path(url)
+  cache_file.parent.mkdir(parents=True, exist_ok=True)
+  cache_file.write_text(make_ics("Cached Event"))
+  expired = time.time() - 7200
+  os.utime(cache_file, (expired, expired))
+
+  mock_response = MagicMock()
+  mock_response.status_code = 200
+  mock_response.text = make_ics("Fetched Event")
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    cal = read_calendar(url, cache=CalendarCache(ttl=3600))
+  assert any(event.name == "Fetched Event" for event in cal.events)
+@
+
+A 200 response that is not ICS---the SSO login page case---must not
+poison the cache: the parse error propagates and no cache file is
+written.
+<<test functions>>=
+def test_unparseable_response_not_cached(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  mock_response = MagicMock()
+  mock_response.status_code = 200
+  mock_response.text = "<html>Please log in</html>"
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    with pytest.raises(Exception):
+      read_calendar(url, cache=CalendarCache())
+  assert not nytid.schedules._cache_path(url).exists()
+@
+
+The [[--no-cache]] flag maps to [[read=False]]: the fresh cached copy
+must be ignored, but the refetched data must overwrite it.
+<<test functions>>=
+def test_no_cache_read_bypasses_but_writes(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  cache_file = nytid.schedules._cache_path(url)
+  cache_file.parent.mkdir(parents=True, exist_ok=True)
+  cache_file.write_text(make_ics("Cached Event"))
+
+  mock_response = MagicMock()
+  mock_response.status_code = 200
+  mock_response.text = make_ics("Fetched Event")
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    cal = read_calendar(url, cache=CalendarCache(read=False))
+  assert any(event.name == "Fetched Event" for event in cal.events)
+  assert cache_file.read_text() == make_ics("Fetched Event")
+@
+
+A failed fetch with an expired copy on disk yields the stale copy and
+a warning; without any copy, the failure propagates as before, so
+[[read_calendars]] still skips the source.
+<<test functions>>=
+def test_stale_fallback_on_fetch_failure(tmp_path, monkeypatch,
+                                         caplog):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  url = "https://example.com/cal.ics"
+  cache_file = nytid.schedules._cache_path(url)
+  cache_file.parent.mkdir(parents=True, exist_ok=True)
+  cache_file.write_text(make_ics("Cached Event"))
+  expired = time.time() - 7200
+  os.utime(cache_file, (expired, expired))
+
+  mock_response = MagicMock()
+  mock_response.status_code = 404
+  mock_response.text = "Not Found"
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    cal = read_calendar(url, cache=CalendarCache(ttl=3600))
+  assert any(event.name == "Cached Event" for event in cal.events)
+  assert "stale" in caplog.text
+
+def test_fetch_failure_without_cache_raises(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  mock_response = MagicMock()
+  mock_response.status_code = 404
+  mock_response.text = "Not Found"
+
+  with patch("nytid.schedules.ladok3") as mock_ladok:
+    mock_ladok.session.session.get.return_value = mock_response
+    with pytest.raises(Exception, match="Not Found"):
+      read_calendar("https://example.com/notfound.ics",
+                    cache=CalendarCache())
+@
+
+Local files bypass the cache entirely; not even the cache directory
+should be created.
+<<test functions>>=
+def test_local_file_not_cached(tmp_path, monkeypatch):
+  cache = tmp_path / "cache"
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: cache)
+  ics_path = tmp_path / "calendar.ics"
+  ics_path.write_text(make_ics("File Event"))
+
+  cal = read_calendar(str(ics_path), cache=CalendarCache())
+  assert len(cal.events) == 1
+  assert not cache.exists()
+@
+
+\subsection{Clearing the cache}
+\label{ClearingTheCache}
+
+Sometimes the user knows the cached copies are wrong---a course was
+rescheduled, or a feed URL started serving different content---and
+waiting out the TTL is not an option.
+The user-facing command [[nytid schedule external clear-cache]] wraps
+this function.
+We return the number of removed files so the CLI can report what
+happened.
+A missing cache directory simply means there is nothing to remove:
+[[glob]] on a non-existent directory yields nothing.
+<<functions>>=
+def clear_cache():
+  """
+  Deletes all cached external ICS files.
+  Returns the number of files removed.
+  """
+  removed = 0
+  for path in cache_dir().glob("*.ics"):
+    path.unlink()
+    removed += 1
+  return removed
+@
+
+Let's verify both the populated and the empty case:
+<<test functions>>=
+def test_clear_cache_removes_files(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir", lambda: tmp_path)
+  for number in range(3):
+    (tmp_path / f"{number}.ics").write_text("data")
+
+  assert clear_cache() == 3
+  assert list(tmp_path.glob("*.ics")) == []
+
+def test_clear_cache_missing_dir(tmp_path, monkeypatch):
+  monkeypatch.setattr("nytid.schedules.cache_dir",
+                      lambda: tmp_path / "absent")
+  assert clear_cache() == 0
 @
 
 
@@ -592,15 +970,23 @@ We use a fixed date so that week numbers and weekday names are deterministic.
 <<test [[schedules.py]]>>=
 import arrow as arrowlib
 import datetime
+import os
+import time
 import ics.event
 import pytest
 from unittest.mock import patch, MagicMock
 
+import nytid.schedules
 from nytid.schedules import *
 
 <<test helper: make event>>
+<<test helper: make ics>>
 <<test functions>>
 @
+
+We import [[nytid.schedules]] as a module---in addition to the star
+import---because the cache tests need the private [[_cache_path]]
+helper, which a star import does not bring in.
 
 To avoid duplicating event creation logic across tests, we provide a
 factory function.
@@ -621,4 +1007,20 @@ def make_event(name="Laboration",
   event.location = location
   event.description = description
   return event
+@
+
+The cache tests need ICS \emph{text} (the wire format) rather than
+event objects, and they need calendars that differ only in event name
+so the assertions can tell a cached copy from a fetched one.
+<<test helper: make ics>>=
+def make_ics(summary):
+  return f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:{summary}
+DTSTART:20240115T100000Z
+DTEND:20240115T120000Z
+END:VEVENT
+END:VCALENDAR"""
 @
