@@ -4,25 +4,27 @@ In this chapter we cover the [[nytid.signup.sheets]] module.
 The outline of the module is as follows:
 <<[[sheets.py]]>>=
 import csv
-from datetime import datetime
-import dateutil.tz
-import ics.attendee
-import ics.event
+from datetime import datetime, timezone
+import icalendar
+import logging
 import nytid.schedules
 import nytid.signup.utils
 import os
 from nytid.signup import sheets
 import re
-import requests
 import ladok3
 
 <<constants>>
-<<classes>>
 <<functions>>
 @
 
 Let's set up the tests.
+Note that the star import re-exports the module's own imports, so
+[[datetime]] here is the \emph{class} ([[from datetime import
+datetime]]), not the module.
 <<test [[sheets.py]]>>=
+import icalendar
+
 from nytid.signup.sheets import *
 
 <<test functions>>
@@ -36,6 +38,9 @@ sessions, \eg lab or tutorial sessions.
 It takes the course title (used for file name) and a URL to TimeEdit for the 
 course schedule.
 It outputs a CSV that can be imported to Google Sheets that the TAs can fill.
+Since the function returns nothing, we log the written file and its
+event count at INFO; with [[-v]] that confirms the sheet actually
+contains events before anyone imports it to Google Sheets.
 <<functions>>=
 def generate_signup_sheet(outfile, url,
                           needed_TAs=nytid.signup.utils.needed_TAs, 
@@ -69,6 +74,7 @@ def generate_signup_sheet(outfile, url,
         ["..."])
 
     csvout.writerows(rows)
+    logging.info(f"Wrote sign-up sheet {outfile} with {len(rows)} events")
 @
 
 To open the file for writing, we want to ensure that the directory exists.
@@ -83,13 +89,14 @@ except FileNotFoundError:
   out = open(outfile, "w")
 @
 
-To generate the rows of the sheet, we simply go through the calendar in 
-chronological order.
+To generate the rows of the sheet, we simply go through the calendar in
+chronological order, using [[nytid.schedules.timeline]] to sort the
+events.
 We want TAs to sign up for any event in the calendar.
 If we don't want any TAs, we can simply filter out those events from the 
 TimeEdit ICS export.
 <<generate [[rows]] of sign-up sheet>>=
-for event in event_filter(calendar.timeline):
+for event in event_filter(nytid.schedules.timeline(calendar)):
   num_TAs = needed_TAs(event)
 
   if num_TAs > max_num_TAs:
@@ -128,15 +135,15 @@ else:
 <<functions>>=
 def event_to_CSV(event):
   """
-  Input: event is an ics.event.Event object.
+  Input: event is an icalendar.Event object.
 
-  Output: a list of strings containing the event's attributes in the order 
+  Output: a list of strings containing the event's attributes in the order
   specified in SIGNUP_SHEET_HEADER.
   """
   return [
-    event.name,
-    event.begin.to("local").format(DATETIME_FORMAT),
-    event.end.to("local").format(DATETIME_FORMAT),
+    event.summary,
+    event.start.astimezone().strftime(STRPTIME_FORMAT),
+    event.end.astimezone().strftime(STRPTIME_FORMAT),
     event.location
   ]
 <<constants>>=
@@ -144,7 +151,6 @@ SIGNUP_SHEET_HEADER = [
   "Event", "Start", "End", "Rooms",
   "#Needed TAs"
 ]
-DATETIME_FORMAT = "YYYY-MM-DD HH:mm"
 STRPTIME_FORMAT = "%Y-%m-%d %H:%M"
 @
 
@@ -184,6 +190,9 @@ We provide two ways:
 \item read from a URL.
 \end{itemize}
 In both cases we want to return the rows of the CSV.
+Both readers log the number of rows read at INFO: when a sheet comes
+back empty further down the pipeline, [[-v]] tells apart an empty
+source from rows lost in later processing.
 
 \subsection{Reading from a file}
 
@@ -198,7 +207,9 @@ def read_signup_sheet_from_file(filename):
   """
   with open(filename, "r") as f:
     csvfile = csv.reader(f)
-    return list(filter(any, list(csvfile)[1:]))
+    rows = list(filter(any, list(csvfile)[1:]))
+  logging.info(f"Read {len(rows)} rows from sign-up sheet {filename}")
+  return rows
 @
 
 \subsection{Reading from a URL}
@@ -219,7 +230,9 @@ def read_signup_sheet_from_url(url):
 
   response.encoding = response.apparent_encoding
   csvdata = response.text.splitlines()
-  return list(filter(any, list(csv.reader(csvdata))[1:]))
+  rows = list(filter(any, list(csv.reader(csvdata))[1:]))
+  logging.info(f"Read {len(rows)} rows from sign-up sheet at {url}")
+  return rows
 @
 
 We also provide a function that takes the sharing URL of a publicly visible 
@@ -239,78 +252,86 @@ def google_sheet_to_csv_url(share_url):
   return url + "/export?format=csv"
 @
 
-\section{Converting between \texttt{ics.event.Event}s and CSV data}
+\section{Converting between \texttt{icalendar.Event}s and CSV data}
 
 Sometimes we want to convert this CSV-format back to a calendar.
-What we want to do is to be able to convert a row of this CSV (that corresponds 
-to an event) and convert it to an [[ics.event.Event]] object.
-We will introduce an [[EventFromCSV]] class that inherits from the standard 
-[[Event]] class.
-This is just to make constructing the objects easier.
-<<classes>>=
-class EventFromCSV(ics.event.Event):
-  """A class to create an ics.event.Event from an event in CSV format"""
-
-  def __init__(self, csv_row):
-    """
-    Input: a row from a calendar in CSV format (e.g. the sign-up sheet).
-    """
-    <<process CSV row, initialize attributes>>
+What we want to do is to be able to convert a row of this CSV (that corresponds
+to an event) and convert it to an [[icalendar.Event]] object.
+We provide a factory function [[EventFromCSV]].
+It used to be a class inheriting from the [[ics]] package's event class,
+but [[icalendar]] components are configured through properties on an
+already-constructed object rather than constructor arguments, so a
+factory function is the natural form.
+We keep the class-like name: every call site uses it as a constructor,
+[[map(sheets.EventFromCSV, rows)]], and that reading is still accurate.
+<<functions>>=
+def EventFromCSV(csv_row):
+  """
+  Creates an icalendar.Event from a row of a calendar in CSV format
+  (e.g. the sign-up sheet).
+  """
+  event = icalendar.Event()
+  <<process CSV row, initialize attributes>>
+  return event
 @
 
 The CSV from the sign-up sheet doesn't contain all the data as before.
-It only contains the event (type), start and end times and the TAs that will 
+It only contains the event (type), start and end times and the TAs that will
 attend.
 We can put the attributes number of rooms and needed TAs in the description.
+We build up the description in a plain string and assign it to the
+event once it's complete.
 <<process CSV row, initialize attributes>>=
-kwargs = dict()
+event.summary = csv_row[SIGNUP_SHEET_HEADER.index("Event")]
 
-kwargs["name"] = csv_row[SIGNUP_SHEET_HEADER.index("Event")]
-
-<<add begin and end to [[kwargs]]>>
+<<add begin and end to [[event]]>>
 
 rooms = csv_row[SIGNUP_SHEET_HEADER.index("Rooms")]
-kwargs["location"] = rooms
+event.location = rooms
 needed_TAs = csv_row[SIGNUP_SHEET_HEADER.index("#Needed TAs")]
-kwargs["description"] = f"Needed TAs: {needed_TAs}\n"
+description = f"Needed TAs: {needed_TAs}\n"
 
-<<add TAs to [[kwargs["attendees"]]]>>
+<<add TAs as attendees of [[event]]>>
 <<add attendees to description>>
 
-super().__init__(**kwargs)
+event.description = description
 @
 
 \subsection{Reading start and end}
 
-When we read the start and end time, we want to ensure they're interpreted in 
-the local timezone, since that's how they were written.
-However, it seems like we must set the [[begin]] and [[end]] attributes of the 
-event in UTC, hence the [[.astimezone(dateutil.tz.UTC)]].
-<<add begin and end to [[kwargs]]>>=
-tz = dateutil.tz.tzlocal()
-
+The sheet's times are written in local time (that's what
+[[event_to_CSV]] writes), so we parse them as naive datetimes and let
+[[astimezone]] interpret them in the local timezone.
+We store them in UTC, which is what the [[ics]]-based version of this
+code effectively did, so the serialized events are unchanged.
+(That version contained a decoy: it called [[begin.replace(tzinfo=tz)]]
+without using the result---[[replace]] returns a copy---so the
+conversion was always naive-local to UTC, exactly what the single
+[[astimezone]] call below does.)
+<<add begin and end to [[event]]>>=
 begin = datetime.strptime(csv_row[SIGNUP_SHEET_HEADER.index("Start")],
                           STRPTIME_FORMAT)
-begin.replace(tzinfo=tz)
-kwargs["begin"] = begin.astimezone(dateutil.tz.UTC)
+event.start = begin.astimezone(timezone.utc)
 
 end = datetime.strptime(csv_row[SIGNUP_SHEET_HEADER.index("End")],
                         STRPTIME_FORMAT)
-end.replace(tzinfo=tz)
-kwargs["end"] = end.astimezone(dateutil.tz.UTC)
+event.end = end.astimezone(timezone.utc)
 @
 
 \subsection{Attendees}
 
 If we need to add an attendee, that value is the KTH username.
-The attendee object requires an email, so we can easily form that from the 
-username, which we've done above.
-We might have an empty value, due to empty columns in the CSV, so we must 
+An ICS attendee is a calendar-user address---a [[mailto:]] URI---so we
+form one from the username.
+([[icalendar]] encodes the value as a [[vCalAddress]]; consumers
+reading attendees back strip the [[mailto:]] prefix to recover the
+address.)
+We might have an empty value, due to empty columns in the CSV, so we must
 filter those.
-<<add TAs to [[kwargs["attendees"]]]>>=
-kwargs["attendees"] = [ics.attendee.Attendee(f"{user}@kth.se")
-                       for user in csv_row[len(SIGNUP_SHEET_HEADER):]
-                       if user]
+<<add TAs as attendees of [[event]]>>=
+for user in csv_row[len(SIGNUP_SHEET_HEADER):]:
+  if user:
+    event.add("ATTENDEE", f"mailto:{user}@kth.se")
 @
 
 When we import this schedule in Google Calendar, we don't get the attendees.
@@ -328,19 +349,19 @@ TAs.
 <<add attendees to description>>=
 booked, reserves = sheets.get_booked_TAs_from_csv(csv_row)
 
-kwargs["description"] += "Booked TAs:"
+description += "Booked TAs:"
 if booked:
   for username in booked:
-    kwargs["description"] += f" {username}"
+    description += f" {username}"
 else:
-  kwargs["description"] += " None"
-kwargs["description"] += "\n"
+  description += " None"
+description += "\n"
 
 if reserves:
-  kwargs["description"] += "Reserve TAs:"
+  description += "Reserve TAs:"
   for username in reserves:
-    kwargs["description"] += f" {username}"
-  kwargs["description"] += "\n"
+    description += f" {username}"
+  description += "\n"
 @
 
 
@@ -652,16 +673,34 @@ This function extracts event attributes into a list matching the
 sign-up sheet header order.
 <<test functions>>=
 def test_event_to_CSV():
-  import arrow as arrowlib
-  event = ics.event.Event()
-  event.name = "Laboration"
-  event.begin = arrowlib.get("2024-01-15T10:00:00+01:00")
-  event.end = arrowlib.get("2024-01-15T12:00:00+01:00")
+  event = icalendar.Event()
+  event.summary = "Laboration"
+  event.start = datetime.fromisoformat("2024-01-15T10:00:00+01:00")
+  event.end = datetime.fromisoformat("2024-01-15T12:00:00+01:00")
   event.location = "D1"
   row = event_to_CSV(event)
   assert row[0] == "Laboration"
   assert "2024-01-15" in row[1]
   assert row[3] == "D1"
+@
+
+We also verify the opposite direction.
+[[EventFromCSV]] must produce timezone-aware times (the module-wide
+invariant) and expose the TAs both as attendees and in the
+description.
+<<test functions>>=
+def test_EventFromCSV():
+  row = ["Laboration", "2024-01-15 10:00", "2024-01-15 12:00",
+         "D1", "1", "alice", "bob"]
+  event = EventFromCSV(row)
+  assert event.summary == "Laboration"
+  assert event.start.tzinfo is not None
+  assert event.start.astimezone().hour == 10
+  attendees = event.get("ATTENDEE")
+  assert len(attendees) == 2
+  assert str(attendees[0]) == "mailto:alice@kth.se"
+  assert "Booked TAs: alice" in event.description
+  assert "Reserve TAs: bob" in event.description
 @
 
 
