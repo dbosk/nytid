@@ -8,6 +8,7 @@ MODULES+=	signupsheets.py
 MODULES+=	hr.py
 MODULES+=	track.py
 MODULES+=	todo.py
+MODULES+=	zulip.py
 
 EXTRAS+=	nytid.hourly.sh
 EXTRAS+=	nytid.daily.sh

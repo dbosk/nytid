@@ -1,0 +1,246 @@
+\chapter{The \texttt{cli.zulip} module and the \texttt{zulip} subcommands}%
+\label{cli.zulip}
+
+In this chapter we introduce the subcommands found under [[nytid zulip]],
+the [[cli.zulip]] module.
+They let us drive a course's Zulip bot---send messages, manage streams and
+topics, read unread messages, and run an event-loop bot---directly from
+[[nytid]].
+
+\section{Why this lives in nytid, and what it reuses}
+
+Zulip is the team-chat platform we use to communicate with the TAs of a
+course.
+A bot acts through Zulip's HTTP API using an \emph{API key}, and Zulip issues
+a \emph{separate} key per organization.
+We run one Zulip organization per course, so the credentials differ from
+course to course.
+That is the whole reason this belongs in [[nytid]]: [[nytid]] already knows
+how to find a course and where that course keeps its data, so it is the
+natural place to pick the right Zulip credentials for the course at hand.
+
+We do \emph{not} reimplement any Zulip operations here.
+The [[zulipcli]] package\footnote{%
+  A sibling literate-programming project by the same author.
+} already implements them, and it exposes [[build_embedded_app]] precisely so
+that a host program can mount its command set.
+Contrast the two ways [[zulipcli]] runs:
+\begin{description}
+\item[Standalone] the [[zulipcli]] command reads credentials from
+  [[~/.zuliprc]], the single zuliprc of the invoking user.
+\item[Embedded] mounted inside a host like [[nytid]], it instead reads the
+  zuliprc path that the host stores in [[ctx.obj["zuliprc"]]] on the root
+  context, before any subcommand runs.
+\end{description}
+So the only nytid-specific work is to translate a course (and the register it
+lives in) into \emph{that course's} zuliprc path, and hand it to
+[[zulipcli]] through the context.
+
+\paragraph{Where a course's zuliprc lives.}
+We keep a real [[zuliprc]] file in the course's own directory, next to its
+[[config.json]] (see \cref{cli.courses}).
+This keeps the bot's secret together with the rest of the course's shared
+state: a co-teacher who accesses the course through a shared register---or
+through the symlinks in the [[mine]] register---gets the same bot identity for
+free.
+We deliberately do \emph{not} store the API key as a value inside
+[[config.json]]: a [[zuliprc]] is the native INI format that [[zulipcli]] and
+the underlying [[zulip]] client already expect, so no transformation and no
+temporary-file handling of secrets is needed.
+
+\section{Reusing the \texttt{zulipcli} command set}
+
+The module's structure differs from the other command modules in one telling
+way.
+Elsewhere we write [[cli = typer.Typer(name=...)]] and then add our own
+subcommands.
+Here the subcommands are not ours, so our [[cli]] \emph{is} the embedded
+[[zulipcli]] app; we only rename it and replace its placeholder callback.
+<<[[zulip.py]]>>=
+"""The nytid zulip command: drive a course's Zulip bot."""
+
+import logging
+import pathlib
+import typer
+import typerconf
+from typing import Annotated
+
+from zulipcli.cli import build_embedded_app
+
+from nytid import courses as courseutils
+from nytid.courses import registry
+from nytid.cli import courses as coursescli
+
+<<constants>>
+
+cli = build_embedded_app(help=<<zulip help text>>)
+<<name the embedded app [[zulip]]>>
+
+<<argument and option definitions>>
+<<the course-selection callback>>
+<<helper functions>>
+
+if __name__ == "__main__":
+  cli()
+@
+
+The auto-discovery in \cref{climodule} registers each module with
+[[cli.add_typer(module.cli)]]---without passing a name---so it reads the name
+from [[module.cli.info.name]].
+The standalone [[build_embedded_app]] leaves that name unset, so we set it
+ourselves; this is what makes the command group appear as [[nytid zulip]].
+<<name the embedded app [[zulip]]>>=
+cli.info.name = "zulip"
+@
+
+We can verify the wiring without touching the network: the module must expose
+a [[cli]] named [[zulip]] that already carries [[zulipcli]]'s commands.
+<<test [[clizulip.py]]>>=
+import pathlib
+import tempfile
+
+import pytest
+
+import nytid.cli.zulip as zulip_module
+from nytid.cli.zulip import *
+from nytid.courses import registry
+
+<<test functions>>
+@
+
+<<test functions>>=
+def test_cli_is_named_zulip_with_zulipcli_commands():
+  assert zulip_module.cli.info.name == "zulip"
+  command_names = {command.name
+                   for command in zulip_module.cli.registered_commands}
+  assert {"send", "dm", "streams", "topics", "read", "bot"} \
+      <= command_names
+@
+
+The help text frames the command around course selection, since that is the
+one thing a user must supply that the standalone tool does not need.
+<<zulip help text>>=
+(
+  "Drive a course's Zulip bot.\n\n"
+  "Send messages, manage streams and topics, read unread messages,\n"
+  "and run an event-loop bot, all authenticating as the Zulip bot\n"
+  "configured for a given course.  Select the course with --course.\n\n"
+  "Examples:\n\n\b"
+  "  nytid zulip --course prgi24 streams        # list the course's"
+  " streams\n"
+  "  nytid zulip --course prgi24 send --help    # how to send a message"
+)
+@
+
+\section{Selecting the course}
+
+The callback runs before every subcommand, so it is where we translate the
+chosen course into the zuliprc that [[zulipcli]] will read.
+Selection is an \emph{option} ([[--course]]) on the group rather than a
+positional argument, so the invocation reads
+[[nytid zulip --course prgi24 send ...]].
+We make it required: a bot always speaks as exactly one course's identity, so
+there is no sensible \enquote{all courses} default for sending messages.
+<<the course-selection callback>>=
+@cli.callback()
+def select_course(ctx: typer.Context,
+                  course: Annotated[str, course_opt],
+                  register: Annotated[str, coursescli.register_option]
+                      = coursescli.MINE):
+  """
+  Select the course whose Zulip bot to act as.
+
+  Every subcommand authenticates as the bot configured for `course`,
+  reading its credentials from a `zuliprc` file in the course's own
+  directory (next to its config.json).
+  """
+  try:
+    zuliprc = course_zuliprc(course, register)
+  except KeyError as err:
+    logging.error(err)
+    raise typer.Exit(1)
+  <<store [[zuliprc]] on the root context>>
+@
+
+The course option reuses the same completion as the rest of [[nytid]], so the
+shell suggests the same course nicknames here as for, say,
+[[nytid courses config]].
+We reuse [[register_option]] (\cref{cli.courses}) unchanged for [[--register]].
+<<argument and option definitions>>=
+course_opt = typer.Option(help="Nickname of the course whose Zulip "
+                               "credentials (zuliprc) to use.",
+                          autocompletion=coursescli.complete_course_name)
+@
+
+The subtle part is \emph{where} we store the path.
+[[zulipcli]] looks it up with [[ctx.find_root().obj["zuliprc"]]]---that is, on
+the topmost context, the [[nytid]] root, not on this [[zulip]] group's
+context.
+The root callback in \cref{climodule} never creates [[obj]], so it is [[None]]
+until we set it; we create the dict on the root and write the path there.
+Storing it anywhere else would leave [[zulipcli]] reading [[None]] and falling
+back to [[~/.zuliprc]]---the wrong identity.
+<<store [[zuliprc]] on the root context>>=
+root = ctx.find_root()
+if root.obj is None:
+  root.obj = {}
+root.obj["zuliprc"] = str(zuliprc)
+@
+
+\section{Locating a course's zuliprc}
+
+The path resolution mirrors how [[get_course_config]] (\cref{cli.courses})
+finds a course's [[config.json]]: we ask the registry for the register's
+directory, let [[get_course_conf_path]] resolve (and uniquely identify) the
+course within it, and then take the sibling [[zuliprc]] in the same directory.
+Reusing [[get_course_conf_path]] means we inherit its uniqueness check and its
+[[KeyError]] for an unknown course, which the callback turns into a clean exit.
+
+We accept a [[config]] argument---defaulting to the global [[typerconf]]
+configuration, exactly as the [[courses]] library functions do---so the test
+suite can point us at a throwaway registry instead of the user's real one.
+<<helper functions>>=
+def course_zuliprc(course: str,
+                   register: str = coursescli.MINE,
+                   config: typerconf.Config = typerconf) -> pathlib.Path:
+  """
+  Return the path to `course`'s zuliprc file.
+
+  The file lives in the course's own directory, next to its
+  config.json, so the course's bot authenticates with that course's
+  own Zulip API key.  `register` names the course register to search;
+  it defaults to the personal `mine` register.  Raises `KeyError` if
+  `course` is not found there.
+
+  The default `config` is the global typerconf configuration.
+  """
+  register_map = {register: registry.get(register, config=config)}
+  conf_path = courseutils.get_course_conf_path(course, register_map)
+  return pathlib.Path(conf_path).parent / ZULIPRC_FILENAME
+@
+
+<<constants>>=
+ZULIPRC_FILENAME = "zuliprc"
+@
+
+A course directory holds [[config.json]]; the zuliprc is its sibling.
+<<test functions>>=
+def test_course_zuliprc_in_course_dir(tmp_path):
+  config = typerconf.Config()
+  registry.add("reg", str(tmp_path), config=config)
+  (tmp_path / "somecourse").mkdir()
+
+  path = course_zuliprc("somecourse", "reg", config=config)
+  assert path == tmp_path / "somecourse" / ZULIPRC_FILENAME
+@
+
+An unknown course has no directory to resolve, so the lookup raises
+[[KeyError]]; the callback relies on this to exit cleanly.
+<<test functions>>=
+def test_course_zuliprc_unknown_course(tmp_path):
+  config = typerconf.Config()
+  registry.add("reg", str(tmp_path), config=config)
+
+  with pytest.raises(KeyError):
+    course_zuliprc("nonexistent", "reg", config=config)
+@
