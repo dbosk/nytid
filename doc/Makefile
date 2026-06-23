@@ -37,6 +37,11 @@ FIGS+=		figs/timesheet-dbosk.pdf
 FIGS+=		figs/timeedit-csv-export.png
 
 DEPENDS+=	didactic.sty
+# minted highlights the woven code with a per-language Pygments lexer
+# (noweb_lexer.py:Noweb<Lang>Lexer) emitted by noweave's tominted filter, so the
+# lexer module must sit next to the PDF build. It ships with the makefiles
+# submodule; copy it in.
+DEPENDS+=	noweb_lexer.py
 
 nytid.pdf: preamble.tex abstract.tex ../LICENSE ${FIGS}
 nytid.pdf: ${DEPENDS}
@@ -53,7 +58,7 @@ ${FIGS}:
 
 .PHONY: clean
 clean:
-	${RM} nytid.pdf
+	${RM} nytid.pdf noweb_lexer.py
 	#${MAKE} -C ../src/nytid/cli clean
 	${MAKE} -C ../src/nytid clean
 	${MAKE} -C figs clean
@@ -69,5 +74,9 @@ distclean:
 
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
+include ${INCLUDE_MAKEFILES}/noweb.mk
+
+NOWEAVEFLAGS.tex+=-langrule 'sending signed time sheets=bash'
+
 INCLUDE_DIDACTIC=didactic
 include ${INCLUDE_DIDACTIC}/didactic.mk
