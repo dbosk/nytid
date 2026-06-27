@@ -2346,8 +2346,12 @@ the discard and restart happen against fresh on-disk state rather than
 against this earlier snapshot.
 
 When [[start]] launches a command or tmux shell, it may need to derive one
-extra label from the command name, validate tmux usage, and choose between
-the plain tmux shell path and the prompted direct-shell path.
+extra label from the command name and validate tmux usage.  When no
+command was named, [[build_launch_shell]] picks the shell---plain tmux
+or prompted direct---and seeds the prompt context as part of building
+it.  An explicit command builds no shell, so there we seed the context
+into its environment ourselves; it is harmless for a non-shell command
+and lets an explicitly launched shell still show the marker.
 
 Launch mode also needs a clear ownership rule for labels.  If a label is
 already active and we launch a child process without saying what should
@@ -2399,7 +2403,9 @@ likely overwrite [[PS1]] during normal startup, so the tmux window name is
 the primary context indicator for pane and window launches.
 
 <<prepare launch mode>>=
-launch_requested = command_args is not None or pane or window
+launch_requested = (
+    command_args is not None or pane or window or bool(wd_path)
+)
 tracking_labels = list(labels)
 explicit_launch_labels = list(tracking_labels)
 inherited_context_labels = []
@@ -2505,11 +2511,14 @@ if launch_requested:
         )
         raise typer.Exit(1)
 
-    if command_args is not None:
+    if command_args is None:
+        command_args, prompt_file, prompt_dir = \
+            build_launch_shell(
+                launch_context, proc_env,
+                tmux=bool(pane or window),
+            )
+    else:
         apply_context_prompt(launch_context, proc_env)
-    elif pane or window:
-        apply_context_prompt(launch_context, proc_env)
-        command_args = build_plain_shell_command(proc_env)
 
     if window:
         window_name = launch_context
@@ -2899,8 +2908,24 @@ wd_path: Annotated[str | None,
                    wd_opt] = None,
 @
 
+Used \emph{alone}---with no command, [[--pane]], or [[--window]]---the
+[[--wd]] option still launches something: a tracked shell in the
+current terminal, rooted at the requested directory.  This is the
+current-terminal counterpart of [[--window]], which opens that same
+tracked shell in a new tmux window.  We cannot simply change directory
+for the user, because [[nytid]] runs as a child of their shell and a
+child can only change its own working directory, never its parent's.
+Spawning a subshell at the target directory is the only way to drop the
+user there while tracking runs, and tracking stops automatically when
+they leave that shell with [[exit]].  The shell is built through
+[[build_launch_shell]]---shared with [[todo start]]---which gives us a
+prompt-prefixed shell here, so the prompt advertises the active
+tracking context since without a tmux window name there is no other
+visible indicator.
+
 <<start command docstring examples>>=
 nytid track start grading --wd ~/courses/DD1310 -- vim
+nytid track start grading -C ~/courses/DD1310     # tracked shell there
 @
 
 The environment is always forwarded unconditionally to subprocesses,
@@ -2919,6 +2944,89 @@ if wd_path and not os.path.isdir(wd_path):
         err=True,
     )
     raise typer.Exit(1)
+@
+
+Let us verify the bare-[[--wd]] behaviour.  With no command and no tmux
+mode, [[--wd]] should still launch: a prompted shell rooted at the
+requested directory, run in the current terminal.  We patch
+[[subprocess.run]] so the shell is never really spawned and assert it
+was asked to run a shell with the directory as its working directory.
+
+<<test functions>>=
+def test_start_wd_only_spawns_prompted_shell(
+  temp_tracking_dir, tmp_path,
+):
+  """--wd alone launches a tracked shell in that directory."""
+  with patch.dict(
+    os.environ, {"SHELL": "/bin/bash"},
+  ):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+    ) as mock_run:
+      mock_run.return_value.returncode = 0
+      result = runner.invoke(
+        cli,
+        ["start", "work", "-C", str(tmp_path)],
+      )
+  assert result.exit_code == 0
+  assert "Started tracking: work" in result.stdout
+  mock_run.assert_called_once()
+  call_kwargs = mock_run.call_args.kwargs
+  assert call_kwargs["cwd"] == str(tmp_path)
+  launched = mock_run.call_args.args[0]
+  assert launched[0] == "/bin/bash"
+  assert "--init-file" in launched
+  # The announcement names the directory, not a tmux window,
+  # since this shell opens in the current terminal.
+  assert str(tmp_path) in result.stdout
+  assert "tmux window" not in result.stdout
+@
+
+A bare-[[--wd]] launch now reaches the early directory check, so a
+nonexistent path must fail before any tracking is recorded and before
+any shell is spawned.
+
+<<test functions>>=
+def test_start_wd_nonexistent_errors_before_launch(
+  temp_tracking_dir,
+):
+  """--wd with a missing directory errors before launching."""
+  with patch(
+    "nytid.cli.track.subprocess.run",
+  ) as mock_run:
+    result = runner.invoke(
+      cli,
+      ["start", "work", "-C", "/no/such/dir"],
+    )
+  assert result.exit_code == 1
+  assert "directory does not exist" in result.output
+  mock_run.assert_not_called()
+@
+
+On a shell we cannot write an init file for, the prompt marker comes
+from the seeded environment alone.  The caller seeds it once, so the
+forwarded [[PS1]] must carry exactly one context prefix---a regression
+guard against the old double-application in the fallback path.
+
+<<test functions>>=
+def test_start_wd_only_seeds_single_prompt_prefix(
+  temp_tracking_dir, tmp_path,
+):
+  """Fallback shells get exactly one context prefix in PS1."""
+  with patch.dict(
+    os.environ, {"SHELL": "/bin/sh"}, clear=True,
+  ):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+    ) as mock_run:
+      mock_run.return_value.returncode = 0
+      result = runner.invoke(
+        cli,
+        ["start", "work", "-C", str(tmp_path)],
+      )
+  assert result.exit_code == 0
+  env = mock_run.call_args.kwargs["env"]
+  assert env["PS1"] == "track:work \\w\\n$ "
 @
 
 \subsubsection{Calculating Start Time}
@@ -4292,8 +4400,9 @@ timeout_opt = typer.Option(
 )
 wd_opt = typer.Option(
     "--wd", "-C",
-    help="Working directory for "
-         "launched command",
+    help="Working directory for launched "
+         "command; alone, opens a tracked "
+         "shell there",
 )
 env_opt = typer.Option(
     "--env",
@@ -4533,17 +4642,35 @@ def build_plain_shell_command(
 @
 
 
-Direct interactive subprocesses still need one extra trick: run the
-user's usual shell init files, then prepend a context marker to the
-prompt without losing tab completion or other interactive setup.  We
-therefore keep a separate helper for the non-tmux case.
+Direct interactive subprocesses still need one extra trick.
+[[build_launch_shell]] has already seeded the context marker into
+[[env]]'s [[PS1]] (the same single application the tmux path relies
+on), but an interactive [[bash]] or [[zsh]] sources its init files at
+startup and reassigns [[PS1]], discarding that seed.  So for those two
+shells we write a temporary init file that sources the user's normal
+startup and \emph{then} re-prepends the marker to the resulting
+prompt---preserving completion and other interactive setup while making
+the marker stick.
+
+For any other shell we do not know the init-file convention, so we
+leave the already-seeded [[PS1]] as the best effort and add nothing:
+re-applying the marker here would double it, since
+[[build_launch_shell]] seeded it once already.  Keeping the seed in
+that one owner---rather than having every shell branch reapply it---is
+what avoids the double prefix.
 
 <<helper functions>>=
 def build_prompted_shell_command(
     prefix: str,
     env: dict[str, str],
 ) -> tuple[list[str], str | None, str | None]:
-    """Return a shell command with a prefixed prompt."""
+    """Return a shell command with a prefixed prompt.
+
+    ``env['PS1']`` is expected to already carry the context marker
+    (``build_launch_shell`` seeds it); for bash and zsh we
+    additionally write a temporary init file so an interactive
+    startup does not discard it.
+    """
     shell = env.get("SHELL") or os.environ.get(
         "SHELL", "/bin/sh"
     )
@@ -4570,9 +4697,48 @@ def build_prompted_shell_command(
         env["ZDOTDIR"] = prompt_dir
         return [shell], None, prompt_dir
 
-    apply_context_prompt(prefix, env)
-
     return [shell], None, None
+@
+
+
+The two builders above answer the same question---\enquote{what shell
+do we launch when the user named no command?}---but the choice between
+them is identical everywhere it occurs: a tmux pane or window wants the
+plain login shell, while a launch in the caller's own terminal wants
+the prompt-prefixed shell.  Both [[track start]] and [[todo start]]
+faced this fork, so we lift the rule into one place rather than letting
+each command re-derive it.
+
+Building the shell and marking its prompt are the same concern, so this
+helper owns both: it seeds the context into [[env]]'s [[PS1]] and then
+returns the shell, rather than trusting each caller to remember to seed
+first.  That single seed is what every branch needs---the plain tmux
+shell inherits it through the forwarded environment, and
+[[build_prompted_shell_command]] makes it stick across an interactive
+[[bash]] or [[zsh]] startup.  We return the same
+[[(command, prompt_file, prompt_dir)]] triple as
+[[build_prompted_shell_command]], with empty cleanup handles for the
+tmux branch, which needs none.
+
+<<helper functions>>=
+def build_launch_shell(
+    context_name: str,
+    env: dict[str, str],
+    *,
+    tmux: bool,
+) -> tuple[list[str], str | None, str | None]:
+    """Return the shell command for a no-command launch.
+
+    Seeds the context marker into ``env['PS1']``, then returns the
+    shell: a plain login shell for ``tmux`` launches, or a
+    prompt-prefixed shell for a direct launch in the caller's
+    terminal.  Returns ``(command, prompt_file, prompt_dir)``; the
+    latter two are ``None`` for the tmux case.
+    """
+    apply_context_prompt(context_name, env)
+    if tmux:
+        return build_plain_shell_command(env), None, None
+    return build_prompted_shell_command(context_name, env)
 @
 
 
@@ -8161,6 +8327,13 @@ if launch_requested:
     raise typer.Exit(exit_code)
 @
 
+We tell the user where the launch went, and the four destinations are
+distinct: an explicit command, a tmux pane, a tmux window, or---for a
+bare [[--wd]]---a shell in the current terminal.  The last case must
+not be folded into the tmux-window branch: it has no tmux window at
+all, so we name the directory the shell opened in instead, which is the
+whole reason that launch exists.
+
 <<announce launch>>=
 if command_text is not None:
     typer.echo(
@@ -8172,9 +8345,14 @@ elif pane:
         f"Opening tracked shell in tmux pane with "
         f"labels: {', '.join(sorted(launch_owned_labels))}"
     )
-else:
+elif window:
     typer.echo(
         f"Opening tracked shell in tmux window with "
+        f"labels: {', '.join(sorted(launch_owned_labels))}"
+    )
+else:
+    typer.echo(
+        f"Opening tracked shell in {proc_cwd} with "
         f"labels: {', '.join(sorted(launch_owned_labels))}"
     )
 @
@@ -8269,6 +8447,14 @@ For the direct subprocess branch, we ignore [[SIGINT]] in the
 parent (see the signal handling discussion above) and optionally apply
 a timeout.
 
+We forward [[proc_env]] explicitly rather than relying on inheritance.
+The bare [[--wd]] shell stores its prompt context there (and, for zsh,
+a [[ZDOTDIR]] pointing at the temporary [[.zshrc]]); inheriting the
+parent's environment alone would drop those additions and the tracking
+marker would silently vanish from the prompt.  This matches the tmux
+launch path and [[todo]]'s direct launch, which already pass
+[[env=proc_env]].
+
 <<run direct subprocess>>=
 old_sigint = signal.signal(
     signal.SIGINT, signal.SIG_IGN
@@ -8282,6 +8468,7 @@ try:
         command_args,
         capture_output=False,
         cwd=proc_cwd,
+        env=proc_env,
         timeout=timeout_secs,
     )
     exit_code = result.returncode
