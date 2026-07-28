@@ -4525,6 +4525,44 @@ def test_status_with_batch_tracking(temp_tracking_dir):
 
 The notes command allows adding or updating notes/descriptions for any active label.
 
+Annotating a label is a read-modify-write of the session file, so it
+belongs behind [[mutate_worker_tracking_state]] like every other
+mutation.  Loading and saving directly would take a snapshot outside any
+lock and write it back later, and auto-suspend makes a competing writer
+ordinary rather than exotic: a [[pane-focus-out]] hook firing in between
+would have its work overwritten by a snapshot that still lists the
+suspended labels as active with their original start times.  The next
+stop would then record an interval overlapping the one the suspend
+already wrote---the same wall-clock time counted twice.
+
+The callback shape also gives us the answer we need: whether the label
+was active is decided inside the critical section, on state nobody else
+can be halfway through changing, so the message we print cannot describe
+a session that no longer exists.
+
+<<session management>>=
+def add_session_notes(
+    label: str,
+    notes: str,
+    *,
+    who: str = None,
+) -> tuple[bool, list[str]]:
+    """Annotate one active label under the tracking locks.
+
+    Returns whether the label was active, together with the
+    labels that were active at that moment.
+    """
+    outcome = {}
+
+    def update(session, history_entries):
+        outcome["added"] = session.add_notes(label, notes)
+        outcome["active"] = session.get_active_labels()
+        return session, history_entries
+
+    mutate_worker_tracking_state(update, who)
+    return outcome["added"], outcome["active"]
+@
+
 <<argument and option definitions>>=
 notes_label_arg = typer.Argument(
     ..., help="Label to add notes to",
@@ -4551,16 +4589,17 @@ def notes(
       nytid track notes DD1310 "Discussing course structure with TA"
       nytid track notes email "Answered student questions about lab 2"
     """
-    session = load_active_session(who)
+    added, active = add_session_notes(
+        label, note_text, who=who,
+    )
 
-    if not session.is_active():
+    if not active:
         typer.echo(
             "No active tracking session", err=True
         )
         raise typer.Exit(1)
 
-    if session.add_notes(label, note_text):
-        save_active_session(session, who)
+    if added:
         typer.echo(
             f"Added notes to '{label}': {note_text}"
         )
@@ -4569,12 +4608,55 @@ def notes(
             f"Label '{label}' is not currently "
             f"being tracked", err=True
         )
-        active = session.get_active_labels()
-        if active:
-            typer.echo(
-                f"Active labels: {', '.join(active)}"
-            )
+        typer.echo(
+            f"Active labels: {', '.join(active)}"
+        )
         raise typer.Exit(1)
+@
+
+The property worth pinning down is structural rather than observable
+from outside: the read and the write must happen inside one critical
+section.  We assert it where it is decided, by checking that the command
+reaches the session through [[mutate_worker_tracking_state]] at all---a
+future refactoring that reintroduces a bare load/save pair would fail
+here rather than in a rare interleaving nobody can reproduce:
+
+<<test functions>>=
+def test_notes_mutates_under_tracking_locks(temp_tracking_dir):
+  """Annotating goes through the shared locked mutation path."""
+  runner.invoke(cli, ["start", "A"])
+
+  real_mutate = mutate_worker_tracking_state
+  observed_workers = []
+
+  def recording_mutate(callback, who=None, post_update=None):
+    observed_workers.append(who)
+    return real_mutate(callback, who, post_update=post_update)
+
+  with patch(
+    "nytid.cli.track.mutate_worker_tracking_state",
+    side_effect=recording_mutate,
+  ):
+    result = runner.invoke(cli, ["notes", "A", "under lock"])
+
+  assert result.exit_code == 0
+  assert observed_workers == [default_username]
+  assert load_active_session().get_label_info("A")[1] == "under lock"
+
+def test_notes_rejects_inactive_label(temp_tracking_dir):
+  """Annotating an untracked label lists what is actually active."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["notes", "B", "text"])
+  assert result.exit_code == 1
+  assert "not currently being tracked" in result.output
+  assert "Active labels: A" in result.output
+
+def test_notes_without_session_fails(temp_tracking_dir):
+  """Annotating with nothing active reports the empty session."""
+  result = runner.invoke(cli, ["notes", "A", "text"])
+  assert result.exit_code == 1
+  assert "No active tracking session" in result.output
 @
 
 \subsection{Tmux-Managed Commands}
@@ -10822,6 +10904,7 @@ from nytid.cli.track import (
     AUTO_SUSPEND_CONFIG,
     TRACK_DEBUG_CONFIG,
     load_tracking_data, load_active_session,
+    mutate_worker_tracking_state,
     format_duration,
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
