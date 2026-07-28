@@ -527,6 +527,7 @@ target_value = "Test Tester"
 
 runner.invoke(cli, ["new", target_course, "--register", register])
 <<test imports>>=
+import logging
 import pathlib
 import tempfile
 from types import SimpleNamespace
@@ -1058,7 +1059,7 @@ def mine_add(course: Annotated[str, course_arg_autocomplete],
   if not alias:
     alias = course
 
-  <<set [[mine_path]] to the path of the mine register>>
+  mine_path = get_mine_path()
   <<exit if [[alias]] is already in [[mine_path]]>>
 
   <<set [[course_path]] to [[course]]'s path>>
@@ -1078,36 +1079,69 @@ except FileExistsError:
   sys.exit(1)
 @
 
-\subsection{Create the default mine register if it doesn't exist}
+\subsection{Getting at the mine register}
 
-When we attempt to get the [[mine_path]] from [[registry]], it might not exist 
-if it's the first time we use it.
-This means we want to create it in the default location.
-<<set [[mine_path]] to the path of the mine register>>=
-try:
-  mine_path = registry.get(MINE)
-except KeyError:
-  <<create the default mine register>>
-  mine_path = registry.get(MINE)
-@
+The [[mine]] register is unlike the others: nobody adds it deliberately,
+it appears the first time a course is added to it.
+That makes two states normal rather than exceptional---no register
+entry in the config, and an entry whose directory doesn't exist---and
+the register lives under the user's home directory, so both states
+arise routinely on a fresh machine or after dotfiles are restored
+without their data.
 
-Now, if the register doesn't exist, we want to create it in [[~/.nytid/mine]] 
-and add it to the registry.
-<<create the default mine register>>=
-home_path = pathlib.Path(os.environ["HOME"])
-registry.add(MINE, home_path / ".nytid/mine")
-mine_path = registry.get(MINE)
-os.makedirs(mine_path)
-logging.warning(f"Added register {MINE} and created its path {mine_path}.")
+All three [[mine]] subcommands need the same thing: a directory they
+can rely on.
+So rather than let each of them rediscover the register and each of
+them get the error handling slightly differently, we resolve it once,
+here.
+The function creates whatever is missing and, when it can't, reports it
+the way the rest of this module does---[[logging.error]] and
+[[sys.exit(1)]] rather than a traceback.
+We use [[pathlib.Path.home()]] instead of reading [[HOME]] directly, so
+that a process without that variable falls back to the password
+database rather than raising.
+<<helper functions>>=
+def get_mine_path():
+  """
+  Returns the path of the `mine` register, creating the register
+  entry and its directory if they don't exist.
+
+  Exits with an error message if the directory can't be created.
+  """
+  try:
+    mine_path = registry.get(MINE)
+  except KeyError:
+    mine_path = pathlib.Path.home() / ".nytid" / MINE
+    registry.add(MINE, mine_path)
+    logging.warning(f"Added register {MINE} at {mine_path}.")
+
+  try:
+    os.makedirs(mine_path, exist_ok=True)
+  except OSError as err:
+    logging.error(f"Can't use the {MINE} directory {mine_path}: {err}")
+    sys.exit(1)
+
+  return mine_path
 @
 
 \subsection{Check if the course is already among my courses}
 
-To check if the alias already exists among our courses, we simply iterate 
+To check if the alias already exists among our courses, we iterate
 through and look for such a filename.
+
+The comparison has to be against [[my_course.name]].
+[[registry.get]] returns a [[pathlib.Path]], so [[iterdir]] yields
+[[Path]] objects, and a [[Path]] never compares equal to a [[str]]---
+comparing them directly makes the check silently vacuous, which is what
+it used to be.
+The duplicate was then caught only by accident, further down, when
+[[os.symlink]] raised [[FileExistsError]]; that accident doesn't cover
+the case this check exists for, an [[alias]] that collides with a
+course added under a different name.
+The sibling [[mine_ls]] below already does it correctly.
 <<exit if [[alias]] is already in [[mine_path]]>>=
 for my_course in mine_path.iterdir():
-  if my_course == alias:
+  if my_course.name == alias:
     logging.error(f"{alias} is already among your courses.")
     sys.exit(1)
 @
@@ -1161,14 +1195,26 @@ course_path = registry.get(register) / course
 
 \subsection{Listing my courses}
 
+Listing goes through [[get_mine_path]] like the others, so an
+unconfigured or absent register is set up rather than reported as a
+[[KeyError]] traceback.
+That still leaves a directory that exists but can't be read---a
+permission problem the user has to fix themselves---so we say so
+plainly instead of letting the [[OSError]] surface raw.
 <<mine subcommands>>=
 @minecli.command(name="ls")
 def mine_ls():
   """
   Lists my courses.
   """
-  mine_path = registry.get(MINE)
-  for course in mine_path.iterdir():
+  mine_path = get_mine_path()
+  try:
+    my_courses = list(mine_path.iterdir())
+  except OSError as err:
+    logging.error(f"Can't list {mine_path}: {err}")
+    sys.exit(1)
+
+  for course in my_courses:
     print(course.name)
 @
 
@@ -1180,22 +1226,97 @@ def mine_rm(course: Annotated[str, my_course_arg]):
   """
   Removes a course from my courses.
   """
-  mine_path = registry.get(MINE)
+  mine_path = get_mine_path()
   try:
     os.unlink(mine_path / course)
   <<handle errors for trying to remove a course from mine>>
 <<argument and option definitions>>=
 my_course_arg = typer.Argument(help="The course in my courses.",
                                autocompletion=complete_my_course_arg)
+@
+
+Completion can't use [[get_mine_path]], even though it wants the same
+directory.
+A completer runs whenever the user presses \textsc{tab}, so it must
+neither create a register as a side effect nor call [[sys.exit]] in the
+middle of the shell's completion machinery.
+Instead it reads what is there and, if anything is missing or
+unreadable, offers nothing---the worst outcome being that the user
+types the name out in full.
+We materialise the courses inside the [[try]], because
+[[all_courses]] is a generator and would otherwise do its file-system
+work outside it (\cref{cli.courses}).
 <<helper functions>>=
 def complete_my_course_arg(incomplete: str) -> list[str]:
   """
-  Returns a list of courses in my courses that match `incomplete`.
+  Yields the courses in my courses that match `incomplete`.
+
+  Yields nothing when the `mine` register is missing or
+  unreadable; completion must never fail loudly.
   """
-  mine_path = registry.get(MINE)
-  for course in courses.all_courses(mine_path):
+  try:
+    my_courses = list(courses.all_courses(registry.get(MINE)))
+  except COURSE_ACCESS_ERRORS:
+    return
+
+  for course in my_courses:
     if course.startswith(incomplete):
       yield course
+@
+
+Let's verify the three claims above.
+Every test points [[HOME]] and the [[mine]] register at a temporary
+directory, and removes the register afterwards, so nothing here can
+reach the real [[~/.nytid]].
+
+The duplicate check must actually fire.
+We assert on the log rather than on the command output, because the
+module reports errors through [[logging]], which the Click runner does
+not capture:
+<<test functions>>=
+def test_mine_add_rejects_duplicate_alias(tmp_path, monkeypatch, caplog):
+  monkeypatch.setenv("HOME", str(tmp_path))
+  runner.invoke(cli, ["registry", "add", MINE, str(tmp_path / MINE)])
+  try:
+    assert runner.invoke(cli, ["mine", "add", target_course,
+                               register]).exit_code == 0
+
+    with caplog.at_level(logging.ERROR):
+      result = runner.invoke(cli, ["mine", "add", target_course, register])
+
+    assert result.exit_code == 1
+    assert "already among your courses" in caplog.text
+  finally:
+    runner.invoke(cli, ["registry", "rm", MINE])
+@
+
+A register whose directory was never created must be repaired by every
+subcommand rather than raising [[FileNotFoundError]]:
+<<test functions>>=
+def test_mine_commands_create_missing_directory(tmp_path, monkeypatch):
+  monkeypatch.setenv("HOME", str(tmp_path))
+  mine_dir = tmp_path / "never-created" / MINE
+  runner.invoke(cli, ["registry", "add", MINE, str(mine_dir)])
+  try:
+    assert runner.invoke(cli, ["mine", "ls"]).exit_code == 0
+    assert mine_dir.is_dir()
+
+    assert runner.invoke(cli, ["mine", "add", target_course,
+                               register]).exit_code == 0
+    assert (mine_dir / target_course).is_symlink()
+
+    assert runner.invoke(cli, ["mine", "rm", target_course]).exit_code == 0
+    assert not (mine_dir / target_course).exists()
+  finally:
+    runner.invoke(cli, ["registry", "rm", MINE])
+@
+
+Completion, by contrast, must stay silent and create nothing when the
+register isn't there at all:
+<<test functions>>=
+def test_complete_my_course_arg_without_register():
+  runner.invoke(cli, ["registry", "rm", MINE])
+  assert list(complete_my_course_arg("")) == []
 @
 
 There are several errors that can occur.
