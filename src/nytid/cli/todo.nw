@@ -130,6 +130,7 @@ cli = typer.Typer(
 )
 
 <<data model>>
+<<deadline helpers>>
 <<effective priority>>
 <<storage functions>>
 <<active stack helpers>>
@@ -469,6 +470,198 @@ def test_todo_item_from_dict_preserves_null_priority():
     assert item.priority is None
 @
 
+\section{Deadlines}
+
+A deadline enters the system as whatever string the user typed at the
+command line or in the editor buffer, and is then read back on every
+subsequent listing, ranking, and export.  Those two roles pull in
+opposite directions.  The write side wants to be \emph{strict}: at the
+moment of writing we still know which option produced the value, so a
+mistake can be reported against the flag the user just typed.  The read
+side wants to be \emph{forgiving}: by then the value sits in
+[[todos.json]] next to dozens of healthy items, and one bad timestamp
+must not take the whole list down with it.
+
+Doing only one of the two is not enough.  Validating on write alone
+leaves every todo file written by an older version---or edited by hand,
+which the plain-JSON storage format openly invites---able to crash
+[[ls]].  Being forgiving on read alone silently accepts
+[[--deadline tomorrow]] and then quietly ignores it forever.  So we do
+both, and share the one primitive they need: turning a stored string
+into a [[datetime]] that can be compared with the current time.
+
+\subsection{Comparable Timestamps}
+
+Two shapes of stored value defeat a direct comparison.  A string that is
+not ISO 8601 at all cannot be parsed.  A string that carries a UTC
+offset \emph{does} parse, but into an \emph{aware} [[datetime]], and
+Python refuses to subtract that from the \emph{naive}
+[[datetime.datetime.now()]] the rest of this module compares against.
+
+Converting an aware value to local time and then dropping its offset
+resolves the second case without distorting the first: the local
+wall-clock reading denotes the same instant, so ordering and
+time-remaining arithmetic are unchanged, and the result is
+commensurable with every other timestamp we hold.  Returning [[None]]
+rather than raising for unparseable input lets each caller decide what
+a missing timestamp means for it, instead of forcing every call site to
+wrap the parse in a [[try]] block.
+
+<<deadline helpers>>=
+def naive_local_datetime(value):
+    """Return `value` as a naive local-time datetime.
+
+    Accepts a datetime or an ISO 8601 string.  Aware
+    values are converted to local time and stripped of
+    their offset so that they can be compared with
+    `datetime.datetime.now()`.  Returns ``None`` when
+    the value is empty or is not a recognizable
+    timestamp.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.datetime.fromisoformat(
+                str(value)
+            )
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone().replace(tzinfo=None)
+@
+
+Let's verify all four cases: a naive string passes through unchanged,
+an aware string loses its offset while denoting the same instant, an
+already-parsed [[datetime]] is accepted directly, and unparseable
+input yields [[None]] instead of an exception.
+
+<<test functions>>=
+def test_naive_local_datetime_passes_naive_through():
+  """A naive ISO string parses unchanged."""
+  assert naive_local_datetime(
+    "2026-03-01T12:00:00"
+  ) == datetime.datetime(2026, 3, 1, 12, 0)
+
+
+def test_naive_local_datetime_strips_offset():
+  """An aware string becomes naive local time."""
+  aware = "2026-03-01T12:00:00+01:00"
+  expected = datetime.datetime.fromisoformat(
+    aware
+  ).astimezone().replace(tzinfo=None)
+  result = naive_local_datetime(aware)
+  assert result.tzinfo is None
+  assert result == expected
+
+
+def test_naive_local_datetime_accepts_datetime():
+  """An already-parsed datetime is accepted."""
+  when = datetime.datetime(2026, 3, 1, 12, 0)
+  assert naive_local_datetime(when) == when
+
+
+def test_naive_local_datetime_rejects_garbage():
+  """Unparseable input yields None, not an exception."""
+  assert naive_local_datetime("tomorrow") is None
+  assert naive_local_datetime("") is None
+  assert naive_local_datetime(None) is None
+@
+
+\subsection{Validating Deadlines at Write Time}
+
+Every command that stores a deadline routes it through
+[[normalize_deadline]], which is what makes the stored field
+trustworthy: it either becomes a string that
+[[datetime.datetime.fromisoformat]] will accept, or the command exits
+before writing anything.  Reporting the error here rather than at read
+time is the whole point---the user is looking at the deadline they just
+typed, so the message can name it.
+
+The bare calendar date is the shape people actually type, so we detect
+it exactly with [[strptime]] and return it untouched.  Preserving it
+keeps [[todo view]] and the editor buffer showing [[2026-03-01]]
+instead of a padded [[2026-03-01T00:00:00]], and an exact format match
+behaves identically on every supported Python version, unlike
+[[datetime.date.fromisoformat]], whose accepted syntax widened in
+Python~3.11.
+
+Anything else is stored as naive local time.  That matters beyond
+[[effective_priority]]: [[todo_display_sort_key]] orders the unranked
+tail by comparing deadline \emph{strings}, and a mixture of offsets
+would make that lexicographic comparison disagree with chronological
+order.
+
+<<deadline helpers>>=
+def normalize_deadline(value):
+    """Return `value` as a canonical deadline string.
+
+    A bare ``YYYY-MM-DD`` date is kept as written; any
+    other ISO 8601 timestamp is stored as naive local
+    time.  Returns ``None`` for ``None`` or an empty
+    string, and exits with an error when the value is
+    not a recognizable timestamp.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        datetime.datetime.strptime(text, "%Y-%m-%d")
+        return text
+    except ValueError:
+        pass
+    parsed = naive_local_datetime(text)
+    if parsed is None:
+        typer.echo(
+            f"Error: invalid deadline {text!r}; use "
+            "YYYY-MM-DD or an ISO 8601 datetime such "
+            "as 2026-03-01T17:00",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return parsed.isoformat()
+@
+
+Let's verify the three outcomes: a bare date survives verbatim, an
+offset-bearing timestamp is rewritten to naive local time, and prose
+input is rejected rather than stored.
+
+<<test functions>>=
+def test_normalize_deadline_keeps_bare_date():
+  """A YYYY-MM-DD deadline is stored as written."""
+  assert normalize_deadline("2026-03-01") == "2026-03-01"
+
+
+def test_normalize_deadline_strips_offset():
+  """An offset-bearing deadline becomes naive local."""
+  stored = normalize_deadline(
+    "2026-03-01T12:00:00+01:00"
+  )
+  assert "+" not in stored
+  assert datetime.datetime.fromisoformat(
+    stored
+  ) == datetime.datetime.fromisoformat(
+    "2026-03-01T12:00:00+01:00"
+  ).astimezone().replace(tzinfo=None)
+
+
+def test_normalize_deadline_rejects_prose():
+  """A non-ISO deadline exits instead of being stored."""
+  with pytest.raises(typer.Exit):
+    normalize_deadline("tomorrow")
+
+
+def test_normalize_deadline_passes_empty_through():
+  """Absent deadlines stay absent."""
+  assert normalize_deadline(None) is None
+  assert normalize_deadline("") is None
+@
+
 \section{Effective Priority}
 
 The effective priority determines display and scheduling order for
@@ -488,6 +681,24 @@ quadratic curve stays near zero until roughly the last third of the
 time span, then ramps up sharply---matching the human experience of
 \enquote{it's not urgent yet} followed by \enquote{this is due soon!}
 
+This function is on the read path of nearly every command, so it is
+also where a single malformed stored timestamp does the most damage.
+[[normalize_deadline]] keeps new writes clean, but a file written by an
+older version or edited by hand can still hold anything, and raising
+here would take down [[ls]], [[next]], [[export]], and
+[[schedule show --todo]] for \emph{all} items because of \emph{one}.
+We therefore treat the boost as a refinement that can be skipped: an
+unparseable deadline simply yields the base priority, so the item keeps
+its place in the ranking rather than crashing it.
+
+The [[created]] timestamp needs a different fallback, because it is
+only used to measure how long the item has been waiting.  When it is
+missing---it defaults to the empty string---we substitute the deadline
+itself, which drives [[total_span]] down to its one-day floor.  The
+resulting curve stays flat until the final day and still awards the
+full boost once the deadline has passed, so overdue work keeps
+surfacing even when we cannot tell how long it has been pending.
+
 <<effective priority>>=
 def effective_priority(
     item: TodoItem,
@@ -498,10 +709,13 @@ def effective_priority(
     Returns ``None`` when the stored base priority is
     unset. Otherwise returns base priority plus a
     deadline-based urgency boost that increases
-    quadratically as the deadline approaches.
+    quadratically as the deadline approaches.  An
+    unparseable stored deadline yields the base
+    priority instead of raising.
     """
     if now is None:
         now = datetime.datetime.now()
+    now = naive_local_datetime(now)
 
     if item.priority is None:
         return None
@@ -511,11 +725,12 @@ def effective_priority(
     if not item.deadline:
         return base
 
-    deadline_dt = datetime.datetime.fromisoformat(
-        item.deadline
-    )
-    created_dt = datetime.datetime.fromisoformat(
-        item.created
+    deadline_dt = naive_local_datetime(item.deadline)
+    if deadline_dt is None:
+        return base
+    created_dt = (
+        naive_local_datetime(item.created)
+        or deadline_dt
     )
 
     max_boost = get_max_boost()
@@ -612,6 +827,45 @@ def test_effective_priority_past_deadline():
     now = datetime.datetime(2026, 1, 20)
     result = effective_priority(item, now)
     assert result == 5.0 + DEFAULT_MAX_BOOST
+
+
+def test_effective_priority_ignores_bad_deadline():
+    """An unparseable deadline yields the base priority."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00",
+        deadline="tomorrow",
+    )
+    now = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, now) == 5.0
+
+
+def test_effective_priority_accepts_aware_deadline():
+    """A timezone-aware deadline does not break the math."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00",
+        deadline="2026-01-15T00:00:00+01:00",
+    )
+    now = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, now) == (
+        5.0 + DEFAULT_MAX_BOOST
+    )
+
+
+def test_effective_priority_without_created():
+    """A missing created timestamp still boosts overdue work."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="",
+        deadline="2026-01-15T00:00:00",
+    )
+    overdue = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, overdue) == (
+        5.0 + DEFAULT_MAX_BOOST
+    )
+    early = datetime.datetime(2026, 1, 1)
+    assert effective_priority(item, early) == 5.0
 
 
 def test_effective_priority_unset_priority():
@@ -4468,11 +4722,15 @@ if parent is None and not top_level:
 @
 
 When a parent is set, inherit its deadline and labels unless the user
-explicitly provided overrides:
+explicitly provided overrides.  This chunk is shared by [[add]] and
+[[import]], which makes it the single place where a command-line
+[[--deadline]] becomes stored data---so it is also where that string
+has to be validated.  An inherited parent deadline needs no check: it
+was normalized when the parent was written.
 
 <<inherit from parent>>=
 inherited_labels = list(label) if label else []
-inherited_deadline = deadline
+inherited_deadline = normalize_deadline(deadline)
 if resolved_parent is not None:
     parent_item = next(
         (t for t in todos if t.id == resolved_parent),
@@ -4488,6 +4746,51 @@ if resolved_parent is not None:
         inherited_labels = list(parent_item.labels)
     if deadline is None and parent_item.deadline:
         inherited_deadline = parent_item.deadline
+@
+
+Let's verify the two halves of the deadline contract end to end.  A
+mistyped [[--deadline]] must be refused before anything reaches disk,
+and a todo file that already contains such a value---written by an
+older version, or edited by hand---must still list.
+
+<<test functions>>=
+def test_add_rejects_invalid_deadline(temp_todo_dir):
+  """A non-ISO --deadline fails before writing."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "-d", "tomorrow",
+     "--prio", "1"],
+  )
+  assert result.exit_code == 1
+  assert "invalid deadline" in result.output
+  _, todos = load_todos()
+  assert todos == []
+
+
+def test_add_normalizes_aware_deadline(temp_todo_dir):
+  """An offset-bearing --deadline is stored naive."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--prio", "1",
+     "-d", "2026-03-01T12:00:00+01:00"],
+  )
+  assert result.exit_code == 0
+  _, todos = load_todos()
+  assert "+" not in todos[0].deadline
+
+
+def test_ls_survives_unparseable_deadline(temp_todo_dir):
+  """A legacy bad deadline must not break the listing."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Legacy task", priority=5.0,
+      created="2026-02-20T10:00:00",
+      deadline="tomorrow",
+    ),
+  ])
+  result = runner.invoke(cli, ["ls", "--who", ""])
+  assert result.exit_code == 0
+  assert "Legacy task" in result.output
 @
 
 Priority selection has three modes. [[--prio]] bypasses all inference.
@@ -4775,7 +5078,9 @@ initial_meta = {}
 if label:
     initial_meta["labels"] = list(label)
 if deadline:
-    initial_meta["deadline"] = deadline
+    initial_meta["deadline"] = normalize_deadline(
+        deadline
+    )
 if estimate:
     initial_meta["estimate"] = parse_hours(estimate)
 if who:
@@ -4814,7 +5119,9 @@ parent_item = TodoItem(
     priority=priority,
     status="pending",
     created=now,
-    deadline=deadline or meta.get("deadline"),
+    deadline=normalize_deadline(
+        deadline or meta.get("deadline")
+    ),
     estimated=(
         parse_hours(estimate)
         if estimate
@@ -4920,8 +5227,8 @@ child_meta = parsed_child.metadata
 child_labels = child_meta.get(
     "labels", list(parent_labels)
 )
-child_deadline = child_meta.get(
-    "deadline", parent_deadline
+child_deadline = normalize_deadline(
+    child_meta.get("deadline", parent_deadline)
 )
 child_who = child_meta.get("who", parent_who)
 child_wd = canonicalize_wd(child_meta.get("wd"))
@@ -6426,7 +6733,7 @@ item:
 if title is not None:
     item.title = title
 if deadline is not None:
-    item.deadline = deadline
+    item.deadline = normalize_deadline(deadline)
 if estimate is not None:
     item.estimated = parse_hours(estimate)
 <<apply label edits>>
@@ -6546,7 +6853,9 @@ if "command" in meta:
 if "labels" in meta:
     item.labels = meta["labels"]
 if "deadline" in meta:
-    item.deadline = meta["deadline"]
+    item.deadline = normalize_deadline(
+        meta["deadline"]
+    )
 if "estimate" in meta:
     item.estimated = parse_hours(str(meta["estimate"]))
 if "who" in meta:
@@ -6656,7 +6965,9 @@ for i, parsed_child in enumerate(parsed.children):
         if "labels" in child_meta:
             child.labels = child_meta["labels"]
         if "deadline" in child_meta:
-            child.deadline = child_meta["deadline"]
+            child.deadline = normalize_deadline(
+                child_meta["deadline"]
+            )
         if "estimate" in child_meta:
             child.estimated = parse_hours(
                 str(child_meta["estimate"])
@@ -6676,8 +6987,10 @@ for i, parsed_child in enumerate(parsed.children):
             priority=prio,
             status="pending",
             created=now,
-            deadline=child_meta.get(
-                "deadline", item.deadline
+            deadline=normalize_deadline(
+                child_meta.get(
+                    "deadline", item.deadline
+                )
             ),
             parent_id=todo_id,
             who=child_meta.get("who", item.who),
@@ -12585,6 +12898,8 @@ from nytid.cli.todo import (
     ParsedItem,
     ParsedTodo,
     canonicalize_wd,
+    naive_local_datetime,
+    normalize_deadline,
     effective_priority,
     sort_todos_for_display,
     load_todos,
