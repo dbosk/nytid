@@ -443,6 +443,54 @@ we normalize here: dates become local midnight, naive times are
 interpreted as local time.
 Local is the right reading for both---an all-day event on the 15th
 means the 15th in the user's calendar, not in UTC.
+
+\paragraph{What \enquote{local} must mean}
+
+The obvious way to say \enquote{local} in Python is the no-argument
+[[datetime.astimezone()]], and that is what this function used to do.
+It produces a timezone-\emph{aware} value, so the invariant above
+holds---but the zone it attaches is a fixed offset
+([[datetime.timezone(datetime.timedelta(hours=2))]]), namely the offset
+that happened to be in effect at that one instant.
+A fixed offset has no daylight-saving rules, and that difference
+escapes as soon as anything derives a \emph{new} datetime from the
+value.
+Recurrence expansion (\cref{ExpandingRecurrences}) does exactly that:
+every occurrence of an [[RRULE]] inherits [[DTSTART]]'s [[tzinfo]], so
+a weekly meeting anchored in summer keeps reporting the summer offset
+all winter, and every occurrence past the October changeover is off by
+an hour.
+For an all-day event the error is worse than an hour: local midnight
+under the wrong offset falls at 23:00 the previous day, which changes
+the date, the weekday, and the ISO week number the schedule prints.
+
+So we attach the local \emph{zone} rather than the local offset.
+[[zoneinfo]] can build one from an IANA name, and [[tzlocal]] is what
+tells us which name the host is configured for---the standard library
+exposes no portable way to ask.
+We resolve it through a function rather than a module-level constant so
+that a process which changes its timezone, and a test that fakes one,
+both see the change.
+<<functions>>=
+def local_timezone():
+  """
+  Returns the host's local timezone as a `zoneinfo.ZoneInfo`.
+
+  Unlike the fixed offset that `datetime.astimezone()` attaches, the
+  returned zone carries the daylight-saving rules, so datetimes derived
+  from it get the offset in effect at their own time.
+  """
+  return zoneinfo.ZoneInfo(tzlocal.get_localzone_name())
+<<imports>>=
+import tzlocal
+import zoneinfo
+@
+
+With that settled, parsing is a sweep over the events, rewriting the
+two properties that carry times.
+We resolve the zone once per calendar rather than once per property:
+the answer cannot change while we parse, and the lookup reads the
+host's timezone configuration.
 <<functions>>=
 def parse_calendar(text):
   """
@@ -454,6 +502,7 @@ def parse_calendar(text):
   time. Raises ValueError if `text` is not valid ICS.
   """
   cal = icalendar.Calendar.from_ical(text)
+  local = local_timezone()
   for event in cal.events:
     for name in ("DTSTART", "DTEND"):
       <<normalize the [[name]] property of [[event]]>>
@@ -466,6 +515,10 @@ bare datetimes.
 The [[datetime]]-before-[[date]] test order matters:
 [[datetime.datetime]] is a subclass of [[datetime.date]], so testing
 [[date]] first would match everything.
+A floating time is normalized with [[replace]] rather than a
+conversion: the wall-clock reading is the part we trust---\enquote{ten
+o'clock} means ten o'clock here---and [[replace]] keeps it while
+declaring which zone it is read in.
 <<normalize the [[name]] property of [[event]]>>=
 value = event.get(name)
 if value is None:
@@ -473,10 +526,10 @@ if value is None:
 if isinstance(value.dt, datetime.datetime):
   if value.dt.tzinfo is None:
     del event[name]
-    event.add(name, value.dt.astimezone())
+    event.add(name, value.dt.replace(tzinfo=local))
 elif isinstance(value.dt, datetime.date):
   midnight = datetime.datetime(value.dt.year, value.dt.month,
-                               value.dt.day).astimezone()
+                               value.dt.day, tzinfo=local)
   del event[name]
   event.add(name, midnight)
 @
@@ -702,6 +755,90 @@ def test_no_window_keeps_master_event(tmp_path):
   path.write_text(make_recurring_ics())
   cal = read_calendar(str(path))
   assert len(cal.events) == 1
+@
+
+Expansion is also where the choice of [[tzinfo]] in
+\cref{ParsingCalendars} becomes observable, so this is where we pin it.
+Both tests below fake the local zone to Europe/Stockholm rather than
+setting [[TZ]] in the environment: the assertions must hold whatever
+timezone the developer's machine is in, and faking the resolver keeps
+the effect contained to the test instead of mutating process-global
+state.
+
+A floating weekly event anchored on 20 October 2024 crosses the
+European changeover the following week.
+Its wall-clock reading must stay at ten o'clock for every occurrence;
+with a fixed offset the later ones drift to nine.
+<<test functions>>=
+STOCKHOLM = "Europe/Stockholm"
+
+def fake_local_zone(monkeypatch, name=STOCKHOLM):
+  """Pins schedules' idea of the local zone; returns the zone."""
+  import zoneinfo
+  zone = zoneinfo.ZoneInfo(name)
+  monkeypatch.setattr(nytid.schedules, "local_timezone",
+                      lambda: zone)
+  return zone
+
+def make_dst_crossing_ics():
+  """Weekly floating event crossing the October 2024 changeover."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Weekly meeting
+DTSTART:20241020T100000
+DTEND:20241020T110000
+RRULE:FREQ=WEEKLY;COUNT=4
+END:VEVENT
+END:VCALENDAR"""
+
+def test_recurrence_keeps_wall_clock_across_dst(tmp_path,
+                                                monkeypatch):
+  zone = fake_local_zone(monkeypatch)
+  path = tmp_path / "dst.ics"
+  path.write_text(make_dst_crossing_ics())
+  window = (datetime.datetime(2024, 10, 1, tzinfo=zone),
+            datetime.datetime(2024, 11, 30, tzinfo=zone))
+  cal = read_calendar(str(path), window=window)
+  assert len(cal.events) == 4
+  hours = {event.start.astimezone(zone).hour
+           for event in cal.events}
+  assert hours == {10}
+@
+
+The all-day case is the same defect with a coarser symptom.
+A Monday all-day series anchored in January expands into July, where a
+frozen winter offset would place every occurrence at 23:00 on the
+preceding Sunday---a different date, weekday and ISO week than the one
+the calendar states.
+<<test functions>>=
+def make_all_day_recurring_ics():
+  """Weekly all-day event anchored on Monday 15 January 2024."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:All day weekly
+DTSTART;VALUE=DATE:20240115
+DTEND;VALUE=DATE:20240116
+RRULE:FREQ=WEEKLY;COUNT=30
+END:VEVENT
+END:VCALENDAR"""
+
+def test_all_day_recurrence_keeps_date_across_dst(tmp_path,
+                                                  monkeypatch):
+  zone = fake_local_zone(monkeypatch)
+  path = tmp_path / "allday.ics"
+  path.write_text(make_all_day_recurring_ics())
+  window = (datetime.datetime(2024, 7, 1, tzinfo=zone),
+            datetime.datetime(2024, 7, 31, tzinfo=zone))
+  cal = read_calendar(str(path), window=window)
+  assert cal.events
+  for event in cal.events:
+    local = event.start.astimezone(zone)
+    assert local.hour == 0
+    assert local.weekday() == 0  # still a Monday
 @
 
 \subsection{Iterating events in chronological order}
