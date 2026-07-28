@@ -504,23 +504,53 @@ DEFAULT_WEEKLY_LIMIT_HOURS = 40.0  # Standard full-time work week
 DEFAULT_DAILY_LIMIT_HOURS = 8.0    # Standard work day
 @
 
+Durations are normally positive, but they must never be \emph{rendered}
+as positive when they are not.  Python's [[divmod]] floors towards
+negative infinity, so splitting a raw negative second count into hours,
+minutes and seconds yields components that read as a plausible positive
+duration: $-30$~minutes becomes [[30m 0s]], and so does $-90$~minutes.
+A corrupt entry would then be indistinguishable from a healthy one in
+[[status]], [[ls]], and [[stats]] output.
+
+We therefore split the magnitude and carry the sign as an explicit
+prefix.  This is a display safeguard rather than a licence to store
+negative durations---the commands that build entries reject inverted
+intervals---but a formatter that cannot lie is what makes such a bug
+visible instead of silent.
+
 <<helper functions>>=
 def format_duration(duration: datetime.timedelta) -> str:
-    """Format a duration in a human-readable way"""
+    """Format a duration in a human-readable way.
+
+    Negative durations keep a leading minus sign so an
+    inverted interval can never be displayed as a
+    positive one.
+    """
     total_seconds = int(duration.total_seconds())
-    hours, remainder = divmod(total_seconds, 3600)
+    sign = "-" if total_seconds < 0 else ""
+    hours, remainder = divmod(abs(total_seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
     if hours > 0:
-        return f"{hours}h {minutes}m {seconds}s"
+        return f"{sign}{hours}h {minutes}m {seconds}s"
     elif minutes > 0:
-        return f"{minutes}m {seconds}s"
+        return f"{sign}{minutes}m {seconds}s"
     else:
-        return f"{seconds}s"
+        return f"{sign}{seconds}s"
 
 def get_labels_display(labels: list[str]) -> str:
     """Get a display string for labels (as comma-separated tags)"""
     return ", ".join(sorted(labels)) if labels else "No labels"
+@
+
+<<test functions>>=
+def test_format_duration_is_sign_aware():
+  """Negative durations must not render as positive ones."""
+  assert format_duration(datetime.timedelta(minutes=30)) == "30m 0s"
+  assert format_duration(datetime.timedelta(minutes=-30)) == "-30m 0s"
+  assert format_duration(datetime.timedelta(minutes=-90)) == "-1h 30m 0s"
+  assert format_duration(datetime.timedelta(seconds=-5)) == "-5s"
+  assert format_duration(datetime.timedelta()) == "0s"
 @
 
 \subsubsection{Abbreviating Content Hashes}
@@ -1228,6 +1258,10 @@ class ActiveSession:
 
         Returns:
             List of TrackingEntry objects for the stopped labels
+
+        Raises:
+            ValueError: if `end_time` is not after the start time of
+                every label that would be stopped
         """
         if who is None:
             who = default_username
@@ -1257,7 +1291,39 @@ class ActiveSession:
             # Stop the N most recently started labels
             labels = self.label_order[-count:] if self.label_order else []
         # else: use the provided labels list
+
+        inverted = sorted(
+            label for label in labels
+            if label in self.active_labels
+            and end_time <= self.active_labels[label][0]
+        )
+        if inverted:
+            raise ValueError(
+                "End time must be after start time for: "
+                + ", ".join(inverted)
+            )
 @
+
+The check above belongs here, before anything is popped, because this is
+the last point at which the session is still untouched.  Every caller
+reaches [[stop_labels]] through [[mutate_worker_tracking_state]], which
+persists whatever the callback returns; raising once the labels have
+already been removed would leave the on-disk session inconsistent with
+the error the user sees.
+
+The rule is the same one [[edit]] enforces on historical entries: an
+entry's end must come after its start.  Only [[stop]] could break it,
+because [[--at]] and [[--offset]] let the user name an end time
+independently of when tracking began.  An inverted entry is not merely
+displayed wrongly---it is stored, and a negative interval subtracts from
+every aggregate built on top of it: the merged wall-clock totals,
+[[stats]], the exports, and the times [[nytid todo]] derives from
+tracking history.
+
+We name the offending labels rather than failing anonymously.  A
+[[stop --all]] can span labels started hours apart, so
+\enquote{which of them started after the end time you gave?} is exactly
+the question the user needs answered.
 
 At this point [[labels]] is only a \emph{request}.  The caller may have
 named a label that is not being tracked---most often a typo---and the
@@ -3602,16 +3668,7 @@ def stop(
             )
             raise typer.Exit(1)
 
-    try:
-        session, completed_entries = stop_tracking_labels(
-            who=who,
-            labels=labels,
-            all_labels=all_labels,
-            end_time=end_time,
-        )
-    except ValueError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1)
+    <<stop the requested labels or report why not>>
 
     # Display what was completed
     for entry in completed_entries:
@@ -3639,7 +3696,69 @@ def stop(
 
 @
 
+Two quite different things can go wrong once the end time is known, and
+both surface here as a [[ValueError]] carrying its own explanation:
+either none of the named labels are tracking, or the end time given by
+[[--at]]/[[--offset]] falls before some label started.  The command has
+nothing to add to either message, so it prints the exception verbatim
+and exits non-zero.
+
+What matters is that the exception reaches this point with the on-disk
+state untouched.  [[stop_labels]] validates before it pops anything, so
+a rejected [[stop]] leaves the session exactly as it was and the user
+can simply retry with a corrected time.
+
+<<stop the requested labels or report why not>>=
+try:
+    session, completed_entries = stop_tracking_labels(
+        who=who,
+        labels=labels,
+        all_labels=all_labels,
+        end_time=end_time,
+    )
+except ValueError as exc:
+    typer.echo(str(exc), err=True)
+    raise typer.Exit(1)
+@
+
 \subsubsection{Testing Stop Command}
+
+Let's verify that a backdated stop cannot invert an entry, and that the
+rejection is total---no entry written, no label stopped:
+
+<<test functions>>=
+def test_stop_rejects_end_before_start(temp_tracking_dir):
+  """A backdated stop must not record a negative interval."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["stop", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "End time must be after start time" in result.output
+  assert "A" in result.output
+
+  assert load_tracking_data() == []
+  assert load_active_session().get_active_labels() == ["A"]
+
+def test_stop_all_names_only_inverted_labels(temp_tracking_dir):
+  """The error names the labels that started after the end time."""
+  runner.invoke(cli, ["start", "old", "--offset", "-2h"])
+  runner.invoke(cli, ["start", "new"])
+
+  result = runner.invoke(cli, ["stop", "--all", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "new" in result.output
+  assert "old" not in result.output
+
+def test_switch_rejects_end_before_start(temp_tracking_dir):
+  """A backdated switch fails instead of inverting the old context."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["switch", "B", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "End time must be after start time" in result.output
+
+  assert load_tracking_data() == []
+  assert load_active_session().get_active_labels() == ["A"]
 
 <<test functions>>=
 def test_stop_batch_behavior(temp_tracking_dir):
@@ -3840,6 +3959,52 @@ elif offset is not None:
         raise typer.Exit(1)
 @
 
+\subsubsection{Closing the Current Context}
+
+Both switch directions begin identically: whatever is running must be
+stopped at [[switch_time]] before the new context starts.  We name that
+step once so the forward and reverse directions cannot drift apart, and
+so the error handling below exists in exactly one place.
+
+A backdated [[--at]] or [[--offset]] may name a moment before one of the
+active labels began.  [[stop_tracking_labels]] rejects that rather than
+recording an inverted interval, and there is nothing sensible to do with
+the rest of the switch: starting the new context while the old one is
+still open would leave both running.  We therefore report the problem
+and stop.
+
+<<stop current context at switch time>>=
+if session.is_active():
+    try:
+        session, completed = stop_tracking_labels(
+            who=who,
+            all_labels=all_labels,
+            end_time=switch_time,
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    session = load_active_session(who)
+    for entry in completed:
+        typer.echo(
+            f"Stopped: "
+            f"{get_labels_display(entry.labels)}"
+            f" ({format_duration(entry.duration())})"
+        )
+    stopped_labels = [
+        label
+        for entry in completed
+        for label in entry.labels
+    ]
+else:
+    stopped_labels = []
+@
+
+The chunk expects [[session]], [[who]], [[all_labels]] and
+[[switch_time]] to be in scope, and leaves behind a refreshed
+[[session]] plus the [[stopped_labels]] both directions need for the
+toggle bookkeeping.
+
 \subsubsection{Switching to New Labels}
 
 The key question when labels are given is whether the current context
@@ -3855,26 +4020,7 @@ so a subsequent bare [[switch]] correctly restores the idle state.
 
 <<switch to new labels>>=
 session = load_active_session(who)
-if session.is_active():
-    session, completed = stop_tracking_labels(
-        who=who,
-        all_labels=all_labels,
-        end_time=switch_time,
-    )
-    session = load_active_session(who)
-    for entry in completed:
-        typer.echo(
-            f"Stopped: "
-            f"{get_labels_display(entry.labels)}"
-            f" ({format_duration(entry.duration())})"
-        )
-    stopped_labels = [
-        label
-        for entry in completed
-        for label in entry.labels
-    ]
-else:
-    stopped_labels = []
+<<stop current context at switch time>>
 previous_switch_other = session.switch_other
 if not pop:
     update_switch_other_labels(stopped_labels, who=who)
@@ -3920,26 +4066,7 @@ if session.switch_other is None:
         "only one label set in play."
     )
     raise typer.Exit(0)
-if session.is_active():
-    session, completed = stop_tracking_labels(
-        who=who,
-        all_labels=all_labels,
-        end_time=switch_time,
-    )
-    session = load_active_session(who)
-    for entry in completed:
-        typer.echo(
-            f"Stopped: "
-            f"{get_labels_display(entry.labels)}"
-            f" ({format_duration(entry.duration())})"
-        )
-    stopped_labels = [
-        label
-        for entry in completed
-        for label in entry.labels
-    ]
-else:
-    stopped_labels = []
+<<stop current context at switch time>>
 if session.switch_other is None:
     typer.echo(
         "Nothing to switch back to: "
@@ -10539,6 +10666,7 @@ from nytid.cli.track import (
     AUTO_SUSPEND_CONFIG,
     TRACK_DEBUG_CONFIG,
     load_tracking_data, load_active_session,
+    format_duration,
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
