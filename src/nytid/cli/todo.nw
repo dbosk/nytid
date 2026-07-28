@@ -10000,9 +10000,24 @@ environment or another non-system interpreter, so the detached helper
 must reuse [[sys.executable]] rather than assuming [[python3]] points at
 the correct environment.
 
+Because nobody is watching a detached run, the exit code is the only
+report it ever files.  We give it the same treatment the blocking
+headless path gives its subprocess: record it as a note so the outcome
+survives in the item's history, and hand a failed task to
+[[--reassign-to]] so it lands in a human's queue instead of quietly
+returning to [[pending]] indistinguishable from a run that simply did
+not finish.  Without that, the entire exit-code apparatus---the status
+file, [[read_detached_exit_code]] and its signal mapping---would deliver
+a number with no consumer.
+
+The note says \enquote{no output} because a detached pane writes to the
+terminal, not to a pipe we can capture; the wording matches the blocking
+path so both kinds of run leave notes in one format.
+
 <<helpers>>=
 def finalize_detached_todo(
-    todo_id, exit_code=1, exit_code_file=None
+    todo_id, exit_code=1, exit_code_file=None,
+    reassign_to=None,
 ):
     """Finish a non-blocking tmux-backed todo run."""
     if exit_code_file is not None:
@@ -10022,15 +10037,16 @@ def finalize_detached_todo(
     if item is None:
         return
 
-    result = type(
-        "DetachedResult", (),
-        {
-            "returncode": exit_code,
-            "stdout": None,
-        },
-    )()
+    append_note_to_item(
+        item,
+        f"Exit code: {exit_code} (no output)",
+        next_id,
+        todos,
+    )
 
     if item.status != "done":
+        if exit_code != 0 and reassign_to:
+            item.who = reassign_to
         item.status = "pending"
     for child in descendants:
         if child.status != "done":
@@ -10055,7 +10071,8 @@ def read_detached_exit_code(exit_code_file):
 
 
 def build_detached_todo_finalize_command(
-    todo_id, proc_wd, exit_code_file
+    todo_id, proc_wd, exit_code_file,
+    reassign_to=None,
 ):
     """Return shell command to finalize a detached todo run."""
     pythonpath = os.path.abspath(
@@ -10063,15 +10080,28 @@ def build_detached_todo_finalize_command(
             os.path.dirname(__file__), "..", "..", ".."
         )
     )
+    reassign_arg = (
+        f" --reassign-to {shlex.quote(reassign_to)}"
+        if reassign_to else ""
+    )
     return (
         f"PYTHONPATH={shlex.quote(pythonpath)} "
         f"{shlex.quote(sys.executable)} "
         "-c 'from nytid.cli.todo import cli; cli()' "
         f"_finalize-detached {todo_id} "
         f"--exit-code-file {shlex.quote(exit_code_file)}"
+        f"{reassign_arg}"
         f"; rm -f {shlex.quote(exit_code_file)}"
     )
 @
+
+The reassignee has to travel through that shell string because the
+finalizer runs in a fresh process minutes or hours later, long after
+the [[start]] invocation that knew about [[--reassign-to]] has exited.
+It is a user-supplied name interpolated into a command line, so it goes
+through [[shlex.quote]] like every other value here; omitting the flag
+entirely when there is no reassignee keeps the common case identical to
+what tmux ran before.
 
 <<argument and option definitions>>=
 finalize_id_arg = typer.Argument(
@@ -10081,6 +10111,9 @@ finalize_exit_arg = typer.Argument(
 finalize_file_opt = typer.Option(
     "--exit-code-file",
     help="File containing the exit code")
+finalize_reassign_opt = typer.Option(
+    "--reassign-to",
+    help="Worker to receive the todo if the run failed")
 @
 
 <<detached finalize command>>=
@@ -10091,10 +10124,13 @@ def finalize_detached_cmd(
                          finalize_exit_arg] = 1,
     exit_code_file: Annotated[str | None,
                               finalize_file_opt] = None,
+    reassign_to: Annotated[
+        str | None, finalize_reassign_opt] = None,
 ):
     """Finalize a detached tmux-backed todo run."""
     finalize_detached_todo(
-        todo_id, exit_code, exit_code_file
+        todo_id, exit_code, exit_code_file,
+        reassign_to,
     )
 @
 
@@ -10581,7 +10617,8 @@ try:
         )
         os.close(exit_fd)
         finalize_cmd = build_detached_todo_finalize_command(
-            todo_id, proc_wd, exit_code_file
+            todo_id, proc_wd, exit_code_file,
+            reassign_to,
         )
         run_todo_tmux_command(
             cmd,
@@ -11009,6 +11046,81 @@ def test_finalize_detached_todo_resets_pending(
     _, todos = load_todos()
     assert todos[0].status == "pending"
     assert load_active_stack() == []
+
+
+def test_finalize_detached_todo_records_exit_code(
+    temp_todo_dir,
+):
+    """Detached finalize leaves the exit code in the notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(1, 3)
+    _, todos = load_todos()
+    assert "Exit code: 3" in todos[0].notes
+
+
+def test_finalize_detached_todo_reassigns_on_failure(
+    temp_todo_dir,
+):
+    """A failed detached run goes to the reassignee."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="agent",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(
+        1, 1, reassign_to="teacher",
+    )
+    _, todos = load_todos()
+    assert todos[0].who == "teacher"
+    assert todos[0].status == "pending"
+
+
+def test_finalize_detached_todo_keeps_owner_on_success(
+    temp_todo_dir,
+):
+    """A clean detached run stays with its worker."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="agent",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(
+        1, 0, reassign_to="teacher",
+    )
+    _, todos = load_todos()
+    assert todos[0].who == "agent"
+
+
+def test_detached_finalize_command_carries_reassignee():
+    """The tmux hook forwards --reassign-to to the finalizer."""
+    cmd = build_detached_todo_finalize_command(
+        7, "/tmp/project", "/tmp/status",
+        reassign_to="teacher",
+    )
+    assert "--reassign-to teacher" in cmd
+
+    plain = build_detached_todo_finalize_command(
+        7, "/tmp/project", "/tmp/status",
+    )
+    assert "--reassign-to" not in plain
 
 
 def test_finalize_detached_todo_reads_status_file(
@@ -13410,6 +13522,7 @@ from nytid.cli.todo import (
     get_active_stack_file,
     find_pending_by_priority,
     finalize_detached_todo,
+    build_detached_todo_finalize_command,
     read_detached_exit_code,
     parse_timeout,
     append_note_to_item,
