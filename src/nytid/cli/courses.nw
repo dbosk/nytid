@@ -527,6 +527,8 @@ target_value = "Test Tester"
 
 runner.invoke(cli, ["new", target_course, "--register", register])
 <<test imports>>=
+import logging
+import pathlib
 import tempfile
 from types import SimpleNamespace
 import pytest
@@ -556,7 +558,8 @@ Hence, we need both the register name and its path.
 <<helper functions>>=
 def complete_course_name(ctx: typer.Context, incomplete: str):
   """
-  Returns a list of course names matching `incomplete`.
+  Yields (course name, register)-pairs matching `incomplete`,
+  across every register in scope.
   """
   <<populate [[registers]] with the registers to use>>
   for register, register_path in registers:
@@ -587,13 +590,53 @@ def register_pairs(register=None):
 @
 
 In the register, each course has its own subdirectory.
-So we simply need to return the subdirectories of [[register_path]] matching 
-[[incomplete]] together with [[register]].
+So we need the courses of [[register_path]] that match [[incomplete]],
+paired with [[register]] so that same-named courses from different
+registers stay distinguishable.
+
+We must \emph{yield} those pairs rather than return them.
+This chunk is expanded inside the loop over registers, so a [[return]]
+here ends the entire function on the very first register: the user is
+silently offered only that register's courses, and with no registers at
+all the function falls off the end and hands [[None]] to Click.
+The chunk's name says nothing about where it is expanded, which is what
+makes the distinction invisible at the definition site---the
+chunk-composition hazard that literate programs have to watch for.
+Yielding makes [[complete_course_name]] a generator, so it visits every
+register and produces an empty sequence when there are none.
 <<yield (course name, register name) tuples that matches [[incomplete]]>>=
 courses_in_reg = courses.all_courses(register_path)
 matching_courses = filter(lambda x: x.startswith(incomplete), courses_in_reg)
-return map(lambda x: (x, f"from {register}"),
-           matching_courses)
+yield from map(lambda x: (x, f"from {register}"),
+               matching_courses)
+@
+
+Let's check both halves of that claim.
+With two registers configured, completion must reach past the first
+one:
+<<test functions>>=
+def test_complete_course_name_spans_registers():
+  second_reg = "second register"
+  second_path = pathlib.Path(tempfile.mkdtemp())
+  runner.invoke(cli, ["registry", "add", second_reg, str(second_path)])
+  try:
+    runner.invoke(cli, ["new", "secondcourse", "--register", second_reg])
+    ctx = SimpleNamespace(params={})
+    names = [name for name, _ in complete_course_name(ctx, "")]
+    assert target_course in names
+    assert "secondcourse" in names
+  finally:
+    runner.invoke(cli, ["registry", "rm", second_reg])
+@
+
+And with no registers at all, completion must produce an empty
+sequence rather than [[None]]:
+<<test functions>>=
+def test_complete_course_name_without_registers(monkeypatch):
+  monkeypatch.setattr("nytid.cli.courses.register_pairs",
+                      lambda register=None: [])
+  ctx = SimpleNamespace(params={})
+  assert list(complete_course_name(ctx, "")) == []
 @
 
 Now let's turn back to the main problem:
@@ -1016,7 +1059,7 @@ def mine_add(course: Annotated[str, course_arg_autocomplete],
   if not alias:
     alias = course
 
-  <<set [[mine_path]] to the path of the mine register>>
+  mine_path = get_mine_path()
   <<exit if [[alias]] is already in [[mine_path]]>>
 
   <<set [[course_path]] to [[course]]'s path>>
@@ -1036,36 +1079,69 @@ except FileExistsError:
   sys.exit(1)
 @
 
-\subsection{Create the default mine register if it doesn't exist}
+\subsection{Getting at the mine register}
 
-When we attempt to get the [[mine_path]] from [[registry]], it might not exist 
-if it's the first time we use it.
-This means we want to create it in the default location.
-<<set [[mine_path]] to the path of the mine register>>=
-try:
-  mine_path = registry.get(MINE)
-except KeyError:
-  <<create the default mine register>>
-  mine_path = registry.get(MINE)
-@
+The [[mine]] register is unlike the others: nobody adds it deliberately,
+it appears the first time a course is added to it.
+That makes two states normal rather than exceptional---no register
+entry in the config, and an entry whose directory doesn't exist---and
+the register lives under the user's home directory, so both states
+arise routinely on a fresh machine or after dotfiles are restored
+without their data.
 
-Now, if the register doesn't exist, we want to create it in [[~/.nytid/mine]] 
-and add it to the registry.
-<<create the default mine register>>=
-home_path = pathlib.Path(os.environ["HOME"])
-registry.add(MINE, home_path / ".nytid/mine")
-mine_path = registry.get(MINE)
-os.makedirs(mine_path)
-logging.warning(f"Added register {MINE} and created its path {mine_path}.")
+All three [[mine]] subcommands need the same thing: a directory they
+can rely on.
+So rather than let each of them rediscover the register and each of
+them get the error handling slightly differently, we resolve it once,
+here.
+The function creates whatever is missing and, when it can't, reports it
+the way the rest of this module does---[[logging.error]] and
+[[sys.exit(1)]] rather than a traceback.
+We use [[pathlib.Path.home()]] instead of reading [[HOME]] directly, so
+that a process without that variable falls back to the password
+database rather than raising.
+<<helper functions>>=
+def get_mine_path():
+  """
+  Returns the path of the `mine` register, creating the register
+  entry and its directory if they don't exist.
+
+  Exits with an error message if the directory can't be created.
+  """
+  try:
+    mine_path = registry.get(MINE)
+  except KeyError:
+    mine_path = pathlib.Path.home() / ".nytid" / MINE
+    registry.add(MINE, mine_path)
+    logging.warning(f"Added register {MINE} at {mine_path}.")
+
+  try:
+    os.makedirs(mine_path, exist_ok=True)
+  except OSError as err:
+    logging.error(f"Can't use the {MINE} directory {mine_path}: {err}")
+    sys.exit(1)
+
+  return mine_path
 @
 
 \subsection{Check if the course is already among my courses}
 
-To check if the alias already exists among our courses, we simply iterate 
+To check if the alias already exists among our courses, we iterate
 through and look for such a filename.
+
+The comparison has to be against [[my_course.name]].
+[[registry.get]] returns a [[pathlib.Path]], so [[iterdir]] yields
+[[Path]] objects, and a [[Path]] never compares equal to a [[str]]---
+comparing them directly makes the check silently vacuous, which is what
+it used to be.
+The duplicate was then caught only by accident, further down, when
+[[os.symlink]] raised [[FileExistsError]]; that accident doesn't cover
+the case this check exists for, an [[alias]] that collides with a
+course added under a different name.
+The sibling [[mine_ls]] below already does it correctly.
 <<exit if [[alias]] is already in [[mine_path]]>>=
 for my_course in mine_path.iterdir():
-  if my_course == alias:
+  if my_course.name == alias:
     logging.error(f"{alias} is already among your courses.")
     sys.exit(1)
 @
@@ -1119,14 +1195,26 @@ course_path = registry.get(register) / course
 
 \subsection{Listing my courses}
 
+Listing goes through [[get_mine_path]] like the others, so an
+unconfigured or absent register is set up rather than reported as a
+[[KeyError]] traceback.
+That still leaves a directory that exists but can't be read---a
+permission problem the user has to fix themselves---so we say so
+plainly instead of letting the [[OSError]] surface raw.
 <<mine subcommands>>=
 @minecli.command(name="ls")
 def mine_ls():
   """
   Lists my courses.
   """
-  mine_path = registry.get(MINE)
-  for course in mine_path.iterdir():
+  mine_path = get_mine_path()
+  try:
+    my_courses = list(mine_path.iterdir())
+  except OSError as err:
+    logging.error(f"Can't list {mine_path}: {err}")
+    sys.exit(1)
+
+  for course in my_courses:
     print(course.name)
 @
 
@@ -1138,22 +1226,97 @@ def mine_rm(course: Annotated[str, my_course_arg]):
   """
   Removes a course from my courses.
   """
-  mine_path = registry.get(MINE)
+  mine_path = get_mine_path()
   try:
     os.unlink(mine_path / course)
   <<handle errors for trying to remove a course from mine>>
 <<argument and option definitions>>=
 my_course_arg = typer.Argument(help="The course in my courses.",
                                autocompletion=complete_my_course_arg)
+@
+
+Completion can't use [[get_mine_path]], even though it wants the same
+directory.
+A completer runs whenever the user presses \textsc{tab}, so it must
+neither create a register as a side effect nor call [[sys.exit]] in the
+middle of the shell's completion machinery.
+Instead it reads what is there and, if anything is missing or
+unreadable, offers nothing---the worst outcome being that the user
+types the name out in full.
+We materialise the courses inside the [[try]], because
+[[all_courses]] is a generator and would otherwise do its file-system
+work outside it (\cref{cli.courses}).
 <<helper functions>>=
 def complete_my_course_arg(incomplete: str) -> list[str]:
   """
-  Returns a list of courses in my courses that match `incomplete`.
+  Yields the courses in my courses that match `incomplete`.
+
+  Yields nothing when the `mine` register is missing or
+  unreadable; completion must never fail loudly.
   """
-  mine_path = registry.get(MINE)
-  for course in courses.all_courses(mine_path):
+  try:
+    my_courses = list(courses.all_courses(registry.get(MINE)))
+  except COURSE_ACCESS_ERRORS:
+    return
+
+  for course in my_courses:
     if course.startswith(incomplete):
       yield course
+@
+
+Let's verify the three claims above.
+Every test points [[HOME]] and the [[mine]] register at a temporary
+directory, and removes the register afterwards, so nothing here can
+reach the real [[~/.nytid]].
+
+The duplicate check must actually fire.
+We assert on the log rather than on the command output, because the
+module reports errors through [[logging]], which the Click runner does
+not capture:
+<<test functions>>=
+def test_mine_add_rejects_duplicate_alias(tmp_path, monkeypatch, caplog):
+  monkeypatch.setenv("HOME", str(tmp_path))
+  runner.invoke(cli, ["registry", "add", MINE, str(tmp_path / MINE)])
+  try:
+    assert runner.invoke(cli, ["mine", "add", target_course,
+                               register]).exit_code == 0
+
+    with caplog.at_level(logging.ERROR):
+      result = runner.invoke(cli, ["mine", "add", target_course, register])
+
+    assert result.exit_code == 1
+    assert "already among your courses" in caplog.text
+  finally:
+    runner.invoke(cli, ["registry", "rm", MINE])
+@
+
+A register whose directory was never created must be repaired by every
+subcommand rather than raising [[FileNotFoundError]]:
+<<test functions>>=
+def test_mine_commands_create_missing_directory(tmp_path, monkeypatch):
+  monkeypatch.setenv("HOME", str(tmp_path))
+  mine_dir = tmp_path / "never-created" / MINE
+  runner.invoke(cli, ["registry", "add", MINE, str(mine_dir)])
+  try:
+    assert runner.invoke(cli, ["mine", "ls"]).exit_code == 0
+    assert mine_dir.is_dir()
+
+    assert runner.invoke(cli, ["mine", "add", target_course,
+                               register]).exit_code == 0
+    assert (mine_dir / target_course).is_symlink()
+
+    assert runner.invoke(cli, ["mine", "rm", target_course]).exit_code == 0
+    assert not (mine_dir / target_course).exists()
+  finally:
+    runner.invoke(cli, ["registry", "rm", MINE])
+@
+
+Completion, by contrast, must stay silent and create nothing when the
+register isn't there at all:
+<<test functions>>=
+def test_complete_my_course_arg_without_register():
+  runner.invoke(cli, ["registry", "rm", MINE])
+  assert list(complete_my_course_arg("")) == []
 @
 
 There are several errors that can occur.
@@ -1342,26 +1505,124 @@ courses rather than crashing.
 This design lets callers decide whether an empty result is fatal
 (like [[signupsheets]], which calls [[sys.exit(1)]]) or merely means
 there is nothing to show (like [[schedule]]).
+
+Honouring that contract takes more care than wrapping the
+config-reading call in a [[try]], because there are \emph{two} places
+that touch the file system, not one.
+Reading a course's config is the obvious one.
+The less obvious one is scanning a register for course names: that
+scan lives inside the [[courses_regex]] generator, and a generator's
+body runs when the loop \emph{advances} it---that is, in the [[for]]
+statement itself, outside any [[try]] in the loop body.
+A register whose directory has gone missing (a common state when AFS
+isn't mounted) therefore raises from a line that looks like plain
+iteration.
+So we drive the generator explicitly, with [[next]] inside the guarded
+region.
+
+We also scan one register at a time.
+A generator that raises is exhausted and can't be resumed, so a single
+[[courses_regex]] over every register would let one unreachable
+register hide the courses of every register after it.
+Giving each register its own generator confines the damage to that
+register.
 <<helper functions>>=
 def get_courses_configs(course_regex,
                         register=MINE):
   """Return {(course, register): config} for matching courses.
 
-  Logs warnings for KeyError and PermissionError,
-  skipping inaccessible courses.
+  Registers that can't be scanned and courses whose config
+  can't be read are skipped with a warning, so one broken
+  register or config never hides the healthy courses.
   """
-  regs = registers_regex(register)
   result = {}
-  for course_reg in courses_regex(course_regex, regs):
-    try:
-      result[course_reg] = courses.get_course_config(
-        *course_reg
-      )
-    except KeyError as err:
-      logging.warning(err)
-    except PermissionError as err:
-      c, r = course_reg
-      logging.warning(
-        f"You don't have access to {c} in {r}: {err}"
-      )
+  for reg in registers_regex(register):
+    <<add [[reg]]'s matching courses to [[result]]>>
   return result
+@
+
+The errors that mean \enquote{we can't get at this course} are the same
+at both sites, so we name them once.
+Beyond the [[KeyError]] and [[PermissionError]] the function already
+handled, a course directory can vanish or turn out not to be a
+directory, and [[typerconf]] reports a corrupt [[config.json]] as a
+[[ValueError]]---which is precisely the state a half-written config
+leaves behind.
+<<constants>>=
+COURSE_ACCESS_ERRORS = (KeyError, FileNotFoundError,
+                        NotADirectoryError, PermissionError,
+                        ValueError)
+@
+
+Exhausting the generator normally means we're done with the register;
+any other exception means the scan itself failed, and since we can't
+resume a generator that raised, we warn and move on to the next
+register.
+<<add [[reg]]'s matching courses to [[result]]>>=
+matches = courses_regex(course_regex, [reg])
+while True:
+  try:
+    course_reg = next(matches)
+  except StopIteration:
+    break
+  except COURSE_ACCESS_ERRORS as err:
+    logging.warning(f"Can't list the courses in {reg}: {err}")
+    break
+  <<read [[course_reg]]'s config into [[result]]>>
+@
+
+Reading the config keeps the tailored message for [[PermissionError]],
+since \enquote{you don't have access} tells the user what to do about
+it, whereas the remaining errors are best reported verbatim.
+The specific clause has to come first: [[PermissionError]] is also a
+member of [[COURSE_ACCESS_ERRORS]], and Python takes the first clause
+that matches.
+<<read [[course_reg]]'s config into [[result]]>>=
+try:
+  result[course_reg] = courses.get_course_config(
+    *course_reg
+  )
+except PermissionError as err:
+  c, r = course_reg
+  logging.warning(
+    f"You don't have access to {c} in {r}: {err}"
+  )
+except COURSE_ACCESS_ERRORS as err:
+  logging.warning(err)
+@
+
+Let's verify both failure modes.
+A register pointing at a directory that was never created must yield
+nothing rather than a traceback.
+We remove the register again afterwards so that the shared test config
+stays healthy for the other tests.
+<<test functions>>=
+def test_get_courses_configs_skips_unreadable_register():
+  gone_reg = "goneregister"
+  gone_path = pathlib.Path(tempfile.mkdtemp()) / "never-created"
+  runner.invoke(cli, ["registry", "add", gone_reg, str(gone_path)])
+  try:
+    assert get_courses_configs(".*", f"^{gone_reg}$") == {}
+  finally:
+    runner.invoke(cli, ["registry", "rm", gone_reg])
+@
+
+A corrupt config must cost us that one course and no more---the point
+of the whole exercise is that the healthy course in the same register
+still comes back.
+<<test functions>>=
+def test_get_courses_configs_skips_corrupt_config():
+  broken_reg = "brokenregister"
+  broken_path = pathlib.Path(tempfile.mkdtemp())
+  runner.invoke(cli, ["registry", "add", broken_reg, str(broken_path)])
+  try:
+    runner.invoke(cli, ["new", "brokencourse", "--register", broken_reg])
+    runner.invoke(cli, ["new", "healthycourse", "--register", broken_reg])
+    (broken_path / "brokencourse" / "config.json").write_text("{not json")
+
+    configs = get_courses_configs(".*", f"^{broken_reg}$")
+    assert ("healthycourse", broken_reg) in configs
+    assert ("brokencourse", broken_reg) not in configs
+  finally:
+    runner.invoke(cli, ["registry", "rm", broken_reg])
+@

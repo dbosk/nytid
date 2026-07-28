@@ -20,6 +20,7 @@ manage courses found in the course registers.
 import typerconf
 
 import logging
+import os
 import pathlib
 from nytid.courses import registry
 from nytid import storage
@@ -92,9 +93,37 @@ To create a course, we need a name for the course.
 <<new args>>=
 name: str,
 <<new doc>>=
-- `name` (mandatory), which is the human readable nickname of the course. This 
-  is used to refer to the course with other parts of nytid.
+- `name` (mandatory), which is the human readable nickname of the course. This
+  is used to refer to the course with other parts of nytid. It must be
+  non-empty, must not start with a period and must not contain a path
+  separator.
 
+@
+
+The name isn't only a label: we build the course's directory by
+appending it to the register's path, which makes it a path fragment.
+An unchecked path fragment can leave the register entirely.
+[[nytid courses new ../escaped]] would create the course in the
+register's \emph{parent}---where no register scan will ever find it,
+and where the shared directory's permissions, which are our entire
+access-control mechanism (\cref{cli.courses}), don't apply.
+A name containing a separator nests the course a level deeper than the
+scan looks, with the same effect.
+
+So we validate before creating anything.
+We reject a name that is empty, contains a path separator, or begins
+with a period.
+Rejecting the leading period is what rules out [[..]] and [[.]]
+themselves, and it also keeps course names clear of the hidden
+bookkeeping files that share these directories.
+[[registry.add]] validates register names for much the same reason
+(\cref{registry}); this brings courses into line with registers.
+<<check that [[name]] is a valid course name>>=
+if not name or name.startswith(".") \
+   or "/" in name or os.sep in name:
+  raise ValueError(f"`{name}` is not a valid course name: it must be "
+                   f"non-empty, must not start with a period and must "
+                   f"not contain a path separator.")
 @
 
 We will create the course by creating a directory in an available courses
@@ -104,6 +133,7 @@ Once the config is written the course exists; we log that at INFO,
 including which register it ended up in, since the register might
 have been selected automatically rather than by the user.
 <<new body>>=
+<<check that [[name]] is a valid course name>>
 <<determine which course register path [[register_path]] to use>>
 
 with storage.open_root(f"{register_path}/{name}") as root:
@@ -117,10 +147,45 @@ with storage.open_root(f"{register_path}/{name}") as root:
                           f"{register_path}/{name}/config.json")
 
   <<add settings to [[course_conf]]>>
+  <<write [[course_conf]] to [[config.json]] atomically>>
 
-  with root.open("config.json", "w") as course_conf_file:
-    course_conf.write_config(course_conf_file)
   logging.info(f"Created course {name} in register {register}")
+@
+
+\subsection{Writing the config without risking corruption}
+
+Writing straight into [[config.json]] would make the file's contents
+depend on the serialisation succeeding.
+Opening for writing truncates the file immediately, whereas
+[[json.dump]] only discovers a value it can't serialise part-way
+through---leaving a half-written file that is neither absent nor
+readable.
+The course is then wedged: creating it again raises
+[[FileExistsError]] because a config exists, and reading it raises
+[[ValueError]] because the JSON is truncated.
+The only way out is to delete the course directory by hand.
+
+We avoid that by never letting a partial write reach [[config.json]].
+We serialise into a temporary file in the \emph{same} directory, then
+rename it over the target.
+Same directory means same file system, and that is precisely what makes
+[[os.replace]] atomic on POSIX: any reader sees either the old file or
+the complete new one, never a prefix of it.
+The temporary name carries the process id so that two concurrent
+creations can't corrupt each other's staging file, and we remove it on
+any failure so a crashed run leaves no debris in the course directory.
+<<write [[course_conf]] to [[config.json]] atomically>>=
+tmp_name = f".config.json.{os.getpid()}"
+try:
+  with root.open(tmp_name, "w") as course_conf_file:
+    course_conf.write_config(course_conf_file)
+  os.replace(root.path / tmp_name, root.path / "config.json")
+except BaseException:
+  try:
+    os.unlink(root.path / tmp_name)
+  except OSError:
+    pass
+  raise
 @
 
 Now we want to test the function~[[new]].
@@ -300,6 +365,14 @@ If the user didn't specify a data directory, then [[data_path]] will be
 In this case, we should update it with the default value.
 We get the default value from [[root.path]] (see
 [[<<new body>>]]).
+
+Whichever value we end up with, we store it as a string.
+The config is JSON, and the CLI declares its [[--data-path]] option as
+a [[pathlib.Path]] (\cref{cli.courses}), so Typer hands us a [[Path]]
+object that [[json.dump]] can't serialise.
+Coercing only inside the default branch would leave exactly the
+user-supplied case broken, so we convert once, after the default has
+been applied, and thereby cover both.
 <<process expected [[key]]s>>=
 try:
   data_path = kwdata["data_path"]
@@ -307,9 +380,9 @@ except KeyError:
   data_path = None
 
 if not data_path:
-  data_path = str(root.path / "data")
+  data_path = root.path / "data"
 
-kwdata["data_path"] = data_path
+kwdata["data_path"] = str(data_path)
 @
 
 \subsection{Testing the \texttt{new} function}
@@ -317,6 +390,54 @@ kwdata["data_path"] = data_path
 Now we can finally make the call to [[new]] to test it.
 <<call new to test>>=
 new(course, register, config=config)
+@
+
+The path the user supplies must survive the round trip through JSON.
+We read the written file directly rather than through
+[[get_course_config]], because what is under test is what [[new]]
+\emph{wrote}, not what the reader makes of it.
+<<test functions>>=
+def test_new_coerces_path_data_path():
+  import json
+  course_name = "pathcourse"
+  data_dir = pathlib.Path(tempfile.mkdtemp()) / "elsewhere"
+  new(course_name, register, {"data_path": data_dir}, config=config)
+  with open(reg_path / course_name / "config.json") as conf_file:
+    assert json.load(conf_file)["data_path"] == str(data_dir)
+@
+
+A failed serialisation must leave the course creatable.
+We provoke one with a value JSON can't represent and check that no
+config survives---and, crucially, that a subsequent honest attempt
+succeeds rather than tripping over the debris of the first.
+<<test functions>>=
+def test_new_leaves_no_config_on_failure():
+  import pytest
+  course_name = "failcourse"
+
+  with pytest.raises(TypeError):
+    new(course_name, register, {"unserialisable": object()}, config=config)
+  assert not (reg_path / course_name / "config.json").exists()
+
+  new(course_name, register, config=config)
+  assert (reg_path / course_name / "config.json").exists()
+@
+
+The names that escape or hide the course must all be refused, and---
+just as importantly---refused before anything is written.
+We therefore assert on the register's contents rather than on the
+absence of one particular directory: the invariant is that a rejected
+name leaves the register exactly as it found it.
+<<test functions>>=
+def test_new_rejects_invalid_names():
+  import pytest
+  before = sorted(entry.name for entry in reg_path.iterdir())
+
+  for bad_name in ["../escaped", "a/b", "..", ".hidden", ""]:
+    with pytest.raises(ValueError):
+      new(bad_name, register, config=config)
+
+  assert sorted(entry.name for entry in reg_path.iterdir()) == before
 @
 
 
@@ -426,15 +547,36 @@ conf_path = None
 
 \subsection{Listing all courses in register}
 
-To list all the courses, we simply list all directories in the register's 
-directory.
+Every course is a directory in the register, but not every directory in
+the register is a course.
+A register is an ordinary shared directory, so it collects other
+things: a [[.git]] directory when the register is kept under version
+control, scratch directories, the remains of a course whose creation
+failed.
+
+Listing those as courses is not harmless.
+[[typerconf]] swallows the [[FileNotFoundError]] for a missing
+[[config.json]] and hands back an empty config, so a phantom course
+looks perfectly valid right up until someone reads a setting off it and
+gets a [[KeyError]] from what appears to be a real course.
+In the meantime it pads [[nytid courses ls]] and tab completion with
+entries the user never created.
+
+What makes a directory a course is the [[config.json]] that [[new]]
+writes into it (\cref{courses.CreatingTheCourse}), so that is what we
+test for.
+Asking whether that file exists also subsumes the directory test: a
+plain file has no [[config.json]] beneath it.
 <<functions>>=
 def all_courses(register_path: pathlib.Path) -> list[str]:
   """
   Returns a list (generator) of all courses found in `register_path`.
+
+  A subdirectory counts as a course only if it contains a
+  `config.json`.
   """
   for file in pathlib.Path(register_path).iterdir():
-    if file.is_dir():
+    if (file / "config.json").is_file():
       yield file.name
 @
 
@@ -519,4 +661,21 @@ def test_all_courses_empty():
   empty = pathlib.Path(tempfile.mkdtemp())
   courses_list = list(all_courses(empty))
   assert len(courses_list) == 0
+@
+
+The two kinds of clutter a register accumulates are a stray directory
+(here [[.git]], the one every version-controlled register has) and a
+stray file.
+Neither may appear as a course, and the real course must survive the
+filtering.
+<<test functions>>=
+def test_all_courses_skips_non_courses():
+  import os
+  os.makedirs(reg_path / ".git", exist_ok=True)
+  (reg_path / "stray.txt").write_text("not a course")
+
+  courses_list = list(all_courses(reg_path))
+  assert ".git" not in courses_list
+  assert "stray.txt" not in courses_list
+  assert course in courses_list
 
