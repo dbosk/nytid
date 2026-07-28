@@ -5270,13 +5270,19 @@ def run_tmux_command(
     focus_labels: list[str] | None = None,
     focus_who: str | None = None,
     focus_window: bool = False,
+    auto_suspend: bool = True,
 ) -> int | None:
     """Run a command in tmux and optionally wait for exit.
 
-    When ``focus_labels`` is set, auto-suspend hooks are
-    installed.  Pane launches suspend directly on pane focus
-    changes, while window launches synchronize against the
-    authoritative tmux selected window.
+    When ``focus_labels`` is set, they are published as the new
+    pane's or window's tracked context, which is what lets
+    nested commands discover the labels they run under.
+
+    ``auto_suspend`` additionally arms the hooks that stop and
+    restart those labels when attention moves.  Pane launches
+    suspend directly on pane focus changes, while window
+    launches synchronize against the authoritative tmux
+    selected window.
     """
     ready_channel = make_tmux_channel("ready")
     wait_channel = None
@@ -5437,11 +5443,12 @@ state of its own.
 source_window_id = None
 source_window_labels = None
 needs_window_sync = False
+published_window_labels = False
 
 def launch_and_publish_state():
     nonlocal pane_id, window_id, session_id
     nonlocal source_window_id, source_window_labels
-    nonlocal needs_window_sync
+    nonlocal needs_window_sync, published_window_labels
 
     result = subprocess.run(
         tmux_args,
@@ -5460,7 +5467,7 @@ def launch_and_publish_state():
     if focus_labels and focus_who:
         if not tmux_server_key:
             raise RuntimeError(
-                "tmux server key missing for auto-suspend launch"
+                "tmux server key missing for tracked launch"
             )
         if focus_window and window_id and session_id:
             write_window_labels(
@@ -5469,25 +5476,27 @@ def launch_and_publish_state():
                 tmux_server_key,
                 focus_labels,
             )
-            prev_wid = read_last_selected_window(
-                focus_who,
-                tmux_server_key,
-                session_id,
-            )
-            source_window_id = prev_wid
-            if prev_wid is not None:
-                source_window_labels = read_window_labels(
-                    prev_wid,
+            published_window_labels = True
+            if auto_suspend:
+                prev_wid = read_last_selected_window(
                     focus_who,
                     tmux_server_key,
+                    session_id,
                 )
+                source_window_id = prev_wid
+                if prev_wid is not None:
+                    source_window_labels = read_window_labels(
+                        prev_wid,
+                        focus_who,
+                        tmux_server_key,
+                    )
+                needs_window_sync = True
             write_last_selected_window(
                 focus_who,
                 tmux_server_key,
                 session_id,
                 window_id,
             )
-            needs_window_sync = True
         else:
             write_pane_labels(
                 pane_id,
@@ -5495,11 +5504,12 @@ def launch_and_publish_state():
                 tmux_server_key,
                 focus_labels,
             )
-            install_tmux_focus_hooks(
-                pane_id,
-                focus_who,
-                tmux_server_key,
-            )
+            if auto_suspend:
+                install_tmux_focus_hooks(
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
+                )
             install_tmux_suspend_cleanup_hook(
                 pane_id,
                 focus_who,
@@ -5548,6 +5558,8 @@ if needs_window_sync:
         focus_who,
         tmux_server_key,
     )
+
+if published_window_labels:
     install_tmux_window_cleanup_hook(
         pane_id,
         window_id,
@@ -5556,6 +5568,24 @@ if needs_window_sync:
         focus_labels,
     )
 @
+
+Note which steps hang off which condition.  Publishing the labels and
+installing the cleanup hook that eventually removes them are two halves
+of the same act, so they follow \emph{publication}: leaving them coupled
+to auto-suspend would let a labels file outlive the pane that owned it
+and make every later command believe that window is still tracked.
+
+The transition itself---suspending the window we came from, restarting
+the labels of the one we arrived at, and arming the session hook that
+repeats this on every subsequent switch---is the auto-suspend behaviour
+proper, so it follows [[auto_suspend]].
+
+[[write_last_selected_window]] stays unconditional because it is a
+statement of fact about tmux, not a policy: some \emph{other} tracked
+window in this session may already have armed the session hook, and that
+hook compares against this file.  Leaving it pointing at the window we
+just left would make the next real switch compute its transition from a
+window nobody is in.
 
 When [[--no-block]] is used, the tmux pane needs to call
 [[nytid track stop]] after the child exits.  The
@@ -8638,16 +8668,25 @@ else:
     )
 @
 
+The pane and window labels files answer two questions that happen to
+share a storage location.  Auto-suspend asks \enquote{which labels
+should I stop when attention moves away from here?}, but every nested
+command asks a different one: \enquote{what am I working on right
+now?}---[[--inherit-labels]] to branch off the current context,
+[[register_tmux_context_labels]] to join it, and the ID-less [[todo]]
+commands to know which task they refer to.
+
+Only the first question is about suspending.  Withholding the labels
+when the user passes [[--no-auto-suspend]] therefore disabled a set of
+features that have nothing to do with suspension, and did so silently:
+[[--inherit-labels]] simply inherited nothing.  We publish the context
+for every tracked launch and let [[auto_suspend]] decide only whether
+the suspend machinery is armed on top of it.
+
 <<run launched process>>=
-focus_labels_for_tmux = (
-    tracking_labels if use_auto_suspend else None
-)
-focus_who_for_tmux = (
-    who if use_auto_suspend else None
-)
-focus_window_for_tmux = (
-    bool(window and use_auto_suspend)
-)
+focus_labels_for_tmux = tracking_labels
+focus_who_for_tmux = who
+focus_window_for_tmux = bool(window)
 try:
     if pane or window:
         if block:
@@ -8660,6 +8699,7 @@ try:
                 focus_labels=focus_labels_for_tmux,
                 focus_who=focus_who_for_tmux,
                 focus_window=focus_window_for_tmux,
+                auto_suspend=use_auto_suspend,
             )
         else:
             <<set up non-blocking tmux launch>>
@@ -8736,6 +8776,7 @@ run_tmux_command(
     focus_labels=focus_labels_for_tmux,
     focus_who=focus_who_for_tmux,
     focus_window=focus_window_for_tmux,
+    auto_suspend=use_auto_suspend,
 )
 exit_code = None
 @
@@ -11916,6 +11957,145 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
     assert "#{pane_dead_signal}" in hook
     assert "cleanup-command" in hook
     assert "tmux wait-for -S done-chan" in hook
+
+def test_start_publishes_context_without_auto_suspend(
+  temp_tracking_dir,
+):
+  """--no-auto-suspend still hands the launch its context labels."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=0,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli,
+      ["start", "work", "--pane", "--no-auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args.kwargs
+  assert call_kwargs["focus_labels"] == ["work"]
+  assert call_kwargs["focus_who"] == default_username
+  assert call_kwargs["auto_suspend"] is False
+
+
+def test_start_window_publishes_context_without_auto_suspend(
+  temp_tracking_dir,
+):
+  """A --window launch publishes window labels either way."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=0,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli,
+      ["start", "work", "--window", "--no-auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args.kwargs
+  assert call_kwargs["focus_window"] is True
+  assert call_kwargs["focus_labels"] == ["work"]
+  assert call_kwargs["auto_suspend"] is False
+
+
+def test_run_tmux_command_publishes_pane_labels_unsuspended(
+  temp_tracking_dir,
+):
+  """Pane labels are written even when the focus hooks stay off."""
+  events = []
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.build_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.install_tmux_focus_hooks",
+    side_effect=lambda *a, **k: events.append("focus-hooks"),
+  ), patch(
+    "nytid.cli.track.install_tmux_suspend_cleanup_hook",
+    side_effect=lambda *a, **k: events.append("cleanup-hook"),
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      auto_suspend=False,
+    )
+
+  assert read_pane_labels(
+    "%42", default_username, TEST_SERVER_KEY,
+  ) == ["work"]
+  assert "focus-hooks" not in events
+  assert "cleanup-hook" in events
+
+
+def test_run_tmux_command_publishes_window_labels_unsuspended(
+  temp_tracking_dir,
+):
+  """Window labels are published without arming the transition."""
+  events = []
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.build_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.stop_tracking_labels",
+    side_effect=lambda *a, **k: events.append("stop"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_sync_hooks",
+    side_effect=lambda *a, **k: events.append("sync-hooks"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+    side_effect=lambda *a, **k: events.append("cleanup-hook"),
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      window=True,
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      focus_window=True,
+      auto_suspend=False,
+    )
+
+  assert read_window_labels(
+    "@7", default_username, TEST_SERVER_KEY,
+  ) == ["work"]
+  assert read_last_selected_window(
+    default_username, TEST_SERVER_KEY, "$9",
+  ) == "@7"
+  assert "stop" not in events
+  assert "sync-hooks" not in events
+  assert "cleanup-hook" in events
+
 
 def test_make_tmux_completion_guard_without_status_file():
   """A launch with no status file still gets a unique guard."""
