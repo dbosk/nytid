@@ -4279,19 +4279,26 @@ def status(
         <<show all workers status>>
 @
 
-<<show single worker status>>=
-session = load_active_session(who)
+Rendering one worker's active labels is needed in three places---the
+single-worker view, the per-worker loop below, and the
+backward-compatibility path that follows it.  Keeping three copies is
+how the three views drift apart, so we write it once as a function.  A
+function rather than a chunk: the three call sites live in different
+scopes, and a parameter list makes the inputs explicit where a shared
+chunk would silently depend on whatever names happen to be bound.
 
-if not session.is_active():
-    typer.echo(f"No active tracking for {who}")
-    return
-
-typer.echo(f"Currently tracking ({who}):")
-current_time = datetime.datetime.now()
-
-for label in session.get_active_labels():
-    info = session.get_label_info(label)
-    if info:
+<<helper functions>>=
+def echo_worker_status(
+    display_name: str,
+    session: "ActiveSession",
+) -> None:
+    """Print one worker's active labels with their durations."""
+    typer.echo(f"Currently tracking ({display_name}):")
+    current_time = datetime.datetime.now()
+    for label in session.get_active_labels():
+        info = session.get_label_info(label)
+        if info is None:
+            continue
         start_time, notes, batch_id = info
         duration = current_time - start_time
         notes_display = f" - {notes}" if notes else ""
@@ -4302,13 +4309,38 @@ for label in session.get_active_labels():
         )
 @
 
+<<show single worker status>>=
+session = load_active_session(who)
+
+if not session.is_active():
+    typer.echo(f"No active tracking for {who}")
+    return
+
+echo_worker_status(who, session)
+@
+
 When no [[--who]] is specified, we discover all active workers by
 globbing for session files in the tracking directory. This gives a
 quick overview of who is currently tracking time.
 
+The glob deliberately cannot match the pre-multi-worker
+[[current_session.json]], whose name carries no worker suffix.  That
+file therefore needs its own pass, and the question that pass must ask
+is narrow: \emph{was the default worker already shown?}  Asking the
+broader question---was \emph{anything} shown---hides an unmigrated
+user's own session as soon as any other worker (an agent, say) is
+tracking, which is precisely when a stale timer is easiest to miss.
+
+We answer it by recording which session files the loop actually
+rendered.  Comparing paths rather than worker names is what makes this
+robust: [[get_current_session_file]] is the single authority on which
+file a worker's session lives in, including its own fallback to the
+legacy name, so a path already in the set means the same session, no
+matter which spelling of the worker got us there.
+
 <<show all workers status>>=
 tracking_dir = get_tracking_dir()
-found_any = False
+rendered_session_files = set()
 
 if tracking_dir.exists():
     for session_file in sorted(
@@ -4319,48 +4351,22 @@ if tracking_dir.exists():
         )
         session = load_active_session(worker)
         if session.is_active():
-            found_any = True
-            typer.echo(f"Currently tracking ({worker}):")
-            current_time = datetime.datetime.now()
-            for label in session.get_active_labels():
-                info = session.get_label_info(label)
-                if info:
-                    start_time, notes, batch_id = info
-                    duration = current_time - start_time
-                    notes_display = (
-                        f" - {notes}" if notes else ""
-                    )
-                    typer.echo(
-                        f"  {label}: "
-                        f"{format_duration(duration)}"
-                        f"{notes_display}"
-                    )
+            rendered_session_files.add(session_file)
+            echo_worker_status(worker, session)
 
 # Also check old unsuffixed file for backward compat
 old_session_file = tracking_dir / "current_session.json"
 if old_session_file.exists():
     session = load_active_session(default_username)
-    if session.is_active() and not found_any:
-        found_any = True
-        typer.echo(
-            f"Currently tracking ({default_username}):"
-        )
-        current_time = datetime.datetime.now()
-        for label in session.get_active_labels():
-            info = session.get_label_info(label)
-            if info:
-                start_time, notes, batch_id = info
-                duration = current_time - start_time
-                notes_display = (
-                    f" - {notes}" if notes else ""
-                )
-                typer.echo(
-                    f"  {label}: "
-                    f"{format_duration(duration)}"
-                    f"{notes_display}"
-                )
+    already_shown = (
+        get_current_session_file(default_username)
+        in rendered_session_files
+    )
+    if session.is_active() and not already_shown:
+        rendered_session_files.add(old_session_file)
+        echo_worker_status(default_username, session)
 
-if not found_any:
+if not rendered_session_files:
     typer.echo("No active tracking")
 @
 
@@ -4447,6 +4453,58 @@ def test_status_tuple_unpacking_regression(temp_tracking_dir):
     # Should not see any error messages
     assert "ValueError" not in result.stdout
     assert "too many values to unpack" not in result.stdout
+
+def test_status_shows_legacy_session_beside_other_workers(
+  temp_tracking_dir,
+):
+  """An unmigrated session stays visible when another worker tracks."""
+  legacy_file = temp_tracking_dir / "current_session.json"
+
+  def legacy_aware_session_file(who=None):
+    if who is None:
+      who = default_username
+    per_worker = temp_tracking_dir / (
+      f"current_session_{sanitize_who(who)}.json"
+    )
+    if (who == default_username
+        and not per_worker.exists()
+        and legacy_file.exists()):
+      return legacy_file
+    return per_worker
+
+  legacy_session = ActiveSession()
+  legacy_session.start_labels(["mine"], datetime.datetime.now())
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  legacy_file.write_text(json.dumps(legacy_session.to_dict()))
+
+  with patch(
+    "nytid.cli.track.get_current_session_file",
+    side_effect=legacy_aware_session_file,
+  ), patch(
+    "nytid.cli.track.get_current_session_lock_file",
+    side_effect=lambda who=None:
+      legacy_aware_session_file(who).with_suffix(".lock"),
+  ):
+    runner.invoke(cli, ["start", "theirs", "--who", "Agent"])
+    result = runner.invoke(cli, ["status"])
+
+  assert result.exit_code == 0
+  assert "mine" in result.stdout
+  assert "theirs" in result.stdout
+
+def test_status_does_not_repeat_migrated_worker(temp_tracking_dir):
+  """A worker with both file names is rendered exactly once."""
+  runner.invoke(cli, ["start", "work"])
+  legacy_file = temp_tracking_dir / "current_session.json"
+  legacy_file.write_text(
+    (temp_tracking_dir / (
+      f"current_session_{sanitize_who(default_username)}.json"
+    )).read_text()
+  )
+
+  result = runner.invoke(cli, ["status"])
+  assert result.exit_code == 0
+  assert result.stdout.count("Currently tracking") == 1
 
 def test_status_with_batch_tracking(temp_tracking_dir):
     """Test status command with labels from different batches"""
