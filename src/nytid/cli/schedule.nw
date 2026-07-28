@@ -1035,7 +1035,7 @@ def schedule_todo_events(user, end, occupied):
   if not free_slots:
     return []
 
-  <<sort todos by priority>>
+  <<sort todos into scheduling order>>
 
   scheduled_events = []
   remaining_slots = list(free_slots)
@@ -1059,15 +1059,23 @@ if user:
   todos = [t for t in todos if t.who == user]
 @
 
-Sorting by effective priority means high-urgency items claim the
-earliest available slots.
+High-urgency items should claim the earliest available slots, so we
+order todos before assigning them.
+We cannot sort on [[effective_priority]] directly: unranked todos have
+no priority, so [[effective_priority]] returns [[None]] for them, and
+[[None]] does not compare with floats---one unranked open todo would
+crash the whole command.
+Instead we reuse [[sort_todos_for_display]], the shared helper that
+[[todo ls]] uses for exactly this mixed ranked/unranked case: ranked
+todos come first in descending effective priority, and unranked todos
+follow, earliest deadline first.
+Reusing it also means the schedule fills slots in the same order the
+user sees in [[todo ls]], so the two views never disagree about what
+comes next.
 We reuse the [[now]] that anchors the scheduling range, so priorities
 are evaluated at the same instant the plan starts.
-<<sort todos by priority>>=
-todos.sort(
-  key=lambda t: todocli.effective_priority(t, now),
-  reverse=True,
-)
+<<sort todos into scheduling order>>=
+todos = todocli.sort_todos_for_display(todos, now)
 @
 
 We greedily consume slots until the todo's estimated hours are
@@ -1124,13 +1132,18 @@ all, and with free time available the first event starts exactly at the
 frozen now.
 We fake the todo store and the clock so the tests are independent of
 the user's real todos and of when they run.
+The fake todo carries the ranking fields ([[priority]], [[deadline]],
+[[created]], [[id]]) that the shared sort key reads, so the tests
+exercise the real ordering code instead of mocking it away.
 <<test functions>>=
-def make_fake_todo():
+def make_fake_todo(id=1, title="task", priority=1.0, deadline=None):
   """Returns a minimal open todo for scheduling tests."""
   import types
   return types.SimpleNamespace(
-    status="open", who=None, estimated=1.0,
-    title="task", description="", labels=[],
+    id=id, status="open", who=None, estimated=1.0,
+    title=title, description="", labels=[],
+    priority=priority, deadline=deadline,
+    created="2024-01-01T00:00:00",
   )
 
 def freeze_schedule_now(monkeypatch, now):
@@ -1170,10 +1183,6 @@ def test_schedule_todo_events_starts_from_now(monkeypatch):
     lambda: (None, [make_fake_todo()]),
   )
   monkeypatch.setattr(
-    "nytid.cli.todo.effective_priority",
-    lambda t, now: 1.0,
-  )
-  monkeypatch.setattr(
     "nytid.cli.schedule.work_window",
     lambda: ("09:00", "12:00", ["mon"]),
   )
@@ -1184,6 +1193,34 @@ def test_schedule_todo_events_starts_from_now(monkeypatch):
   events = schedule_todo_events(None, end, [])
   assert len(events) == 1
   assert events[0].start == now.astimezone()
+@
+
+Unranked todos---those with no priority set---once crashed this
+function: their effective priority is [[None]], which cannot be
+compared with the floats of ranked todos.
+Let's verify that a mixed list schedules cleanly, with the ranked todo
+claiming the earliest slot and the unranked one still getting slots
+after it.
+<<test functions>>=
+def test_schedule_todo_events_mixed_ranked_unranked(monkeypatch):
+  ranked = make_fake_todo(id=1, title="ranked", priority=1.0)
+  unranked = make_fake_todo(id=2, title="unranked", priority=None)
+  monkeypatch.setattr(
+    "nytid.cli.todo.load_todos",
+    lambda: (None, [unranked, ranked]),
+  )
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  now = datetime.datetime(2024, 1, 8, 10, 30)
+  freeze_schedule_now(monkeypatch, now)
+
+  end = datetime.datetime(2024, 1, 15, 23, 59)
+  events = schedule_todo_events(None, end, [])
+  assert events[0].summary == "[TODO] ranked"
+  assert events[0].start == now.astimezone()
+  assert any(e.summary == "[TODO] unranked" for e in events)
 @
 
 Once we have the course schedule, we merge external calendars and then
@@ -1272,8 +1309,9 @@ def test_show_todo_option_defaults_to_scheduling(monkeypatch):
 @
 
 With all occupied time now in [[schedule]], we extract the busy intervals
-and greedily fill the remaining work-hour slots with todos, sorted by
-effective priority---unless the user opted out with [[--no-todo]].
+and greedily fill the remaining work-hour slots with todos, in the shared
+display order ([[todo ls]]'s ranked-first ordering)---unless the user
+opted out with [[--no-todo]].
 Note that [[start]] plays no role here: todos are scheduled from now
 until [[end]], and the print-time filtering
 (\cref{cli.schedule.filter-events}) trims any todo events that fall
