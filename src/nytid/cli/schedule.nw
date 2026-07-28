@@ -476,8 +476,41 @@ def update_end_date(start, end):
   if end < start:
     return start + datetime.timedelta(weeks=1)
   return end
+@
+
+\paragraph{The end date is a day, not an instant}
+
+Both bounds are parsed with [[formats=["%Y-%m-%d"]]], so [[end]] is the
+\emph{midnight that starts} the end date.
+The user, however, said a date, and the print-time filter agrees with
+them: it keeps everything up to and including [[end.date()]].
+Anything that consumes [[end]] as an instant therefore stops a whole
+day short of what gets displayed.
+Three things did.
+The recurrence window never expanded external events on the last shown
+day, so the default seven-day view always lost day seven.
+[[compute_free_slots]] clipped that day's work window with
+[[min(day_end, end)]], collapsing it to nothing, so no todo was ever
+scheduled on the end date.
+And because those external events were missing, they were also missing
+from the occupied intervals, so a todo scheduled there would have
+double-booked.
+
+We fix all three at once by deriving the instant the user meant---the
+last moment of the end date---and passing \emph{that} wherever [[end]]
+is treated as a point in time.
+[[end]] itself stays as parsed, so the filter and the option's meaning
+are untouched.
+<<helper functions>>=
+def end_of_day(when):
+  """
+  Returns the last moment of `when`'s date.
+  """
+  return datetime.datetime.combine(when.date(),
+                                   datetime.time.max)
 <<double check [[start]] and [[end]] dates>>=
 end = update_end_date(start, end)
+end_of_range = end_of_day(end)
 @
 
 \paragraph{Testing [[update_end_date]]}
@@ -504,6 +537,42 @@ def test_update_end_date_equal():
   end = datetime.datetime(2024, 3, 1)
   result = update_end_date(start, end)
   assert result == end
+@
+
+\paragraph{Testing [[end_of_day]]}
+
+The helper itself is one line, so the test that matters is the one that
+shows what it buys us.
+We schedule a todo over a range whose only work day \emph{is} the end
+date: with the bare [[end]] the day collapses to a zero-length window
+and nothing is scheduled, while the end of that day leaves the whole
+work window available.
+<<test functions>>=
+def test_end_of_day_covers_the_whole_date():
+  end = datetime.datetime(2024, 1, 15)
+  assert end_of_day(end).date() == end.date()
+  assert end_of_day(end).hour == 23
+
+def test_todos_reach_the_last_shown_day(monkeypatch):
+  """The end date is a day the user can still work."""
+  monkeypatch.setattr(
+    "nytid.cli.todo.load_todos",
+    lambda: (None, [make_fake_todo()]),
+  )
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  # Friday; the only work day in range is Monday the 15th.
+  freeze_schedule_now(monkeypatch,
+                      datetime.datetime(2024, 1, 12, 10, 30))
+
+  end = datetime.datetime(2024, 1, 15)
+  assert schedule_todo_events(None, end, []) == []
+
+  events = schedule_todo_events(None, end_of_day(end), [])
+  assert len(events) == 1
+  assert events[0].start.date() == datetime.date(2024, 1, 15)
 @
 
 \subsection{Managing external calendars}
@@ -1360,22 +1429,58 @@ expanded into their occurrences (\cref{ExpandingRecurrences} in the
 schedules chapter).
 The window must cover both consumers of these events: the displayed
 range starts at [[start]], while todo scheduling treats events from
-\emph{now} until [[end]] as occupied time---so the window runs from
-the earlier of the two.
+\emph{now} until the end of the range as occupied time---so the window
+runs from the earlier of the two, and up to [[end_of_range]] so that
+the last shown day is included.
 The window bounds must be timezone aware (the expansion compares them
-against aware event times), whereas [[start]] and [[end]] arrive
-naive from the command line, hence the [[astimezone()]] calls.
+against aware event times), whereas the range bounds are naive, hence
+the [[astimezone()]] calls.
 <<add external calendar events to [[schedule]]>>=
 if not user or user == default_username:
   external_sources = get_external_sources(external)
   cache = build_calendar_cache(no_cache)
   now = datetime.datetime.now().astimezone()
-  window = (min(start.astimezone(), now), end.astimezone())
+  window = (min(start.astimezone(), now),
+            end_of_range.astimezone())
   external_calendar = schedutils.read_calendars(external_sources,
                                                 cache=cache,
                                                 window=window)
   for event in external_calendar.events:
     schedule.add_component(event)
+@
+
+The other consumer of [[end_of_range]] is worth pinning at the command
+level, since the window is assembled inline rather than in a helper we
+could call directly.
+We drive [[show]] with no courses and no todos, stubbing the calendar
+reader to capture the window it is handed.
+<<test functions>>=
+def test_show_window_covers_the_last_shown_day(monkeypatch):
+  """External recurrences must be expanded on the end date too."""
+  from typer.testing import CliRunner
+  captured = {}
+
+  def fake_read_calendars(sources, cache=None, window=None):
+    captured["window"] = window
+    return icalendar.Calendar()
+
+  monkeypatch.setattr(schedule_module.coursescli,
+                      "get_courses_configs", lambda *a, **k: {})
+  monkeypatch.setattr(schedule_module, "get_external_sources",
+                      lambda cli_sources=None: ["external.ics"])
+  monkeypatch.setattr(schedule_module.schedutils, "read_calendars",
+                      fake_read_calendars)
+
+  result = CliRunner().invoke(
+    schedule_module.cli,
+    ["show", "--start", "2024-06-03", "--end", "2024-06-09",
+     "--no-todo"])
+  assert result.exit_code == 0, result.output
+
+  _, window_end = captured["window"]
+  window_end = window_end.astimezone()
+  assert window_end.date() == datetime.date(2024, 6, 9)
+  assert window_end.hour == 23
 @
 
 \paragraph{Opting out of todo scheduling}
@@ -1427,17 +1532,49 @@ and greedily fill the remaining work-hour slots with todos, in the shared
 display order ([[todo ls]]'s ranked-first ordering)---unless the user
 opted out with [[--no-todo]].
 Note that [[start]] plays no role here: todos are scheduled from now
-until [[end]], and the print-time filtering
+until the end of the range, and the print-time filtering
 (\cref{cli.schedule.filter-events}) trims any todo events that fall
 before the shown range.
+We pass [[end_of_range]] for the same reason the recurrence window
+does---the last shown day is a day the user can work.
 [[schedule.events]] holds the \emph{complete} sign-up and external
 calendars---range filtering happens only at print time---so the busy
-intervals between now and a future [[end]] are all known here.
+intervals between now and the end of the range are all known here.
 <<add scheduled todo events to [[schedule]]>>=
 if todo:
   occupied = event_bounds(schedule.events)
-  for event in schedule_todo_events(user, end, occupied):
+  for event in schedule_todo_events(user, end_of_range, occupied):
     schedule.add_component(event)
+@
+
+Let's pin this wiring too, by stubbing the scheduler and inspecting the
+bound it is handed.
+Stubbing also keeps the test away from the running user's real todo
+store.
+<<test functions>>=
+def test_show_schedules_todos_to_the_last_shown_day(monkeypatch):
+  """Todo scheduling gets the same end-of-day bound."""
+  from typer.testing import CliRunner
+  captured = {}
+
+  def fake_schedule_todo_events(user, end, occupied):
+    captured["end"] = end
+    return []
+
+  monkeypatch.setattr(schedule_module.coursescli,
+                      "get_courses_configs", lambda *a, **k: {})
+  monkeypatch.setattr(schedule_module, "get_external_sources",
+                      lambda cli_sources=None: [])
+  monkeypatch.setattr(schedule_module, "schedule_todo_events",
+                      fake_schedule_todo_events)
+
+  result = CliRunner().invoke(
+    schedule_module.cli,
+    ["show", "--start", "2024-06-03", "--end", "2024-06-09",
+     "--todo"])
+  assert result.exit_code == 0, result.output
+  assert captured["end"].date() == datetime.date(2024, 6, 9)
+  assert captured["end"].hour == 23
 @
 
 \subsection{Filter events based on start--end time}
