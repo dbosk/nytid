@@ -527,6 +527,7 @@ target_value = "Test Tester"
 
 runner.invoke(cli, ["new", target_course, "--register", register])
 <<test imports>>=
+import pathlib
 import tempfile
 from types import SimpleNamespace
 import pytest
@@ -1342,26 +1343,124 @@ courses rather than crashing.
 This design lets callers decide whether an empty result is fatal
 (like [[signupsheets]], which calls [[sys.exit(1)]]) or merely means
 there is nothing to show (like [[schedule]]).
+
+Honouring that contract takes more care than wrapping the
+config-reading call in a [[try]], because there are \emph{two} places
+that touch the file system, not one.
+Reading a course's config is the obvious one.
+The less obvious one is scanning a register for course names: that
+scan lives inside the [[courses_regex]] generator, and a generator's
+body runs when the loop \emph{advances} it---that is, in the [[for]]
+statement itself, outside any [[try]] in the loop body.
+A register whose directory has gone missing (a common state when AFS
+isn't mounted) therefore raises from a line that looks like plain
+iteration.
+So we drive the generator explicitly, with [[next]] inside the guarded
+region.
+
+We also scan one register at a time.
+A generator that raises is exhausted and can't be resumed, so a single
+[[courses_regex]] over every register would let one unreachable
+register hide the courses of every register after it.
+Giving each register its own generator confines the damage to that
+register.
 <<helper functions>>=
 def get_courses_configs(course_regex,
                         register=MINE):
   """Return {(course, register): config} for matching courses.
 
-  Logs warnings for KeyError and PermissionError,
-  skipping inaccessible courses.
+  Registers that can't be scanned and courses whose config
+  can't be read are skipped with a warning, so one broken
+  register or config never hides the healthy courses.
   """
-  regs = registers_regex(register)
   result = {}
-  for course_reg in courses_regex(course_regex, regs):
-    try:
-      result[course_reg] = courses.get_course_config(
-        *course_reg
-      )
-    except KeyError as err:
-      logging.warning(err)
-    except PermissionError as err:
-      c, r = course_reg
-      logging.warning(
-        f"You don't have access to {c} in {r}: {err}"
-      )
+  for reg in registers_regex(register):
+    <<add [[reg]]'s matching courses to [[result]]>>
   return result
+@
+
+The errors that mean \enquote{we can't get at this course} are the same
+at both sites, so we name them once.
+Beyond the [[KeyError]] and [[PermissionError]] the function already
+handled, a course directory can vanish or turn out not to be a
+directory, and [[typerconf]] reports a corrupt [[config.json]] as a
+[[ValueError]]---which is precisely the state a half-written config
+leaves behind.
+<<constants>>=
+COURSE_ACCESS_ERRORS = (KeyError, FileNotFoundError,
+                        NotADirectoryError, PermissionError,
+                        ValueError)
+@
+
+Exhausting the generator normally means we're done with the register;
+any other exception means the scan itself failed, and since we can't
+resume a generator that raised, we warn and move on to the next
+register.
+<<add [[reg]]'s matching courses to [[result]]>>=
+matches = courses_regex(course_regex, [reg])
+while True:
+  try:
+    course_reg = next(matches)
+  except StopIteration:
+    break
+  except COURSE_ACCESS_ERRORS as err:
+    logging.warning(f"Can't list the courses in {reg}: {err}")
+    break
+  <<read [[course_reg]]'s config into [[result]]>>
+@
+
+Reading the config keeps the tailored message for [[PermissionError]],
+since \enquote{you don't have access} tells the user what to do about
+it, whereas the remaining errors are best reported verbatim.
+The specific clause has to come first: [[PermissionError]] is also a
+member of [[COURSE_ACCESS_ERRORS]], and Python takes the first clause
+that matches.
+<<read [[course_reg]]'s config into [[result]]>>=
+try:
+  result[course_reg] = courses.get_course_config(
+    *course_reg
+  )
+except PermissionError as err:
+  c, r = course_reg
+  logging.warning(
+    f"You don't have access to {c} in {r}: {err}"
+  )
+except COURSE_ACCESS_ERRORS as err:
+  logging.warning(err)
+@
+
+Let's verify both failure modes.
+A register pointing at a directory that was never created must yield
+nothing rather than a traceback.
+We remove the register again afterwards so that the shared test config
+stays healthy for the other tests.
+<<test functions>>=
+def test_get_courses_configs_skips_unreadable_register():
+  gone_reg = "goneregister"
+  gone_path = pathlib.Path(tempfile.mkdtemp()) / "never-created"
+  runner.invoke(cli, ["registry", "add", gone_reg, str(gone_path)])
+  try:
+    assert get_courses_configs(".*", f"^{gone_reg}$") == {}
+  finally:
+    runner.invoke(cli, ["registry", "rm", gone_reg])
+@
+
+A corrupt config must cost us that one course and no more---the point
+of the whole exercise is that the healthy course in the same register
+still comes back.
+<<test functions>>=
+def test_get_courses_configs_skips_corrupt_config():
+  broken_reg = "brokenregister"
+  broken_path = pathlib.Path(tempfile.mkdtemp())
+  runner.invoke(cli, ["registry", "add", broken_reg, str(broken_path)])
+  try:
+    runner.invoke(cli, ["new", "brokencourse", "--register", broken_reg])
+    runner.invoke(cli, ["new", "healthycourse", "--register", broken_reg])
+    (broken_path / "brokencourse" / "config.json").write_text("{not json")
+
+    configs = get_courses_configs(".*", f"^{broken_reg}$")
+    assert ("healthycourse", broken_reg) in configs
+    assert ("brokencourse", broken_reg) not in configs
+  finally:
+    runner.invoke(cli, ["registry", "rm", broken_reg])
+@
