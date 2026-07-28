@@ -130,6 +130,7 @@ cli = typer.Typer(
 )
 
 <<data model>>
+<<deadline helpers>>
 <<effective priority>>
 <<storage functions>>
 <<active stack helpers>>
@@ -378,6 +379,7 @@ class TodoItem:
         """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
+        <<coerce stored estimate to hours>>
         return cls(**filtered)
 @
 
@@ -407,6 +409,52 @@ def __setattr__(self, name, value):
     if name == "labels" and value is not None:
         value = sorted(set(value))
     object.__setattr__(self, name, value)
+@
+
+\subsection{Estimates Are Numbers, Not Strings}
+
+[[estimated]] is declared [[float | None]] and is formatted with
+[[:.1f]] and fed to [[datetime.timedelta]] throughout the module, so a
+string in that field is not merely untidy---it makes [[ls]], [[view]],
+and [[export]] raise.  Every command that writes an estimate converts
+it with [[parse_hours]] first, but the store is plain JSON that users
+are invited to inspect and edit, and older versions of the [[--edit]]
+path wrote the raw front-matter string.  Deserialization is the one
+place all of that flows through, so it is where we can repair it.
+
+We fall back to [[None]] rather than propagating the [[ValueError]] for
+the same reason [[effective_priority]] tolerates a bad deadline: one
+unreadable estimate should cost that item its duration, not lock the
+user out of their entire todo list.
+
+<<coerce stored estimate to hours>>=
+if isinstance(filtered.get("estimated"), str):
+    try:
+        filtered["estimated"] = parse_hours(
+            filtered["estimated"]
+        )
+    except ValueError:
+        filtered["estimated"] = None
+@
+
+Let's verify that a suffixed string estimate is converted on load and
+that an unreadable one degrades to no estimate:
+
+<<test functions>>=
+def test_from_dict_coerces_string_estimate():
+  """A stored '90m' estimate loads as 1.5 hours."""
+  item = TodoItem.from_dict({
+    "id": 1, "title": "Test", "estimated": "90m",
+  })
+  assert item.estimated == pytest.approx(1.5)
+
+
+def test_from_dict_drops_unreadable_estimate():
+  """An unparseable estimate becomes None, not a crash."""
+  item = TodoItem.from_dict({
+    "id": 1, "title": "Test", "estimated": "soon",
+  })
+  assert item.estimated is None
 @
 
 \subsection{Testing the Data Model}
@@ -469,6 +517,198 @@ def test_todo_item_from_dict_preserves_null_priority():
     assert item.priority is None
 @
 
+\section{Deadlines}
+
+A deadline enters the system as whatever string the user typed at the
+command line or in the editor buffer, and is then read back on every
+subsequent listing, ranking, and export.  Those two roles pull in
+opposite directions.  The write side wants to be \emph{strict}: at the
+moment of writing we still know which option produced the value, so a
+mistake can be reported against the flag the user just typed.  The read
+side wants to be \emph{forgiving}: by then the value sits in
+[[todos.json]] next to dozens of healthy items, and one bad timestamp
+must not take the whole list down with it.
+
+Doing only one of the two is not enough.  Validating on write alone
+leaves every todo file written by an older version---or edited by hand,
+which the plain-JSON storage format openly invites---able to crash
+[[ls]].  Being forgiving on read alone silently accepts
+[[--deadline tomorrow]] and then quietly ignores it forever.  So we do
+both, and share the one primitive they need: turning a stored string
+into a [[datetime]] that can be compared with the current time.
+
+\subsection{Comparable Timestamps}
+
+Two shapes of stored value defeat a direct comparison.  A string that is
+not ISO 8601 at all cannot be parsed.  A string that carries a UTC
+offset \emph{does} parse, but into an \emph{aware} [[datetime]], and
+Python refuses to subtract that from the \emph{naive}
+[[datetime.datetime.now()]] the rest of this module compares against.
+
+Converting an aware value to local time and then dropping its offset
+resolves the second case without distorting the first: the local
+wall-clock reading denotes the same instant, so ordering and
+time-remaining arithmetic are unchanged, and the result is
+commensurable with every other timestamp we hold.  Returning [[None]]
+rather than raising for unparseable input lets each caller decide what
+a missing timestamp means for it, instead of forcing every call site to
+wrap the parse in a [[try]] block.
+
+<<deadline helpers>>=
+def naive_local_datetime(value):
+    """Return `value` as a naive local-time datetime.
+
+    Accepts a datetime or an ISO 8601 string.  Aware
+    values are converted to local time and stripped of
+    their offset so that they can be compared with
+    `datetime.datetime.now()`.  Returns ``None`` when
+    the value is empty or is not a recognizable
+    timestamp.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.datetime.fromisoformat(
+                str(value)
+            )
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone().replace(tzinfo=None)
+@
+
+Let's verify all four cases: a naive string passes through unchanged,
+an aware string loses its offset while denoting the same instant, an
+already-parsed [[datetime]] is accepted directly, and unparseable
+input yields [[None]] instead of an exception.
+
+<<test functions>>=
+def test_naive_local_datetime_passes_naive_through():
+  """A naive ISO string parses unchanged."""
+  assert naive_local_datetime(
+    "2026-03-01T12:00:00"
+  ) == datetime.datetime(2026, 3, 1, 12, 0)
+
+
+def test_naive_local_datetime_strips_offset():
+  """An aware string becomes naive local time."""
+  aware = "2026-03-01T12:00:00+01:00"
+  expected = datetime.datetime.fromisoformat(
+    aware
+  ).astimezone().replace(tzinfo=None)
+  result = naive_local_datetime(aware)
+  assert result.tzinfo is None
+  assert result == expected
+
+
+def test_naive_local_datetime_accepts_datetime():
+  """An already-parsed datetime is accepted."""
+  when = datetime.datetime(2026, 3, 1, 12, 0)
+  assert naive_local_datetime(when) == when
+
+
+def test_naive_local_datetime_rejects_garbage():
+  """Unparseable input yields None, not an exception."""
+  assert naive_local_datetime("tomorrow") is None
+  assert naive_local_datetime("") is None
+  assert naive_local_datetime(None) is None
+@
+
+\subsection{Validating Deadlines at Write Time}
+
+Every command that stores a deadline routes it through
+[[normalize_deadline]], which is what makes the stored field
+trustworthy: it either becomes a string that
+[[datetime.datetime.fromisoformat]] will accept, or the command exits
+before writing anything.  Reporting the error here rather than at read
+time is the whole point---the user is looking at the deadline they just
+typed, so the message can name it.
+
+The bare calendar date is the shape people actually type, so we detect
+it exactly with [[strptime]] and return it untouched.  Preserving it
+keeps [[todo view]] and the editor buffer showing [[2026-03-01]]
+instead of a padded [[2026-03-01T00:00:00]], and an exact format match
+behaves identically on every supported Python version, unlike
+[[datetime.date.fromisoformat]], whose accepted syntax widened in
+Python~3.11.
+
+Anything else is stored as naive local time.  That matters beyond
+[[effective_priority]]: [[todo_display_sort_key]] orders the unranked
+tail by comparing deadline \emph{strings}, and a mixture of offsets
+would make that lexicographic comparison disagree with chronological
+order.
+
+<<deadline helpers>>=
+def normalize_deadline(value):
+    """Return `value` as a canonical deadline string.
+
+    A bare ``YYYY-MM-DD`` date is kept as written; any
+    other ISO 8601 timestamp is stored as naive local
+    time.  Returns ``None`` for ``None`` or an empty
+    string, and exits with an error when the value is
+    not a recognizable timestamp.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        datetime.datetime.strptime(text, "%Y-%m-%d")
+        return text
+    except ValueError:
+        pass
+    parsed = naive_local_datetime(text)
+    if parsed is None:
+        typer.echo(
+            f"Error: invalid deadline {text!r}; use "
+            "YYYY-MM-DD or an ISO 8601 datetime such "
+            "as 2026-03-01T17:00",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return parsed.isoformat()
+@
+
+Let's verify the three outcomes: a bare date survives verbatim, an
+offset-bearing timestamp is rewritten to naive local time, and prose
+input is rejected rather than stored.
+
+<<test functions>>=
+def test_normalize_deadline_keeps_bare_date():
+  """A YYYY-MM-DD deadline is stored as written."""
+  assert normalize_deadline("2026-03-01") == "2026-03-01"
+
+
+def test_normalize_deadline_strips_offset():
+  """An offset-bearing deadline becomes naive local."""
+  stored = normalize_deadline(
+    "2026-03-01T12:00:00+01:00"
+  )
+  assert "+" not in stored
+  assert datetime.datetime.fromisoformat(
+    stored
+  ) == datetime.datetime.fromisoformat(
+    "2026-03-01T12:00:00+01:00"
+  ).astimezone().replace(tzinfo=None)
+
+
+def test_normalize_deadline_rejects_prose():
+  """A non-ISO deadline exits instead of being stored."""
+  with pytest.raises(typer.Exit):
+    normalize_deadline("tomorrow")
+
+
+def test_normalize_deadline_passes_empty_through():
+  """Absent deadlines stay absent."""
+  assert normalize_deadline(None) is None
+  assert normalize_deadline("") is None
+@
+
 \section{Effective Priority}
 
 The effective priority determines display and scheduling order for
@@ -488,6 +728,24 @@ quadratic curve stays near zero until roughly the last third of the
 time span, then ramps up sharply---matching the human experience of
 \enquote{it's not urgent yet} followed by \enquote{this is due soon!}
 
+This function is on the read path of nearly every command, so it is
+also where a single malformed stored timestamp does the most damage.
+[[normalize_deadline]] keeps new writes clean, but a file written by an
+older version or edited by hand can still hold anything, and raising
+here would take down [[ls]], [[next]], [[export]], and
+[[schedule show --todo]] for \emph{all} items because of \emph{one}.
+We therefore treat the boost as a refinement that can be skipped: an
+unparseable deadline simply yields the base priority, so the item keeps
+its place in the ranking rather than crashing it.
+
+The [[created]] timestamp needs a different fallback, because it is
+only used to measure how long the item has been waiting.  When it is
+missing---it defaults to the empty string---we substitute the deadline
+itself, which drives [[total_span]] down to its one-day floor.  The
+resulting curve stays flat until the final day and still awards the
+full boost once the deadline has passed, so overdue work keeps
+surfacing even when we cannot tell how long it has been pending.
+
 <<effective priority>>=
 def effective_priority(
     item: TodoItem,
@@ -498,10 +756,13 @@ def effective_priority(
     Returns ``None`` when the stored base priority is
     unset. Otherwise returns base priority plus a
     deadline-based urgency boost that increases
-    quadratically as the deadline approaches.
+    quadratically as the deadline approaches.  An
+    unparseable stored deadline yields the base
+    priority instead of raising.
     """
     if now is None:
         now = datetime.datetime.now()
+    now = naive_local_datetime(now)
 
     if item.priority is None:
         return None
@@ -511,11 +772,12 @@ def effective_priority(
     if not item.deadline:
         return base
 
-    deadline_dt = datetime.datetime.fromisoformat(
-        item.deadline
-    )
-    created_dt = datetime.datetime.fromisoformat(
-        item.created
+    deadline_dt = naive_local_datetime(item.deadline)
+    if deadline_dt is None:
+        return base
+    created_dt = (
+        naive_local_datetime(item.created)
+        or deadline_dt
     )
 
     max_boost = get_max_boost()
@@ -612,6 +874,45 @@ def test_effective_priority_past_deadline():
     now = datetime.datetime(2026, 1, 20)
     result = effective_priority(item, now)
     assert result == 5.0 + DEFAULT_MAX_BOOST
+
+
+def test_effective_priority_ignores_bad_deadline():
+    """An unparseable deadline yields the base priority."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00",
+        deadline="tomorrow",
+    )
+    now = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, now) == 5.0
+
+
+def test_effective_priority_accepts_aware_deadline():
+    """A timezone-aware deadline does not break the math."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="2026-01-01T00:00:00",
+        deadline="2026-01-15T00:00:00+01:00",
+    )
+    now = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, now) == (
+        5.0 + DEFAULT_MAX_BOOST
+    )
+
+
+def test_effective_priority_without_created():
+    """A missing created timestamp still boosts overdue work."""
+    item = TodoItem(
+        id=1, title="Test", priority=5.0,
+        created="",
+        deadline="2026-01-15T00:00:00",
+    )
+    overdue = datetime.datetime(2026, 1, 20)
+    assert effective_priority(item, overdue) == (
+        5.0 + DEFAULT_MAX_BOOST
+    )
+    early = datetime.datetime(2026, 1, 1)
+    assert effective_priority(item, early) == 5.0
 
 
 def test_effective_priority_unset_priority():
@@ -1220,6 +1521,49 @@ def get_siblings(
         for t in todos
         if t.parent_id == item.parent_id and t.id != item.id
     ]
+@
+
+Direct children are the right unit for display and for priority
+comparison, because both work one level at a time.  Deletion is
+different: it is the one operation whose correctness depends on the
+\emph{whole} subtree, since an item whose parent no longer exists is
+treated as a visible root by [[get_visible_roots]] and would reappear
+at the top of [[ls]].  We therefore also offer the transitive view.
+
+<<sub-item helpers>>=
+def get_descendants(
+    todos: list[TodoItem], parent_id: int
+) -> list[TodoItem]:
+    """Get every descendant of a todo item.
+
+    Returns children, grandchildren, and deeper, in
+    depth-first order.
+    """
+    found = []
+    for child in get_children(todos, parent_id):
+        found.append(child)
+        found.extend(
+            get_descendants(todos, child.id)
+        )
+    return found
+@
+
+Let's verify that the transitive walk reaches past the first level and
+that the one-level helper still does not:
+
+<<test functions>>=
+def test_get_descendants_reaches_grandchildren():
+  """Descendants include deeper levels, children do not."""
+  todos = [
+    TodoItem(id=1, title="Root"),
+    TodoItem(id=2, title="Child", parent_id=1),
+    TodoItem(id=3, title="Grandchild", parent_id=2),
+    TodoItem(id=4, title="Unrelated"),
+  ]
+  assert {t.id for t in get_children(todos, 1)} == {2}
+  assert {
+    t.id for t in get_descendants(todos, 1)
+  } == {2, 3}
 @
 
 The [[add]], [[reprioritize]], and [[import]] commands compare a
@@ -4468,11 +4812,15 @@ if parent is None and not top_level:
 @
 
 When a parent is set, inherit its deadline and labels unless the user
-explicitly provided overrides:
+explicitly provided overrides.  This chunk is shared by [[add]] and
+[[import]], which makes it the single place where a command-line
+[[--deadline]] becomes stored data---so it is also where that string
+has to be validated.  An inherited parent deadline needs no check: it
+was normalized when the parent was written.
 
 <<inherit from parent>>=
 inherited_labels = list(label) if label else []
-inherited_deadline = deadline
+inherited_deadline = normalize_deadline(deadline)
 if resolved_parent is not None:
     parent_item = next(
         (t for t in todos if t.id == resolved_parent),
@@ -4488,6 +4836,51 @@ if resolved_parent is not None:
         inherited_labels = list(parent_item.labels)
     if deadline is None and parent_item.deadline:
         inherited_deadline = parent_item.deadline
+@
+
+Let's verify the two halves of the deadline contract end to end.  A
+mistyped [[--deadline]] must be refused before anything reaches disk,
+and a todo file that already contains such a value---written by an
+older version, or edited by hand---must still list.
+
+<<test functions>>=
+def test_add_rejects_invalid_deadline(temp_todo_dir):
+  """A non-ISO --deadline fails before writing."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "-d", "tomorrow",
+     "--prio", "1"],
+  )
+  assert result.exit_code == 1
+  assert "invalid deadline" in result.output
+  _, todos = load_todos()
+  assert todos == []
+
+
+def test_add_normalizes_aware_deadline(temp_todo_dir):
+  """An offset-bearing --deadline is stored naive."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--prio", "1",
+     "-d", "2026-03-01T12:00:00+01:00"],
+  )
+  assert result.exit_code == 0
+  _, todos = load_todos()
+  assert "+" not in todos[0].deadline
+
+
+def test_ls_survives_unparseable_deadline(temp_todo_dir):
+  """A legacy bad deadline must not break the listing."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Legacy task", priority=5.0,
+      created="2026-02-20T10:00:00",
+      deadline="tomorrow",
+    ),
+  ])
+  result = runner.invoke(cli, ["ls", "--who", ""])
+  assert result.exit_code == 0
+  assert "Legacy task" in result.output
 @
 
 Priority selection has three modes. [[--prio]] bypasses all inference.
@@ -4775,7 +5168,9 @@ initial_meta = {}
 if label:
     initial_meta["labels"] = list(label)
 if deadline:
-    initial_meta["deadline"] = deadline
+    initial_meta["deadline"] = normalize_deadline(
+        deadline
+    )
 if estimate:
     initial_meta["estimate"] = parse_hours(estimate)
 if who:
@@ -4789,7 +5184,16 @@ if run_command:
 @
 
 We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided:
+with CLI flags taking precedence where provided.
+
+The estimate needs the same [[parse_hours]] treatment on both branches,
+not just on the CLI one.  Our minimal YAML parser deliberately returns a
+plain string for anything that is not a bare number, so the
+[[1h30m]] and [[90m]] forms that [[--estimate]] advertises arrive here
+as text.  Storing that text in a field the rest of the module formats
+with [[:.1f]] would write a value that every later [[ls]], [[view]],
+and [[export]] chokes on, so the front-matter branch converts it to
+hours exactly as its sibling child and [[edit]] paths already do.
 
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
@@ -4814,11 +5218,15 @@ parent_item = TodoItem(
     priority=priority,
     status="pending",
     created=now,
-    deadline=deadline or meta.get("deadline"),
+    deadline=normalize_deadline(
+        deadline or meta.get("deadline")
+    ),
     estimated=(
         parse_hours(estimate)
         if estimate
-        else meta.get("estimate")
+        else parse_hours(str(meta["estimate"]))
+        if "estimate" in meta
+        else None
     ),
     description=description or "",
     parent_id=resolved_parent,
@@ -4837,6 +5245,39 @@ typer.echo(
     f"Added todo #{parent_item.id}: "
     f"{parent_item.title}"
 )
+@
+
+Let's verify that a suffixed front-matter estimate is stored as a
+number, and that the resulting item survives the listing that used to
+crash on it:
+
+<<test functions>>=
+def test_add_edit_yaml_estimate_parses_suffix(
+  temp_todo_dir,
+):
+  """Editor YAML `estimate: 90m` stores 1.5 hours."""
+  buffer = (
+    "Estimated task\n"
+    "---\n"
+    "estimate: 90m\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1"],
+    )
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].estimated == pytest.approx(1.5)
+
+  listing = runner.invoke(cli, ["ls", "--who", ""])
+  assert listing.exit_code == 0
+  assert "1.5" in listing.output
 @
 
 Children are created recursively. Each child inherits the parent's
@@ -4920,8 +5361,8 @@ child_meta = parsed_child.metadata
 child_labels = child_meta.get(
     "labels", list(parent_labels)
 )
-child_deadline = child_meta.get(
-    "deadline", parent_deadline
+child_deadline = normalize_deadline(
+    child_meta.get("deadline", parent_deadline)
 )
 child_who = child_meta.get("who", parent_who)
 child_wd = canonicalize_wd(child_meta.get("wd"))
@@ -5221,8 +5662,39 @@ if label_filter:
 if who_filter:
     filtered = [
         t for t in filtered
-        if t.who and re.search(who_filter, t.who)
+        if re.search(
+            who_filter, t.who or default_username
+        )
     ]
+@
+
+An unset [[who]] means the current user, not \enquote{nobody}.  That is
+the rule [[find_pending_by_priority]] already documents and applies for
+the same backward-compatibility reason as the active stack: items
+written before the field existed have no owner recorded, but they still
+belong to whoever is running the command.
+
+Getting this wrong is not merely a display difference, because [[ls]]
+and [[next]] answer the same question from the same data.  With the
+stricter test, [[--who]] defaulting to [[$USER]] hid every ownerless
+item from the listing while [[next]] went on choosing them---so the
+user could be handed a task that their own todo list insisted did not
+exist, and no [[--who]] value short of the empty string would reveal
+it.
+
+<<test functions>>=
+def test_ls_shows_items_without_who(temp_todo_dir):
+  """An ownerless item is listed for the current user."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Legacy task", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=None,
+    ),
+  ])
+  result = runner.invoke(cli, ["ls"])
+  assert result.exit_code == 0
+  assert "Legacy task" in result.output
 @
 
 Let's verify that the [[--status]] filter correctly isolates items
@@ -6426,7 +6898,7 @@ item:
 if title is not None:
     item.title = title
 if deadline is not None:
-    item.deadline = deadline
+    item.deadline = normalize_deadline(deadline)
 if estimate is not None:
     item.estimated = parse_hours(estimate)
 <<apply label edits>>
@@ -6546,7 +7018,9 @@ if "command" in meta:
 if "labels" in meta:
     item.labels = meta["labels"]
 if "deadline" in meta:
-    item.deadline = meta["deadline"]
+    item.deadline = normalize_deadline(
+        meta["deadline"]
+    )
 if "estimate" in meta:
     item.estimated = parse_hours(str(meta["estimate"]))
 if "who" in meta:
@@ -6565,21 +7039,49 @@ priority, reconciliation keeps it that way instead of silently assigning
 one.  New children only receive numeric priorities when the parent has a
 numeric priority and the new child is entering the ranked subset.
 
+Reconciliation has to recurse, because the buffer the user edited does.
+[[render_child_markdown]] emits each child's own children at one deeper
+heading level and [[parse_editor_content]] parses them back into
+[[parsed_child.children]], so a reconciliation that walked only the
+first level would show the user their grandchildren, accept their
+edits, report success, and discard them.  Silently losing text the user
+typed is the worst failure mode an editor round-trip can have.
+
+We express the recursion as a nested \emph{function} rather than a
+reusable chunk.  The level being reconciled is described entirely by
+[[parent]] and [[parsed_children]]; making those parameters means a
+recursive call cannot accidentally inherit the outer level's variables,
+which is exactly the mistake a chunk reference would invite.  This also
+mirrors [[create_children_from_parsed]] on the [[add]] side, which has
+recursed from the start.
+
 <<reconcile children>>=
-<<build existing children index>>
-<<distribute child priorities>>
-<<update or create each parsed child>>
-<<remove deleted children>>
+def reconcile_children(parent, parsed_children):
+    """Match parsed sections against a parent's children.
+
+    Sections are matched to existing children by
+    normalized title so that they keep their ID,
+    status, and tracked time.  Unmatched sections
+    become new children, unmatched children are
+    removed with their subtrees, and each matched
+    child is reconciled against its own sections.
+    """
+    nonlocal next_id, todos
+    <<build existing children index>>
+    <<distribute child priorities>>
+    <<update or create each parsed child>>
+    <<remove deleted children>>
+
+reconcile_children(item, parsed.children)
 @
 
 We normalize titles to lowercase with stripped whitespace so that
 minor formatting changes in the editor do not accidentally create
 duplicate children.
 <<build existing children index>>=
-existing_children = get_children(todos, todo_id)
 existing_by_title = {
     c.title.strip().lower(): c
-    for c in existing_children
+    for c in get_children(todos, parent.id)
 }
 @
 
@@ -6593,13 +7095,13 @@ Existing unranked children do not consume a numeric slot.  They stay in
 the unranked tail until the user runs [[reprioritize]], while ranked or
 new children still share the parent's numeric range.
 <<distribute child priorities>>=
-if item.priority is None:
+if parent.priority is None:
     ranked_titles = []
     priorities = []
 else:
     ranked_titles = [
         parsed_child.title.strip().lower()
-        for parsed_child in parsed.children
+        for parsed_child in parsed_children
         if (
             parsed_child.title.strip().lower()
             not in existing_by_title
@@ -6610,7 +7112,7 @@ else:
     ]
     if ranked_titles:
         prio_high, prio_low = compute_child_priority_range(
-            todos, item
+            todos, parent
         )
         priorities = distribute_priorities_in_range(
             len(ranked_titles), prio_high, prio_low,
@@ -6620,21 +7122,27 @@ else:
 priority_iter = iter(priorities)
 @
 
-For each child in the parsed document we either update the matching
+For each section in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
-New children inherit [[who]] from the parent ([[item]]) when their
+New children inherit [[who]] from the parent when their
 YAML block does not specify one --- the same rule as in
 [[create_children_from_parsed]] --- so that adding a sub-task in
 the editor never silently leaves it unassigned.
-We use a set to track which existing children were seen; any that
-remain unseen after this loop were removed in the editor.
+Popping each match out of [[existing_by_title]] doubles as the
+seen-marker: whatever is still in the index afterwards had no section
+and was therefore deleted in the editor.
+
+Each child is reconciled against its own sections immediately after it
+is settled, so a freshly created child can already receive
+grandchildren in the same save.  A newly appended child is on
+[[todos]] by then, which is what lets [[get_children]] find its own
+level on the recursive call.
 <<update or create each parsed child>>=
-new_child_ids = set()
-for i, parsed_child in enumerate(parsed.children):
+for parsed_child in parsed_children:
     norm_title = parsed_child.title.strip().lower()
     existing_child = existing_by_title.get(norm_title)
     if (
-        item.priority is None
+        parent.priority is None
         or (
             existing_child is not None
             and existing_child.priority is None
@@ -6643,7 +7151,7 @@ for i, parsed_child in enumerate(parsed.children):
         prio = None
     else:
         prio = next(priority_iter, None)
-    if norm_title in existing_by_title:
+    if existing_child is not None:
         child = existing_by_title.pop(norm_title)
         child.title = parsed_child.title
         child.notes = parsed_child.notes
@@ -6656,50 +7164,60 @@ for i, parsed_child in enumerate(parsed.children):
         if "labels" in child_meta:
             child.labels = child_meta["labels"]
         if "deadline" in child_meta:
-            child.deadline = child_meta["deadline"]
+            child.deadline = normalize_deadline(
+                child_meta["deadline"]
+            )
         if "estimate" in child_meta:
             child.estimated = parse_hours(
                 str(child_meta["estimate"])
             )
         if "who" in child_meta:
             child.who = child_meta["who"]
-        new_child_ids.add(child.id)
     else:
         now = datetime.datetime.now().isoformat()
         child_meta = parsed_child.metadata
-        new_child = TodoItem(
+        child = TodoItem(
             id=next_id,
             title=parsed_child.title,
             labels=child_meta.get(
-                "labels", list(item.labels)
+                "labels", list(parent.labels)
             ),
             priority=prio,
             status="pending",
             created=now,
-            deadline=child_meta.get(
-                "deadline", item.deadline
+            deadline=normalize_deadline(
+                child_meta.get(
+                    "deadline", parent.deadline
+                )
             ),
-            parent_id=todo_id,
-            who=child_meta.get("who", item.who),
+            parent_id=parent.id,
+            who=child_meta.get("who", parent.who),
             notes=parsed_child.notes,
             wd=canonicalize_wd(child_meta.get("wd")),
             command=child_meta.get("command"),
         )
-        todos.append(new_child)
-        new_child_ids.add(next_id)
+        todos.append(child)
         next_id += 1
         typer.echo(
-            f"  Added sub-item #{new_child.id}: "
-            f"{new_child.title}"
+            f"  Added sub-item #{child.id}: "
+            f"{child.title}"
         )
+    reconcile_children(child, parsed_child.children)
 @
 
 Children remaining in [[existing_by_title]] were not present in the
-parsed document, meaning the user deleted their headings.  We remove
-them from the list rather than silently keeping orphaned sub-items.
+parsed document, meaning the user deleted their headings.  Their own
+subtrees go with them: an item whose parent is gone is not hidden but
+promoted to a visible root by [[get_visible_roots]], so leaving
+grandchildren behind would move them into the main list instead of
+removing them.
 <<remove deleted children>>=
 for removed in existing_by_title.values():
-    todos = [t for t in todos if t.id != removed.id]
+    doomed = {removed.id} | {
+        d.id
+        for d in get_descendants(todos, removed.id)
+    }
+    todos = [t for t in todos if t.id not in doomed]
     typer.echo(
         f"  Removed sub-item #{removed.id}: "
         f"{removed.title}"
@@ -6708,6 +7226,124 @@ for removed in existing_by_title.values():
 
 
 \subsection{Testing Editor Reconciliation}
+
+Let's verify the recursion in both directions: an edit to an existing
+grandchild reaches it and preserves its identity, and a brand-new
+[[##]] section becomes a real grandchild rather than being ignored.
+
+<<test functions>>=
+def test_edit_interactive_updates_grandchild(
+  temp_todo_dir,
+):
+  """Editing a '##' section reaches the grandchild."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+    TodoItem(
+      id=3, title="Grandchild", parent_id=2,
+      created="2026-02-20T10:00:00",
+      priority=3.0, status="done",
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "\n"
+    "## Grandchild\n"
+    "\n"
+    "Reviewed the notes.\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  grandchild = next(t for t in todos if t.id == 3)
+  assert grandchild.notes == "Reviewed the notes."
+  assert grandchild.status == "done"
+  assert grandchild.parent_id == 2
+
+
+def test_edit_interactive_adds_grandchild(
+  temp_todo_dir,
+):
+  """A new '##' section becomes a real grandchild."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "\n"
+    "## Brand new\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  added = next(
+    t for t in todos if t.title == "Brand new"
+  )
+  assert added.parent_id == 2
+
+
+def test_edit_interactive_removes_subtree(
+  temp_todo_dir,
+):
+  """Deleting a '#' section removes its grandchildren too."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+    TodoItem(
+      id=3, title="Grandchild", parent_id=2,
+      created="2026-02-20T10:00:00",
+      priority=3.0,
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Parent\n",
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1]
+@
 
 <<test functions>>=
 def test_edit_interactive_reconcile():
@@ -7344,8 +7980,18 @@ view.  We therefore give [[done]] its own [[--who]] option: omitting
 it defaults to the current user, while completing another worker's
 item requires naming that worker explicitly.
 
+[[<<argument and option definitions>>]] is a bucket chunk: noweb
+concatenates every definition of it into a single module-level block,
+so two chunks that happen to bind the same name are not a duplicate
+definition the reader can see---they are an ordinary reassignment, and
+the later one wins silently.  [[--force]] means something different for
+[[done]] than it does for [[rm]], so each gets a command-qualified
+name.  A bare [[force_opt]] here would be adopted by whichever command
+was defined last in the file, and the flag's help would describe the
+wrong operation.
+
 <<argument and option definitions>>=
-force_opt = typer.Option(
+done_force_opt = typer.Option(
     "--force", "-f",
     help="Force-complete even if children are "
          "still active (marks them done too)")
@@ -7360,7 +8006,7 @@ done_who_opt = typer.Option(
 def done(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
-    force: Annotated[bool, force_opt] = False,
+    force: Annotated[bool, done_force_opt] = False,
     who: Annotated[str | None,
                    done_who_opt] = default_username,
 ):
@@ -8518,18 +9164,35 @@ def test_done_closes_github_issue(temp_todo_dir):
 
 \subsection{The [[rm]] Command}
 
-Removing a todo requires confirmation. If the item has children,
-those are removed as well.  We stop any active tracking for the
-removed item and clean up stale labels left by previously removed
-todos---otherwise orphaned [[todo:N]] labels accumulate in the
-session and generate phantom tracking entries.
+Removing a todo requires confirmation.  The whole subtree goes with
+it---children, grandchildren, and deeper---because the store has no
+notion of a parentless sub-item: [[get_visible_roots]] promotes any
+item whose parent is missing to the top level, so a surviving
+grandchild would not be tidied away but instead reappear in the main
+[[ls]] list, detached from the tree the user just deleted.
+
+That is also why the count shown in the confirmation prompt is the
+transitive one.  The prompt is the user's last chance to notice that
+[[rm]] is about to take more than they had in mind, so it must state
+the real size of what will disappear.
+
+We stop any active tracking for the removed item and clean up stale
+labels left by previously removed todos---otherwise orphaned
+[[todo:N]] labels accumulate in the session and generate phantom
+tracking entries.
 
 An omitted ID means \enquote{remove the current active todo}, which mirrors
 the way [[done]], [[note]], and [[edit]] already target the same
 context-aware default.
 
+Here [[--force]] only waives the confirmation prompt; the removal it
+skips asking about is the same one either way.  That is a different
+promise from [[done --force]], which changes what the command
+\emph{does}, so the two carry separate option objects under
+command-qualified names.
+
 <<argument and option definitions>>=
-force_opt = typer.Option(
+rm_force_opt = typer.Option(
     "--force", "-f",
     help="Skip confirmation")
 @
@@ -8539,7 +9202,7 @@ force_opt = typer.Option(
 def rm(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
-    force: Annotated[bool, force_opt] = False,
+    force: Annotated[bool, rm_force_opt] = False,
 ):
     """Remove a todo item.
 
@@ -8560,28 +9223,71 @@ def rm(
         )
         raise typer.Exit(1)
 
-    children = get_children(todos, todo_id)
+    descendants = get_descendants(todos, todo_id)
     if not force:
         msg = f"Remove #{todo_id}: {item.title}?"
-        if children:
-            msg += f" ({len(children)} sub-items)"
+        if descendants:
+            msg += f" ({len(descendants)} sub-items)"
         if not typer.confirm(msg):
             typer.echo("Cancelled.")
             raise typer.Exit(0)
 
-    # Remove item and its children
     ids_to_remove = {todo_id}
-    ids_to_remove.update(c.id for c in children)
+    ids_to_remove.update(d.id for d in descendants)
     todos = [t for t in todos if t.id not in ids_to_remove]
 
     <<stop tracking if active>>
 
     save_todos(next_id, todos)
     typer.echo(f"Removed #{todo_id}: {item.title}")
-    if children:
+    if descendants:
         typer.echo(
-            f"  Also removed {len(children)} sub-items"
+            f"  Also removed {len(descendants)} sub-items"
         )
+@
+
+Let's pin the separation down, since a name collision in a bucket chunk
+leaves no trace at either definition site---only the help output tells
+you which one survived:
+
+<<test functions>>=
+def test_force_help_is_per_command():
+  """done --force and rm --force document themselves."""
+  done_help = runner.invoke(cli, ["done", "--help"])
+  assert "Force-complete" in done_help.output
+
+  rm_help = runner.invoke(cli, ["rm", "--help"])
+  assert "Skip confirmation" in rm_help.output
+  assert "Force-complete" not in rm_help.output
+@
+
+Let's verify that a three-level tree disappears completely and that the
+summary counts what actually went:
+
+<<test functions>>=
+def test_rm_removes_whole_subtree(temp_todo_dir):
+  """Removing a root also removes grandchildren."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Root",
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Grandchild", parent_id=2,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  result = runner.invoke(cli, ["rm", "1", "--force"])
+
+  assert result.exit_code == 0
+  assert "Also removed 2 sub-items" in result.output
+  _, todos = load_todos()
+  assert todos == []
 @
 
 Let's verify both the explicit and active-stack forms of [[rm]]:
@@ -9294,9 +10000,24 @@ environment or another non-system interpreter, so the detached helper
 must reuse [[sys.executable]] rather than assuming [[python3]] points at
 the correct environment.
 
+Because nobody is watching a detached run, the exit code is the only
+report it ever files.  We give it the same treatment the blocking
+headless path gives its subprocess: record it as a note so the outcome
+survives in the item's history, and hand a failed task to
+[[--reassign-to]] so it lands in a human's queue instead of quietly
+returning to [[pending]] indistinguishable from a run that simply did
+not finish.  Without that, the entire exit-code apparatus---the status
+file, [[read_detached_exit_code]] and its signal mapping---would deliver
+a number with no consumer.
+
+The note says \enquote{no output} because a detached pane writes to the
+terminal, not to a pipe we can capture; the wording matches the blocking
+path so both kinds of run leave notes in one format.
+
 <<helpers>>=
 def finalize_detached_todo(
-    todo_id, exit_code=1, exit_code_file=None
+    todo_id, exit_code=1, exit_code_file=None,
+    reassign_to=None,
 ):
     """Finish a non-blocking tmux-backed todo run."""
     if exit_code_file is not None:
@@ -9316,15 +10037,16 @@ def finalize_detached_todo(
     if item is None:
         return
 
-    result = type(
-        "DetachedResult", (),
-        {
-            "returncode": exit_code,
-            "stdout": None,
-        },
-    )()
+    append_note_to_item(
+        item,
+        f"Exit code: {exit_code} (no output)",
+        next_id,
+        todos,
+    )
 
     if item.status != "done":
+        if exit_code != 0 and reassign_to:
+            item.who = reassign_to
         item.status = "pending"
     for child in descendants:
         if child.status != "done":
@@ -9349,7 +10071,8 @@ def read_detached_exit_code(exit_code_file):
 
 
 def build_detached_todo_finalize_command(
-    todo_id, proc_wd, exit_code_file
+    todo_id, proc_wd, exit_code_file,
+    reassign_to=None,
 ):
     """Return shell command to finalize a detached todo run."""
     pythonpath = os.path.abspath(
@@ -9357,15 +10080,28 @@ def build_detached_todo_finalize_command(
             os.path.dirname(__file__), "..", "..", ".."
         )
     )
+    reassign_arg = (
+        f" --reassign-to {shlex.quote(reassign_to)}"
+        if reassign_to else ""
+    )
     return (
         f"PYTHONPATH={shlex.quote(pythonpath)} "
         f"{shlex.quote(sys.executable)} "
         "-c 'from nytid.cli.todo import cli; cli()' "
         f"_finalize-detached {todo_id} "
         f"--exit-code-file {shlex.quote(exit_code_file)}"
+        f"{reassign_arg}"
         f"; rm -f {shlex.quote(exit_code_file)}"
     )
 @
+
+The reassignee has to travel through that shell string because the
+finalizer runs in a fresh process minutes or hours later, long after
+the [[start]] invocation that knew about [[--reassign-to]] has exited.
+It is a user-supplied name interpolated into a command line, so it goes
+through [[shlex.quote]] like every other value here; omitting the flag
+entirely when there is no reassignee keeps the common case identical to
+what tmux ran before.
 
 <<argument and option definitions>>=
 finalize_id_arg = typer.Argument(
@@ -9375,6 +10111,9 @@ finalize_exit_arg = typer.Argument(
 finalize_file_opt = typer.Option(
     "--exit-code-file",
     help="File containing the exit code")
+finalize_reassign_opt = typer.Option(
+    "--reassign-to",
+    help="Worker to receive the todo if the run failed")
 @
 
 <<detached finalize command>>=
@@ -9385,10 +10124,13 @@ def finalize_detached_cmd(
                          finalize_exit_arg] = 1,
     exit_code_file: Annotated[str | None,
                               finalize_file_opt] = None,
+    reassign_to: Annotated[
+        str | None, finalize_reassign_opt] = None,
 ):
     """Finalize a detached tmux-backed todo run."""
     finalize_detached_todo(
-        todo_id, exit_code, exit_code_file
+        todo_id, exit_code, exit_code_file,
+        reassign_to,
     )
 @
 
@@ -9683,6 +10425,7 @@ if item.wd or run or pane or window or item.command:
     <<prepare subprocess environment>>
     <<resolve todo auto-suspend>>
     <<determine command to run>>
+    <<initialize run outcome>>
     if pane or window:
         <<run in tmux>>
         if block:
@@ -9690,6 +10433,18 @@ if item.wd or run or pane or window or item.command:
     else:
         <<run subprocess>>
         <<handle subprocess exit>>
+@
+
+[[<<handle subprocess exit>>]] is shared by both arms of that branch,
+so every variable it reads has to be bound before the branch rather
+than inside one arm.  [[result]] satisfies that on its own because each
+arm assigns it, but only the direct-spawn arm can time out---tmux
+launches pass no timeout to the pane---so its outcome flag needs a
+default here.  Without one, the shared exit handler would raise
+[[NameError]] on every blocking [[--pane]] and [[--window]] run.
+
+<<initialize run outcome>>=
+timed_out = False
 @
 
 Todo launches now follow the same context-building path as track launches.
@@ -9862,7 +10617,8 @@ try:
         )
         os.close(exit_fd)
         finalize_cmd = build_detached_todo_finalize_command(
-            todo_id, proc_wd, exit_code_file
+            todo_id, proc_wd, exit_code_file,
+            reassign_to,
         )
         run_todo_tmux_command(
             cmd,
@@ -10292,6 +11048,81 @@ def test_finalize_detached_todo_resets_pending(
     assert load_active_stack() == []
 
 
+def test_finalize_detached_todo_records_exit_code(
+    temp_todo_dir,
+):
+    """Detached finalize leaves the exit code in the notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(1, 3)
+    _, todos = load_todos()
+    assert "Exit code: 3" in todos[0].notes
+
+
+def test_finalize_detached_todo_reassigns_on_failure(
+    temp_todo_dir,
+):
+    """A failed detached run goes to the reassignee."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="agent",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(
+        1, 1, reassign_to="teacher",
+    )
+    _, todos = load_todos()
+    assert todos[0].who == "teacher"
+    assert todos[0].status == "pending"
+
+
+def test_finalize_detached_todo_keeps_owner_on_success(
+    temp_todo_dir,
+):
+    """A clean detached run stays with its worker."""
+    save_todos(2, [
+        TodoItem(
+            id=1,
+            title="Review PR",
+            created="2026-02-20T10:00:00",
+            status="in-progress",
+            who="agent",
+        ),
+    ])
+    save_active_stack([1])
+    finalize_detached_todo(
+        1, 0, reassign_to="teacher",
+    )
+    _, todos = load_todos()
+    assert todos[0].who == "agent"
+
+
+def test_detached_finalize_command_carries_reassignee():
+    """The tmux hook forwards --reassign-to to the finalizer."""
+    cmd = build_detached_todo_finalize_command(
+        7, "/tmp/project", "/tmp/status",
+        reassign_to="teacher",
+    )
+    assert "--reassign-to teacher" in cmd
+
+    plain = build_detached_todo_finalize_command(
+        7, "/tmp/project", "/tmp/status",
+    )
+    assert "--reassign-to" not in plain
+
+
 def test_finalize_detached_todo_reads_status_file(
     temp_todo_dir,
 ):
@@ -10623,12 +11454,23 @@ finally:
 
 When a [[--timeout]] fires, [[subprocess.TimeoutExpired]] carries
 any partial output captured before the kill signal.  We post that
-partial output as a note (so the teacher sees what the agent
-managed to do), reassign the task to [[--reassign-to]] (defaulting
-to [[$USER]]), and reset to pending.  Setting [[result = None]]
-signals to the exit handler that timeout was already handled.
+partial output as a note so the teacher sees what the agent managed
+to do, and reset the item to pending.
+
+What we deliberately do \emph{not} do here is reassign the task, even
+though this is where we learn that it timed out.  Ownership is what
+[[stop_todo_hierarchy]] uses to decide whose tracking session to close:
+it reloads the item from disk and derives the worker as
+[[item.who or default_username]].  Writing the new owner before the
+stop would therefore aim the stop at somebody who never started
+tracking, and the agent's clock would keep running long after its
+process was killed.  Recording [[timed_out]] instead lets the exit
+handler apply the reassignment on the far side of the stop, which is
+exactly what the non-timeout failure path in
+[[<<handle headless exit status>>]] already does.
 
 <<handle subprocess timeout>>=
+timed_out = True
 partial = (
     exc.stdout if exc.stdout else ""
 )
@@ -10650,8 +11492,6 @@ if item is not None:
     append_note_to_item(
         item, note, next_id, todos
     )
-    if reassign_to:
-        item.who = reassign_to
     item.status = "pending"
     save_todos(next_id, todos)
 typer.echo(
@@ -10689,6 +11529,8 @@ if item is None:
 
 if item.status == "done":
     pass
+elif timed_out:
+    <<handle timeout exit status>>
 elif headless:
     <<handle headless exit status>>
 elif typer.confirm(
@@ -10725,6 +11567,23 @@ if headless and result is not None:
     append_note_to_item(
         item, note, next_id, todos
     )
+@
+
+This is the deferred half of the timeout handling: tracking has now
+been stopped against the worker who started it, so we are finally free
+to hand the task to whoever should look at it.
+
+The branch sits ahead of the [[headless]] one and ahead of the
+interactive prompt because a killed process never reported an outcome.
+Asking \enquote{mark todo as done?} about work we ourselves cut short
+invites the user to record a completion that did not happen, so a
+timed-out task always goes back to pending regardless of how it was
+launched.
+
+<<handle timeout exit status>>=
+if reassign_to:
+    item.who = reassign_to
+item.status = "pending"
 @
 
 In headless mode, a non-zero exit code indicates failure.
@@ -10807,6 +11666,47 @@ def test_start_headless_captures_output(temp_todo_dir):
     assert "Exit code: 0" in item.notes
 @
 
+A timed-out run must close the \emph{original} worker's tracking
+session before the task changes hands.  We drive the timeout by making
+[[subprocess.run]] raise, then check both halves: the agent's clock is
+closed, and the task now belongs to the teacher.
+
+<<test functions>>=
+def test_start_timeout_stops_original_worker(
+  temp_todo_dir,
+):
+  """A timed-out run closes the agent's clock, then reassigns."""
+  from subprocess import TimeoutExpired
+  from nytid.cli.track import load_active_session
+
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      who="agent", labels=["grading"],
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=TimeoutExpired(["true"], 1),
+  ):
+    result = runner.invoke(
+      cli,
+      ["start", "1", "--headless",
+       "--command", "true",
+       "--timeout", "1s",
+       "--reassign-to", "teacher"],
+    )
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  item = todos[0]
+  assert item.who == "teacher"
+  assert item.status == "pending"
+  agent_session = load_active_session("agent")
+  assert agent_session.get_active_labels() == []
+@
+
 A failing subprocess in headless mode should reassign to the
 [[--reassign-to]] user:
 
@@ -10844,6 +11744,17 @@ exit handling.  That keeps the high-level rule uniform across all three
 paths: stopping a parent also unwinds any active descendants before the
 caller decides what status changes, if any, should follow.
 
+It also means sharing the helper's one awkward property: it reports the
+item by looking it up in state reloaded \emph{after} the descendants
+were unwound, so a concurrent [[rm]] can leave that lookup empty.  The
+todo store is built for concurrent workers---that is what
+[[mutate_todo_state]] and its file locking are for---and the other two
+callers already treat the miss as reachable.  By the time we get here
+the stop has succeeded; only the sentence describing it is missing a
+title, so we fall back to naming the ID rather than turning a completed
+operation into a traceback the user might respond to by running it
+again.
+
 <<stop command>>=
 @cli.command()
 def stop(
@@ -10865,7 +11776,37 @@ def stop(
     ) = stop_todo_hierarchy(
         todo_id, who=default_username
     )
+    if item is None:
+        typer.echo(f"Stopped: #{todo_id}")
+        return
     typer.echo(f"Stopped: #{todo_id} {item.title}")
+@
+
+Let's verify the fallback, standing in for the concurrent removal by
+making the post-stop reload find nothing:
+
+<<test functions>>=
+def test_stop_reports_id_when_item_vanished(
+  temp_todo_dir,
+):
+  """A todo removed mid-stop is reported by ID, not a traceback."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      status="in-progress",
+    ),
+  ])
+  save_active_stack([1])
+
+  with patch(
+    "nytid.cli.todo.stop_todo_hierarchy",
+    return_value=(1, None, 2, [], [], []),
+  ):
+    result = runner.invoke(cli, ["stop", "1"])
+
+  assert result.exit_code == 0, result.stdout
+  assert "Stopped: #1" in result.output
 @
 
 Let's verify that the [[stop]] command also protects shared labels.
@@ -12585,6 +13526,8 @@ from nytid.cli.todo import (
     ParsedItem,
     ParsedTodo,
     canonicalize_wd,
+    naive_local_datetime,
+    normalize_deadline,
     effective_priority,
     sort_todos_for_display,
     load_todos,
@@ -12592,6 +13535,7 @@ from nytid.cli.todo import (
     get_todo_dir,
     get_todo_file,
     get_children,
+    get_descendants,
     get_siblings,
     get_active_siblings,
     check_parent_completion,
@@ -12619,6 +13563,7 @@ from nytid.cli.todo import (
     get_active_stack_file,
     find_pending_by_priority,
     finalize_detached_todo,
+    build_detached_todo_finalize_command,
     read_detached_exit_code,
     parse_timeout,
     append_note_to_item,
