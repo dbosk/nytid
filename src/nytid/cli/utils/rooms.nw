@@ -106,34 +106,116 @@ return a CSV (list of tuples) of the free rooms:
 
 [(start, end, unbooked_rooms), ...]
 
-where start and end are datetime objects and unbooked_rooms is a set of 
+where start and end are strings and unbooked_rooms is a set of
 strings.
+@
+
+The tempting implementation---for each event, report every interesting
+room it does not book---is wrong, and wrong in the direction that gets
+someone turned away at a door.
+Freedom is a property of an \emph{instant}, not of an event: a room is
+free at some moment only if \emph{no} event books it then.
+Deriving the answer one event at a time can only ever consult one
+event, so with D1 booked 15--17 and D2 booked 15--16 it happily reports
+D1 free for the second row's 15--16 and D2 free for the first row's
+15--17.
+Both statements are false during the hour they overlap, and the
+command's help text invites the user to act on them.
+That the schedule contains such partial overlaps is not speculation:
+the [[booked]] command exists precisely because \enquote{some rooms are
+booked 15--17 and some 15--16}.
+
+So we invert the loop.
+First we cut the timeline at every point where anything starts or
+ends.
+Between two consecutive cuts nothing changes---by construction, no
+booking begins or ends there---so each such \emph{atomic} interval has
+a single, well-defined set of booked rooms, and subtracting it from the
+interesting rooms gives an answer that holds for the whole interval.
+Cutting this finely would make the output unreadable, though, so we
+glue back together any neighbours that turned out to say the same
+thing.
 <<helper functions>>=
 def free_rooms(ics_url: str) -> list[tuple]:
   """
   <<[[free_rooms]] doc>>
   """
-  results = []
   all_rooms = set(typerconf.get(INTERESTING_ROOMS))
 
   <<let [[schedule]] be the parsed ICS file we get from [[ics_url]]>>
-  for event in schedule.events:
-    start = event.start
-    end = event.end
-
-    <<let [[booked_rooms]] be the rooms of [[event]]>>
-
-    # If there are no booked rooms, we can skip this event.
-    if not booked_rooms:
-      continue
-
-    unbooked_rooms = all_rooms - booked_rooms
-    results.append((start, end, unbooked_rooms))
-
-  <<clean up [[results]]>>
+  <<let [[bookings]] be the room bookings in [[schedule]]>>
+  <<let [[results]] be the free rooms per atomic interval>>
+  <<merge neighbours that free the same rooms>>
+  <<format [[results]] for output>>
   return results
 <<imports>>=
 import datetime
+@
+
+Gathering the bookings is the old loop with its conclusion removed: we
+keep what each event books instead of deciding, then and there, what it
+leaves free.
+<<let [[bookings]] be the room bookings in [[schedule]]>>=
+bookings = []
+for event in schedule.events:
+  <<let [[booked_rooms]] be the rooms of [[event]]>>
+
+  # If there are no booked rooms, we can skip this event.
+  if not booked_rooms:
+    continue
+
+  bookings.append((event.start, event.end, booked_rooms))
+@
+
+The cut points are every start and every end, deduplicated and sorted;
+consecutive pairs of them are the atomic intervals.
+An interval that no booking overlaps gets no row, because the command
+documents an absent time as one where every room is free---emitting it
+would say the same thing at greater length.
+An interval where every interesting room is booked \emph{does} get a
+row, empty set and all: silence already means \enquote{everything
+free}, so an empty row is the only way left to say the opposite.
+<<let [[results]] be the free rooms per atomic interval>>=
+cuts = sorted({moment for start, end, _ in bookings
+                      for moment in (start, end)})
+results = []
+for start, end in zip(cuts, cuts[1:]):
+  booked = set()
+  for booking_start, booking_end, rooms in bookings:
+    if booking_start < end and booking_end > start:
+      booked |= rooms
+
+  if not booked:
+    continue
+
+  results.append((start, end, all_rooms - booked))
+@
+
+Neighbours that free exactly the same rooms describe one uninterrupted
+stretch, and the cut between them was an artefact of some \emph{other}
+room's booking changing.
+Extending the previous row rather than appending a new one restores the
+reading a person expects: back-to-back lectures in D1 are one span
+during which D2 and D3 are free, not two.
+<<merge neighbours that free the same rooms>>=
+merged = []
+for start, end, unbooked_rooms in results:
+  if merged and merged[-1][1] == start \
+             and merged[-1][2] == unbooked_rooms:
+    merged[-1] = (merged[-1][0], end, unbooked_rooms)
+  else:
+    merged.append((start, end, unbooked_rooms))
+
+results = merged
+@
+
+The rows come out in chronological order already, since they are built
+by walking the sorted cut points, so formatting is all that remains.
+<<format [[results]] for output>>=
+results = [(start.strftime(DATE_FORMAT),
+            end.strftime(DATE_FORMAT),
+            unbooked_rooms)
+           for start, end, unbooked_rooms in results]
 @
 
 A TimeEdit feed carries the rooms as a comma-separated list in
@@ -169,28 +251,7 @@ from nytid.schedules import read_calendar
 @
 
 
-\subsection{Clean up the results}
-
-Now that we have the CSV, we just have to merge all the overlap.
-We'll make it a simple algorithm:
-If the start and end are the same, merge them by taking the union.
-
-We'll use a dictionary to keep track of start and end times that are the same.
-We use the start and end as the key, the free rooms as the value.
-Then we can merge whenever the key already exists.
-<<clean up [[results]]>>=
-time_dict = {}
-for start, end, unbooked_rooms in results:
-  if (start, end) in time_dict:
-    time_dict[(start, end)] |= unbooked_rooms
-  else:
-    time_dict[(start, end)] = unbooked_rooms
-
-results = [(start.strftime(DATE_FORMAT),
-            end.strftime(DATE_FORMAT),
-            unbooked_rooms)
-           for (start, end), unbooked_rooms in time_dict.items()]
-results.sort()
+Both commands print timestamps, so they share one format.
 <<constants>>=
 DATE_FORMAT = "%Y-%m-%d %H:%M"
 @
@@ -264,6 +325,95 @@ def test_free_rooms_missing_location():
     assert len(result) == 1
     _, _, rooms = result[0]
     assert rooms == {"D2"}
+@
+
+The case the per-event computation got wrong is two bookings that
+overlap without sharing both endpoints.
+D1 is taken 15--17 and D2 only 15--16, so during the first hour nothing
+but D3 is free, and only in the second hour does D2 open up.
+The old code reported D1 free during 15--16, which is the answer that
+sends someone to a room in use.
+<<test functions>>=
+def test_free_rooms_partial_overlap():
+  """A room booked 15-17 is not free during 15-16."""
+  cal = make_schedule([
+    ("Long", "2024-01-15T15:00:00+01:00",
+     "2024-01-15T17:00:00+01:00", "D1"),
+    ("Short", "2024-01-15T15:00:00+01:00",
+     "2024-01-15T16:00:00+01:00", "D2"),
+  ])
+  with patch("nytid.cli.utils.rooms.read_calendar",
+             return_value=cal), \
+       patch("typerconf.get",
+             return_value=["D1", "D2", "D3"]):
+    result = free_rooms("http://example.com")
+    assert result == [
+      ("2024-01-15 15:00", "2024-01-15 16:00", {"D3"}),
+      ("2024-01-15 16:00", "2024-01-15 17:00", {"D2", "D3"}),
+    ]
+@
+
+Cutting at every boundary would also split runs that say the same
+thing, so the other half of the contract is that such runs come back
+out as one row: two back-to-back lectures in D1 leave D2 and D3 free
+for one continuous stretch, not two.
+<<test functions>>=
+def test_free_rooms_merges_adjacent_identical():
+  """Back-to-back bookings of one room give one free row."""
+  cal = make_schedule([
+    ("Lecture A", "2024-01-15T10:00:00+01:00",
+     "2024-01-15T11:00:00+01:00", "D1"),
+    ("Lecture B", "2024-01-15T11:00:00+01:00",
+     "2024-01-15T12:00:00+01:00", "D1"),
+  ])
+  with patch("nytid.cli.utils.rooms.read_calendar",
+             return_value=cal), \
+       patch("typerconf.get",
+             return_value=["D1", "D2", "D3"]):
+    result = free_rooms("http://example.com")
+    assert result == [
+      ("2024-01-15 10:00", "2024-01-15 12:00", {"D2", "D3"}),
+    ]
+@
+
+Finally, the two ways of saying \enquote{nothing to offer} must stay
+distinguishable.
+A gap between bookings carries no row, since an absent time already
+means every room is free; an interval in which every interesting room
+is taken carries a row with nothing in it, which is the only remaining
+way to say so.
+<<test functions>>=
+def test_free_rooms_skips_gaps_between_bookings():
+  """A time with no booking is absent, meaning all rooms free."""
+  cal = make_schedule([
+    ("Morning", "2024-01-15T10:00:00+01:00",
+     "2024-01-15T11:00:00+01:00", "D1"),
+    ("Afternoon", "2024-01-15T14:00:00+01:00",
+     "2024-01-15T15:00:00+01:00", "D1"),
+  ])
+  with patch("nytid.cli.utils.rooms.read_calendar",
+             return_value=cal), \
+       patch("typerconf.get",
+             return_value=["D1", "D2"]):
+    result = free_rooms("http://example.com")
+    assert [(start, end) for start, end, _ in result] == [
+      ("2024-01-15 10:00", "2024-01-15 11:00"),
+      ("2024-01-15 14:00", "2024-01-15 15:00"),
+    ]
+
+def test_free_rooms_reports_fully_booked_intervals():
+  """No room left free is still worth a row, unlike silence."""
+  cal = make_schedule([
+    ("Event", "2024-01-15T10:00:00+01:00",
+     "2024-01-15T12:00:00+01:00", "D1, D2"),
+  ])
+  with patch("nytid.cli.utils.rooms.read_calendar",
+             return_value=cal), \
+       patch("typerconf.get",
+             return_value=["D1", "D2"]):
+    assert free_rooms("http://example.com") == [
+      ("2024-01-15 10:00", "2024-01-15 12:00", set()),
+    ]
 @
 
 
@@ -346,36 +496,47 @@ def booked_cmd(<<arg [[delimiter]]>>):
     raise typer.Exit(1)
 @
 
-Now we implement the [[booked_rooms]] function similarly to the [[free_rooms]] 
-function.
+This function reuses the gathering step of [[free_rooms]] but stops
+there: reporting what is booked is exactly reporting the bookings, so
+cutting the timeline into atomic intervals would only obscure the
+answer.
+Where [[free_rooms]] must reason about instants---a claim of freedom is
+falsified by any overlapping booking---a claim that a room \emph{is}
+booked from 15 to 17 stands on its own, and keeping the interval the
+schedule states is what makes this command useful for spotting the
+ragged overlaps [[free_rooms]] has to work around.
+
+The one thing worth combining is bookings that state the same interval,
+which are one occasion split across rows; their union reads better than
+two rows.
 <<helper functions>>=
 def booked_rooms(ics_url: str) -> list[tuple]:
   """
-  Given a URL or path to a TimeEdit ICS file ([[ics_url]]),
-  return a ics (list of tuples) of the booked rooms:
+  Given a URL or path to a TimeEdit ICS file (`ics_url`),
+  return a list of tuples of the booked rooms:
 
   [(start, end, booked_rooms), ...]
 
-  where start and end are datetime objects and booked_rooms is a set of 
+  where start and end are strings and booked_rooms is a set of
   strings.
   """
-  results = []
-
   <<let [[schedule]] be the parsed ICS file we get from [[ics_url]]>>
-  for event in schedule.events:
-    start = event.start
-    end = event.end
-
-    <<let [[booked_rooms]] be the rooms of [[event]]>>
-
-    # If there are no booked rooms, we can skip this event.
-    if not booked_rooms:
-      continue
-
-    results.append((start, end, booked_rooms))
-
-  <<clean up [[results]]>>
+  <<let [[bookings]] be the room bookings in [[schedule]]>>
+  <<merge bookings stating the same interval>>
+  <<format [[results]] for output>>
   return results
+@
+
+<<merge bookings stating the same interval>>=
+time_dict = {}
+for start, end, rooms in bookings:
+  if (start, end) in time_dict:
+    time_dict[(start, end)] |= rooms
+  else:
+    time_dict[(start, end)] = rooms
+
+results = [(start, end, rooms)
+           for (start, end), rooms in sorted(time_dict.items())]
 @
 
 \subsection{Testing [[booked_rooms]]}
