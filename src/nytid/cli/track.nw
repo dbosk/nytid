@@ -5020,6 +5020,16 @@ child needs an atomic guard file so completion is recorded exactly once
 even if multiple cleanup paths race.  The helper functions below provide
 those two mechanisms.
 
+The guard is a \emph{directory}, because [[mkdir]] is the one filesystem
+operation every POSIX shell can perform atomically: it either creates
+the directory or fails, and exactly one racer sees success.  Deriving
+its path from the status file is what makes it disarmable.  A launch
+whose parent does not stick around to clean up puts both files in one
+throwaway directory; when the detached cleanup removes that directory,
+a later [[mkdir]] of the guard fails with [[ENOENT]] rather than
+succeeding on a fresh path---so releasing the guard and closing it
+permanently are the same act.
+
 <<helper functions>>=
 def make_tmux_channel(prefix: str) -> str:
     """Return a unique tmux wait-for channel name."""
@@ -5031,10 +5041,18 @@ def make_tmux_channel(prefix: str) -> str:
 
 def make_tmux_completion_guard(
     status_file: str | None,
-) -> str | None:
-    """Return the atomic completion guard path."""
+) -> str:
+    """Return the atomic completion guard path.
+
+    Derived from the status file when there is one, so that
+    removing the directory holding the status file also
+    removes -- and disarms -- the guard.
+    """
     if status_file is None:
-        return None
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"nytid-guard-{os.getpid()}-{time.time_ns()}",
+        )
     return status_file + ".guard"
 
 
@@ -5279,6 +5297,7 @@ def run_tmux_command(
         remove_status_file = True
     if block:
         wait_channel = make_tmux_channel("done")
+    if status_file is not None or on_exit_shell is not None:
         completion_guard = make_tmux_completion_guard(
             status_file
         )
@@ -5363,12 +5382,34 @@ def run_tmux_command(
                 os.unlink(status_file)
             except OSError:
                 pass
-        if completion_guard is not None:
+        if block and completion_guard is not None:
             try:
                 os.rmdir(completion_guard)
             except OSError:
                 pass
 @
+
+Two details of the setup above are easy to get wrong, and getting either
+wrong breaks the exactly-once invariant.
+
+The guard is built whenever there is a status file \emph{or} an
+[[on_exit_shell]], not only when we block.  Both the pane wrapper and
+the [[pane-exited]]/[[pane-died]] hooks are handed the same
+[[completion_guard]], and [[build_tmux_completion_shell]] emits an
+unguarded body when it is [[None]].  Tying the guard to [[block]] left
+detached launches---every [[--no-block]] pane or window, and every
+detached [[todo start]]---running their finalize command twice: once
+from the wrapper as the child exits, once again from the hook after the
+pane dies.  [[_stop-detached]] tolerates that, but the todo finalize
+does not.
+
+The parent only tears the guard down when it blocked.  Having waited for
+the completion signal, it knows the guard has served its purpose.  A
+detached parent knows nothing of the sort: it returns while the pane is
+still alive, so removing the guard then would simply hand the later
+hooks a clean slate to re-claim.  Detached launches instead let their
+own cleanup remove the throwaway directory that holds guard and status
+alike (see \cref{track:detached-launch-dir}).
 
 Tracked window launches need one stronger serialization guarantee than
 steady-state hooks.  The [[tmux new-window]] command itself may spawn a
@@ -8649,23 +8690,39 @@ finally:
     )
 @
 
+\label{track:detached-launch-dir}
 For the non-blocking case, we create a temporary file for exit status
 and set up a finalize command that calls [[track stop]] when the pane
 exits.  The [[run_tmux_command]] function installs tmux hooks that
 execute the command automatically.
 
+That file lives in a directory of its own rather than directly in
+[[/tmp]], and the choice is load-bearing rather than tidiness.  The
+completion guard is derived from the status file's path, so it lands in
+the same directory; removing the directory as the finalize command's
+last step therefore deletes the status file, deletes the guard, and---
+because [[mkdir]] does not create intermediate directories---makes every
+subsequent attempt to claim the guard fail outright.  Nothing is left
+behind, and no late [[pane-died]] hook can re-run the finalize on a
+launch that has already finished.
+
+The ordering inside the finalize command matters: the directory must go
+last, after the tracking state has been updated, since removing it is
+what closes the launch.
+
 <<set up non-blocking tmux launch>>=
-exit_fd, exit_code_file = tempfile.mkstemp(
+launch_state_dir = tempfile.mkdtemp(
     prefix="nytid-track-",
-    suffix=".status",
 )
-os.close(exit_fd)
+exit_code_file = os.path.join(
+    launch_state_dir, "status",
+)
 finalize_cmd = \
     build_detached_track_finalize_command(
         launch_cleanup_labels, who
     )
 finalize_cmd += (
-    f"; rm -f {shlex.quote(exit_code_file)}"
+    f"; rm -rf {shlex.quote(launch_state_dir)}"
 )
 run_tmux_command(
     command_args,
@@ -11859,6 +11916,90 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
     assert "#{pane_dead_signal}" in hook
     assert "cleanup-command" in hook
     assert "tmux wait-for -S done-chan" in hook
+
+def test_make_tmux_completion_guard_without_status_file():
+  """A launch with no status file still gets a unique guard."""
+  first = make_tmux_completion_guard(None)
+  second = make_tmux_completion_guard(None)
+  assert first and second
+  assert first != second
+  assert make_tmux_completion_guard(
+    "/tmp/nytid.status"
+  ) == "/tmp/nytid.status.guard"
+
+
+def test_run_tmux_command_guards_detached_completion(
+  temp_tracking_dir,
+):
+  """A detached launch guards the wrapper and the exit hooks alike."""
+  observed = {}
+
+  def fake_subprocess_run(args, **kwargs):
+    if args[:2] == ["tmux", "split-window"]:
+      observed["argv"] = args
+      class Result:
+        stdout = "%42 @7 $9\n"
+      return Result()
+    class Result:
+      stdout = ""
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+    side_effect=lambda pane_id, hook_command:
+      observed.__setitem__("hook", hook_command),
+  ):
+    result = run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={},
+      block=False,
+      exit_status_file="/tmp/nytid-detached/status",
+      on_exit_shell="finalize-command",
+    )
+
+  assert result is None
+  guard = "mkdir /tmp/nytid-detached/status.guard"
+  wrapper = observed["argv"][-1]
+  assert guard in wrapper
+  assert "finalize-command" in wrapper
+  assert guard in observed["hook"]
+  assert "finalize-command" in observed["hook"]
+
+
+def test_start_no_block_finalize_disarms_guard(
+  temp_tracking_dir,
+):
+  """Detached cleanup removes the directory holding guard and status."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=None,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli, ["start", "grading", "--pane", "--no-block"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args[1]
+  status_file = call_kwargs["exit_status_file"]
+  launch_dir = os.path.dirname(status_file)
+
+  assert make_tmux_completion_guard(status_file).startswith(
+    launch_dir + os.sep
+  )
+  assert "rm -rf" in call_kwargs["on_exit_shell"]
+  assert launch_dir in call_kwargs["on_exit_shell"]
+  assert call_kwargs["on_exit_shell"].index(
+    "_stop-detached"
+  ) < call_kwargs["on_exit_shell"].index("rm -rf")
+
+  os.rmdir(launch_dir)
+
 
 def test_install_tmux_exit_hooks_guards_pane_id():
     """Hooks use pane-existence guard to prevent
