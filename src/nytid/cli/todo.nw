@@ -7008,21 +7008,49 @@ priority, reconciliation keeps it that way instead of silently assigning
 one.  New children only receive numeric priorities when the parent has a
 numeric priority and the new child is entering the ranked subset.
 
+Reconciliation has to recurse, because the buffer the user edited does.
+[[render_child_markdown]] emits each child's own children at one deeper
+heading level and [[parse_editor_content]] parses them back into
+[[parsed_child.children]], so a reconciliation that walked only the
+first level would show the user their grandchildren, accept their
+edits, report success, and discard them.  Silently losing text the user
+typed is the worst failure mode an editor round-trip can have.
+
+We express the recursion as a nested \emph{function} rather than a
+reusable chunk.  The level being reconciled is described entirely by
+[[parent]] and [[parsed_children]]; making those parameters means a
+recursive call cannot accidentally inherit the outer level's variables,
+which is exactly the mistake a chunk reference would invite.  This also
+mirrors [[create_children_from_parsed]] on the [[add]] side, which has
+recursed from the start.
+
 <<reconcile children>>=
-<<build existing children index>>
-<<distribute child priorities>>
-<<update or create each parsed child>>
-<<remove deleted children>>
+def reconcile_children(parent, parsed_children):
+    """Match parsed sections against a parent's children.
+
+    Sections are matched to existing children by
+    normalized title so that they keep their ID,
+    status, and tracked time.  Unmatched sections
+    become new children, unmatched children are
+    removed with their subtrees, and each matched
+    child is reconciled against its own sections.
+    """
+    nonlocal next_id, todos
+    <<build existing children index>>
+    <<distribute child priorities>>
+    <<update or create each parsed child>>
+    <<remove deleted children>>
+
+reconcile_children(item, parsed.children)
 @
 
 We normalize titles to lowercase with stripped whitespace so that
 minor formatting changes in the editor do not accidentally create
 duplicate children.
 <<build existing children index>>=
-existing_children = get_children(todos, todo_id)
 existing_by_title = {
     c.title.strip().lower(): c
-    for c in existing_children
+    for c in get_children(todos, parent.id)
 }
 @
 
@@ -7036,13 +7064,13 @@ Existing unranked children do not consume a numeric slot.  They stay in
 the unranked tail until the user runs [[reprioritize]], while ranked or
 new children still share the parent's numeric range.
 <<distribute child priorities>>=
-if item.priority is None:
+if parent.priority is None:
     ranked_titles = []
     priorities = []
 else:
     ranked_titles = [
         parsed_child.title.strip().lower()
-        for parsed_child in parsed.children
+        for parsed_child in parsed_children
         if (
             parsed_child.title.strip().lower()
             not in existing_by_title
@@ -7053,7 +7081,7 @@ else:
     ]
     if ranked_titles:
         prio_high, prio_low = compute_child_priority_range(
-            todos, item
+            todos, parent
         )
         priorities = distribute_priorities_in_range(
             len(ranked_titles), prio_high, prio_low,
@@ -7063,21 +7091,27 @@ else:
 priority_iter = iter(priorities)
 @
 
-For each child in the parsed document we either update the matching
+For each section in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
-New children inherit [[who]] from the parent ([[item]]) when their
+New children inherit [[who]] from the parent when their
 YAML block does not specify one --- the same rule as in
 [[create_children_from_parsed]] --- so that adding a sub-task in
 the editor never silently leaves it unassigned.
-We use a set to track which existing children were seen; any that
-remain unseen after this loop were removed in the editor.
+Popping each match out of [[existing_by_title]] doubles as the
+seen-marker: whatever is still in the index afterwards had no section
+and was therefore deleted in the editor.
+
+Each child is reconciled against its own sections immediately after it
+is settled, so a freshly created child can already receive
+grandchildren in the same save.  A newly appended child is on
+[[todos]] by then, which is what lets [[get_children]] find its own
+level on the recursive call.
 <<update or create each parsed child>>=
-new_child_ids = set()
-for i, parsed_child in enumerate(parsed.children):
+for parsed_child in parsed_children:
     norm_title = parsed_child.title.strip().lower()
     existing_child = existing_by_title.get(norm_title)
     if (
-        item.priority is None
+        parent.priority is None
         or (
             existing_child is not None
             and existing_child.priority is None
@@ -7086,7 +7120,7 @@ for i, parsed_child in enumerate(parsed.children):
         prio = None
     else:
         prio = next(priority_iter, None)
-    if norm_title in existing_by_title:
+    if existing_child is not None:
         child = existing_by_title.pop(norm_title)
         child.title = parsed_child.title
         child.notes = parsed_child.notes
@@ -7108,45 +7142,51 @@ for i, parsed_child in enumerate(parsed.children):
             )
         if "who" in child_meta:
             child.who = child_meta["who"]
-        new_child_ids.add(child.id)
     else:
         now = datetime.datetime.now().isoformat()
         child_meta = parsed_child.metadata
-        new_child = TodoItem(
+        child = TodoItem(
             id=next_id,
             title=parsed_child.title,
             labels=child_meta.get(
-                "labels", list(item.labels)
+                "labels", list(parent.labels)
             ),
             priority=prio,
             status="pending",
             created=now,
             deadline=normalize_deadline(
                 child_meta.get(
-                    "deadline", item.deadline
+                    "deadline", parent.deadline
                 )
             ),
-            parent_id=todo_id,
-            who=child_meta.get("who", item.who),
+            parent_id=parent.id,
+            who=child_meta.get("who", parent.who),
             notes=parsed_child.notes,
             wd=canonicalize_wd(child_meta.get("wd")),
             command=child_meta.get("command"),
         )
-        todos.append(new_child)
-        new_child_ids.add(next_id)
+        todos.append(child)
         next_id += 1
         typer.echo(
-            f"  Added sub-item #{new_child.id}: "
-            f"{new_child.title}"
+            f"  Added sub-item #{child.id}: "
+            f"{child.title}"
         )
+    reconcile_children(child, parsed_child.children)
 @
 
 Children remaining in [[existing_by_title]] were not present in the
-parsed document, meaning the user deleted their headings.  We remove
-them from the list rather than silently keeping orphaned sub-items.
+parsed document, meaning the user deleted their headings.  Their own
+subtrees go with them: an item whose parent is gone is not hidden but
+promoted to a visible root by [[get_visible_roots]], so leaving
+grandchildren behind would move them into the main list instead of
+removing them.
 <<remove deleted children>>=
 for removed in existing_by_title.values():
-    todos = [t for t in todos if t.id != removed.id]
+    doomed = {removed.id} | {
+        d.id
+        for d in get_descendants(todos, removed.id)
+    }
+    todos = [t for t in todos if t.id not in doomed]
     typer.echo(
         f"  Removed sub-item #{removed.id}: "
         f"{removed.title}"
@@ -7155,6 +7195,124 @@ for removed in existing_by_title.values():
 
 
 \subsection{Testing Editor Reconciliation}
+
+Let's verify the recursion in both directions: an edit to an existing
+grandchild reaches it and preserves its identity, and a brand-new
+[[##]] section becomes a real grandchild rather than being ignored.
+
+<<test functions>>=
+def test_edit_interactive_updates_grandchild(
+  temp_todo_dir,
+):
+  """Editing a '##' section reaches the grandchild."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+    TodoItem(
+      id=3, title="Grandchild", parent_id=2,
+      created="2026-02-20T10:00:00",
+      priority=3.0, status="done",
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "\n"
+    "## Grandchild\n"
+    "\n"
+    "Reviewed the notes.\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  grandchild = next(t for t in todos if t.id == 3)
+  assert grandchild.notes == "Reviewed the notes."
+  assert grandchild.status == "done"
+  assert grandchild.parent_id == 2
+
+
+def test_edit_interactive_adds_grandchild(
+  temp_todo_dir,
+):
+  """A new '##' section becomes a real grandchild."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "\n"
+    "## Brand new\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  added = next(
+    t for t in todos if t.title == "Brand new"
+  )
+  assert added.parent_id == 2
+
+
+def test_edit_interactive_removes_subtree(
+  temp_todo_dir,
+):
+  """Deleting a '#' section removes its grandchildren too."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      priority=5.0,
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+      priority=4.0,
+    ),
+    TodoItem(
+      id=3, title="Grandchild", parent_id=2,
+      created="2026-02-20T10:00:00",
+      priority=3.0,
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Parent\n",
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1]
+@
 
 <<test functions>>=
 def test_edit_interactive_reconcile():
