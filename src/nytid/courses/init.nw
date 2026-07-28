@@ -20,6 +20,7 @@ manage courses found in the course registers.
 import typerconf
 
 import logging
+import os
 import pathlib
 from nytid.courses import registry
 from nytid import storage
@@ -117,10 +118,45 @@ with storage.open_root(f"{register_path}/{name}") as root:
                           f"{register_path}/{name}/config.json")
 
   <<add settings to [[course_conf]]>>
+  <<write [[course_conf]] to [[config.json]] atomically>>
 
-  with root.open("config.json", "w") as course_conf_file:
-    course_conf.write_config(course_conf_file)
   logging.info(f"Created course {name} in register {register}")
+@
+
+\subsection{Writing the config without risking corruption}
+
+Writing straight into [[config.json]] would make the file's contents
+depend on the serialisation succeeding.
+Opening for writing truncates the file immediately, whereas
+[[json.dump]] only discovers a value it can't serialise part-way
+through---leaving a half-written file that is neither absent nor
+readable.
+The course is then wedged: creating it again raises
+[[FileExistsError]] because a config exists, and reading it raises
+[[ValueError]] because the JSON is truncated.
+The only way out is to delete the course directory by hand.
+
+We avoid that by never letting a partial write reach [[config.json]].
+We serialise into a temporary file in the \emph{same} directory, then
+rename it over the target.
+Same directory means same file system, and that is precisely what makes
+[[os.replace]] atomic on POSIX: any reader sees either the old file or
+the complete new one, never a prefix of it.
+The temporary name carries the process id so that two concurrent
+creations can't corrupt each other's staging file, and we remove it on
+any failure so a crashed run leaves no debris in the course directory.
+<<write [[course_conf]] to [[config.json]] atomically>>=
+tmp_name = f".config.json.{os.getpid()}"
+try:
+  with root.open(tmp_name, "w") as course_conf_file:
+    course_conf.write_config(course_conf_file)
+  os.replace(root.path / tmp_name, root.path / "config.json")
+except BaseException:
+  try:
+    os.unlink(root.path / tmp_name)
+  except OSError:
+    pass
+  raise
 @
 
 Now we want to test the function~[[new]].
@@ -300,6 +336,14 @@ If the user didn't specify a data directory, then [[data_path]] will be
 In this case, we should update it with the default value.
 We get the default value from [[root.path]] (see
 [[<<new body>>]]).
+
+Whichever value we end up with, we store it as a string.
+The config is JSON, and the CLI declares its [[--data-path]] option as
+a [[pathlib.Path]] (\cref{cli.courses}), so Typer hands us a [[Path]]
+object that [[json.dump]] can't serialise.
+Coercing only inside the default branch would leave exactly the
+user-supplied case broken, so we convert once, after the default has
+been applied, and thereby cover both.
 <<process expected [[key]]s>>=
 try:
   data_path = kwdata["data_path"]
@@ -307,9 +351,9 @@ except KeyError:
   data_path = None
 
 if not data_path:
-  data_path = str(root.path / "data")
+  data_path = root.path / "data"
 
-kwdata["data_path"] = data_path
+kwdata["data_path"] = str(data_path)
 @
 
 \subsection{Testing the \texttt{new} function}
@@ -317,6 +361,37 @@ kwdata["data_path"] = data_path
 Now we can finally make the call to [[new]] to test it.
 <<call new to test>>=
 new(course, register, config=config)
+@
+
+The path the user supplies must survive the round trip through JSON.
+We read the written file directly rather than through
+[[get_course_config]], because what is under test is what [[new]]
+\emph{wrote}, not what the reader makes of it.
+<<test functions>>=
+def test_new_coerces_path_data_path():
+  import json
+  course_name = "pathcourse"
+  data_dir = pathlib.Path(tempfile.mkdtemp()) / "elsewhere"
+  new(course_name, register, {"data_path": data_dir}, config=config)
+  with open(reg_path / course_name / "config.json") as conf_file:
+    assert json.load(conf_file)["data_path"] == str(data_dir)
+@
+
+A failed serialisation must leave the course creatable.
+We provoke one with a value JSON can't represent and check that no
+config survives---and, crucially, that a subsequent honest attempt
+succeeds rather than tripping over the debris of the first.
+<<test functions>>=
+def test_new_leaves_no_config_on_failure():
+  import pytest
+  course_name = "failcourse"
+
+  with pytest.raises(TypeError):
+    new(course_name, register, {"unserialisable": object()}, config=config)
+  assert not (reg_path / course_name / "config.json").exists()
+
+  new(course_name, register, config=config)
+  assert (reg_path / course_name / "config.json").exists()
 @
 
 
