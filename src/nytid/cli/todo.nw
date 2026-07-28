@@ -10169,6 +10169,7 @@ if item.wd or run or pane or window or item.command:
     <<prepare subprocess environment>>
     <<resolve todo auto-suspend>>
     <<determine command to run>>
+    <<initialize run outcome>>
     if pane or window:
         <<run in tmux>>
         if block:
@@ -10176,6 +10177,18 @@ if item.wd or run or pane or window or item.command:
     else:
         <<run subprocess>>
         <<handle subprocess exit>>
+@
+
+[[<<handle subprocess exit>>]] is shared by both arms of that branch,
+so every variable it reads has to be bound before the branch rather
+than inside one arm.  [[result]] satisfies that on its own because each
+arm assigns it, but only the direct-spawn arm can time out---tmux
+launches pass no timeout to the pane---so its outcome flag needs a
+default here.  Without one, the shared exit handler would raise
+[[NameError]] on every blocking [[--pane]] and [[--window]] run.
+
+<<initialize run outcome>>=
+timed_out = False
 @
 
 Todo launches now follow the same context-building path as track launches.
@@ -11109,12 +11122,23 @@ finally:
 
 When a [[--timeout]] fires, [[subprocess.TimeoutExpired]] carries
 any partial output captured before the kill signal.  We post that
-partial output as a note (so the teacher sees what the agent
-managed to do), reassign the task to [[--reassign-to]] (defaulting
-to [[$USER]]), and reset to pending.  Setting [[result = None]]
-signals to the exit handler that timeout was already handled.
+partial output as a note so the teacher sees what the agent managed
+to do, and reset the item to pending.
+
+What we deliberately do \emph{not} do here is reassign the task, even
+though this is where we learn that it timed out.  Ownership is what
+[[stop_todo_hierarchy]] uses to decide whose tracking session to close:
+it reloads the item from disk and derives the worker as
+[[item.who or default_username]].  Writing the new owner before the
+stop would therefore aim the stop at somebody who never started
+tracking, and the agent's clock would keep running long after its
+process was killed.  Recording [[timed_out]] instead lets the exit
+handler apply the reassignment on the far side of the stop, which is
+exactly what the non-timeout failure path in
+[[<<handle headless exit status>>]] already does.
 
 <<handle subprocess timeout>>=
+timed_out = True
 partial = (
     exc.stdout if exc.stdout else ""
 )
@@ -11136,8 +11160,6 @@ if item is not None:
     append_note_to_item(
         item, note, next_id, todos
     )
-    if reassign_to:
-        item.who = reassign_to
     item.status = "pending"
     save_todos(next_id, todos)
 typer.echo(
@@ -11175,6 +11197,8 @@ if item is None:
 
 if item.status == "done":
     pass
+elif timed_out:
+    <<handle timeout exit status>>
 elif headless:
     <<handle headless exit status>>
 elif typer.confirm(
@@ -11211,6 +11235,23 @@ if headless and result is not None:
     append_note_to_item(
         item, note, next_id, todos
     )
+@
+
+This is the deferred half of the timeout handling: tracking has now
+been stopped against the worker who started it, so we are finally free
+to hand the task to whoever should look at it.
+
+The branch sits ahead of the [[headless]] one and ahead of the
+interactive prompt because a killed process never reported an outcome.
+Asking \enquote{mark todo as done?} about work we ourselves cut short
+invites the user to record a completion that did not happen, so a
+timed-out task always goes back to pending regardless of how it was
+launched.
+
+<<handle timeout exit status>>=
+if reassign_to:
+    item.who = reassign_to
+item.status = "pending"
 @
 
 In headless mode, a non-zero exit code indicates failure.
@@ -11291,6 +11332,47 @@ def test_start_headless_captures_output(temp_todo_dir):
     assert item.notes is not None
     assert "hello" in item.notes
     assert "Exit code: 0" in item.notes
+@
+
+A timed-out run must close the \emph{original} worker's tracking
+session before the task changes hands.  We drive the timeout by making
+[[subprocess.run]] raise, then check both halves: the agent's clock is
+closed, and the task now belongs to the teacher.
+
+<<test functions>>=
+def test_start_timeout_stops_original_worker(
+  temp_todo_dir,
+):
+  """A timed-out run closes the agent's clock, then reassigns."""
+  from subprocess import TimeoutExpired
+  from nytid.cli.track import load_active_session
+
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      who="agent", labels=["grading"],
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=TimeoutExpired(["true"], 1),
+  ):
+    result = runner.invoke(
+      cli,
+      ["start", "1", "--headless",
+       "--command", "true",
+       "--timeout", "1s",
+       "--reassign-to", "teacher"],
+    )
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  item = todos[0]
+  assert item.who == "teacher"
+  assert item.status == "pending"
+  agent_session = load_active_session("agent")
+  assert agent_session.get_active_labels() == []
 @
 
 A failing subprocess in headless mode should reassign to the
