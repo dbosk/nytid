@@ -297,13 +297,38 @@ string, so that a change to the sheet format cannot silently desynchronize
 the writer and this reader.
 
 We start with a function to compute the number of hours spent per student.
+
+A row of the sign-up sheet is not the same thing as a session, and this
+is where the distinction bites.
+When [[generate_signup_sheet]] meets a hybrid event---one whose location
+includes a digital room---it writes the event out \emph{twice}, once for
+the physical rooms and once for the digital room, so that TAs can sign up
+separately for each.
+The two rows carry the same [[Event]], [[Start]] and [[End]]; only the
+[[Rooms]] column differs.
+Summing rows would therefore report a two-hour hybrid lab as four hours
+per student.
+
+We assume that a figure labelled \enquote{per student} describes what a
+single student is scheduled for, and a student cannot attend the campus
+half and the digital half of one session at the same time---so a session
+counts once however many rows it was split into.
+That is precisely what separates this function from [[hours_per_event]]
+below, which sums the same rows to describe the total supervision effort
+and \emph{should} count both halves.
+Without this distinction the two functions compute the same thing, and
+one of them is redundant.
+
+We identify a session by the three columns that [[generate_signup_sheet]]
+leaves untouched when it splits an event, and count each identity once.
 <<functions>>=
 def hours_per_student(csv_rows, round_time=round_time):
   """
   Input: The schedule as rows of CSV data as from csv.reader.
 
-  Output: A dictionary mapping event type to the total number of hours per 
-  student.
+  Output: A dictionary mapping event type to the total number of hours per
+  student. Sessions split across several rows (e.g. a hybrid event with
+  separate physical and digital rows) count once.
   """
 
   start_index = SIGNUP_SHEET_HEADER.index("Start")
@@ -311,8 +336,16 @@ def hours_per_student(csv_rows, round_time=round_time):
   event_index = SIGNUP_SHEET_HEADER.index("Event")
 
   event_hours = dict()
+  counted_sessions = set()
 
   for row in csv_rows:
+    session = (row[event_index], row[start_index], row[end_index])
+
+    if session in counted_sessions:
+      continue
+
+    counted_sessions.add(session)
+
     time = round_time(
       datetime.datetime.strptime(row[end_index], STRPTIME_FORMAT)
       - datetime.datetime.strptime(row[start_index], STRPTIME_FORMAT))
@@ -348,6 +381,36 @@ def test_hours_per_student_multiple():
   result = hours_per_student(rows)
   assert "Laboration" in result
   assert "Övning" in result
+@
+
+The rows below are shaped exactly as [[generate_signup_sheet]] emits them
+for one hybrid two-hour lab.
+The student-facing figure stays at two hours, while [[hours_per_event]]
+still sees both halves.
+Two genuinely distinct sessions of the same type must of course still
+add up.
+<<test functions>>=
+def test_hours_per_student_hybrid_counted_once():
+  rows = [
+    make_row(event="Laboration", rooms="D1"),
+    make_row(event="Laboration", rooms="Digital"),
+  ]
+
+  assert hours_per_student(rows)["Laboration"] \
+           == datetime.timedelta(hours=2)
+  assert hours_per_event(rows)["Laboration"] \
+           == datetime.timedelta(hours=4)
+
+def test_hours_per_student_distinct_sessions_add_up():
+  rows = [
+    make_row(event="Laboration",
+             start="2024-09-02 10:00", end="2024-09-02 12:00"),
+    make_row(event="Laboration",
+             start="2024-09-03 10:00", end="2024-09-03 12:00"),
+  ]
+
+  assert hours_per_student(rows)["Laboration"] \
+           == datetime.timedelta(hours=4)
 @
 
 Now we can compute the hours per TA.
@@ -713,20 +776,52 @@ def test_sheet_date():
   assert date.hour == 0 and date.minute == 0
 @
 
-We start by finding all start and end dates for every TA.
+We start by finding the earliest start and the latest end among the rows
+the TA is actually booked on.
+
+Restricting the scan to the TA's own rows is what makes the period
+personal.
+Were we to scan the whole sheet, the inner loop would not mention [[ta]]
+anywhere---it would be loop-invariant, and every TA would come out with
+the same period, namely the span of the entire course.
+That is not a cosmetic difference, because the two halves of the
+contract would then be measured over different populations: the hours
+come from the TA's own bookings, but the days would come from everyone's.
+A TA who only works in December would be handed an August start date and
+their hours would be spread over five months instead of one, which can
+push a genuinely over-cap appointment below the 50 percent ceiling of the
+Higher Education Ordinance without anyone noticing.
+
+The names we give the row-local variables matter more than they look.
+This chunk and [[<<expand earliest and latest dates if beneficial>>]]
+below are written a page apart, but [[notangle]] splices both into the
+same function body, so every name introduced here is still live down
+there.
+The parameters [[begin_date]] and [[end_date]] are exactly such names.
+An earlier version of this chunk stored the row's end date in a variable
+called [[end_date]], which silently overwrote the caller's \emph{forced}
+end date before the code below ever got to read it---so a contract's end
+date became whatever the last row of the sheet happened to say, and the
+result depended on the order of the CSV rows.
+The start side survived by luck alone: its parameter is spelled
+[[begin_date]], so the row-local [[start_date]] happened not to collide.
+We therefore prefix both row-local names with [[row_]], which puts them
+in a namespace the function signature cannot reach.
 <<compute the earliest and latest dates for each TA>>=
 for ta in ta_hours.keys():
-  earliest_date = sheet_date(csv_rows[0][start_index])
-  latest_date = sheet_date(csv_rows[0][end_index])
+  <<let [[ta_rows]] be the rows where [[ta]] is booked>>
 
-  for row in csv_rows:
-    start_date = sheet_date(row[start_index])
-    end_date = sheet_date(row[end_index])
+  earliest_date = sheet_date(ta_rows[0][start_index])
+  latest_date = sheet_date(ta_rows[0][end_index])
 
-    if start_date < earliest_date:
-      earliest_date = start_date
-    if end_date > latest_date:
-      latest_date = end_date
+  for row in ta_rows:
+    row_start = sheet_date(row[start_index])
+    row_end = sheet_date(row[end_index])
+
+    if row_start < earliest_date:
+      earliest_date = row_start
+    if row_end > latest_date:
+      latest_date = row_end
 
   hours = ta_hours[ta].total_seconds()/60/60
 
@@ -738,7 +833,20 @@ for ta in ta_hours.keys():
   ta_data[ta] = (earliest_date, latest_date, hours)
 @
 
-Now we want to try to use different start and end dates to optimize the period 
+We select the TA's rows with the same membership test that
+[[hours_per_TA]] uses (\cref{HoursPerTA}), rather than a private one, so
+that the period and the hours are always derived from the identical set
+of bookings---a row where the TA is only a reserve contributes to
+neither.
+Indexing [[ta_rows[0] ]] needs no emptiness check: [[ta_hours]] contains
+a TA precisely when [[hours_per_TA]] found that TA booked on at least one
+row, so the list is guaranteed non-empty for every key we iterate over.
+<<let [[ta_rows]] be the rows where [[ta]] is booked>>=
+ta_rows = [row for row in csv_rows
+           if ta in sheets.get_booked_TAs_from_csv(row)[0]]
+@
+
+Now we want to try to use different start and end dates to optimize the period
 for the student.
 We first try with the start and end dates expanded to the semester, then the 
 first and last of the months, finally the exact dates.
@@ -832,7 +940,96 @@ else:
   continue # skip to next TA
 @
 
+Both halves of the computation are now in view, so we can check the
+property that ties them together: what the caller forces must reach the
+output untouched.
+The TA below works in September and December, so the row scan would
+otherwise leave December behind as the end date.
+We drop [[low_percentage]] to zero to isolate the date handling from the
+percentage thresholds.
+<<test functions>>=
+def test_compute_amanuensis_data_honours_forced_dates():
+  rows = [
+    make_row(start="2024-09-02 10:00", end="2024-09-02 12:00",
+             tas=["alice"]),
+    make_row(start="2024-12-10 10:00", end="2024-12-10 12:00",
+             tas=["alice"]),
+  ]
+  begin = datetime.datetime(2024, 8, 1).astimezone()
+  end = datetime.datetime(2025, 1, 31).astimezone()
+
+  data = compute_amanuensis_data(rows, low_percentage=0,
+                                 begin_date=begin, end_date=end)
+
+  assert data["alice"][0] == begin
+  assert data["alice"][1] == end
+@
+
+The forced dates must also be independent of the order of the rows,
+which is the symptom a leaked row-local produces.
+<<test functions>>=
+def test_compute_amanuensis_data_forced_end_ignores_row_order():
+  rows = [
+    make_row(start="2024-09-02 10:00", end="2024-09-02 12:00",
+             tas=["alice"]),
+    make_row(start="2024-12-10 10:00", end="2024-12-10 12:00",
+             tas=["alice"]),
+  ]
+  end = datetime.datetime(2025, 1, 31).astimezone()
+
+  forwards = compute_amanuensis_data(rows, low_percentage=0,
+                                     end_date=end)
+  backwards = compute_amanuensis_data(list(reversed(rows)),
+                                      low_percentage=0, end_date=end)
+
+  assert forwards["alice"][1] == end
+  assert forwards == backwards
+@
+
+The per-TA scan is visible in the same output.
+Alice works one day in February and Bob one day in September, which puts
+them in different semesters, so rounding to the semester must send them
+to different periods.
+A scan over the whole sheet would instead give both of them February as
+the earliest date, and both would be rounded into the spring semester.
+<<test functions>>=
+def test_compute_amanuensis_data_periods_are_per_TA():
+  rows = [
+    make_row(start="2024-02-10 10:00", end="2024-02-10 12:00",
+             tas=["alice"]),
+    make_row(start="2024-09-02 10:00", end="2024-09-02 12:00",
+             tas=["bob"]),
+  ]
+
+  data = compute_amanuensis_data(rows, low_percentage=0, min_days=1)
+
+  assert data["alice"][0].date() == datetime.date(2024, 1, 1)
+  assert data["alice"][1].date() == datetime.date(2024, 6, 30)
+  assert data["bob"][0].date() == datetime.date(2024, 8, 1)
+  assert data["bob"][1].date() == datetime.date(2025, 1, 31)
+@
+
 The [[compute_percentage]] function simply computes the average working time.
+
+A period of no days is not an exotic input here.
+[[sheet_date]] deliberately truncates the sheet's times to local
+midnight, so a TA booked on a single day arrives with
+[[earliest_date == latest_date]]; the caller can also force
+[[begin_date]] and [[end_date]] to the same day from [[--start]] and
+[[--end]].
+The division would then raise [[ZeroDivisionError]] from inside the
+[[elif]]-chain above---which runs \emph{before} the [[min_days]] check
+that was meant to reject such a period in the first place.
+
+We report such a period as zero rather than raising.
+An employment has day resolution, so a period spanning no days cannot
+express any working time at all, and reporting zero lets the
+[[elif]]-chain reject it the way it rejects every other period that is
+too thin: the TA falls through to [[continue]] and is left out.
+Raising would instead force a [[try]]/[[except]] on every caller,
+including the two in the CLI that print the percentage.
+The same reasoning covers an inverted period, so we guard on
+[[days <= 0]].
 <<functions>>=
 def compute_percentage(start, end, hours):
   """
@@ -840,8 +1037,14 @@ def compute_percentage(start, end, hours):
     hours as a float.
 
   Output: a float in the interval [0, 1], which is the percentage of full time.
+  A period covering no days yields 0.0, since a contract cannot express
+  any working time over no days.
   """
   days = (end - start).total_seconds()/60/60/24
+
+  if days <= 0:
+    return 0.0
+
   return (hours / 1600) * (365 / days)
 @
 
@@ -857,6 +1060,28 @@ def test_compute_percentage():
   result = compute_percentage(start, end, hours)
   expected = (160 / 1600) * (365 / 366)
   assert abs(result - expected) < 0.001
+@
+
+The degenerate periods must be answered, not raised on---both directly
+and through the amanuensis computation that forces a single-day period.
+<<test functions>>=
+def test_compute_percentage_same_day():
+  day = datetime.datetime(2024, 1, 1)
+  assert compute_percentage(day, day, 10) == 0.0
+
+def test_compute_percentage_inverted():
+  start = datetime.datetime(2024, 2, 1)
+  end = datetime.datetime(2024, 1, 1)
+  assert compute_percentage(start, end, 10) == 0.0
+
+def test_compute_amanuensis_data_single_day_period():
+  rows = [make_row(start="2024-09-02 10:00", end="2024-09-02 12:00",
+                   tas=["alice"])]
+  day = datetime.datetime(2024, 9, 2).astimezone()
+
+  data = compute_amanuensis_data(rows, begin_date=day, end_date=day)
+
+  assert data == {}
 @
 
 

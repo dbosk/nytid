@@ -333,16 +333,62 @@ def sanitize_tmux_id(value: str) -> str:
         for c in value
     )
 
-def build_tmux_server_key(
+@
+
+Tmux-scoped state files---window labels, pane labels, suspend state,
+the last-selected window---embed a \emph{server key} in their
+filenames.  The key must identify a server \emph{instance}, not merely
+a server address.  Hostname and socket path alone are not enough:
+after a reboot, a fresh tmux server listens on the very same default
+socket path, and its window numbering restarts at [[@0]].  Under an
+address-only key, a brand-new window would collide with a dead
+server's state file for the same [[@N]] identifier, and nytid would
+resurrect the dead window's labels in a window that was never tracked.
+The reboot also kills tmux without firing any [[pane-exited]] hooks,
+so the hook-based cleanup (\cref{track:detached-finalize}) never gets
+a chance to remove those files.
+
+We therefore extend the key with a \emph{generation}: the server's
+PID and start time.  The PID comes for free from [[$TMUX]]; the start
+time guards against a deterministic boot sequence handing a new
+server the same PID again.  The address part (the \emph{sockethash})
+and the generation are joined with hyphens---characters that
+[[sanitize_tmux_id]] passes through unchanged---so every state
+filename carries the key as a single underscore-free token from which
+the sockethash prefix is recoverable.  That recoverability is what
+makes sweeping possible: a socket path hosts at most one live server
+at a time, so a state file carrying the current sockethash but a
+different generation provably belongs to a dead server
+(\cref{track:server-sweep}).
+
+<<configuration management>>=
+def build_tmux_sockethash(
     hostname: str,
     socket_path: str,
 ) -> str:
-    """Return a stable key for one tmux server."""
+    """Return the address part of a tmux server key."""
     digest = hashlib.sha256(
         f"{hostname}\0{socket_path}".encode()
     ).hexdigest()
     return digest[:16]
 
+def build_tmux_server_key(
+    hostname: str,
+    socket_path: str,
+    generation: str,
+) -> str:
+    """Return a stable key for one tmux server instance."""
+    sockethash = build_tmux_sockethash(
+        hostname, socket_path,
+    )
+    return f"{sockethash}-{generation}"
+@
+
+Both the socket path and the server PID live in [[$TMUX]], whose
+format is [[socket,server_pid,session_idx]].  We split from the right
+because the socket path itself may contain commas.
+
+<<configuration management>>=
 def parse_tmux_socket_path(
     tmux_env: str | None,
 ) -> str | None:
@@ -355,17 +401,119 @@ def parse_tmux_socket_path(
         return tmux_env or None
     return socket_path or None
 
-def get_current_tmux_server_key() -> str | None:
-    """Return the current tmux server key from the environment."""
-    socket_path = parse_tmux_socket_path(
-        os.environ.get("TMUX")
-    )
-    if not socket_path:
+def parse_tmux_server_pid(
+    tmux_env: str | None,
+) -> str | None:
+    """Extract the tmux server PID from ``$TMUX`` if present."""
+    if not tmux_env:
+        return None
+    try:
+        _socket_path, server_pid, _session_idx = tmux_env.rsplit(",", 2)
+    except ValueError:
+        return None
+    return server_pid or None
+@
+
+The start time is not part of [[$TMUX]], so we have to ask the server
+itself.  One subprocess call per CLI process is acceptable, but hook
+subprocesses and nested commands may build several keys, so we
+memoize the answer per [[$TMUX]] value.  A failed query yields
+[[None]] rather than an exception: a server that cannot answer is
+dying or absent, and every caller already treats a missing key as
+\enquote{no tmux context}.
+
+<<configuration management>>=
+def get_tmux_server_start_time() -> str | None:
+    """Return the current tmux server's start time, or ``None``."""
+    tmux_env = os.environ.get("TMUX")
+    if not tmux_env:
+        return None
+    if tmux_env in _TMUX_START_TIME_CACHE:
+        return _TMUX_START_TIME_CACHE[tmux_env]
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "#{start_time}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    start_time = result.stdout.strip()
+    if not start_time:
+        return None
+    _TMUX_START_TIME_CACHE[tmux_env] = start_time
+    return start_time
+<<constants>>=
+_TMUX_START_TIME_CACHE: dict[str, str] = {}
+@
+
+Assembling a key combines all three ingredients.  The [[tmux_env]]
+parameter names the server whose namespace we are keying, while the
+start-time query always asks the ambient server---the two agree
+because tmux client commands themselves resolve the server from the
+process environment, which is also where callers obtain the
+[[tmux_env]] they pass in.
+
+<<configuration management>>=
+def compute_tmux_server_key(
+    tmux_env: str | None,
+) -> str | None:
+    """Return the instance key for the server named by ``tmux_env``."""
+    socket_path = parse_tmux_socket_path(tmux_env)
+    server_pid = parse_tmux_server_pid(tmux_env)
+    if not socket_path or not server_pid:
+        return None
+    start_time = get_tmux_server_start_time()
+    if not start_time:
         return None
     return build_tmux_server_key(
+        socket.gethostname(),
+        socket_path,
+        f"{server_pid}-{start_time}",
+    )
+@
+
+The everyday entry point adds one refinement: it returns [[None]] not
+only outside tmux but also when this worker's filesystem holds no
+state for the current socket at all.  All its callers use the key
+solely to address \emph{existing} state (state files are only ever
+created by [[run_tmux_command]], which computes its key directly via
+[[compute_tmux_server_key]]), so when no state exists we can skip the
+start-time query and keep untracked [[track start]]/[[stop]]
+invocations free of tmux subprocess calls---the same hot-path
+principle as [[has_tracked_window_state]].  The glob requires a
+hyphen after the sockethash, so state written by the pre-generation
+key format never reactivates this path.
+
+<<configuration management>>=
+def get_current_tmux_server_key() -> str | None:
+    """Return the current tmux server instance key, or ``None``.
+
+    Returns ``None`` outside tmux, and also when no tmux-scoped
+    state exists for the current server's socket, so that callers
+    addressing existing state stay subprocess-free.
+    """
+    tmux_env = os.environ.get("TMUX")
+    socket_path = parse_tmux_socket_path(tmux_env)
+    if not socket_path:
+        return None
+    sockethash = build_tmux_sockethash(
         socket.gethostname(), socket_path,
     )
+    if not any(
+        get_tracking_dir().glob(f"*_{sockethash}-*")
+    ):
+        return None
+    return compute_tmux_server_key(tmux_env)
+@
 
+<<configuration management>>=
 def get_current_session_file(
     who: str = None
 ) -> pathlib.Path:
@@ -504,23 +652,53 @@ DEFAULT_WEEKLY_LIMIT_HOURS = 40.0  # Standard full-time work week
 DEFAULT_DAILY_LIMIT_HOURS = 8.0    # Standard work day
 @
 
+Durations are normally positive, but they must never be \emph{rendered}
+as positive when they are not.  Python's [[divmod]] floors towards
+negative infinity, so splitting a raw negative second count into hours,
+minutes and seconds yields components that read as a plausible positive
+duration: $-30$~minutes becomes [[30m 0s]], and so does $-90$~minutes.
+A corrupt entry would then be indistinguishable from a healthy one in
+[[status]], [[ls]], and [[stats]] output.
+
+We therefore split the magnitude and carry the sign as an explicit
+prefix.  This is a display safeguard rather than a licence to store
+negative durations---the commands that build entries reject inverted
+intervals---but a formatter that cannot lie is what makes such a bug
+visible instead of silent.
+
 <<helper functions>>=
 def format_duration(duration: datetime.timedelta) -> str:
-    """Format a duration in a human-readable way"""
+    """Format a duration in a human-readable way.
+
+    Negative durations keep a leading minus sign so an
+    inverted interval can never be displayed as a
+    positive one.
+    """
     total_seconds = int(duration.total_seconds())
-    hours, remainder = divmod(total_seconds, 3600)
+    sign = "-" if total_seconds < 0 else ""
+    hours, remainder = divmod(abs(total_seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
     if hours > 0:
-        return f"{hours}h {minutes}m {seconds}s"
+        return f"{sign}{hours}h {minutes}m {seconds}s"
     elif minutes > 0:
-        return f"{minutes}m {seconds}s"
+        return f"{sign}{minutes}m {seconds}s"
     else:
-        return f"{seconds}s"
+        return f"{sign}{seconds}s"
 
 def get_labels_display(labels: list[str]) -> str:
     """Get a display string for labels (as comma-separated tags)"""
     return ", ".join(sorted(labels)) if labels else "No labels"
+@
+
+<<test functions>>=
+def test_format_duration_is_sign_aware():
+  """Negative durations must not render as positive ones."""
+  assert format_duration(datetime.timedelta(minutes=30)) == "30m 0s"
+  assert format_duration(datetime.timedelta(minutes=-30)) == "-30m 0s"
+  assert format_duration(datetime.timedelta(minutes=-90)) == "-1h 30m 0s"
+  assert format_duration(datetime.timedelta(seconds=-5)) == "-5s"
+  assert format_duration(datetime.timedelta()) == "0s"
 @
 
 \subsubsection{Abbreviating Content Hashes}
@@ -1228,6 +1406,10 @@ class ActiveSession:
 
         Returns:
             List of TrackingEntry objects for the stopped labels
+
+        Raises:
+            ValueError: if `end_time` is not after the start time of
+                every label that would be stopped
         """
         if who is None:
             who = default_username
@@ -1257,26 +1439,82 @@ class ActiveSession:
             # Stop the N most recently started labels
             labels = self.label_order[-count:] if self.label_order else []
         # else: use the provided labels list
-        
-        # Remember stopped labels for resume functionality
-        self.last_stopped = labels.copy() if labels else []
-            
-        # Group labels that share the same start time and
-        # batch into a single entry, so that concurrent labels
-        # do not produce duplicate wall-clock intervals.
+
+        inverted = sorted(
+            label for label in labels
+            if label in self.active_labels
+            and end_time <= self.active_labels[label][0]
+        )
+        if inverted:
+            raise ValueError(
+                "End time must be after start time for: "
+                + ", ".join(inverted)
+            )
+@
+
+The check above belongs here, before anything is popped, because this is
+the last point at which the session is still untouched.  Every caller
+reaches [[stop_labels]] through [[mutate_worker_tracking_state]], which
+persists whatever the callback returns; raising once the labels have
+already been removed would leave the on-disk session inconsistent with
+the error the user sees.
+
+The rule is the same one [[edit]] enforces on historical entries: an
+entry's end must come after its start.  Only [[stop]] could break it,
+because [[--at]] and [[--offset]] let the user name an end time
+independently of when tracking began.  An inverted entry is not merely
+displayed wrongly---it is stored, and a negative interval subtracts from
+every aggregate built on top of it: the merged wall-clock totals,
+[[stats]], the exports, and the times [[nytid todo]] derives from
+tracking history.
+
+We name the offending labels rather than failing anonymously.  A
+[[stop --all]] can span labels started hours apart, so
+\enquote{which of them started after the end time you gave?} is exactly
+the question the user needs answered.
+
+At this point [[labels]] is only a \emph{request}.  The caller may have
+named a label that is not being tracked---most often a typo---and the
+loop below simply skips such names.  The resume set must therefore be
+derived from what we actually stop, not from what was asked for.
+
+Recording the request instead is not a cosmetic slip: the caller
+[[stop_tracking_labels]] reports \enquote{none of the specified labels
+are currently tracking} by raising \emph{after}
+[[mutate_worker_tracking_state]] has already persisted the session.  A
+mistyped [[track stop]] would exit non-zero and \emph{still} leave
+[[last_stopped]] naming the phantom label, so the next bare
+[[track start]] would resume a label that never existed and the real
+previous context would be gone.
+
+We also leave [[last_stopped]] untouched when nothing was stopped.  A
+failed stop should be a no-op, and clearing the resume set would throw
+away the still-valid answer to \enquote{what did I stop last?}.
+
+Labels that share both a start time and a batch collapse into one
+entry.  Two labels started together cover the same wall-clock interval,
+so emitting them separately would double-count that time in every
+downstream total.
+
+<<active session class>>=
         groups = {}
+        stopped = []
         for label in labels:
             if label in self.active_labels:
                 start_time, notes, batch_id = (
                     self.active_labels.pop(label)
                 )
                 self.label_order.remove(label)
+                stopped.append(label)
                 key = (start_time, batch_id)
                 if key not in groups:
                     groups[key] = (
                         start_time, [], notes
                     )
                 groups[key][1].append(label)
+
+        if stopped:
+            self.last_stopped = stopped
 
         entries = []
         for key, (st, grp_labels, notes) in (
@@ -1289,6 +1527,37 @@ class ActiveSession:
             entries.append(entry)
 
         return entries
+@
+
+Let's verify that a stop naming an unknown label leaves the resume set
+alone---first at the class level, then end-to-end through the CLI, where
+the failing exit code and the surviving resume set must coexist:
+
+<<test functions>>=
+def test_failed_stop_keeps_last_stopped(temp_tracking_dir):
+  """A stop that matches nothing must not rewrite the resume set."""
+  session = ActiveSession()
+  session.start_labels(["A", "B"], datetime.datetime.now())
+  session.stop_labels()
+  assert set(session.last_stopped) == {"A", "B"}
+
+  assert session.stop_labels(["TYPO"]) == []
+  assert set(session.last_stopped) == {"A", "B"}
+
+def test_failed_stop_does_not_break_resume(temp_tracking_dir):
+  """A mistyped stop must not make bare start resume a phantom label."""
+  runner.invoke(cli, ["start", "A", "B"])
+  runner.invoke(cli, ["stop"])
+
+  result = runner.invoke(cli, ["stop", "TYPO"])
+  assert result.exit_code == 1
+
+  assert set(load_active_session().last_stopped) == {"A", "B"}
+
+  result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  assert "TYPO" not in result.stdout
+  assert set(load_active_session().get_active_labels()) == {"A", "B"}
 @
 
 \subsubsection{Discarding an Active Session}
@@ -3547,16 +3816,7 @@ def stop(
             )
             raise typer.Exit(1)
 
-    try:
-        session, completed_entries = stop_tracking_labels(
-            who=who,
-            labels=labels,
-            all_labels=all_labels,
-            end_time=end_time,
-        )
-    except ValueError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1)
+    <<stop the requested labels or report why not>>
 
     # Display what was completed
     for entry in completed_entries:
@@ -3584,7 +3844,69 @@ def stop(
 
 @
 
+Two quite different things can go wrong once the end time is known, and
+both surface here as a [[ValueError]] carrying its own explanation:
+either none of the named labels are tracking, or the end time given by
+[[--at]]/[[--offset]] falls before some label started.  The command has
+nothing to add to either message, so it prints the exception verbatim
+and exits non-zero.
+
+What matters is that the exception reaches this point with the on-disk
+state untouched.  [[stop_labels]] validates before it pops anything, so
+a rejected [[stop]] leaves the session exactly as it was and the user
+can simply retry with a corrected time.
+
+<<stop the requested labels or report why not>>=
+try:
+    session, completed_entries = stop_tracking_labels(
+        who=who,
+        labels=labels,
+        all_labels=all_labels,
+        end_time=end_time,
+    )
+except ValueError as exc:
+    typer.echo(str(exc), err=True)
+    raise typer.Exit(1)
+@
+
 \subsubsection{Testing Stop Command}
+
+Let's verify that a backdated stop cannot invert an entry, and that the
+rejection is total---no entry written, no label stopped:
+
+<<test functions>>=
+def test_stop_rejects_end_before_start(temp_tracking_dir):
+  """A backdated stop must not record a negative interval."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["stop", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "End time must be after start time" in result.output
+  assert "A" in result.output
+
+  assert load_tracking_data() == []
+  assert load_active_session().get_active_labels() == ["A"]
+
+def test_stop_all_names_only_inverted_labels(temp_tracking_dir):
+  """The error names the labels that started after the end time."""
+  runner.invoke(cli, ["start", "old", "--offset", "-2h"])
+  runner.invoke(cli, ["start", "new"])
+
+  result = runner.invoke(cli, ["stop", "--all", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "new" in result.output
+  assert "old" not in result.output
+
+def test_switch_rejects_end_before_start(temp_tracking_dir):
+  """A backdated switch fails instead of inverting the old context."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["switch", "B", "--offset", "-30m"])
+  assert result.exit_code == 1
+  assert "End time must be after start time" in result.output
+
+  assert load_tracking_data() == []
+  assert load_active_session().get_active_labels() == ["A"]
 
 <<test functions>>=
 def test_stop_batch_behavior(temp_tracking_dir):
@@ -3785,6 +4107,52 @@ elif offset is not None:
         raise typer.Exit(1)
 @
 
+\subsubsection{Closing the Current Context}
+
+Both switch directions begin identically: whatever is running must be
+stopped at [[switch_time]] before the new context starts.  We name that
+step once so the forward and reverse directions cannot drift apart, and
+so the error handling below exists in exactly one place.
+
+A backdated [[--at]] or [[--offset]] may name a moment before one of the
+active labels began.  [[stop_tracking_labels]] rejects that rather than
+recording an inverted interval, and there is nothing sensible to do with
+the rest of the switch: starting the new context while the old one is
+still open would leave both running.  We therefore report the problem
+and stop.
+
+<<stop current context at switch time>>=
+if session.is_active():
+    try:
+        session, completed = stop_tracking_labels(
+            who=who,
+            all_labels=all_labels,
+            end_time=switch_time,
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    session = load_active_session(who)
+    for entry in completed:
+        typer.echo(
+            f"Stopped: "
+            f"{get_labels_display(entry.labels)}"
+            f" ({format_duration(entry.duration())})"
+        )
+    stopped_labels = [
+        label
+        for entry in completed
+        for label in entry.labels
+    ]
+else:
+    stopped_labels = []
+@
+
+The chunk expects [[session]], [[who]], [[all_labels]] and
+[[switch_time]] to be in scope, and leaves behind a refreshed
+[[session]] plus the [[stopped_labels]] both directions need for the
+toggle bookkeeping.
+
 \subsubsection{Switching to New Labels}
 
 The key question when labels are given is whether the current context
@@ -3800,26 +4168,7 @@ so a subsequent bare [[switch]] correctly restores the idle state.
 
 <<switch to new labels>>=
 session = load_active_session(who)
-if session.is_active():
-    session, completed = stop_tracking_labels(
-        who=who,
-        all_labels=all_labels,
-        end_time=switch_time,
-    )
-    session = load_active_session(who)
-    for entry in completed:
-        typer.echo(
-            f"Stopped: "
-            f"{get_labels_display(entry.labels)}"
-            f" ({format_duration(entry.duration())})"
-        )
-    stopped_labels = [
-        label
-        for entry in completed
-        for label in entry.labels
-    ]
-else:
-    stopped_labels = []
+<<stop current context at switch time>>
 previous_switch_other = session.switch_other
 if not pop:
     update_switch_other_labels(stopped_labels, who=who)
@@ -3865,26 +4214,7 @@ if session.switch_other is None:
         "only one label set in play."
     )
     raise typer.Exit(0)
-if session.is_active():
-    session, completed = stop_tracking_labels(
-        who=who,
-        all_labels=all_labels,
-        end_time=switch_time,
-    )
-    session = load_active_session(who)
-    for entry in completed:
-        typer.echo(
-            f"Stopped: "
-            f"{get_labels_display(entry.labels)}"
-            f" ({format_duration(entry.duration())})"
-        )
-    stopped_labels = [
-        label
-        for entry in completed
-        for label in entry.labels
-    ]
-else:
-    stopped_labels = []
+<<stop current context at switch time>>
 if session.switch_other is None:
     typer.echo(
         "Nothing to switch back to: "
@@ -4097,19 +4427,26 @@ def status(
         <<show all workers status>>
 @
 
-<<show single worker status>>=
-session = load_active_session(who)
+Rendering one worker's active labels is needed in three places---the
+single-worker view, the per-worker loop below, and the
+backward-compatibility path that follows it.  Keeping three copies is
+how the three views drift apart, so we write it once as a function.  A
+function rather than a chunk: the three call sites live in different
+scopes, and a parameter list makes the inputs explicit where a shared
+chunk would silently depend on whatever names happen to be bound.
 
-if not session.is_active():
-    typer.echo(f"No active tracking for {who}")
-    return
-
-typer.echo(f"Currently tracking ({who}):")
-current_time = datetime.datetime.now()
-
-for label in session.get_active_labels():
-    info = session.get_label_info(label)
-    if info:
+<<helper functions>>=
+def echo_worker_status(
+    display_name: str,
+    session: "ActiveSession",
+) -> None:
+    """Print one worker's active labels with their durations."""
+    typer.echo(f"Currently tracking ({display_name}):")
+    current_time = datetime.datetime.now()
+    for label in session.get_active_labels():
+        info = session.get_label_info(label)
+        if info is None:
+            continue
         start_time, notes, batch_id = info
         duration = current_time - start_time
         notes_display = f" - {notes}" if notes else ""
@@ -4120,13 +4457,38 @@ for label in session.get_active_labels():
         )
 @
 
+<<show single worker status>>=
+session = load_active_session(who)
+
+if not session.is_active():
+    typer.echo(f"No active tracking for {who}")
+    return
+
+echo_worker_status(who, session)
+@
+
 When no [[--who]] is specified, we discover all active workers by
 globbing for session files in the tracking directory. This gives a
 quick overview of who is currently tracking time.
 
+The glob deliberately cannot match the pre-multi-worker
+[[current_session.json]], whose name carries no worker suffix.  That
+file therefore needs its own pass, and the question that pass must ask
+is narrow: \emph{was the default worker already shown?}  Asking the
+broader question---was \emph{anything} shown---hides an unmigrated
+user's own session as soon as any other worker (an agent, say) is
+tracking, which is precisely when a stale timer is easiest to miss.
+
+We answer it by recording which session files the loop actually
+rendered.  Comparing paths rather than worker names is what makes this
+robust: [[get_current_session_file]] is the single authority on which
+file a worker's session lives in, including its own fallback to the
+legacy name, so a path already in the set means the same session, no
+matter which spelling of the worker got us there.
+
 <<show all workers status>>=
 tracking_dir = get_tracking_dir()
-found_any = False
+rendered_session_files = set()
 
 if tracking_dir.exists():
     for session_file in sorted(
@@ -4137,48 +4499,22 @@ if tracking_dir.exists():
         )
         session = load_active_session(worker)
         if session.is_active():
-            found_any = True
-            typer.echo(f"Currently tracking ({worker}):")
-            current_time = datetime.datetime.now()
-            for label in session.get_active_labels():
-                info = session.get_label_info(label)
-                if info:
-                    start_time, notes, batch_id = info
-                    duration = current_time - start_time
-                    notes_display = (
-                        f" - {notes}" if notes else ""
-                    )
-                    typer.echo(
-                        f"  {label}: "
-                        f"{format_duration(duration)}"
-                        f"{notes_display}"
-                    )
+            rendered_session_files.add(session_file)
+            echo_worker_status(worker, session)
 
 # Also check old unsuffixed file for backward compat
 old_session_file = tracking_dir / "current_session.json"
 if old_session_file.exists():
     session = load_active_session(default_username)
-    if session.is_active() and not found_any:
-        found_any = True
-        typer.echo(
-            f"Currently tracking ({default_username}):"
-        )
-        current_time = datetime.datetime.now()
-        for label in session.get_active_labels():
-            info = session.get_label_info(label)
-            if info:
-                start_time, notes, batch_id = info
-                duration = current_time - start_time
-                notes_display = (
-                    f" - {notes}" if notes else ""
-                )
-                typer.echo(
-                    f"  {label}: "
-                    f"{format_duration(duration)}"
-                    f"{notes_display}"
-                )
+    already_shown = (
+        get_current_session_file(default_username)
+        in rendered_session_files
+    )
+    if session.is_active() and not already_shown:
+        rendered_session_files.add(old_session_file)
+        echo_worker_status(default_username, session)
 
-if not found_any:
+if not rendered_session_files:
     typer.echo("No active tracking")
 @
 
@@ -4266,6 +4602,58 @@ def test_status_tuple_unpacking_regression(temp_tracking_dir):
     assert "ValueError" not in result.stdout
     assert "too many values to unpack" not in result.stdout
 
+def test_status_shows_legacy_session_beside_other_workers(
+  temp_tracking_dir,
+):
+  """An unmigrated session stays visible when another worker tracks."""
+  legacy_file = temp_tracking_dir / "current_session.json"
+
+  def legacy_aware_session_file(who=None):
+    if who is None:
+      who = default_username
+    per_worker = temp_tracking_dir / (
+      f"current_session_{sanitize_who(who)}.json"
+    )
+    if (who == default_username
+        and not per_worker.exists()
+        and legacy_file.exists()):
+      return legacy_file
+    return per_worker
+
+  legacy_session = ActiveSession()
+  legacy_session.start_labels(["mine"], datetime.datetime.now())
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  legacy_file.write_text(json.dumps(legacy_session.to_dict()))
+
+  with patch(
+    "nytid.cli.track.get_current_session_file",
+    side_effect=legacy_aware_session_file,
+  ), patch(
+    "nytid.cli.track.get_current_session_lock_file",
+    side_effect=lambda who=None:
+      legacy_aware_session_file(who).with_suffix(".lock"),
+  ):
+    runner.invoke(cli, ["start", "theirs", "--who", "Agent"])
+    result = runner.invoke(cli, ["status"])
+
+  assert result.exit_code == 0
+  assert "mine" in result.stdout
+  assert "theirs" in result.stdout
+
+def test_status_does_not_repeat_migrated_worker(temp_tracking_dir):
+  """A worker with both file names is rendered exactly once."""
+  runner.invoke(cli, ["start", "work"])
+  legacy_file = temp_tracking_dir / "current_session.json"
+  legacy_file.write_text(
+    (temp_tracking_dir / (
+      f"current_session_{sanitize_who(default_username)}.json"
+    )).read_text()
+  )
+
+  result = runner.invoke(cli, ["status"])
+  assert result.exit_code == 0
+  assert result.stdout.count("Currently tracking") == 1
+
 def test_status_with_batch_tracking(temp_tracking_dir):
     """Test status command with labels from different batches"""
     # Start first batch
@@ -4284,6 +4672,44 @@ def test_status_with_batch_tracking(temp_tracking_dir):
 \subsection{Notes Command}
 
 The notes command allows adding or updating notes/descriptions for any active label.
+
+Annotating a label is a read-modify-write of the session file, so it
+belongs behind [[mutate_worker_tracking_state]] like every other
+mutation.  Loading and saving directly would take a snapshot outside any
+lock and write it back later, and auto-suspend makes a competing writer
+ordinary rather than exotic: a [[pane-focus-out]] hook firing in between
+would have its work overwritten by a snapshot that still lists the
+suspended labels as active with their original start times.  The next
+stop would then record an interval overlapping the one the suspend
+already wrote---the same wall-clock time counted twice.
+
+The callback shape also gives us the answer we need: whether the label
+was active is decided inside the critical section, on state nobody else
+can be halfway through changing, so the message we print cannot describe
+a session that no longer exists.
+
+<<session management>>=
+def add_session_notes(
+    label: str,
+    notes: str,
+    *,
+    who: str = None,
+) -> tuple[bool, list[str]]:
+    """Annotate one active label under the tracking locks.
+
+    Returns whether the label was active, together with the
+    labels that were active at that moment.
+    """
+    outcome = {}
+
+    def update(session, history_entries):
+        outcome["added"] = session.add_notes(label, notes)
+        outcome["active"] = session.get_active_labels()
+        return session, history_entries
+
+    mutate_worker_tracking_state(update, who)
+    return outcome["added"], outcome["active"]
+@
 
 <<argument and option definitions>>=
 notes_label_arg = typer.Argument(
@@ -4311,16 +4737,17 @@ def notes(
       nytid track notes DD1310 "Discussing course structure with TA"
       nytid track notes email "Answered student questions about lab 2"
     """
-    session = load_active_session(who)
+    added, active = add_session_notes(
+        label, note_text, who=who,
+    )
 
-    if not session.is_active():
+    if not active:
         typer.echo(
             "No active tracking session", err=True
         )
         raise typer.Exit(1)
 
-    if session.add_notes(label, note_text):
-        save_active_session(session, who)
+    if added:
         typer.echo(
             f"Added notes to '{label}': {note_text}"
         )
@@ -4329,12 +4756,55 @@ def notes(
             f"Label '{label}' is not currently "
             f"being tracked", err=True
         )
-        active = session.get_active_labels()
-        if active:
-            typer.echo(
-                f"Active labels: {', '.join(active)}"
-            )
+        typer.echo(
+            f"Active labels: {', '.join(active)}"
+        )
         raise typer.Exit(1)
+@
+
+The property worth pinning down is structural rather than observable
+from outside: the read and the write must happen inside one critical
+section.  We assert it where it is decided, by checking that the command
+reaches the session through [[mutate_worker_tracking_state]] at all---a
+future refactoring that reintroduces a bare load/save pair would fail
+here rather than in a rare interleaving nobody can reproduce:
+
+<<test functions>>=
+def test_notes_mutates_under_tracking_locks(temp_tracking_dir):
+  """Annotating goes through the shared locked mutation path."""
+  runner.invoke(cli, ["start", "A"])
+
+  real_mutate = mutate_worker_tracking_state
+  observed_workers = []
+
+  def recording_mutate(callback, who=None, post_update=None):
+    observed_workers.append(who)
+    return real_mutate(callback, who, post_update=post_update)
+
+  with patch(
+    "nytid.cli.track.mutate_worker_tracking_state",
+    side_effect=recording_mutate,
+  ):
+    result = runner.invoke(cli, ["notes", "A", "under lock"])
+
+  assert result.exit_code == 0
+  assert observed_workers == [default_username]
+  assert load_active_session().get_label_info("A")[1] == "under lock"
+
+def test_notes_rejects_inactive_label(temp_tracking_dir):
+  """Annotating an untracked label lists what is actually active."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, ["notes", "B", "text"])
+  assert result.exit_code == 1
+  assert "not currently being tracked" in result.output
+  assert "Active labels: A" in result.output
+
+def test_notes_without_session_fails(temp_tracking_dir):
+  """Annotating with nothing active reports the empty session."""
+  result = runner.invoke(cli, ["notes", "A", "text"])
+  assert result.exit_code == 1
+  assert "No active tracking session" in result.output
 @
 
 \subsection{Tmux-Managed Commands}
@@ -4780,6 +5250,16 @@ child needs an atomic guard file so completion is recorded exactly once
 even if multiple cleanup paths race.  The helper functions below provide
 those two mechanisms.
 
+The guard is a \emph{directory}, because [[mkdir]] is the one filesystem
+operation every POSIX shell can perform atomically: it either creates
+the directory or fails, and exactly one racer sees success.  Deriving
+its path from the status file is what makes it disarmable.  A launch
+whose parent does not stick around to clean up puts both files in one
+throwaway directory; when the detached cleanup removes that directory,
+a later [[mkdir]] of the guard fails with [[ENOENT]] rather than
+succeeding on a fresh path---so releasing the guard and closing it
+permanently are the same act.
+
 <<helper functions>>=
 def make_tmux_channel(prefix: str) -> str:
     """Return a unique tmux wait-for channel name."""
@@ -4791,10 +5271,18 @@ def make_tmux_channel(prefix: str) -> str:
 
 def make_tmux_completion_guard(
     status_file: str | None,
-) -> str | None:
-    """Return the atomic completion guard path."""
+) -> str:
+    """Return the atomic completion guard path.
+
+    Derived from the status file when there is one, so that
+    removing the directory holding the status file also
+    removes -- and disarms -- the guard.
+    """
     if status_file is None:
-        return None
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"nytid-guard-{os.getpid()}-{time.time_ns()}",
+        )
     return status_file + ".guard"
 
 
@@ -5012,13 +5500,19 @@ def run_tmux_command(
     focus_labels: list[str] | None = None,
     focus_who: str | None = None,
     focus_window: bool = False,
+    auto_suspend: bool = True,
 ) -> int | None:
     """Run a command in tmux and optionally wait for exit.
 
-    When ``focus_labels`` is set, auto-suspend hooks are
-    installed.  Pane launches suspend directly on pane focus
-    changes, while window launches synchronize against the
-    authoritative tmux selected window.
+    When ``focus_labels`` is set, they are published as the new
+    pane's or window's tracked context, which is what lets
+    nested commands discover the labels they run under.
+
+    ``auto_suspend`` additionally arms the hooks that stop and
+    restart those labels when attention moves.  Pane launches
+    suspend directly on pane focus changes, while window
+    launches synchronize against the authoritative tmux
+    selected window.
     """
     ready_channel = make_tmux_channel("ready")
     wait_channel = None
@@ -5039,6 +5533,7 @@ def run_tmux_command(
         remove_status_file = True
     if block:
         wait_channel = make_tmux_channel("done")
+    if status_file is not None or on_exit_shell is not None:
         completion_guard = make_tmux_completion_guard(
             status_file
         )
@@ -5086,13 +5581,11 @@ def run_tmux_command(
         )
 
     try:
-        socket_path = parse_tmux_socket_path(
+        tmux_server_key = compute_tmux_server_key(
             env.get("TMUX")
         )
-        if socket_path:
-            tmux_server_key = build_tmux_server_key(
-                socket.gethostname(), socket_path,
-            )
+        if tmux_server_key:
+            sweep_stale_server_state(tmux_server_key)
         <<launch tmux command and install hooks>>
         subprocess.run(
             ["tmux", "wait-for", "-S", ready_channel],
@@ -5123,12 +5616,45 @@ def run_tmux_command(
                 os.unlink(status_file)
             except OSError:
                 pass
-        if completion_guard is not None:
+        if block and completion_guard is not None:
             try:
                 os.rmdir(completion_guard)
             except OSError:
                 pass
 @
+
+Two details of the setup above are easy to get wrong, and getting either
+wrong breaks the exactly-once invariant.
+
+The guard is built whenever there is a status file \emph{or} an
+[[on_exit_shell]], not only when we block.  Both the pane wrapper and
+the [[pane-exited]]/[[pane-died]] hooks are handed the same
+[[completion_guard]], and [[build_tmux_completion_shell]] emits an
+unguarded body when it is [[None]].  Tying the guard to [[block]] left
+detached launches---every [[--no-block]] pane or window, and every
+detached [[todo start]]---running their finalize command twice: once
+from the wrapper as the child exits, once again from the hook after the
+pane dies.  [[_stop-detached]] tolerates that, but the todo finalize
+does not.
+
+The parent only tears the guard down when it blocked.  Having waited for
+the completion signal, it knows the guard has served its purpose.  A
+detached parent knows nothing of the sort: it returns while the pane is
+still alive, so removing the guard then would simply hand the later
+hooks a clean slate to re-claim.  Detached launches instead let their
+own cleanup remove the throwaway directory that holds guard and status
+alike (see \cref{track:detached-launch-dir}).
+
+A tracked launch is also the natural moment to amortize cleanup of
+state left behind by dead tmux servers.  Hook-based cleanup cannot
+fire when the whole server dies---a reboot takes every pane with it
+before any [[pane-exited]] hook runs---so before publishing this
+launch's state we sweep files whose key names a dead instance of the
+current server (\cref{track:server-sweep}).  The sweep runs outside
+[[with_tmux_context_lock]] deliberately: the files it removes belong
+to server instances that no longer exist, so no live hook can race
+it, and keeping it outside the lock avoids nesting with the
+hook-observability critical section below.
 
 Tracked window launches need one stronger serialization guarantee than
 steady-state hooks.  The [[tmux new-window]] command itself may spawn a
@@ -5156,11 +5682,12 @@ state of its own.
 source_window_id = None
 source_window_labels = None
 needs_window_sync = False
+published_window_labels = False
 
 def launch_and_publish_state():
     nonlocal pane_id, window_id, session_id
     nonlocal source_window_id, source_window_labels
-    nonlocal needs_window_sync
+    nonlocal needs_window_sync, published_window_labels
 
     result = subprocess.run(
         tmux_args,
@@ -5179,7 +5706,7 @@ def launch_and_publish_state():
     if focus_labels and focus_who:
         if not tmux_server_key:
             raise RuntimeError(
-                "tmux server key missing for auto-suspend launch"
+                "tmux server key missing for tracked launch"
             )
         if focus_window and window_id and session_id:
             write_window_labels(
@@ -5188,25 +5715,27 @@ def launch_and_publish_state():
                 tmux_server_key,
                 focus_labels,
             )
-            prev_wid = read_last_selected_window(
-                focus_who,
-                tmux_server_key,
-                session_id,
-            )
-            source_window_id = prev_wid
-            if prev_wid is not None:
-                source_window_labels = read_window_labels(
-                    prev_wid,
+            published_window_labels = True
+            if auto_suspend:
+                prev_wid = read_last_selected_window(
                     focus_who,
                     tmux_server_key,
+                    session_id,
                 )
+                source_window_id = prev_wid
+                if prev_wid is not None:
+                    source_window_labels = read_window_labels(
+                        prev_wid,
+                        focus_who,
+                        tmux_server_key,
+                    )
+                needs_window_sync = True
             write_last_selected_window(
                 focus_who,
                 tmux_server_key,
                 session_id,
                 window_id,
             )
-            needs_window_sync = True
         else:
             write_pane_labels(
                 pane_id,
@@ -5214,11 +5743,12 @@ def launch_and_publish_state():
                 tmux_server_key,
                 focus_labels,
             )
-            install_tmux_focus_hooks(
-                pane_id,
-                focus_who,
-                tmux_server_key,
-            )
+            if auto_suspend:
+                install_tmux_focus_hooks(
+                    pane_id,
+                    focus_who,
+                    tmux_server_key,
+                )
             install_tmux_suspend_cleanup_hook(
                 pane_id,
                 focus_who,
@@ -5267,6 +5797,8 @@ if needs_window_sync:
         focus_who,
         tmux_server_key,
     )
+
+if published_window_labels:
     install_tmux_window_cleanup_hook(
         pane_id,
         window_id,
@@ -5275,6 +5807,24 @@ if needs_window_sync:
         focus_labels,
     )
 @
+
+Note which steps hang off which condition.  Publishing the labels and
+installing the cleanup hook that eventually removes them are two halves
+of the same act, so they follow \emph{publication}: leaving them coupled
+to auto-suspend would let a labels file outlive the pane that owned it
+and make every later command believe that window is still tracked.
+
+The transition itself---suspending the window we came from, restarting
+the labels of the one we arrived at, and arming the session hook that
+repeats this on every subsequent switch---is the auto-suspend behaviour
+proper, so it follows [[auto_suspend]].
+
+[[write_last_selected_window]] stays unconditional because it is a
+statement of fact about tmux, not a policy: some \emph{other} tracked
+window in this session may already have armed the session hook, and that
+hook compares against this file.  Leaving it pointing at the window we
+just left would make the next real switch compute its transition from a
+window nobody is in.
 
 When [[--no-block]] is used, the tmux pane needs to call
 [[nytid track stop]] after the child exits.  The
@@ -5321,7 +5871,9 @@ Each tracked pane that uses auto-suspend stores a JSON file
 identifying the labels that were suspended.  The filename encodes the
 tmux server key, the tmux pane ID (with the leading [[%]] replaced by
 [[pane_]]), and the worker identity so that parallel workers or
-independent tmux servers sharing the same filesystem do not collide.
+independent tmux server instances sharing the same filesystem do not
+collide---including a dead pre-reboot server whose pane numbering the
+current server has begun reusing (\cref{track:server-sweep}).
 
 <<helper functions>>=
 def suspend_state_path(
@@ -5654,8 +6206,13 @@ Instead of following terminal focus, it follows whether the tracked tmux
 window is selected by any attached client.  To support that, we keep a
 window-scoped labels file analogous to the pane labels file.  As with
 pane state, the filename includes the tmux server key so two different
-tmux servers sharing a filesystem do not reuse the same window-state
-path for identical [[@...]] identifiers.
+tmux server instances sharing a filesystem do not reuse the same
+window-state path for identical [[@...]] identifiers.  The instance
+distinction matters most across reboots: a fresh server reuses the
+same socket path \emph{and} restarts window numbering at [[@0]], so
+only the generation part of the key keeps a dead server's files from
+being mistaken for the new server's windows
+(\cref{track:server-sweep}).
 
 <<helper functions>>=
 def window_labels_path(
@@ -6986,6 +7543,403 @@ def cleanup_window_detached(
     with_tmux_context_lock(cleanup)
 @
 
+\subsubsection{Sweeping State from Dead Server Instances}
+\label{track:server-sweep}
+
+The pane-exit hooks above share one blind spot: they need the tmux
+server alive to fire.  A reboot (or [[tmux kill-server]]) destroys
+every pane and window without running a single [[pane-exited]] hook,
+so all tmux-scoped state files survive in the persistent tracking
+directory.  These leftovers are worse than clutter.  The next server
+on the same socket restarts window numbering at [[@0]], so a
+generation-less key would let a brand-new, untracked window inherit a
+dead window's labels the moment their [[@N]] identifiers coincide.
+The generation in the server key (\cref{track:configuration})
+prevents that resurrection, but the dead files still accumulate
+forever unless something removes them.  That something is a sweep,
+run at every tracked tmux launch and on demand via
+[[nytid track clean]].
+
+What makes the sweep safe is that staleness is \emph{provable} rather
+than guessed.  Every state filename carries the server key as one
+hyphen-joined token, so the sockethash is recoverable from the
+filename alone.  A socket path hosts at most one live server at a
+time; hence a file whose token shares the current server's sockethash
+but differs in generation belongs to a server that provably no longer
+exists.  No boot-time detection or file-age heuristic is needed.  The
+converse also holds: a file keyed to a \emph{different} sockethash
+may belong to a live server we simply are not attached to (a
+[[tmux -L work]] side server, or another host sharing this home
+directory over NFS), so the sweep must never touch it.
+
+Two legacy name formats are also provably dead, because no current
+code can ever address them: files from before the server key existed
+(their token is the literal [[window]] or [[pane]] from the sanitized
+tmux identifier, or empty for old last-window files), and files whose
+token is a bare generation-less sockethash (the key format that this
+sweep's design replaced---the glob in
+[[get_current_tmux_server_key]] requires a hyphen after the
+sockethash, so such files can never be matched again).  The
+[[window_events_]] prefix covers debug state files from a since
+removed design; nothing writes them anymore, so any survivor is
+swept as legacy.
+
+<<constants>>=
+TMUX_STATE_FILE_PREFIXES = (
+    "window_labels_",
+    "pane_labels_",
+    "suspend_",
+    "last_window_",
+    "window_events_",
+)
+LEGACY_STATE_KEY_TOKENS = frozenset({"window", "pane", ""})
+@
+
+Recovering the key token from a filename relies on the key being the
+first underscore-free token after the prefix, which
+[[sanitize_tmux_id]] guarantees for current keys and which happens to
+classify the legacy formats correctly as well.
+
+<<helper functions>>=
+def parse_state_file_server_key(
+    filename: str,
+) -> str | None:
+    """Return the server-key token of a tmux state filename.
+
+    Returns ``None`` for filenames that are no tmux state files.
+    """
+    for prefix in TMUX_STATE_FILE_PREFIXES:
+        if filename.startswith(prefix):
+            rest = filename[len(prefix):]
+            return rest.split("_", 1)[0]
+    return None
+@
+
+Let's verify the token recovery on all the name formats the sweep
+must classify:
+
+<<test functions>>=
+def test_parse_state_file_server_key():
+  """Key tokens are recovered from current and legacy names."""
+  key = "abc123-45-6789"
+  assert parse_state_file_server_key(
+    f"window_labels_{key}_window_1_me.json"
+  ) == key
+  assert parse_state_file_server_key(
+    f"suspend_{key}_pane_2_me.json"
+  ) == key
+  assert parse_state_file_server_key(
+    "window_labels_abc123_window_1_me.json"
+  ) == "abc123"
+  assert parse_state_file_server_key(
+    "pane_labels_pane_10_me.json"
+  ) == "pane"
+  assert parse_state_file_server_key(
+    "last_window__0_me.txt"
+  ) == ""
+  assert parse_state_file_server_key(
+    "tracking_data.json"
+  ) is None
+@
+
+The two sweep entry points share one walk over the state files and
+differ only in which key tokens they condemn.  The walk returns the
+removed paths so [[nytid track clean --dry-run]] can reuse the exact
+same classification without unlinking anything.  Removal is
+idempotent: a hook or concurrent sweep may have unlinked a file
+between the glob and the unlink, and a dead file that is already gone
+is success, not failure.
+
+<<helper functions>>=
+def _sweep_state_files(
+    should_remove,
+    dry_run: bool,
+) -> list[pathlib.Path]:
+    removed = []
+    tracking_dir = get_tracking_dir()
+    for prefix in TMUX_STATE_FILE_PREFIXES:
+        for path in tracking_dir.glob(prefix + "*"):
+            token = parse_state_file_server_key(path.name)
+            if token is None or not should_remove(token):
+                continue
+            removed.append(path)
+            if not dry_run:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    return removed
+@
+
+The regular sweep condemns exactly the provably dead: same
+sockethash with a different (or no) generation, plus the legacy
+formats.  Everything keyed to another socket survives.
+
+<<helper functions>>=
+def sweep_stale_server_state(
+    current_server_key: str,
+    dry_run: bool = False,
+) -> list[pathlib.Path]:
+    """Remove tmux state files from dead instances of this server.
+
+    Removes files keyed to the current server's socket but another
+    generation, plus files in legacy name formats that no current
+    code can address.  Files keyed to other sockets are kept.
+    Returns the affected paths; with ``dry_run`` nothing is
+    removed, but the same paths are returned.
+    """
+    sockethash = current_server_key.split("-", 1)[0]
+
+    def is_stale(token: str) -> bool:
+        if token == current_server_key:
+            return False
+        return (
+            token.startswith(sockethash)
+            or token in LEGACY_STATE_KEY_TOKENS
+        )
+
+    return _sweep_state_files(is_stale, dry_run)
+@
+
+Let's first verify the scenario that motivated all of this: after a
+reboot, a stale window-labels file must not make a new, untracked
+window appear tracked, even when the window IDs coincide.
+
+<<test functions>>=
+def test_reboot_collision_not_read_as_tracked(temp_tracking_dir):
+  """A dead server's window file never matches a new server's window."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  dead_key = f"{sockethash}-111-1000"
+  new_key = f"{sockethash}-222-2000"
+  (temp_tracking_dir
+   / f"window_labels_{dead_key}_window_1"
+   f"_{sanitize_who(default_username)}.json"
+   ).write_text('{"devel": 1}')
+
+  with patch.dict(
+    os.environ, {"TMUX_PANE": "%1"}, clear=True,
+  ), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value="@1",
+  ):
+    assert get_current_tracked_window_id(
+      default_username, new_key,
+    ) is None
+@
+
+The sweep itself must remove every state-file kind for a dead
+generation while keeping the live generation's files:
+
+<<test functions>>=
+def test_sweep_removes_dead_generation(temp_tracking_dir):
+  """All state files of a dead server generation are removed."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  dead_key = f"{sockethash}-111-1000"
+  dead_files = [
+    f"window_labels_{dead_key}_window_1_me.json",
+    f"pane_labels_{dead_key}_pane_2_me.json",
+    f"suspend_{dead_key}_pane_2_me.json",
+    f"last_window_{dead_key}__0_me.txt",
+    f"window_events_{dead_key}__0_me.txt",
+  ]
+  live_files = [
+    f"window_labels_{TEST_SERVER_KEY}_window_1_me.json",
+    f"last_window_{TEST_SERVER_KEY}__0_me.txt",
+  ]
+  for name in dead_files + live_files:
+    (temp_tracking_dir / name).write_text("{}")
+
+  removed = sweep_stale_server_state(TEST_SERVER_KEY)
+
+  assert sorted(p.name for p in removed) == sorted(dead_files)
+  for name in dead_files:
+    assert not (temp_tracking_dir / name).exists()
+  for name in live_files:
+    assert (temp_tracking_dir / name).exists()
+
+def test_sweep_removes_legacy_names(temp_tracking_dir):
+  """Pre-server-key and generation-less files are swept."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  legacy_files = [
+    f"window_labels_{sockethash}_window_3_me.json",
+    "window_labels_window_9_me.json",
+    "pane_labels_pane_10_me.json",
+    "suspend_pane_11_me.json",
+    "last_window__0_me.txt",
+  ]
+  for name in legacy_files:
+    (temp_tracking_dir / name).write_text("{}")
+
+  removed = sweep_stale_server_state(TEST_SERVER_KEY)
+
+  assert sorted(p.name for p in removed) == sorted(legacy_files)
+  for name in legacy_files:
+    assert not (temp_tracking_dir / name).exists()
+
+def test_sweep_keeps_other_sockets(temp_tracking_dir):
+  """State keyed to other sockets may be alive and survives."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  other = build_tmux_sockethash("host", "/tmp/other.sock")
+  kept = [
+    f"window_labels_{other}-333-4000_window_1_me.json",
+    f"window_labels_{other}_window_1_me.json",
+  ]
+  for name in kept:
+    (temp_tracking_dir / name).write_text("{}")
+
+  assert sweep_stale_server_state(TEST_SERVER_KEY) == []
+  for name in kept:
+    assert (temp_tracking_dir / name).exists()
+
+def test_stale_last_window_not_used(temp_tracking_dir):
+  """A dead generation's last-window file is invisible to reads."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  dead_key = f"{sockethash}-111-1000"
+  path = last_selected_window_path(
+    "me", dead_key, "$0",
+  )
+  path.write_text("@5\n")
+
+  assert read_last_selected_window(
+    "me", TEST_SERVER_KEY, "$0",
+  ) is None
+@
+
+The [[--all]] variant condemns every state file regardless of
+socket.  We cannot prove other sockets' servers dead from here, so
+this variant exists only behind an explicit user assertion in
+[[nytid track clean --all]]: \enquote{no tracked tmux work is in
+flight anywhere on this filesystem}.
+
+<<helper functions>>=
+def sweep_all_server_state(
+    dry_run: bool = False,
+) -> list[pathlib.Path]:
+    """Remove all tmux state files, regardless of server.
+
+    Returns the affected paths; with ``dry_run`` nothing is
+    removed, but the same paths are returned.
+    """
+    return _sweep_state_files(lambda token: True, dry_run)
+@
+
+The user-facing command wraps the two sweeps.  The default scope is
+the current server because that is the only scope where staleness is
+provable; anything wider needs the user's [[--all]] assertion.
+Since deletion is irreversible, [[--dry-run]] lets the user inspect
+the verdict first using the very same classification.  We bypass
+[[get_current_tmux_server_key]] here on purpose: its no-state glob
+guard only recognizes current-format keys, which would make the
+command refuse to run right when only legacy files are left to
+clean.
+
+<<argument and option definitions>>=
+clean_dry_run_opt = typer.Option(
+    "--dry-run", "-n",
+    help="Only list the files that would be removed")
+clean_all_opt = typer.Option(
+    "--all",
+    help="Remove tmux state for all servers, not only "
+         "dead instances of the current one")
+@
+
+<<clean command>>=
+@cli.command()
+def clean(
+    dry_run: Annotated[bool, clean_dry_run_opt] = False,
+    all_servers: Annotated[bool, clean_all_opt] = False,
+):
+    """
+    Remove stale tmux tracking state files.
+
+    Tracked tmux launches sweep automatically; this command covers
+    cleaning up without launching anything, and wiping other
+    servers' state with --all.
+    """
+    if all_servers:
+        removed = sweep_all_server_state(dry_run=dry_run)
+    else:
+        server_key = compute_tmux_server_key(
+            os.environ.get("TMUX")
+        )
+        if server_key is None:
+            typer.echo(
+                "Not inside a running tmux server; "
+                "use --all to remove state for all servers.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        removed = sweep_stale_server_state(
+            server_key, dry_run=dry_run,
+        )
+    verb = "Would remove" if dry_run else "Removed"
+    for path in removed:
+        typer.echo(f"{verb} {path.name}")
+    if not removed:
+        typer.echo("No stale tmux state files found.")
+@
+
+Let's verify the command's scoping and its dry-run contract:
+
+<<test functions>>=
+def test_clean_removes_stale_files(temp_tracking_dir):
+  """clean removes dead-generation files for the current server."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  stale = f"window_labels_{sockethash}-111-1000_window_1_me.json"
+  (temp_tracking_dir / stale).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ):
+    result = runner.invoke(cli, ["clean"])
+
+  assert result.exit_code == 0
+  assert stale in result.stdout
+  assert not (temp_tracking_dir / stale).exists()
+
+def test_clean_dry_run_keeps_files(temp_tracking_dir):
+  """clean --dry-run lists stale files without removing them."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  stale = f"window_labels_{sockethash}-111-1000_window_1_me.json"
+  (temp_tracking_dir / stale).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ):
+    result = runner.invoke(cli, ["clean", "--dry-run"])
+
+  assert result.exit_code == 0
+  assert stale in result.stdout
+  assert (temp_tracking_dir / stale).exists()
+
+def test_clean_all_clears_other_sockets(temp_tracking_dir):
+  """clean --all also removes other sockets' state files."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  other = build_tmux_sockethash("host", "/tmp/other.sock")
+  name = f"window_labels_{other}-333-4000_window_1_me.json"
+  (temp_tracking_dir / name).write_text("{}")
+
+  result = runner.invoke(cli, ["clean", "--all"])
+
+  assert result.exit_code == 0
+  assert not (temp_tracking_dir / name).exists()
+
+def test_clean_outside_tmux_requires_all(temp_tracking_dir):
+  """Without tmux and without --all, clean explains and fails."""
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["clean"])
+
+  assert result.exit_code == 1
+@
+
 \subsubsection{Focus-Events Validation}
 
 The pane [[pane-focus-out]]/[[pane-focus-in]] hooks require tmux's
@@ -8240,11 +9194,13 @@ def test_build_detached_nytid_prefix_requires_resolvable_nytid():
             build_detached_nytid_prefix()
 
 def test_build_tmux_server_key_changes_with_host_or_socket():
-    """Server key distinguishes host/socket combinations."""
-    assert build_tmux_server_key("a", "/tmp/x") != \
-        build_tmux_server_key("b", "/tmp/x")
-    assert build_tmux_server_key("a", "/tmp/x") != \
-        build_tmux_server_key("a", "/tmp/y")
+    """Server key distinguishes host/socket/generation combinations."""
+    assert build_tmux_server_key("a", "/tmp/x", "1-2") != \
+        build_tmux_server_key("b", "/tmp/x", "1-2")
+    assert build_tmux_server_key("a", "/tmp/x", "1-2") != \
+        build_tmux_server_key("a", "/tmp/y", "1-2")
+    assert build_tmux_server_key("a", "/tmp/x", "1-2") != \
+        build_tmux_server_key("a", "/tmp/x", "3-4")
 
 def test_parse_tmux_socket_path_reads_socket_path():
     """$TMUX parsing keeps commas that belong to the socket path."""
@@ -8255,14 +9211,43 @@ def test_parse_tmux_socket_path_reads_socket_path():
     assert parse_tmux_socket_path("malformed") == "malformed"
     assert parse_tmux_socket_path(None) is None
 
-def test_get_current_tmux_server_key_from_env():
-    """Current server key is derived from hostname and $TMUX."""
+def test_parse_tmux_server_pid_reads_pid():
+    """$TMUX parsing extracts the middle server-PID field."""
+    assert parse_tmux_server_pid("/tmp/tmux.sock,123,0") == "123"
+    assert parse_tmux_server_pid("/tmp/tmux,sock,123,0") == "123"
+    assert parse_tmux_server_pid("malformed") is None
+    assert parse_tmux_server_pid(None) is None
+
+def test_get_current_tmux_server_key_from_env(temp_tracking_dir):
+    """Current server key composes sockethash, PID and start time."""
+    temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+    expected = build_tmux_server_key(
+        "host", "/tmp/tmux.sock", "123-1700000000",
+    )
+    (temp_tracking_dir
+     / f"window_labels_{expected}_window_1_me.json"
+     ).write_text("{}")
     with patch.dict(
         os.environ, {"TMUX": "/tmp/tmux.sock,123,0"}, clear=True,
-    ), patch("nytid.cli.track.socket.gethostname", return_value="host"):
-        assert get_current_tmux_server_key() == build_tmux_server_key(
-            "host", "/tmp/tmux.sock",
-        )
+    ), patch(
+        "nytid.cli.track.socket.gethostname", return_value="host",
+    ), patch(
+        "nytid.cli.track.get_tmux_server_start_time",
+        return_value="1700000000",
+    ):
+        assert get_current_tmux_server_key() == expected
+
+def test_get_current_tmux_server_key_skips_tmux_without_state(
+    temp_tracking_dir,
+):
+    """Without any state files, no tmux subprocess is spawned."""
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,123,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_server_start_time",
+        side_effect=AssertionError("tmux queried"),
+    ):
+        assert get_current_tmux_server_key() is None
 @
 
 \subsection{Blocking Command Execution}
@@ -8357,16 +9342,25 @@ else:
     )
 @
 
+The pane and window labels files answer two questions that happen to
+share a storage location.  Auto-suspend asks \enquote{which labels
+should I stop when attention moves away from here?}, but every nested
+command asks a different one: \enquote{what am I working on right
+now?}---[[--inherit-labels]] to branch off the current context,
+[[register_tmux_context_labels]] to join it, and the ID-less [[todo]]
+commands to know which task they refer to.
+
+Only the first question is about suspending.  Withholding the labels
+when the user passes [[--no-auto-suspend]] therefore disabled a set of
+features that have nothing to do with suspension, and did so silently:
+[[--inherit-labels]] simply inherited nothing.  We publish the context
+for every tracked launch and let [[auto_suspend]] decide only whether
+the suspend machinery is armed on top of it.
+
 <<run launched process>>=
-focus_labels_for_tmux = (
-    tracking_labels if use_auto_suspend else None
-)
-focus_who_for_tmux = (
-    who if use_auto_suspend else None
-)
-focus_window_for_tmux = (
-    bool(window and use_auto_suspend)
-)
+focus_labels_for_tmux = tracking_labels
+focus_who_for_tmux = who
+focus_window_for_tmux = bool(window)
 try:
     if pane or window:
         if block:
@@ -8379,6 +9373,7 @@ try:
                 focus_labels=focus_labels_for_tmux,
                 focus_who=focus_who_for_tmux,
                 focus_window=focus_window_for_tmux,
+                auto_suspend=use_auto_suspend,
             )
         else:
             <<set up non-blocking tmux launch>>
@@ -8409,23 +9404,39 @@ finally:
     )
 @
 
+\label{track:detached-launch-dir}
 For the non-blocking case, we create a temporary file for exit status
 and set up a finalize command that calls [[track stop]] when the pane
 exits.  The [[run_tmux_command]] function installs tmux hooks that
 execute the command automatically.
 
+That file lives in a directory of its own rather than directly in
+[[/tmp]], and the choice is load-bearing rather than tidiness.  The
+completion guard is derived from the status file's path, so it lands in
+the same directory; removing the directory as the finalize command's
+last step therefore deletes the status file, deletes the guard, and---
+because [[mkdir]] does not create intermediate directories---makes every
+subsequent attempt to claim the guard fail outright.  Nothing is left
+behind, and no late [[pane-died]] hook can re-run the finalize on a
+launch that has already finished.
+
+The ordering inside the finalize command matters: the directory must go
+last, after the tracking state has been updated, since removing it is
+what closes the launch.
+
 <<set up non-blocking tmux launch>>=
-exit_fd, exit_code_file = tempfile.mkstemp(
+launch_state_dir = tempfile.mkdtemp(
     prefix="nytid-track-",
-    suffix=".status",
 )
-os.close(exit_fd)
+exit_code_file = os.path.join(
+    launch_state_dir, "status",
+)
 finalize_cmd = \
     build_detached_track_finalize_command(
         launch_cleanup_labels, who
     )
 finalize_cmd += (
-    f"; rm -f {shlex.quote(exit_code_file)}"
+    f"; rm -rf {shlex.quote(launch_state_dir)}"
 )
 run_tmux_command(
     command_args,
@@ -8439,6 +9450,7 @@ run_tmux_command(
     focus_labels=focus_labels_for_tmux,
     focus_who=focus_who_for_tmux,
     focus_window=focus_window_for_tmux,
+    auto_suspend=use_auto_suspend,
 )
 exit_code = None
 @
@@ -9881,10 +10893,33 @@ def stats(
       nytid track stats -n 7 --summary
       nytid track stats --who Dan-Claude
     """
+    <<reject a window shorter than a day>>
     <<resolve stats limits>>
     <<load and filter entries for stats>>
     <<display stats summary when requested>>
     <<display grouped daily breakdown>>
+@
+
+A report needs at least one calendar day to describe.  Zero days yields
+no dates, hence no rows, and the two output paths then fail in different
+ways: the summary divides the total by the window length, and the
+plain-text table takes the [[max]] over an empty sequence of rows.
+Neither failure is caught anywhere, so the user gets a traceback.
+
+Rejecting the input is better than clamping it because the value can
+come from [[track.stats.days]] as easily as from [[-n]].  A clamp would
+leave a nonsensical configuration in place and quietly report something
+the user did not ask for, every time; an error names the setting that
+needs fixing.
+
+<<reject a window shorter than a day>>=
+if days < 1:
+    typer.echo(
+        f"Error: --days must be at least 1, got {days} "
+        f"(check {TRACK_STATS_DAYS_CONFIG} in your config)",
+        err=True,
+    )
+    raise typer.Exit(1)
 @
 
 The [[--weekly-limit]] and [[--daily-limit]] flags are optional because
@@ -10068,12 +11103,20 @@ for row in rows:
 console.print(table)
 @
 
+Each column must be at least as wide as its own header, so we simply
+measure the header row alongside the data rows.  Treating the header as
+one more row also makes the computation total: [[max]] over an empty
+sequence raises, and the old spelling---[[max]] of the header width
+\emph{unpacked} together with the row widths---turned an empty report
+into a [[TypeError]] rather than a header with no rows under it.
+
 <<render stats table as plain columns>>=
 headers = ("Date", "Total", "Labels", "Time")
-date_width = max(len(headers[0]), *(len(row[0]) for row in rows))
-total_width = max(len(headers[1]), *(len(row[1]) for row in rows))
-labels_width = max(len(headers[2]), *(len(row[2]) for row in rows))
-time_width = max(len(headers[3]), *(len(row[3]) for row in rows))
+measured_rows = [headers] + rows
+date_width = max(len(row[0]) for row in measured_rows)
+total_width = max(len(row[1]) for row in measured_rows)
+labels_width = max(len(row[2]) for row in measured_rows)
+time_width = max(len(row[3]) for row in measured_rows)
 
 typer.echo(
     f"{headers[0]:<{date_width}}  "
@@ -10094,6 +11137,43 @@ for date, total, labels_text, labels_time in rows:
         f"{labels_text:<{labels_width}}  "
         f"{labels_time:>{time_width}}".rstrip()
     )
+@
+
+Let's verify that a degenerate window is refused rather than crashing,
+whichever way it arrives and whichever output path would have rendered
+it:
+
+<<test functions>>=
+def test_stats_rejects_window_shorter_than_a_day(temp_tracking_dir):
+  """A zero or negative window is an error, not a traceback."""
+  runner.invoke(cli, ["add", "work", "--duration", "1"])
+
+  for args in (
+    ["stats", "-n", "0"],
+    ["stats", "-n", "0", "--summary"],
+    ["stats", "-n", "-3"],
+  ):
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(
+      result.exception, SystemExit
+    )
+    assert "--days must be at least 1" in result.output
+    assert TRACK_STATS_DAYS_CONFIG in result.output
+
+def test_stats_plain_table_survives_empty_rows(temp_tracking_dir):
+  """The plain-text table renders headers even with no rows."""
+  runner.invoke(cli, ["add", "work", "--duration", "1"])
+
+  with patch(
+    "nytid.cli.track.make_stats_dates",
+    return_value=[],
+  ):
+    result = runner.invoke(cli, ["stats"])
+
+  assert result.exit_code == 0
+  assert "Date" in result.stdout
+  assert "Labels" in result.stdout
 @
 
 \subsection{Export Command}
@@ -10353,6 +11433,7 @@ and checking the status of active tracking sessions:
 <<start command>>
 <<stop command>>
 <<switch command>>
+<<clean command>>
 <<detached finalize command>>
 <<detached suspend command>>
 <<detached resume command>>
@@ -10481,9 +11562,12 @@ sys.path.insert(0, '../src')
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
+    TRACK_STATS_DAYS_CONFIG,
     AUTO_SUSPEND_CONFIG,
     TRACK_DEBUG_CONFIG,
     load_tracking_data, load_active_session,
+    mutate_worker_tracking_state,
+    format_duration,
     filter_entries, filter_entries_for_stats_window,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
@@ -10495,9 +11579,17 @@ from nytid.cli.track import (
     build_tmux_hook_command,
     install_tmux_exit_hooks,
     run_tmux_command,
+    build_tmux_sockethash,
     build_tmux_server_key,
     parse_tmux_socket_path,
+    parse_tmux_server_pid,
+    compute_tmux_server_key,
+    get_tmux_server_start_time,
     get_current_tmux_server_key,
+    get_tracking_dir,
+    parse_state_file_server_key,
+    sweep_stale_server_state,
+    sweep_all_server_state,
     sanitize_who, complete_workers,
     complete_entry_hashes,
     should_auto_suspend,
@@ -10548,7 +11640,7 @@ from nytid.cli.track import (
 
 runner = CliRunner()
 TEST_SERVER_KEY = build_tmux_server_key(
-    socket.gethostname(), "/tmp/tmux.sock",
+    socket.gethostname(), "/tmp/tmux.sock", "123-1700000000",
 )
 TEST_SESSION_ID = "$1"
 
@@ -11619,6 +12711,229 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
     assert "cleanup-command" in hook
     assert "tmux wait-for -S done-chan" in hook
 
+def test_start_publishes_context_without_auto_suspend(
+  temp_tracking_dir,
+):
+  """--no-auto-suspend still hands the launch its context labels."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=0,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli,
+      ["start", "work", "--pane", "--no-auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args.kwargs
+  assert call_kwargs["focus_labels"] == ["work"]
+  assert call_kwargs["focus_who"] == default_username
+  assert call_kwargs["auto_suspend"] is False
+
+
+def test_start_window_publishes_context_without_auto_suspend(
+  temp_tracking_dir,
+):
+  """A --window launch publishes window labels either way."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=0,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli,
+      ["start", "work", "--window", "--no-auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args.kwargs
+  assert call_kwargs["focus_window"] is True
+  assert call_kwargs["focus_labels"] == ["work"]
+  assert call_kwargs["auto_suspend"] is False
+
+
+def test_run_tmux_command_publishes_pane_labels_unsuspended(
+  temp_tracking_dir,
+):
+  """Pane labels are written even when the focus hooks stay off."""
+  events = []
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.install_tmux_focus_hooks",
+    side_effect=lambda *a, **k: events.append("focus-hooks"),
+  ), patch(
+    "nytid.cli.track.install_tmux_suspend_cleanup_hook",
+    side_effect=lambda *a, **k: events.append("cleanup-hook"),
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      auto_suspend=False,
+    )
+
+  assert read_pane_labels(
+    "%42", default_username, TEST_SERVER_KEY,
+  ) == ["work"]
+  assert "focus-hooks" not in events
+  assert "cleanup-hook" in events
+
+
+def test_run_tmux_command_publishes_window_labels_unsuspended(
+  temp_tracking_dir,
+):
+  """Window labels are published without arming the transition."""
+  events = []
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.stop_tracking_labels",
+    side_effect=lambda *a, **k: events.append("stop"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_sync_hooks",
+    side_effect=lambda *a, **k: events.append("sync-hooks"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+    side_effect=lambda *a, **k: events.append("cleanup-hook"),
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      window=True,
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      focus_window=True,
+      auto_suspend=False,
+    )
+
+  assert read_window_labels(
+    "@7", default_username, TEST_SERVER_KEY,
+  ) == ["work"]
+  assert read_last_selected_window(
+    default_username, TEST_SERVER_KEY, "$9",
+  ) == "@7"
+  assert "stop" not in events
+  assert "sync-hooks" not in events
+  assert "cleanup-hook" in events
+
+
+def test_make_tmux_completion_guard_without_status_file():
+  """A launch with no status file still gets a unique guard."""
+  first = make_tmux_completion_guard(None)
+  second = make_tmux_completion_guard(None)
+  assert first and second
+  assert first != second
+  assert make_tmux_completion_guard(
+    "/tmp/nytid.status"
+  ) == "/tmp/nytid.status.guard"
+
+
+def test_run_tmux_command_guards_detached_completion(
+  temp_tracking_dir,
+):
+  """A detached launch guards the wrapper and the exit hooks alike."""
+  observed = {}
+
+  def fake_subprocess_run(args, **kwargs):
+    if args[:2] == ["tmux", "split-window"]:
+      observed["argv"] = args
+      class Result:
+        stdout = "%42 @7 $9\n"
+      return Result()
+    class Result:
+      stdout = ""
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+    side_effect=lambda pane_id, hook_command:
+      observed.__setitem__("hook", hook_command),
+  ):
+    result = run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={},
+      block=False,
+      exit_status_file="/tmp/nytid-detached/status",
+      on_exit_shell="finalize-command",
+    )
+
+  assert result is None
+  guard = "mkdir /tmp/nytid-detached/status.guard"
+  wrapper = observed["argv"][-1]
+  assert guard in wrapper
+  assert "finalize-command" in wrapper
+  assert guard in observed["hook"]
+  assert "finalize-command" in observed["hook"]
+
+
+def test_start_no_block_finalize_disarms_guard(
+  temp_tracking_dir,
+):
+  """Detached cleanup removes the directory holding guard and status."""
+  with patch.dict(
+    os.environ, {"TMUX": "session"}, clear=True,
+  ), patch(
+    "nytid.cli.track.run_tmux_command",
+    return_value=None,
+  ) as mock_tmux:
+    result = runner.invoke(
+      cli, ["start", "grading", "--pane", "--no-block"],
+    )
+
+  assert result.exit_code == 0
+  call_kwargs = mock_tmux.call_args[1]
+  status_file = call_kwargs["exit_status_file"]
+  launch_dir = os.path.dirname(status_file)
+
+  assert make_tmux_completion_guard(status_file).startswith(
+    launch_dir + os.sep
+  )
+  assert "rm -rf" in call_kwargs["on_exit_shell"]
+  assert launch_dir in call_kwargs["on_exit_shell"]
+  assert call_kwargs["on_exit_shell"].index(
+    "_stop-detached"
+  ) < call_kwargs["on_exit_shell"].index("rm -rf")
+
+  os.rmdir(launch_dir)
+
+
 def test_install_tmux_exit_hooks_guards_pane_id():
     """Hooks use pane-existence guard to prevent
     inherited hooks from firing while tracked pane
@@ -11676,10 +12991,7 @@ def test_run_tmux_command_locks_window_launch_setup(
         "nytid.cli.track.make_tmux_channel",
         side_effect=["ready-chan"],
     ), patch(
-        "nytid.cli.track.parse_tmux_socket_path",
-        return_value="/tmp/tmux.sock",
-    ), patch(
-        "nytid.cli.track.build_tmux_server_key",
+        "nytid.cli.track.compute_tmux_server_key",
         return_value=TEST_SERVER_KEY,
     ), patch(
         "nytid.cli.track.with_tmux_context_lock",

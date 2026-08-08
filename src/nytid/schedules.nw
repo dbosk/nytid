@@ -443,6 +443,54 @@ we normalize here: dates become local midnight, naive times are
 interpreted as local time.
 Local is the right reading for both---an all-day event on the 15th
 means the 15th in the user's calendar, not in UTC.
+
+\paragraph{What \enquote{local} must mean}
+
+The obvious way to say \enquote{local} in Python is the no-argument
+[[datetime.astimezone()]], and that is what this function used to do.
+It produces a timezone-\emph{aware} value, so the invariant above
+holds---but the zone it attaches is a fixed offset
+([[datetime.timezone(datetime.timedelta(hours=2))]]), namely the offset
+that happened to be in effect at that one instant.
+A fixed offset has no daylight-saving rules, and that difference
+escapes as soon as anything derives a \emph{new} datetime from the
+value.
+Recurrence expansion (\cref{ExpandingRecurrences}) does exactly that:
+every occurrence of an [[RRULE]] inherits [[DTSTART]]'s [[tzinfo]], so
+a weekly meeting anchored in summer keeps reporting the summer offset
+all winter, and every occurrence past the October changeover is off by
+an hour.
+For an all-day event the error is worse than an hour: local midnight
+under the wrong offset falls at 23:00 the previous day, which changes
+the date, the weekday, and the ISO week number the schedule prints.
+
+So we attach the local \emph{zone} rather than the local offset.
+[[zoneinfo]] can build one from an IANA name, and [[tzlocal]] is what
+tells us which name the host is configured for---the standard library
+exposes no portable way to ask.
+We resolve it through a function rather than a module-level constant so
+that a process which changes its timezone, and a test that fakes one,
+both see the change.
+<<functions>>=
+def local_timezone():
+  """
+  Returns the host's local timezone as a `zoneinfo.ZoneInfo`.
+
+  Unlike the fixed offset that `datetime.astimezone()` attaches, the
+  returned zone carries the daylight-saving rules, so datetimes derived
+  from it get the offset in effect at their own time.
+  """
+  return zoneinfo.ZoneInfo(tzlocal.get_localzone_name())
+<<imports>>=
+import tzlocal
+import zoneinfo
+@
+
+With that settled, parsing is a sweep over the events, rewriting the
+two properties that carry times.
+We resolve the zone once per calendar rather than once per property:
+the answer cannot change while we parse, and the lookup reads the
+host's timezone configuration.
 <<functions>>=
 def parse_calendar(text):
   """
@@ -454,6 +502,7 @@ def parse_calendar(text):
   time. Raises ValueError if `text` is not valid ICS.
   """
   cal = icalendar.Calendar.from_ical(text)
+  local = local_timezone()
   for event in cal.events:
     for name in ("DTSTART", "DTEND"):
       <<normalize the [[name]] property of [[event]]>>
@@ -466,6 +515,10 @@ bare datetimes.
 The [[datetime]]-before-[[date]] test order matters:
 [[datetime.datetime]] is a subclass of [[datetime.date]], so testing
 [[date]] first would match everything.
+A floating time is normalized with [[replace]] rather than a
+conversion: the wall-clock reading is the part we trust---\enquote{ten
+o'clock} means ten o'clock here---and [[replace]] keeps it while
+declaring which zone it is read in.
 <<normalize the [[name]] property of [[event]]>>=
 value = event.get(name)
 if value is None:
@@ -473,10 +526,10 @@ if value is None:
 if isinstance(value.dt, datetime.datetime):
   if value.dt.tzinfo is None:
     del event[name]
-    event.add(name, value.dt.astimezone())
+    event.add(name, value.dt.replace(tzinfo=local))
 elif isinstance(value.dt, datetime.date):
   midnight = datetime.datetime(value.dt.year, value.dt.month,
-                               value.dt.day).astimezone()
+                               value.dt.day, tzinfo=local)
   del event[name]
   event.add(name, midnight)
 @
@@ -669,6 +722,30 @@ def expand_recurrences(calendar, window):
 import recurring_ical_events
 @
 
+Not every caller has a date range to offer, though.
+Exporting an ICS feed or writing a sign-up sheet covers \enquote{the
+course}, not a week the user picked---yet these callers need the
+occurrences just as much, since a sheet listing one row for a weekly
+lab is worse than useless.
+Leaving [[window]] unset is not an option for them, and inventing a
+range at each call site would scatter the same arbitrary choice around
+the code base.
+We therefore name the choice once: a span of [[horizon]] on either side
+of now.
+A year in each direction comfortably brackets any course while keeping
+the expansion finite, and the symmetry means a caller never has to
+reason about whether its data lies in the past or the future.
+<<functions>>=
+def default_window(horizon=datetime.timedelta(days=366)):
+  """
+  Returns a (start, end) window spanning `horizon` on either side of
+  now, for callers that need recurrences expanded but have no date
+  range of their own.
+  """
+  now = datetime.datetime.now().astimezone()
+  return (now - horizon, now + horizon)
+@
+
 Let's verify both behaviours with a weekly event: a window covering
 three occurrences yields three events, while no window preserves the
 single master event.
@@ -702,6 +779,107 @@ def test_no_window_keeps_master_event(tmp_path):
   path.write_text(make_recurring_ics())
   cal = read_calendar(str(path))
   assert len(cal.events) == 1
+@
+
+The default window has to be usable as a window---aware bounds
+straddling now---which is all a caller may assume about it.
+<<test functions>>=
+def test_default_window_brackets_now():
+  start, end = default_window()
+  now = datetime.datetime.now().astimezone()
+  assert start < now < end
+  assert start.tzinfo is not None and end.tzinfo is not None
+
+def test_default_window_honours_horizon(tmp_path):
+  """A short horizon still expands, but only nearby occurrences."""
+  path = tmp_path / "recurring.ics"
+  path.write_text(make_recurring_ics())
+  window = default_window(datetime.timedelta(days=1))
+  assert len(read_calendar(str(path), window=window).events) == 0
+@
+
+Expansion is also where the choice of [[tzinfo]] in
+\cref{ParsingCalendars} becomes observable, so this is where we pin it.
+Both tests below fake the local zone to Europe/Stockholm rather than
+setting [[TZ]] in the environment: the assertions must hold whatever
+timezone the developer's machine is in, and faking the resolver keeps
+the effect contained to the test instead of mutating process-global
+state.
+
+A floating weekly event anchored on 20 October 2024 crosses the
+European changeover the following week.
+Its wall-clock reading must stay at ten o'clock for every occurrence;
+with a fixed offset the later ones drift to nine.
+<<test functions>>=
+STOCKHOLM = "Europe/Stockholm"
+
+def fake_local_zone(monkeypatch, name=STOCKHOLM):
+  """Pins schedules' idea of the local zone; returns the zone."""
+  import zoneinfo
+  zone = zoneinfo.ZoneInfo(name)
+  monkeypatch.setattr(nytid.schedules, "local_timezone",
+                      lambda: zone)
+  return zone
+
+def make_dst_crossing_ics():
+  """Weekly floating event crossing the October 2024 changeover."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Weekly meeting
+DTSTART:20241020T100000
+DTEND:20241020T110000
+RRULE:FREQ=WEEKLY;COUNT=4
+END:VEVENT
+END:VCALENDAR"""
+
+def test_recurrence_keeps_wall_clock_across_dst(tmp_path,
+                                                monkeypatch):
+  zone = fake_local_zone(monkeypatch)
+  path = tmp_path / "dst.ics"
+  path.write_text(make_dst_crossing_ics())
+  window = (datetime.datetime(2024, 10, 1, tzinfo=zone),
+            datetime.datetime(2024, 11, 30, tzinfo=zone))
+  cal = read_calendar(str(path), window=window)
+  assert len(cal.events) == 4
+  hours = {event.start.astimezone(zone).hour
+           for event in cal.events}
+  assert hours == {10}
+@
+
+The all-day case is the same defect with a coarser symptom.
+A Monday all-day series anchored in January expands into July, where a
+frozen winter offset would place every occurrence at 23:00 on the
+preceding Sunday---a different date, weekday and ISO week than the one
+the calendar states.
+<<test functions>>=
+def make_all_day_recurring_ics():
+  """Weekly all-day event anchored on Monday 15 January 2024."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:All day weekly
+DTSTART;VALUE=DATE:20240115
+DTEND;VALUE=DATE:20240116
+RRULE:FREQ=WEEKLY;COUNT=30
+END:VEVENT
+END:VCALENDAR"""
+
+def test_all_day_recurrence_keeps_date_across_dst(tmp_path,
+                                                  monkeypatch):
+  zone = fake_local_zone(monkeypatch)
+  path = tmp_path / "allday.ics"
+  path.write_text(make_all_day_recurring_ics())
+  window = (datetime.datetime(2024, 7, 1, tzinfo=zone),
+            datetime.datetime(2024, 7, 31, tzinfo=zone))
+  cal = read_calendar(str(path), window=window)
+  assert cal.events
+  for event in cal.events:
+    local = event.start.astimezone(zone)
+    assert local.hour == 0
+    assert local.weekday() == 0  # still a Monday
 @
 
 \subsection{Iterating events in chronological order}
@@ -1221,13 +1399,27 @@ def event_filter(events, whitelisted=TIMEEDIT_EVENTS):
     <<whitelisted events>>
   """
   for event in events:
+    summary = event.summary or ""
     for event_type in whitelisted:
-      if re.match(f"^{event_type}(,|\\s|$)", event.summary):
+      if re.match(f"^{event_type}(,|\\s|$)", summary):
         yield event
         break
 <<imports>>=
 import re
 @
+
+A [[VEVENT]] need not carry a [[SUMMARY]], and [[icalendar]] reports
+the absent property as [[None]] rather than an empty string, which
+[[re.match]] rejects with [[TypeError]].
+That exception surfaces at whoever drains the generator, and the two
+consumers fail differently and badly: [[schedule show]] catches it in
+its per-course handler and drops the \emph{entire course} from the
+schedule, while [[signupsheets generate]] has no such guard and shows
+the user a traceback.
+Coercing to the empty string is not merely defensive here---it is the
+whitelist's own answer.
+An unnamed event matches no entry, so it is excluded, which is exactly
+what the whitelist promises for anything it does not recognize.
 
 The events that we whitelist are taken from TimeEdits activity types\footnote{%
   URL: 
@@ -1305,6 +1497,20 @@ def test_event_filter_custom_whitelist():
 def test_event_filter_empty():
   result = list(event_filter([]))
   assert result == []
+@
+
+An event without a [[SUMMARY]] must be dropped like any other
+unrecognized event, not raise.
+We pair it with a matching event so the assertion tells apart
+\enquote{dropped the unnamed event} from \enquote{abandoned the feed}.
+<<test functions>>=
+def test_event_filter_missing_summary():
+  """An event without SUMMARY is dropped, not fatal."""
+  unnamed = icalendar.Event()
+  events = [unnamed, make_event(name="Laboration")]
+  result = list(event_filter(events))
+  assert len(result) == 1
+  assert result[0].summary == "Laboration"
 @
 
 

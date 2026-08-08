@@ -81,11 +81,23 @@ def ics_cmd(<<argument for matching courses>> = ".*",
             <<option for matching registers, default to mine>>,
             <<option for username to filter for>>):
   """
-  Prints ICS data to stdout. Redirect to a .ics file, preferably in 
+  Prints ICS data to stdout. Redirect to a .ics file, preferably in
   ~/public_html, and add it to your calendar.
   """
+  <<let [[course_window]] be the export horizon>>
   <<generate [[schedule]] from sign-up sheets for matching courses>>
   print(schedule.to_ical().decode())
+@
+
+The shared generation chunk expands the courses' recurring events, and
+that expansion has to be bounded (\cref{ExpandingRecurrences}), so
+whoever includes the chunk must first say over what range.
+An export has no range to speak of: nobody asked for a week, they asked
+for their calendar.
+We hand it the library's default horizon, which brackets any course
+without ever running away on an endless [[RRULE]].
+<<let [[course_window]] be the export horizon>>=
+course_window = schedutils.default_window()
 @
 
 RFC~5545 requires every serialized calendar to carry exactly one
@@ -146,16 +158,73 @@ if "docs.google.com" in url:
   url = sheets.google_sheet_to_csv_url(url)
 @
 
-We read the ICS URL from the course's config and then read it in and add it to 
+We read the ICS URL from the course's config and then read it in and add it to
 [[schedule]].
-We also run all the events from the schedule through a filter that removes 
+We also run all the events from the schedule through a filter that removes
 events that are uninteresting.
-For instance, we don't want to include events like holidays, exam weeks or 
+For instance, we don't want to include events like holidays, exam weeks or
 fairs like KTH Global.
+
+We pass [[course_window]] for the same reason the external feeds get
+one: a TimeEdit course schedule states a weekly lab once, as a single
+[[VEVENT]] with an [[RRULE]], and reading it without a window leaves
+the occurrences implicit.
+This path is the fallback for courses that have no sign-up sheet, which
+is exactly when the ICS \emph{is} the schedule---so collapsing it to
+first occurrences quietly emptied those courses of everything but their
+first week.
 <<read schedule from [[config]], add to [[schedule]]>>=
-course_schedule = schedutils.read_calendar(config.get("ics"))
+course_schedule = schedutils.read_calendar(config.get("ics"),
+                                           window=course_window)
 for event in schedutils.event_filter(course_schedule.events):
   schedule.add_component(event)
+@
+
+Both commands include this chunk, and each supplies its own window, so
+the test drives both and checks what the reader was handed.
+The course config has no sign-up sheet, which is what sends [[show]]
+and [[ics]] down this fallback path in the first place.
+[[show]] must ask for exactly its own range; [[ics]], having none, must
+still ask for something that brackets now.
+<<test functions>>=
+def capture_course_window(monkeypatch, argv):
+  """Runs a schedule command, returns the course ICS window."""
+  from typer.testing import CliRunner
+  import typerconf
+  captured = {}
+
+  def fake_read_calendar(source, cache=None, window=None):
+    captured["window"] = window
+    return icalendar.Calendar()
+
+  config = typerconf.Config({"ics": "https://example.com/course.ics"})
+  monkeypatch.setattr(
+    schedule_module.coursescli, "get_courses_configs",
+    lambda *a, **k: {("DD1310", "reg"): config})
+  monkeypatch.setattr(schedule_module, "get_external_sources",
+                      lambda cli_sources=None: [])
+  monkeypatch.setattr(schedule_module.schedutils, "read_calendar",
+                      fake_read_calendar)
+
+  result = CliRunner().invoke(schedule_module.cli, argv)
+  assert result.exit_code == 0, result.output
+  return captured["window"]
+
+def test_show_expands_course_recurrences_over_its_range(monkeypatch):
+  """show asks for exactly the range it will display."""
+  window = capture_course_window(
+    monkeypatch,
+    ["show", "--start", "2024-06-03", "--end", "2024-06-09",
+     "--no-todo"])
+  start, end = window
+  assert start.astimezone().date() == datetime.date(2024, 6, 3)
+  assert end.astimezone().date() == datetime.date(2024, 6, 9)
+
+def test_ics_expands_course_recurrences_over_a_horizon(monkeypatch):
+  """ics has no range, so it must still bracket now."""
+  start, end = capture_course_window(monkeypatch, ["ics"])
+  now = datetime.datetime.now().astimezone()
+  assert start < now < end
 @
 
 We need a username.
@@ -190,13 +259,44 @@ for event in map_drop_exceptions(sheets.EventFromCSV, booked):
   schedule.add_component(event)
 <<imports>>=
 import functools
+@
+
+The point of [[map_drop_exceptions]] is that one malformed CSV row must
+not cost the user their whole schedule.
+The obvious implementation---a [[for]] loop with the call to [[func]]
+inside a [[try]]---only half delivers that, because a [[for]] statement
+advances the input iterator \emph{outside} the [[try]].
+With an eager list that distinction is invisible; with the lazy [[map]]
+above it decides whether the command works.
+[[add_reserve_to_title]] calls [[sheets.get_booked_TAs_from_csv]],
+which raises [[ValueError]] on a row whose \enquote{\#Needed TAs} cell
+is blank---the normal state of a sign-up sheet people are still filling
+in.
+Raised inside the [[map]], that exception is produced while the input
+is advanced, so it escapes the generator and aborts the command; and it
+does so only when [[--user]] is given, since that is the only path that
+wraps [[booked]] in a [[map]].
+Advancing the iterator inside the [[try]] ourselves removes the
+distinction: both the production of an item and its transformation are
+covered, so a bad row is dropped with a warning either way.
+[[StopIteration]] must be caught separately and turned into a
+[[return]], since a generator may not let it propagate.
 <<helper functions>>=
 def map_drop_exceptions(func, iterable):
   """
-  Same as map, but ignores exceptions from `func`.
-  Logs a warning when an item is dropped.
+  Same as map, but ignores exceptions from `func` and from producing
+  the items of `iterable`. Logs a warning when an item is dropped.
   """
-  for item in iterable:
+  items = iter(iterable)
+  while True:
+    try:
+      item = next(items)
+    except StopIteration:
+      return
+    except Exception as err:
+      logging.warning(f"Dropped an item: {err}")
+      continue
+
     try:
       yield func(item)
     except Exception as err:
@@ -242,6 +342,37 @@ def test_map_drop_exceptions_all_fail():
 def test_map_drop_exceptions_empty():
   result = list(map_drop_exceptions(int, []))
   assert result == []
+@
+
+The tests above all pass eager lists, where producing an item cannot
+fail, so they say nothing about the case that actually broke.
+Here the input is lazy and \emph{it} raises.
+The second test reproduces the original report end to end: a sign-up
+row with a blank \enquote{\#Needed TAs} cell, run through the same
+[[add_reserve_to_title]] mapping that [[--user]] installs.
+<<test functions>>=
+def test_map_drop_exceptions_lazy_input_raises():
+  """Exceptions raised while producing items are dropped too."""
+  def explode(value):
+    if value == "bad":
+      raise ValueError("boom")
+    return value
+
+  lazy = map(explode, ["1", "bad", "3"])
+  assert list(map_drop_exceptions(int, lazy)) == [1, 3]
+
+def test_map_drop_exceptions_survives_blank_needed_TAs():
+  """A blank '#Needed TAs' cell must not abort a --user export."""
+  rows = [
+    ["Lab", "2024-01-01 10:00", "2024-01-01 12:00",
+     "D1", "", "alice"],
+    ["Lab", "2024-01-02 10:00", "2024-01-02 12:00",
+     "D1", "1", "alice"],
+  ]
+  booked = map(functools.partial(add_reserve_to_title, "alice"),
+               rows)
+  events = list(map_drop_exceptions(sheets.EventFromCSV, booked))
+  assert len(events) == 1
 @
 
 \paragraph{Testing [[add_reserve_to_title]]}
@@ -379,6 +510,7 @@ def show(<<argument for matching courses>> = ".*",
   Shows schedule for courses, external calendars and scheduled todos.
   """
   <<double check [[start]] and [[end]] dates>>
+  <<let [[course_window]] be the shown range>>
   <<generate [[schedule]] from sign-up sheets for matching courses>>
   <<add external calendar events to [[schedule]]>>
   <<add scheduled todo events to [[schedule]]>>
@@ -414,8 +546,50 @@ def update_end_date(start, end):
   if end < start:
     return start + datetime.timedelta(weeks=1)
   return end
+@
+
+\paragraph{The end date is a day, not an instant}
+
+Both bounds are parsed with [[formats=["%Y-%m-%d"]]], so [[end]] is the
+\emph{midnight that starts} the end date.
+The user, however, said a date, and the print-time filter agrees with
+them: it keeps everything up to and including [[end.date()]].
+Anything that consumes [[end]] as an instant therefore stops a whole
+day short of what gets displayed.
+Three things did.
+The recurrence window never expanded external events on the last shown
+day, so the default seven-day view always lost day seven.
+[[compute_free_slots]] clipped that day's work window with
+[[min(day_end, end)]], collapsing it to nothing, so no todo was ever
+scheduled on the end date.
+And because those external events were missing, they were also missing
+from the occupied intervals, so a todo scheduled there would have
+double-booked.
+
+We fix all three at once by deriving the instant the user meant---the
+last moment of the end date---and passing \emph{that} wherever [[end]]
+is treated as a point in time.
+[[end]] itself stays as parsed, so the filter and the option's meaning
+are untouched.
+<<helper functions>>=
+def end_of_day(when):
+  """
+  Returns the last moment of `when`'s date.
+  """
+  return datetime.datetime.combine(when.date(),
+                                   datetime.time.max)
 <<double check [[start]] and [[end]] dates>>=
 end = update_end_date(start, end)
+end_of_range = end_of_day(end)
+@
+
+Unlike the export, [[show]] does have a range, and it is the one the
+user asked for---so the courses' recurrences are expanded over exactly
+what will be displayed rather than over a generic horizon.
+The bounds must be timezone aware, since the expansion compares them
+against aware event times.
+<<let [[course_window]] be the shown range>>=
+course_window = (start.astimezone(), end_of_range.astimezone())
 @
 
 \paragraph{Testing [[update_end_date]]}
@@ -442,6 +616,42 @@ def test_update_end_date_equal():
   end = datetime.datetime(2024, 3, 1)
   result = update_end_date(start, end)
   assert result == end
+@
+
+\paragraph{Testing [[end_of_day]]}
+
+The helper itself is one line, so the test that matters is the one that
+shows what it buys us.
+We schedule a todo over a range whose only work day \emph{is} the end
+date: with the bare [[end]] the day collapses to a zero-length window
+and nothing is scheduled, while the end of that day leaves the whole
+work window available.
+<<test functions>>=
+def test_end_of_day_covers_the_whole_date():
+  end = datetime.datetime(2024, 1, 15)
+  assert end_of_day(end).date() == end.date()
+  assert end_of_day(end).hour == 23
+
+def test_todos_reach_the_last_shown_day(monkeypatch):
+  """The end date is a day the user can still work."""
+  monkeypatch.setattr(
+    "nytid.cli.todo.load_todos",
+    lambda: (None, [make_fake_todo()]),
+  )
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  # Friday; the only work day in range is Monday the 15th.
+  freeze_schedule_now(monkeypatch,
+                      datetime.datetime(2024, 1, 12, 10, 30))
+
+  end = datetime.datetime(2024, 1, 15)
+  assert schedule_todo_events(None, end, []) == []
+
+  events = schedule_todo_events(None, end_of_day(end), [])
+  assert len(events) == 1
+  assert events[0].start.date() == datetime.date(2024, 1, 15)
 @
 
 \subsection{Managing external calendars}
@@ -1035,7 +1245,7 @@ def schedule_todo_events(user, end, occupied):
   if not free_slots:
     return []
 
-  <<sort todos by priority>>
+  <<sort todos into scheduling order>>
 
   scheduled_events = []
   remaining_slots = list(free_slots)
@@ -1049,6 +1259,18 @@ def schedule_todo_events(user, end, occupied):
 We import [[todo]] here rather than at the top of the file to avoid a
 circular import: [[todo]] imports [[schedule]] for scheduling its items,
 and [[schedule]] needs [[todo]] only for this helper.
+
+The owner test has to honour the convention [[todo]] established: an
+item with no [[who]] belongs to the default user.
+That is not a corner case---[[nytid todo add]] leaves [[who]] unset
+unless the user passes [[--who]], so it is the \emph{ordinary} way to
+record one's own task.
+Comparing [[t.who]] to [[user]] directly therefore filtered out
+precisely the todos most likely to be the user's own, and did so
+silently: they simply never appeared in the schedule.
+Every ownership test in [[todo]] spells the convention out the same
+way, and we match it here so the two views keep agreeing about what
+comes next---the reason the sort order is shared in the first place.
 <<load and filter todos>>=
 from nytid.cli import todo as todocli
 
@@ -1056,18 +1278,27 @@ _, todos = todocli.load_todos()
 todos = [t for t in todos if t.status != "done"]
 
 if user:
-  todos = [t for t in todos if t.who == user]
+  todos = [t for t in todos
+           if (t.who or default_username) == user]
 @
 
-Sorting by effective priority means high-urgency items claim the
-earliest available slots.
+High-urgency items should claim the earliest available slots, so we
+order todos before assigning them.
+We cannot sort on [[effective_priority]] directly: unranked todos have
+no priority, so [[effective_priority]] returns [[None]] for them, and
+[[None]] does not compare with floats---one unranked open todo would
+crash the whole command.
+Instead we reuse [[sort_todos_for_display]], the shared helper that
+[[todo ls]] uses for exactly this mixed ranked/unranked case: ranked
+todos come first in descending effective priority, and unranked todos
+follow, earliest deadline first.
+Reusing it also means the schedule fills slots in the same order the
+user sees in [[todo ls]], so the two views never disagree about what
+comes next.
 We reuse the [[now]] that anchors the scheduling range, so priorities
 are evaluated at the same instant the plan starts.
-<<sort todos by priority>>=
-todos.sort(
-  key=lambda t: todocli.effective_priority(t, now),
-  reverse=True,
-)
+<<sort todos into scheduling order>>=
+todos = todocli.sort_todos_for_display(todos, now)
 @
 
 We greedily consume slots until the todo's estimated hours are
@@ -1124,13 +1355,18 @@ all, and with free time available the first event starts exactly at the
 frozen now.
 We fake the todo store and the clock so the tests are independent of
 the user's real todos and of when they run.
+The fake todo carries the ranking fields ([[priority]], [[deadline]],
+[[created]], [[id]]) that the shared sort key reads, so the tests
+exercise the real ordering code instead of mocking it away.
 <<test functions>>=
-def make_fake_todo():
+def make_fake_todo(id=1, title="task", priority=1.0, deadline=None):
   """Returns a minimal open todo for scheduling tests."""
   import types
   return types.SimpleNamespace(
-    status="open", who=None, estimated=1.0,
-    title="task", description="", labels=[],
+    id=id, status="open", who=None, estimated=1.0,
+    title=title, description="", labels=[],
+    priority=priority, deadline=deadline,
+    created="2024-01-01T00:00:00",
   )
 
 def freeze_schedule_now(monkeypatch, now):
@@ -1170,10 +1406,6 @@ def test_schedule_todo_events_starts_from_now(monkeypatch):
     lambda: (None, [make_fake_todo()]),
   )
   monkeypatch.setattr(
-    "nytid.cli.todo.effective_priority",
-    lambda t, now: 1.0,
-  )
-  monkeypatch.setattr(
     "nytid.cli.schedule.work_window",
     lambda: ("09:00", "12:00", ["mon"]),
   )
@@ -1184,6 +1416,73 @@ def test_schedule_todo_events_starts_from_now(monkeypatch):
   events = schedule_todo_events(None, end, [])
   assert len(events) == 1
   assert events[0].start == now.astimezone()
+@
+
+Unranked todos---those with no priority set---once crashed this
+function: their effective priority is [[None]], which cannot be
+compared with the floats of ranked todos.
+Let's verify that a mixed list schedules cleanly, with the ranked todo
+claiming the earliest slot and the unranked one still getting slots
+after it.
+<<test functions>>=
+def test_schedule_todo_events_mixed_ranked_unranked(monkeypatch):
+  ranked = make_fake_todo(id=1, title="ranked", priority=1.0)
+  unranked = make_fake_todo(id=2, title="unranked", priority=None)
+  monkeypatch.setattr(
+    "nytid.cli.todo.load_todos",
+    lambda: (None, [unranked, ranked]),
+  )
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  now = datetime.datetime(2024, 1, 8, 10, 30)
+  freeze_schedule_now(monkeypatch, now)
+
+  end = datetime.datetime(2024, 1, 15, 23, 59)
+  events = schedule_todo_events(None, end, [])
+  assert events[0].summary == "[TODO] ranked"
+  assert events[0].start == now.astimezone()
+  assert any(e.summary == "[TODO] unranked" for e in events)
+@
+
+The owner filter must read an unset [[who]] as the default user, the
+way the rest of [[todo]] does---otherwise the most ordinary kind of
+todo, added without [[--who]], never reaches the schedule.
+We pass the module's own [[default_username]] rather than a literal, so
+the tests hold for whoever runs them.
+The second test is the other half of the contract: honouring the
+default must not turn the filter into a no-op.
+<<test functions>>=
+def schedule_one_todo_for(monkeypatch, todo_item, user):
+  """Schedules `todo_item` for `user` at a frozen Monday now."""
+  monkeypatch.setattr(
+    "nytid.cli.todo.load_todos",
+    lambda: (None, [todo_item]),
+  )
+  monkeypatch.setattr(
+    "nytid.cli.schedule.work_window",
+    lambda: ("09:00", "12:00", ["mon"]),
+  )
+  freeze_schedule_now(monkeypatch,
+                      datetime.datetime(2024, 1, 8, 10, 30))
+  end = datetime.datetime(2024, 1, 15, 23, 59)
+  return schedule_todo_events(user, end, [])
+
+def test_schedule_todo_events_unset_who_is_default_user(monkeypatch):
+  """An unset owner means the default user, as in todo ls."""
+  events = schedule_one_todo_for(monkeypatch, make_fake_todo(),
+                                 schedule_module.default_username)
+  assert len(events) == 1
+  assert events[0].summary == "[TODO] task"
+
+def test_schedule_todo_events_excludes_other_owner(monkeypatch):
+  """Someone else's todos stay out of my schedule."""
+  item = make_fake_todo()
+  item.who = "somebody-else"
+  events = schedule_one_todo_for(monkeypatch, item,
+                                 schedule_module.default_username)
+  assert events == []
 @
 
 Once we have the course schedule, we merge external calendars and then
@@ -1209,22 +1508,58 @@ expanded into their occurrences (\cref{ExpandingRecurrences} in the
 schedules chapter).
 The window must cover both consumers of these events: the displayed
 range starts at [[start]], while todo scheduling treats events from
-\emph{now} until [[end]] as occupied time---so the window runs from
-the earlier of the two.
+\emph{now} until the end of the range as occupied time---so the window
+runs from the earlier of the two, and up to [[end_of_range]] so that
+the last shown day is included.
 The window bounds must be timezone aware (the expansion compares them
-against aware event times), whereas [[start]] and [[end]] arrive
-naive from the command line, hence the [[astimezone()]] calls.
+against aware event times), whereas the range bounds are naive, hence
+the [[astimezone()]] calls.
 <<add external calendar events to [[schedule]]>>=
 if not user or user == default_username:
   external_sources = get_external_sources(external)
   cache = build_calendar_cache(no_cache)
   now = datetime.datetime.now().astimezone()
-  window = (min(start.astimezone(), now), end.astimezone())
+  window = (min(start.astimezone(), now),
+            end_of_range.astimezone())
   external_calendar = schedutils.read_calendars(external_sources,
                                                 cache=cache,
                                                 window=window)
   for event in external_calendar.events:
     schedule.add_component(event)
+@
+
+The other consumer of [[end_of_range]] is worth pinning at the command
+level, since the window is assembled inline rather than in a helper we
+could call directly.
+We drive [[show]] with no courses and no todos, stubbing the calendar
+reader to capture the window it is handed.
+<<test functions>>=
+def test_show_window_covers_the_last_shown_day(monkeypatch):
+  """External recurrences must be expanded on the end date too."""
+  from typer.testing import CliRunner
+  captured = {}
+
+  def fake_read_calendars(sources, cache=None, window=None):
+    captured["window"] = window
+    return icalendar.Calendar()
+
+  monkeypatch.setattr(schedule_module.coursescli,
+                      "get_courses_configs", lambda *a, **k: {})
+  monkeypatch.setattr(schedule_module, "get_external_sources",
+                      lambda cli_sources=None: ["external.ics"])
+  monkeypatch.setattr(schedule_module.schedutils, "read_calendars",
+                      fake_read_calendars)
+
+  result = CliRunner().invoke(
+    schedule_module.cli,
+    ["show", "--start", "2024-06-03", "--end", "2024-06-09",
+     "--no-todo"])
+  assert result.exit_code == 0, result.output
+
+  _, window_end = captured["window"]
+  window_end = window_end.astimezone()
+  assert window_end.date() == datetime.date(2024, 6, 9)
+  assert window_end.hour == 23
 @
 
 \paragraph{Opting out of todo scheduling}
@@ -1272,34 +1607,120 @@ def test_show_todo_option_defaults_to_scheduling(monkeypatch):
 @
 
 With all occupied time now in [[schedule]], we extract the busy intervals
-and greedily fill the remaining work-hour slots with todos, sorted by
-effective priority---unless the user opted out with [[--no-todo]].
+and greedily fill the remaining work-hour slots with todos, in the shared
+display order ([[todo ls]]'s ranked-first ordering)---unless the user
+opted out with [[--no-todo]].
 Note that [[start]] plays no role here: todos are scheduled from now
-until [[end]], and the print-time filtering
+until the end of the range, and the print-time filtering
 (\cref{cli.schedule.filter-events}) trims any todo events that fall
 before the shown range.
+We pass [[end_of_range]] for the same reason the recurrence window
+does---the last shown day is a day the user can work.
 [[schedule.events]] holds the \emph{complete} sign-up and external
 calendars---range filtering happens only at print time---so the busy
-intervals between now and a future [[end]] are all known here.
+intervals between now and the end of the range are all known here.
 <<add scheduled todo events to [[schedule]]>>=
 if todo:
   occupied = event_bounds(schedule.events)
-  for event in schedule_todo_events(user, end, occupied):
+  for event in schedule_todo_events(user, end_of_range, occupied):
     schedule.add_component(event)
+@
+
+Let's pin this wiring too, by stubbing the scheduler and inspecting the
+bound it is handed.
+Stubbing also keeps the test away from the running user's real todo
+store.
+<<test functions>>=
+def test_show_schedules_todos_to_the_last_shown_day(monkeypatch):
+  """Todo scheduling gets the same end-of-day bound."""
+  from typer.testing import CliRunner
+  captured = {}
+
+  def fake_schedule_todo_events(user, end, occupied):
+    captured["end"] = end
+    return []
+
+  monkeypatch.setattr(schedule_module.coursescli,
+                      "get_courses_configs", lambda *a, **k: {})
+  monkeypatch.setattr(schedule_module, "get_external_sources",
+                      lambda cli_sources=None: [])
+  monkeypatch.setattr(schedule_module, "schedule_todo_events",
+                      fake_schedule_todo_events)
+
+  result = CliRunner().invoke(
+    schedule_module.cli,
+    ["show", "--start", "2024-06-03", "--end", "2024-06-09",
+     "--todo"])
+  assert result.exit_code == 0, result.output
+  assert captured["end"].date() == datetime.date(2024, 6, 9)
+  assert captured["end"].hour == 23
 @
 
 \subsection{Filter events based on start--end time}
 \label{cli.schedule.filter-events}
 
 Before output, we keep only events overlapping the chosen interval.
+
+Which \emph{date} an event falls on depends on the timezone one asks
+in, and the events reaching this filter do not agree on one:
+[[sheets.EventFromCSV]] stores sign-up bookings in UTC, external feeds
+keep whatever zone the publisher used, and the todo events carry the
+local zone.
+The [[start]] and [[end]] bounds, meanwhile, are local dates the user
+typed.
+So the comparison must first put both sides in the same
+timezone---and the right one is the local zone, because that is what
+the output shows: [[format_event_csv]] renders every timestamp through
+[[astimezone()]].
+Comparing in the event's own zone instead made the filter and the
+display disagree around midnight, dropping a booking at 00:30 local
+(22:30 UTC the day before) from a range it would have printed inside,
+and keeping one just past the end for the same reason.
 <<set [[events]] to filtered timeline>>=
 events = []
 for event in schedutils.timeline(schedule):
-  if event.end.date() < start.date():
+  if event.end.astimezone().date() < start.date():
     continue
-  if event.start.date() > end.date():
+  if event.start.astimezone().date() > end.date():
     continue
   events.append(event)
+@
+
+Let's pin the agreement between filter and display.
+The test drives the filter through a helper that reuses the very same
+chunk, so it cannot drift from what [[show]] runs.
+The event is a booking at half past midnight local time---the shape
+that goes wrong---stored in a zone ten hours behind the local one, so
+that its own date is the previous day.
+We derive that zone from the current local offset rather than naming
+UTC, because whether UTC is behind or ahead depends on where the test
+runs, and the assertion should not.
+<<test functions>>=
+def filter_events_for_range(schedule, start, end):
+  """Runs show's print-time range filter over `schedule`."""
+  <<set [[events]] to filtered timeline>>
+  return events
+
+def test_filter_keeps_event_shown_on_start_date():
+  """The range filter must agree with the local-time display."""
+  local_start = datetime.datetime(2024, 6, 3, 0, 30).astimezone()
+  behind = datetime.timezone(local_start.utcoffset()
+                             - datetime.timedelta(hours=10))
+  event = icalendar.Event()
+  event.summary = "Early booking"
+  event.start = local_start.astimezone(behind)
+  event.end = (local_start
+               + datetime.timedelta(hours=1)).astimezone(behind)
+  assert event.end.date() < datetime.date(2024, 6, 3)  # premise
+
+  schedule = icalendar.Calendar()
+  schedule.add_component(event)
+  kept = filter_events_for_range(
+    schedule,
+    datetime.datetime(2024, 6, 3),
+    datetime.datetime(2024, 6, 10),
+  )
+  assert [e.summary for e in kept] == ["Early booking"]
 @
 
 \subsection{Output format}

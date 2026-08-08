@@ -121,6 +121,7 @@ def open_root(*args, **kwargs) -> StorageRoot:
 We also add the tests in a test file that will be used by [[pytest]].
 We need a temporary directory that we can use as the root.
 <<test [[storage.py]]>>=
+import os
 import pathlib
 import tempfile
 
@@ -152,15 +153,23 @@ def open(self, *args, **kwargs):
   return open(*args, **kwargs, opener=self.__opener)
 @
 
-The opener is a particular function that the [[open]] built-in will call to 
+The opener is a particular function that the [[open]] built-in will call to
 open the file.
 This opener will ensure that the filename is relative to the root.
 Now, this requires the directory to be opened.
 We will ensure it's opened.
+
+We ask whether the descriptor [[is None]] rather than whether it is
+false.
+A file descriptor is a small integer, and 0 is a perfectly legitimate
+one: a process whose standard input has been closed gets 0 for the next
+file it opens.
+A truthiness test would then read an open root as unopened and reopen
+it on every single file access.
 <<StorageRoot methods>>=
 def __opener(self, path, flags):
   """The opener, used internally"""
-  if not self.__dir_fd:
+  if self.__dir_fd is None:
     self.open_dir()
   return os.open(path, flags, dir_fd=self.__dir_fd)
 @
@@ -169,12 +178,24 @@ self.__dir_fd = None
 @
 
 We want to be able to open and close the directory file descriptor.
+
+Opening a root that is already open must not just overwrite the
+descriptor: the old one would never be closed, and the process would
+leak one descriptor per call until it hits its limit.
+A second open would only hand us another descriptor for the same
+directory, so there is nothing to gain from it; doing nothing is both
+the cheapest and the correct behaviour.
 <<StorageRoot methods>>=
 def open_dir(self):
   """
-  Open the storage root directory. Note that this is done automatically when 
+  Open the storage root directory. Note that this is done automatically when
   opening a file using the `open` method.
+
+  Opening a root that is already open is a no-op.
   """
+  if self.__dir_fd is not None:
+    return
+
   try:
     <<open root directory file descriptor>>
   except FileNotFoundError:
@@ -183,13 +204,66 @@ def open_dir(self):
 self.__dir_fd = os.open(self.path, os.O_RDONLY)
 @
 
-Since this causes the directory file descriptor to be open, we need some way to 
+Since this causes the directory file descriptor to be open, we need some way to
 close it as well.
+
+Closing has to tolerate a root that was never opened, and that is not a
+hypothetical case.
+[[open_root]] constructs without opening, so [[get_course_data]]
+(\cref{courses}) hands out exactly such roots; and [[__exit__]] calls
+[[close]] unconditionally, so a [[with]] block whose body failed before
+touching any file closes an unopened root on the way out.
+Handing [[None]] to [[os.close]] raises [[TypeError]], which would
+replace the error the user actually needs to see with a confusing one
+from the cleanup path.
+The same guard makes a repeated [[close]] harmless.
 <<StorageRoot methods>>=
 def close(self):
-  """Close the storage root"""
+  """Close the storage root.
+
+  Closing a root that is not open is a no-op, so repeated
+  closes are safe.
+  """
+  if self.__dir_fd is None:
+    return
+
   os.close(self.__dir_fd)
   self.__dir_fd = None
+@
+
+Both no-ops are worth asserting, since both used to raise:
+<<test functions>>=
+def test_close_without_open():
+  root = StorageRoot(root_dir.name)
+  root.close()
+
+def test_double_close():
+  root = StorageRoot(root_dir.name)
+  root.open_dir()
+  root.close()
+  root.close()
+@
+
+The leak is only observable by counting the process's open descriptors,
+which we can do on systems that expose [[/proc]]; elsewhere we skip
+rather than assert something weaker.
+<<test functions>>=
+def test_open_dir_does_not_leak_descriptors():
+  import pytest
+
+  fd_dir = pathlib.Path("/proc/self/fd")
+  if not fd_dir.is_dir():
+    pytest.skip("counting open descriptors needs /proc")
+
+  root = StorageRoot(root_dir.name)
+  root.open_dir()
+  before = len(os.listdir(fd_dir))
+  for _ in range(10):
+    root.open_dir()
+  after = len(os.listdir(fd_dir))
+  root.close()
+
+  assert after == before
 @
 
 We test this as follows.
@@ -226,7 +300,7 @@ We also want to test when the storage root doesn't exist.
 <<test functions>>=
 def test_non_existing():
   test_string = "StorageRoot test"
-  new_root_dir = f"{root_dir}/non-existing-subdirectory"
+  new_root_dir = f"{root_dir.name}/non-existing-subdirectory"
 
   with StorageRoot(new_root_dir) as root:
     with root.open("test.txt", "w") as f:
