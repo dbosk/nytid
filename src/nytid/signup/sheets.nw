@@ -3,8 +3,9 @@
 In this chapter we cover the [[nytid.signup.sheets]] module.
 The outline of the module is as follows:
 <<[[sheets.py]]>>=
+import copy
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import icalendar
 import logging
 import nytid.schedules
@@ -155,16 +156,29 @@ To generate the rows of the sheet, we simply go through the calendar in
 chronological order, using [[nytid.schedules.timeline]] to sort the
 events.
 We want TAs to sign up for any event in the calendar.
-If we don't want any TAs, we can simply filter out those events from the 
+If we don't want any TAs, we can simply filter out those events from the
 TimeEdit ICS export.
+
+A scheduled event doesn't always become exactly one row, in two
+independent ways.
+First, an overly long session may be split into several normal-length
+ones (\cref{SplittingLongSessions}); [[split_event]] returns the
+resulting sessions, or just the event itself when there is nothing to
+split.
+Second, each of those sessions gets one row---or two, when a digital
+room is involved, as we'll see below.
+Every part of a split session covers the same material for the same
+students, so they all need the same staffing: we compute [[num_TAs]]
+once, from the whole event, and let each part inherit it.
 <<generate [[rows]] of sign-up sheet>>=
-for event in event_filter(nytid.schedules.timeline(calendar)):
-  num_TAs = needed_TAs(event)
+for whole_event in event_filter(nytid.schedules.timeline(calendar)):
+  num_TAs = needed_TAs(whole_event)
 
   if num_TAs > max_num_TAs:
     max_num_TAs = num_TAs
 
-  <<append [[event]] data to [[rows]]>>
+  for event in split_event(whole_event, split_hours):
+    <<append [[event]] data to [[rows]]>>
 @
 
 In most cases, it would be straight-forward to just extract the event data and 
@@ -283,6 +297,193 @@ def test_generate_signup_sheet_without_location(tmp_path):
   fields = rows[1].split("\t")
   assert fields[SIGNUP_SHEET_HEADER.index("Event")] == "Laboration"
   assert fields[SIGNUP_SHEET_HEADER.index("Rooms")] == ""
+@
+
+\section{Splitting long sessions}\label{SplittingLongSessions}
+
+Some courses schedule the occasional double session: four hours where
+two hours is the norm.
+On the sign-up sheet, that long block is hard to staff---a TA who can
+work either half but not both cannot sign up at all.
+Split into two consecutive normal-length rows, each half can be staffed
+by a different TA, so the same schedule fits many more TAs' calendars.
+Sometimes we do want the long block kept whole, though---\eg when the
+session is one uninterruptible exercise---so splitting must be a
+choice, not a rule.
+
+The caller makes that choice by stating how long a \emph{normal}
+session is; anything longer is cut into pieces of that length.
+This way the caller doesn't have to know which sessions are long: a
+double session yields exactly two normal ones, and a session that
+already is normal-length passes through untouched.
+When the duration isn't an even multiple, the pieces are still cut at
+normal length and the remainder becomes a shorter final piece---%
+\eg three hours becomes two hours plus one---which mirrors how the
+sheet treats short sessions in general: they simply keep their length.
+We accept both [[None]] and zero as \enquote{never split}: [[None]] is
+the natural default for a keyword argument, but a command-line option
+cannot express [[None]], so zero serves as its spelling there
+(\cref{cli.signupsheets}).
+<<more signup args doc>>=
+- split_hours is the number of hours of a normal-length session.
+  Events longer than that are split into consecutive chunks of that
+  length, a shorter last chunk taking any remainder. When None or 0
+  (the default is None), events are never split.
+<<more signup args>>=
+split_hours=None,
+@
+
+The splitting itself works on a single event.
+Each piece is a [[copy.deepcopy]] of the original with only its start
+and end replaced, so summary, location and description tag along---the
+digital-room handling above then treats each piece exactly like any
+other event, and the two features compose without knowing about each
+other.
+A shallow copy would work today, since we \emph{replace} the timestamp
+properties rather than mutate them, but a deep copy also keeps the
+pieces independent of whatever future code mutates, at negligible cost
+for events this small.
+<<functions>>=
+def split_event(event, split_hours):
+  """
+  Input: event is an icalendar.Event object; split_hours is the number
+  of hours (int or float) of a normal-length session, or None.
+
+  Output: a list of icalendar.Event objects jointly covering the same
+  time span as event: consecutive chunks of split_hours hours, with a
+  shorter last chunk taking any remainder. If split_hours is None or 0,
+  or the event is not longer than split_hours, the list contains just
+  the event itself, unchanged.
+  """
+  if not split_hours:
+    return [event]
+
+  chunk_length = timedelta(hours=split_hours)
+  if event.end - event.start <= chunk_length:
+    return [event]
+
+  chunks = []
+  start = event.start
+  while start < event.end:
+    chunk = copy.deepcopy(event)
+    chunk.start = start
+    chunk.end = min(start + chunk_length, event.end)
+    chunks.append(chunk)
+    start = chunk.end
+  return chunks
+@
+
+Let's verify the splitting on its own, contrasting the case the feature
+exists for (a double session) with the cases that must pass through
+untouched (a normal-length session, and any session when splitting is
+off).
+<<test functions>>=
+def make_session_event(hours):
+  """A session of the given length, starting at 10:00 UTC."""
+  event = icalendar.Event()
+  event.start = datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
+  event.end = event.start + timedelta(hours=hours)
+  event.add("summary", "Laboration")
+  return event
+
+def test_split_event_splits_double_session():
+  """A four-hour session becomes two two-hour chunks."""
+  chunks = split_event(make_session_event(4), 2)
+  assert [(c.start.hour, c.end.hour) for c in chunks] == [
+    (10, 12), (12, 14),
+  ]
+
+def test_split_event_remainder_makes_shorter_tail():
+  """Three hours with two-hour chunks: two hours, then one."""
+  chunks = split_event(make_session_event(3), 2)
+  assert [(c.start.hour, c.end.hour) for c in chunks] == [
+    (10, 12), (12, 13),
+  ]
+
+def test_split_event_keeps_short_sessions():
+  """A normal-length session is returned as it is."""
+  event = make_session_event(2)
+  assert split_event(event, 2) == [event]
+
+def test_split_event_none_disables():
+  """Without a normal length, nothing is ever split."""
+  event = make_session_event(4)
+  assert split_event(event, None) == [event]
+@
+
+The end-to-end property worth pinning down is that the sheet's rows
+stay a seamless cover of the original session: the first chunk's end is
+the second chunk's start, and both demand the whole session's number of
+TAs.
+<<test functions>>=
+def make_double_session_ics():
+  """A single four-hour lab session."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Laboration
+DTSTART:20240115T100000Z
+DTEND:20240115T140000Z
+LOCATION:D1
+END:VEVENT
+END:VCALENDAR"""
+
+def test_generate_signup_sheet_splits_long_sessions(tmp_path):
+  """A double session becomes two normal-length rows."""
+  ics = tmp_path / "course.ics"
+  ics.write_text(make_double_session_ics())
+  out = tmp_path / "sheet.csv"
+  generate_signup_sheet(str(out), str(ics),
+                        needed_TAs=lambda event: 2,
+                        split_hours=2)
+  rows = out.read_text().splitlines()
+  assert len(rows) == 1 + 2  # header plus the two chunks
+  start = SIGNUP_SHEET_HEADER.index("Start")
+  end = SIGNUP_SHEET_HEADER.index("End")
+  TAs = SIGNUP_SHEET_HEADER.index("#Needed TAs")
+  first = rows[1].split("\t")
+  second = rows[2].split("\t")
+  assert first[end] == second[start]
+  assert first[TAs] == second[TAs] == "2"
+@
+
+We claimed above that splitting composes with the digital-room
+handling without either knowing about the other; that claim deserves a
+test of its own, since it rests on each chunk being an independent
+copy---the digital branch \emph{mutates} its event's location, which
+with shared state would leak between chunks.
+A hybrid double session must therefore yield four rows: a physical and
+a digital one for each half.
+The comma in the [[LOCATION]] is backslash-escaped as the ICS format
+requires; [[icalendar]] unescapes it on parsing.
+<<test functions>>=
+def make_hybrid_double_session_ics():
+  """A four-hour session in a physical and a digital room."""
+  return """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+SUMMARY:Laboration
+DTSTART:20240115T100000Z
+DTEND:20240115T140000Z
+LOCATION:D1\\, digital
+END:VEVENT
+END:VCALENDAR"""
+
+def test_generate_signup_sheet_splits_hybrid_sessions(tmp_path):
+  """Each half of a hybrid double session gets its own digital row."""
+  ics = tmp_path / "course.ics"
+  ics.write_text(make_hybrid_double_session_ics())
+  out = tmp_path / "sheet.csv"
+  generate_signup_sheet(str(out), str(ics),
+                        needed_TAs=lambda event: 2,
+                        split_hours=2)
+  rows = out.read_text().splitlines()
+  rooms = SIGNUP_SHEET_HEADER.index("Rooms")
+  assert [row.split("\t")[rooms] for row in rows[1:]] == [
+    "D1", "Digital", "D1", "Digital",
+  ]
 @
 
 Finally, we can use the function as follows.
