@@ -32,6 +32,10 @@ Contrast the two ways [[zulipcli]] runs:
   zuliprc path that the host stores in [[ctx.obj["zuliprc"]]] on the root
   context, before any subcommand runs.
 \end{description}
+In both forms [[zulipcli]] also resolves its two optional
+\emph{personas}---the human [[user]] and the [[bot]]---as suffixed
+siblings of whatever zuliprc is active, so handing over the course's
+path buys us per-course persona files for free.
 So the only nytid-specific work is to translate a course (and the register it
 lives in) into \emph{that course's} zuliprc path, and hand it to
 [[zulipcli]] through the context.
@@ -47,6 +51,23 @@ We deliberately do \emph{not} store the API key as a value inside
 [[config.json]]: a [[zuliprc]] is the native INI format that [[zulipcli]] and
 the underlying [[zulip]] client already expect, so no transformation and no
 temporary-file handling of secrets is needed.
+
+\paragraph{The two personas.}
+The same directory can also hold [[zuliprc.user]] and [[zuliprc.bot]],
+because [[zulipcli]] resolves persona files as suffixes on the active
+zuliprc.
+The split exists because Zulip's invitation API refuses \emph{every}
+bot API key---the check is on the account kind, before any permission
+check---so inviting TAs requires a human account's key, while the
+[[bot]] worker must never run with a human's key (it would consume
+the owner's unread messages).
+Per course is the right granularity for these files, for the same
+reason the plain [[zuliprc]] lives there: each course runs its own
+Zulip realm, and Zulip issues keys per realm, so a persona's identity
+only means something \emph{within} one course's realm.
+The plain [[zuliprc]] stays the fallback whenever a persona file is
+missing, so a course configured before personas existed keeps working
+untouched.
 
 \section{Reusing the \texttt{zulipcli} command set}
 
@@ -73,7 +94,8 @@ from nytid.cli import courses as coursescli
 
 <<constants>>
 
-cli = build_embedded_app(help=<<zulip help text>>)
+cli = build_embedded_app(help=<<zulip help text>>,
+                         epilog=<<zulip credentials epilog>>)
 <<name the embedded app [[zulip]]>>
 
 <<course-selection callback>>
@@ -131,6 +153,54 @@ one thing a user must supply that the standalone tool does not need.
 )
 @
 
+[[zulipcli]] ends its help with an epilog explaining where credentials
+come from, and its embedded default can only describe the file
+abstractly (\enquote{chosen by the host application}), because
+[[zulipcli]] cannot know where a host keeps it.
+We know exactly: the course's directory.
+[[build_embedded_app]] accepts [[epilog]] precisely so a host can
+replace the abstract story with its concrete one, so we do---same
+persona model, concrete paths.
+The text is plain paragraphs because the help renderer reflows them
+to the terminal width; a hand-aligned table would be mangled.
+Replacing the epilog wholesale means a persona-model change in
+[[zulipcli]] must be mirrored here by hand; the help test below pins
+the file names so such drift breaks loudly.
+<<zulip credentials epilog>>=
+(
+  "Credentials live in the course's directory, next to its "
+  "config.json: the zuliprc file there holds the course bot's API "
+  "key, and is shared through the course's register, so every "
+  "teacher drives the same bot.\n\n"
+  "Two optional persona files beside it keep you and the bot "
+  "apart: zuliprc.user holds your own API key and zuliprc.bot the "
+  "bot's. Commands prefer the user persona, so once zuliprc.user "
+  "exists, messages are sent in your name. The invitation commands "
+  "require it, because Zulip rejects bot API keys there. The bot "
+  "command runs as the bot persona, or the plain zuliprc.\n\n"
+  "The environment overrides single fields of the chosen file: "
+  "ZULIP_USER_API_KEY and ZULIP_USER_EMAIL for the user persona, "
+  "ZULIP_BOT_API_KEY and ZULIP_BOT_EMAIL for the bot, ZULIP_SITE "
+  "for both."
+)
+@
+
+Let's verify that the help really teaches the configuration: the
+file names and variables a user needs must survive the renderer's
+reflowing and come out in [[--help]].
+Each needle is a single word, so reflowing cannot split it.
+<<test functions>>=
+def test_zulip_help_documents_course_credentials():
+  from typer.testing import CliRunner
+
+  result = CliRunner().invoke(zulip_module.cli, ["--help"])
+
+  for needle in ("config.json", "zuliprc.user", "zuliprc.bot",
+                 "ZULIP_USER_API_KEY", "ZULIP_BOT_API_KEY",
+                 "ZULIP_SITE"):
+    assert needle in result.output
+@
+
 \section{Selecting the course}
 
 The callback runs before every subcommand, so it is where we translate the
@@ -153,9 +223,10 @@ def select_course(ctx: typer.Context,
   """
   Select the course whose Zulip bot to act as.
 
-  Every subcommand authenticates as the bot configured for `course`,
-  reading its credentials from a `zuliprc` file in the course's own
-  directory (next to its config.json).
+  Every subcommand authenticates with credentials from the course's
+  own directory (next to its config.json): the `zuliprc` file there
+  holds the course bot's API key, and the optional `zuliprc.user`
+  and `zuliprc.bot` beside it hold the user and bot personas.
   """
   try:
     zuliprc = course_zuliprc(course, register)
@@ -202,6 +273,10 @@ real subcommand and check that the course's zuliprc is what reaches
 We stub the factory to capture the path and abort before any network call,
 and we stub [[registry.get]] so the lookup uses a throwaway directory rather
 than the user's real registry.
+The stub swallows the factory's other keyword arguments
+([[api_key]], [[email]]), and we clear the persona variables from the
+environment, so a developer's own Zulip configuration cannot change
+what the test sees.
 The course is given as a positional argument before the subcommand
 ([[streams]]), so we check that Click consumes it on the group and the
 callback resolves it to the course's zuliprc.
@@ -215,9 +290,12 @@ def test_callback_hands_course_zuliprc_to_zulipcli(monkeypatch, tmp_path):
   (tmp_path / "prgi24" / "config.json").write_text("{}")
   monkeypatch.setattr(zulip_module.registry, "get",
                       lambda name, config=None: tmp_path)
+  for variable in ("ZULIP_USER_API_KEY", "ZULIP_USER_EMAIL",
+                   "ZULIP_BOT_API_KEY", "ZULIP_BOT_EMAIL"):
+    monkeypatch.delenv(variable, raising=False)
 
   captured = {}
-  def fake_get_client(zuliprc=None):
+  def fake_get_client(zuliprc=None, **kwargs):
     captured["zuliprc"] = zuliprc
     raise SystemExit(0)
   monkeypatch.setattr(zulipcli, "get_client", fake_get_client)
@@ -232,6 +310,46 @@ def test_callback_hands_course_zuliprc_to_zulipcli(monkeypatch, tmp_path):
 
   CliRunner().invoke(root, ["zulip", "prgi24", "streams"])
   assert captured["zuliprc"] == str(tmp_path / "prgi24" / ZULIPRC_FILENAME)
+@
+
+The persona files ride along the same wiring: when the course
+directory holds a [[zuliprc.user]], an ordinary command
+authenticates through it rather than the plain [[zuliprc]], because
+[[zulipcli]] resolves personas beside the path we hand it.
+This is the end-to-end guarantee the help epilog promises, so it
+gets the same stub-based test as the plain path.
+<<test functions>>=
+def test_course_user_persona_reaches_zulipcli(monkeypatch, tmp_path):
+  import typer
+  from typer.testing import CliRunner
+  import zulipcli
+
+  (tmp_path / "prgi24").mkdir()
+  (tmp_path / "prgi24" / "config.json").write_text("{}")
+  (tmp_path / "prgi24" / "zuliprc.user").write_text("[api]\n")
+  monkeypatch.setattr(zulip_module.registry, "get",
+                      lambda name, config=None: tmp_path)
+  for variable in ("ZULIP_USER_API_KEY", "ZULIP_USER_EMAIL",
+                   "ZULIP_BOT_API_KEY", "ZULIP_BOT_EMAIL"):
+    monkeypatch.delenv(variable, raising=False)
+
+  captured = {}
+  def fake_get_client(zuliprc=None, **kwargs):
+    captured["zuliprc"] = zuliprc
+    raise SystemExit(0)
+  monkeypatch.setattr(zulipcli, "get_client", fake_get_client)
+
+  root = typer.Typer()
+
+  @root.callback()
+  def main(ctx: typer.Context):
+    pass
+
+  root.add_typer(zulip_module.cli)
+
+  CliRunner().invoke(root, ["zulip", "prgi24", "streams"])
+  assert captured["zuliprc"] == str(
+    tmp_path / "prgi24" / (ZULIPRC_FILENAME + ".user"))
 @
 
 \section{Locating a course's zuliprc}
