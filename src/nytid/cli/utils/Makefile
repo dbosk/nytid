@@ -4,6 +4,7 @@ MODULES+=	__init__.py init.tex
 MODULES+=	defaults.py defaults.tex
 MODULES+=	rooms.py rooms.tex
 MODULES+=	labels.py labels.tex
+MODULES+=	output.py output.tex
 
 .PHONY: all
 all: ${MODULES}
