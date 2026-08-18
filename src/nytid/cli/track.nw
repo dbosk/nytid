@@ -3326,7 +3326,11 @@ after the [[--wd]] validation, so that a directory outside any
 repository fails as cleanly as a nonexistent one.  We remember the
 worktree directory separately from [[proc_cwd]]; the launch code
 treats [[proc_cwd]] like any other working directory, and only the
-cleanup step needs to know that it was a worktree.
+cleanup step needs to know that it was a worktree.  The launch lands
+in the same \emph{relative} place inside the worktree as [[--wd]]
+was inside the repository (\cref{track:worktrees}), so
+[[-C repo/src --worktree x]] runs in [[.../worktrees/x/src]] just as
+the same command without [[--worktree]] runs in [[repo/src]].
 
 <<fork the launch into a worktree>>=
 if worktree:
@@ -3335,7 +3339,7 @@ if worktree:
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
-    proc_cwd = worktree_dir
+    proc_cwd = worktree_launch_dir(proc_cwd, worktree_dir)
 @
 
 Let us verify that a bare [[--worktree]] launches the shell inside a
@@ -5201,6 +5205,16 @@ directory that exists but is not a worktree is an error rather than
 something to overwrite: it is either the user's data or a broken
 checkout, and both deserve a look.
 
+The directory-gone case has a trap: git remembers every worktree it
+added, and refuses to add one at a path it still has on record as
+\enquote{missing but registered}.  A [[git worktree remove]] clears
+that record, but an [[rm -rf]]---a tmp cleaner, an interrupted removal,
+a user tidying by hand---does not.  We therefore run
+[[git worktree prune]] before adding; it drops only records whose
+directory is gone, so live worktrees are untouched, and it makes the
+restart succeed instead of demanding that the user know about
+[[prune]].
+
 <<helper functions>>=
 def ensure_worktree(base_dir, name):
     """Create or reuse worktree `name` for the repo containing `base_dir`.
@@ -5250,6 +5264,7 @@ if os.path.isdir(worktree_dir):
 @
 
 <<attach or create the worktree branch>>=
+run_git("worktree", "prune", cwd=toplevel)
 os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
 branch_exists = run_git(
     "rev-parse", "--verify", "--quiet",
@@ -5333,6 +5348,15 @@ def test_ensure_worktree_reattaches_existing_branch(tmp_path):
   assert branches.count("worktree-feat") == 1
 
 
+def test_ensure_worktree_survives_rm_rf(tmp_path):
+  """A worktree deleted with rm -rf is recreated on the old branch."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  shutil.rmtree(wt)
+  wt2 = ensure_worktree(repo, "feat")
+  assert wt2 == wt and os.path.isdir(wt2)
+
+
 def test_ensure_worktree_from_subdirectory(tmp_path):
   """The base directory may be anywhere inside the repository."""
   repo = make_git_repo(tmp_path / "repo")
@@ -5366,14 +5390,78 @@ def test_ensure_worktree_rejects_foreign_directory(tmp_path):
     ensure_worktree(repo, "feat")
 @
 
+\paragraph{Where in the worktree.}
+[[--wd]] may point below the repository root, and without
+[[--worktree]] the launch would run exactly there.  Dropping the user
+at the worktree root instead would make [[--worktree]] change the
+working directory in a way that has nothing to do with worktrees, so
+we carry the relative path over.  If that subdirectory does not exist
+in the checkout (the branch predates it), the worktree root is the
+only sensible fallback.
+
+<<helper functions>>=
+def worktree_launch_dir(base_dir, worktree_dir):
+    """Return the directory inside `worktree_dir` matching `base_dir`.
+
+    `base_dir` is where the launch would have run without a
+    worktree; its path relative to the repository toplevel is
+    reapplied inside the worktree, falling back to the worktree
+    root when that subdirectory does not exist there.
+    """
+    toplevel = run_git(
+        "rev-parse", "--show-toplevel", cwd=base_dir,
+    )
+    if toplevel is None or toplevel.returncode != 0:
+        return worktree_dir
+    rel = os.path.relpath(
+        os.path.realpath(base_dir),
+        os.path.realpath(toplevel.stdout.strip()),
+    )
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return worktree_dir
+    candidate = os.path.join(worktree_dir, rel)
+    if os.path.isdir(candidate):
+        return candidate
+    return worktree_dir
+@
+
+<<test functions>>=
+def test_worktree_launch_dir_keeps_subdirectory(tmp_path):
+  """A --wd below the toplevel maps to the same place in the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "src", "deep")
+  os.makedirs(sub)
+  git = ["git", "-C", repo] + TEST_GIT_CONFIG
+  with open(os.path.join(sub, "f"), "w") as f:
+    f.write("x\n")
+  subprocess.run(git + ["add", "src"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "sub"], check=True)
+  wt = ensure_worktree(sub, "feat")
+  assert worktree_launch_dir(sub, wt) == os.path.join(
+    wt, "src", "deep",
+  )
+  assert worktree_launch_dir(repo, wt) == wt
+
+
+def test_worktree_launch_dir_falls_back_to_root(tmp_path):
+  """A subdirectory absent from the checkout maps to the root."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "untracked-dir")
+  os.makedirs(sub)
+  wt = ensure_worktree(sub, "feat")
+  assert worktree_launch_dir(sub, wt) == wt
+@
+
 \paragraph{Cleaning up.}
 A worktree that the session never touched is clutter: an untracked
 directory in the main checkout and a branch that points at the same
 commit as where it started.  We remove it automatically---but only
 then.  \enquote{Unchanged} means two things at once: the working tree
-is clean ([[git status --porcelain]] prints nothing, untracked files
-included), and the branch has no commits of its own, i.e.\ every commit
-reachable from it is also reachable from some other branch.  Either
+is clean ([[git status --porcelain]] prints nothing---untracked
+\emph{and ignored} files included, since [[git worktree remove]] would
+delete an ignored [[.env]] or agent scratch file without a word), and
+the branch has no commits of its own, i.e.\ every commit reachable
+from it is also reachable from some other branch.  Either
 condition alone is not enough: a clean tree may sit on top of committed
 work, and an unchanged branch may carry uncommitted edits.  When both
 hold, removing the worktree and deleting the branch loses nothing that
@@ -5382,15 +5470,16 @@ hold, removing the worktree and deleting the branch loses nothing that
 We ask git for the commits reachable from our branch but from no other
 branch ([[--not --branches]] with our own branch excluded; the
 [[--exclude]] glob is matched against the short name, without
-[[refs/heads/]]) rather than comparing against a recorded base commit: nothing has to be persisted
-between launch and cleanup, which matters for the detached tmux path
-where cleanup runs in a fresh process.
+[[refs/heads/]]) rather than comparing against a recorded base commit:
+nothing has to be persisted between launch and cleanup, which matters
+for the detached tmux path where cleanup runs in a fresh process.
 
 <<helper functions>>=
 def worktree_is_unchanged(worktree_dir):
     """Return whether `worktree_dir` is clean and has no own commits."""
     status = run_git(
-        "status", "--porcelain", cwd=worktree_dir,
+        "status", "--porcelain", "--ignored=traditional",
+        cwd=worktree_dir,
     )
     if status is None or status.returncode != 0:
         return False
@@ -5461,7 +5550,56 @@ def remove_worktree_if_unchanged(worktree_dir):
     return True
 @
 
+Both [[track start]] and [[todo start]] end a worktree launch by
+calling this and telling the user what happened.  The wording matters,
+because there are three different situations and the user's next move
+differs: a removed worktree must not be looked for, a kept one must be
+returned to, and one that could not be examined (already gone, or git
+failed) is worth a glance.  We keep the message in one helper so both
+commands say the same thing.
+
+<<helper functions>>=
+def report_worktree_cleanup(worktree_dir):
+    """Remove `worktree_dir` if unchanged and describe the outcome."""
+    if not os.path.isdir(worktree_dir):
+        typer.echo(
+            f"Worktree {worktree_dir} is already gone"
+        )
+        return
+    if remove_worktree_if_unchanged(worktree_dir):
+        typer.echo(
+            f"Removed unchanged worktree {worktree_dir}"
+        )
+    elif worktree_is_unchanged(worktree_dir):
+        typer.echo(
+            f"Could not remove worktree {worktree_dir}",
+            err=True,
+        )
+    else:
+        typer.echo(
+            f"Kept worktree {worktree_dir} (has changes)"
+        )
+@
+
 <<test functions>>=
+def test_report_worktree_cleanup_messages(tmp_path):
+  """The three outcomes get three different messages."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  with open(os.path.join(wt, "x"), "w") as f:
+    f.write("x\n")
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "Kept worktree" in echo.call_args.args[0]
+  os.remove(os.path.join(wt, "x"))
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "Removed unchanged" in echo.call_args.args[0]
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "already gone" in echo.call_args.args[0]
+
+
 def test_remove_worktree_removes_unchanged(tmp_path):
   """A clean worktree with no own commits is removed with its branch."""
   repo = make_git_repo(tmp_path / "repo")
@@ -5481,6 +5619,21 @@ def test_remove_worktree_keeps_dirty(tmp_path):
   wt = ensure_worktree(repo, "feat")
   with open(os.path.join(wt, "new.txt"), "w") as f:
     f.write("x\n")
+  assert remove_worktree_if_unchanged(wt) is False
+  assert os.path.isdir(wt)
+
+
+def test_remove_worktree_keeps_ignored_files(tmp_path):
+  """Even gitignored files count as changes worth keeping."""
+  repo = make_git_repo(tmp_path / "repo")
+  with open(os.path.join(repo, ".gitignore"), "w") as f:
+    f.write("*.log\n")
+  git = ["git", "-C", repo] + TEST_GIT_CONFIG
+  subprocess.run(git + ["add", ".gitignore"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "ignore"], check=True)
+  wt = ensure_worktree(repo, "feat")
+  with open(os.path.join(wt, "agent.log"), "w") as f:
+    f.write("state\n")
   assert remove_worktree_if_unchanged(wt) is False
   assert os.path.isdir(wt)
 
@@ -9978,22 +10131,14 @@ if launch_requested:
 @
 
 A worktree launch ends with the cleanup rule of \cref{track:worktrees}:
-an untouched worktree disappears again, one with work in it stays.  We
-say which happened, because a kept worktree is something the user has
-to come back to and a removed one is something they must not go
-looking for.  The cleanup runs after the tracking bookkeeping so that
-a slow or failing git cannot delay the stop.
+an untouched worktree disappears again, one with work in it stays, and
+[[report_worktree_cleanup]] says which.  The cleanup runs after the
+tracking bookkeeping so that a slow or failing git cannot delay the
+stop.
 
 <<remove the launch worktree if unchanged>>=
 if worktree_dir:
-    if remove_worktree_if_unchanged(worktree_dir):
-        typer.echo(
-            f"Removed unchanged worktree {worktree_dir}"
-        )
-    else:
-        typer.echo(
-            f"Kept worktree {worktree_dir} (has changes)"
-        )
+    report_worktree_cleanup(worktree_dir)
 @
 
 We tell the user where the launch went, and the four destinations are
@@ -10157,7 +10302,9 @@ def test_start_worktree_detached_appends_cleanup(
   """A detached worktree launch cleans up via the finalize command."""
   repo = make_git_repo(tmp_path / "repo")
   with patch.dict(
-    os.environ, {"TMUX": "session", "SHELL": "/bin/bash"},
+    os.environ,
+    {"TMUX": "session", "SHELL": "/bin/bash",
+     "PATH": os.environ["PATH"]},
     clear=True,
   ):
     with patch(
@@ -12374,6 +12521,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -12461,7 +12609,10 @@ from nytid.cli.track import (
     install_tmux_window_sync_hooks,
     install_tmux_window_cleanup_hook,
     ensure_worktree,
+    worktree_launch_dir,
+    worktree_is_unchanged,
     remove_worktree_if_unchanged,
+    report_worktree_cleanup,
     build_detached_worktree_cleanup_command,
     default_username
 )

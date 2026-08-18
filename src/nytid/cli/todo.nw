@@ -4380,7 +4380,8 @@ from nytid.cli.track import (
     warn_if_focus_events_off,
     validate_worktree_name,
     ensure_worktree,
-    remove_worktree_if_unchanged,
+    worktree_launch_dir,
+    report_worktree_cleanup,
     build_detached_worktree_cleanup_command,
 )
 @
@@ -10176,13 +10177,13 @@ def start(
     except typer.BadParameter as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
+    <<resolve worktree for todo start>>
     todo_id, item, next_id, todos, stack = activate_todo_state(
         todo_id, who=default_username
     )
 
     <<resolve tmux context sync policy>>
     <<auto-activate ancestors>>
-    <<resolve worktree for todo start>>
     <<start tracking via track module>>
 
     typer.echo(
@@ -10219,26 +10220,46 @@ def test_start_ctx_has_no_default():
 
 A todo with a worktree---stored on the item or given as the one-off
 [[--worktree]] override---runs in that worktree instead of directly in
-[[wd]].  We create or reuse it \emph{before} tracking starts, for the
-same reason [[track start]] validates [[--wd]] early: a base directory
-outside any git repository must fail before anything is recorded, not
-after a tracking entry has been opened.  The base directory is the
-item's [[wd]] (which may itself come from the worker config) or the
-current directory, exactly as the launch itself would have used.
-Because [[ensure_worktree]] reuses an existing worktree, restarting the
-todo lands in the same checkout with whatever was left there.
+[[wd]].  We create or reuse it \emph{before} anything is recorded, for
+the same reason [[track start]] validates [[--wd]] early: a base
+directory outside any git repository must fail before the todo is
+pushed onto the active stack and before any tracking entry---the
+item's or an auto-activated ancestor's---has been opened.  That forces
+a read-only peek at the item ahead of [[activate_todo_state]], which
+is otherwise the first thing to look at it; the peek resolves the ID
+the same way, so an ID-less start with no active todo fails here with
+the same message it always did.  The base directory is the item's
+[[wd]] (which may itself come from the worker config) or the current
+directory, exactly as the launch itself would have used, and the
+launch lands in the matching subdirectory of the worktree
+(\cref{track:worktrees}).  Because [[ensure_worktree]] reuses an
+existing worktree, restarting the todo lands in the same checkout with
+whatever was left there.
 
 <<resolve worktree for todo start>>=
 worktree_dir = None
-worktree_name = worktree or item.worktree
+worktree_launch = None
+_, peek_todos = load_todos()
+peek_id = resolve_todo_id(
+    todo_id, "start", who=default_username, todos=peek_todos,
+)
+peek_item = next(
+    (t for t in peek_todos if t.id == peek_id), None,
+)
+worktree_name = worktree or (
+    peek_item.worktree if peek_item else None
+)
 if worktree_name:
+    base_dir = (
+        peek_item.wd if peek_item and peek_item.wd
+        else os.getcwd()
+    )
     try:
-        worktree_dir = ensure_worktree(
-            item.wd or os.getcwd(), worktree_name,
-        )
+        worktree_dir = ensure_worktree(base_dir, worktree_name)
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
+    worktree_launch = worktree_launch_dir(base_dir, worktree_dir)
 @
 
 Detached tmux cleanup happens after the pane process exits, so it cannot
@@ -10720,14 +10741,7 @@ being tidied away.  A worktree with work in it is kept, so the next
 
 <<remove worktree after todo run>>=
 if worktree_dir:
-    if remove_worktree_if_unchanged(worktree_dir):
-        typer.echo(
-            f"Removed unchanged worktree {worktree_dir}"
-        )
-    else:
-        typer.echo(
-            f"Kept worktree {worktree_dir} (has changes)"
-        )
+    report_worktree_cleanup(worktree_dir)
 @
 
 Let us verify the worktree lifecycle of [[todo start]] against a real
@@ -10841,6 +10855,38 @@ def test_start_keeps_and_resumes_changed_worktree(
   assert os.path.exists(os.path.join(expected, "wip"))
 
 
+def test_start_worktree_keeps_wd_subdirectory(
+  temp_todo_dir, tmp_path,
+):
+  """A wd below the repository root maps into the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "labs")
+  os.makedirs(sub)
+  git = ["git", "-C", repo] + TEST_GIT_CONFIG
+  with open(os.path.join(sub, "f"), "w") as f:
+    f.write("x\n")
+  subprocess.run(git + ["add", "labs"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "labs"], check=True)
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=sub, worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(
+    repo, ".claude", "worktrees", "fix-42", "labs",
+  )
+  assert run_only_git.calls[0][1]["cwd"] == expected
+
+
 def test_start_worktree_flag_overrides_stored(
   temp_todo_dir, tmp_path,
 ):
@@ -10898,11 +10944,21 @@ def test_start_worktree_without_wd_uses_cwd(
 def test_start_worktree_outside_git_fails_before_tracking(
   temp_todo_dir, tmp_path,
 ):
-  """A worktree on a non-repository wd fails before tracking starts."""
+  """A worktree on a non-repository wd fails before anything is recorded.
+
+  The child has a parent, so a late failure would leave the
+  parent auto-activated and tracked; nothing of the sort may
+  survive.
+  """
   from nytid.cli.track import load_active_session
-  save_todos(2, [
+  save_todos(3, [
     TodoItem(
-      id=1, title="Fix bug", wd=str(tmp_path), worktree="x",
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Fix bug", parent_id=1,
+      wd=str(tmp_path), worktree="x",
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -10911,12 +10967,15 @@ def test_start_worktree_outside_git_fails_before_tracking(
     "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
   ):
     result = runner.invoke(
-      cli, ["start", "1", "--headless", "--command", "true"],
+      cli, ["start", "2", "--headless", "--command", "true"],
     )
   assert result.exit_code == 1
   assert "requires a git repository" in result.output
   assert run_only_git.calls == []
   assert load_active_session().get_active_labels() == []
+  assert load_active_stack() == []
+  _, todos = load_todos()
+  assert all(t.status == "pending" for t in todos)
 
 
 def test_start_pane_worktree_appends_detached_cleanup(
@@ -10992,7 +11051,7 @@ if item.env:
 todo_context = build_context_name(
     "todo", [str(todo_id)]
 )
-proc_wd = worktree_dir or item.wd or os.getcwd()
+proc_wd = worktree_launch or item.wd or os.getcwd()
 prompt_file = None
 prompt_dir = None
 @
