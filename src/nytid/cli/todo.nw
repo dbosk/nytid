@@ -286,7 +286,11 @@ environment at creation time, extended notes for the editor, and a
 default command to run when starting the task. The [[wd]] and [[env]]
 fields together let [[todo start]] restore the exact context in which
 the task was conceived---solving the common problem of \enquote{where
-was I working on this?} The [[command]] field defaults to [[$SHELL]]
+was I working on this?} The [[worktree]] field refines [[wd]] for
+tasks in a git repository: it names a git worktree (see
+\cref{track:worktrees}) that [[todo start]] creates or reuses under
+the repository containing [[wd]], so a task always resumes on its own
+branch checkout.  The [[command]] field defaults to [[$SHELL]]
 but can be set to tools like [[claude]] or [[opencode]].
 
 The optional [[github]] field links a todo to a GitHub issue or pull
@@ -336,6 +340,7 @@ class TodoItem:
     who: str | None = None
     notes: str = ""
     wd: str | None = None
+    worktree: str | None = None
     env: dict[str, str] | None = None
     command: str | None = None
     github: dict[str, str] | None = None
@@ -2464,6 +2469,8 @@ def build_item_metadata(item):
     meta = {}
     if item.wd:
         meta["wd"] = item.wd
+    if item.worktree:
+        meta["worktree"] = item.worktree
     if item.command:
         meta["command"] = item.command
     if item.labels:
@@ -4366,10 +4373,15 @@ from nytid.cli.track import (
     pane_opt, window_opt,
     block_opt, timeout_opt,
     wd_opt, env_opt, here_opt,
+    worktree_opt,
     auto_suspend_opt,
     resolve_command_argv,
     should_auto_suspend,
     warn_if_focus_events_off,
+    validate_worktree_name,
+    ensure_worktree,
+    remove_worktree_if_unchanged,
+    build_detached_worktree_cleanup_command,
 )
 @
 
@@ -4620,7 +4632,11 @@ directory and environment at creation time. The [[--here]] flag is a
 convenient shorthand that captures both [[os.getcwd()]] and
 [[os.environ]]. For finer control, [[--wd]] stores only an explicit
 directory while [[--env]] stores only the current environment. This
-lets the user update one without silently rewriting the other. The
+lets the user update one without silently rewriting the other.  The
+[[--worktree]] option names a git worktree (\cref{track:worktrees})
+in which [[todo start]] should run the task; it is stored alongside
+[[wd]] and resolved relative to it on every start, so a task can be
+stopped and restarted and always resume in the same checkout.  The
 [[--command]] option sets a default command (such as [[claude]] or
 [[opencode]]) to launch when starting the todo.  The same attributes can
 also be supplied per worker in the config via
@@ -4637,6 +4653,7 @@ command_opt = typer.Option(
 
 <<add command options>>=
 wd_path: Annotated[str | None, wd_opt] = None,
+worktree: Annotated[str | None, worktree_opt] = None,
 capture_env: Annotated[bool, env_opt] = False,
 here: Annotated[bool, here_opt] = False,
 run_command: Annotated[str | None,
@@ -5057,6 +5074,64 @@ def test_canonicalize_wd_rejects_non_string():
         canonicalize_wd(42)
 @
 
+The worktree name gets the same single-helper treatment as [[wd]],
+for the same reason: it is written from CLI flags and from YAML front
+matter, and both must agree on what a valid name is.  The invariant
+itself---non-empty, no path separators---is owned by
+[[validate_worktree_name]] in the [[track]] module
+(\cref{track:worktrees}), because that is where the name is turned into
+a path; here we only translate its [[ValueError]] into the same clean
+[[typer.Exit]] that [[canonicalize_wd]] produces, and map [[None]] and
+the empty string to [[None]] so that [[--worktree ""]] clears the field.
+
+<<helpers>>=
+def normalize_worktree_name(name):
+    """Return a validated worktree name, or ``None`` if unset.
+
+    ``None`` and the empty string mean no worktree.  Any other
+    value must be a string without path separators; otherwise we
+    exit with an error pointing at the offending value.
+    """
+    if name is None or name == "":
+        return None
+    if not isinstance(name, str):
+        typer.echo(
+            f"Error: worktree must be a string, "
+            f"got {type(name).__name__}: {name!r}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        return validate_worktree_name(name)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+@
+
+<<test functions>>=
+def test_normalize_worktree_name_accepts_plain_name():
+    """A plain name passes through unchanged."""
+    assert normalize_worktree_name("fix-42") == "fix-42"
+
+
+def test_normalize_worktree_name_empty_is_none():
+    """None and the empty string both mean no worktree."""
+    assert normalize_worktree_name(None) is None
+    assert normalize_worktree_name("") is None
+
+
+def test_normalize_worktree_name_rejects_separator():
+    """A path separator in the name is a clean error."""
+    with pytest.raises(typer.Exit):
+        normalize_worktree_name("a/b")
+
+
+def test_normalize_worktree_name_rejects_non_string():
+    """A YAML integer is a clean error, not a TypeError."""
+    with pytest.raises(typer.Exit):
+        normalize_worktree_name(42)
+@
+
 With the helper in place, the resolve step simply routes the CLI
 [[wd_path]] through it.  The [[os.getcwd()]] branch used by
 [[--here]] is already absolute, so it needs no wrapping.
@@ -5092,6 +5167,7 @@ item = TodoItem(
     parent_id=resolved_parent,
     who=who,
     wd=resolved_wd,
+    worktree=normalize_worktree_name(worktree),
     env=resolved_env,
     command=run_command,
 )
@@ -5109,8 +5185,56 @@ if who:
     typer.echo(f"  Assigned: {who}")
 if resolved_wd:
     typer.echo(f"  WD: {resolved_wd}")
+if item.worktree:
+    typer.echo(f"  Worktree: {item.worktree}")
 if run_command:
     typer.echo(f"  Command: {run_command}")
+@
+
+Let us verify that [[--worktree]] is persisted next to [[wd]], that
+it survives a save/load round trip, and that todo files written before
+the field existed still load with the field unset:
+
+<<test functions>>=
+def test_add_worktree_stores_name(temp_todo_dir):
+    """Add --worktree stores the name and reports it."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Fix bug",
+            "--wd", "project",
+            "--worktree", "fix-42",
+            "--top-level",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Worktree: fix-42" in result.stdout
+    _, todos = load_todos()
+    assert todos[0].wd == os.path.abspath("project")
+    assert todos[0].worktree == "fix-42"
+
+
+def test_add_worktree_rejects_separator(temp_todo_dir):
+    """A worktree name with a slash is refused."""
+    result = runner.invoke(
+        cli,
+        [
+            "add", "-t", "Fix bug",
+            "--worktree", "a/b",
+            "--top-level",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "path separators" in result.output
+
+
+def test_todo_item_without_worktree_key_loads():
+    """Old JSON without a worktree key loads with worktree unset."""
+    item = TodoItem.from_dict({
+        "id": 1, "title": "Old", "wd": "/tmp/project",
+    })
+    assert item.worktree is None
+    assert TodoItem.from_dict(item.to_dict()).worktree is None
 @
 
 \subsubsection{Adding via Editor}
@@ -5181,6 +5305,10 @@ if wd_path:
     initial_meta["wd"] = canonicalize_wd(wd_path)
 elif here:
     initial_meta["wd"] = os.getcwd()
+if worktree:
+    initial_meta["worktree"] = normalize_worktree_name(
+        worktree
+    )
 if run_command:
     initial_meta["command"] = run_command
 @
@@ -5235,6 +5363,9 @@ parent_item = TodoItem(
     who=who or meta.get("who"),
     notes=parsed.notes,
     wd=resolved_wd,
+    worktree=normalize_worktree_name(
+        worktree or meta.get("worktree")
+    ),
     env=resolved_env,
     command=(
         run_command or meta.get("command")
@@ -5368,6 +5499,9 @@ child_deadline = normalize_deadline(
 )
 child_who = child_meta.get("who", parent_who)
 child_wd = canonicalize_wd(child_meta.get("wd"))
+child_worktree = normalize_worktree_name(
+    child_meta.get("worktree")
+)
 child_env = child_meta.get("env", parent_env)
 @
 
@@ -5391,6 +5525,7 @@ child = TodoItem(
     who=child_who,
     notes=parsed_child.notes,
     wd=child_wd,
+    worktree=child_worktree,
     env=child_env,
     command=child_meta.get("command"),
 )
@@ -6457,6 +6592,8 @@ if meta_parts:
     typer.echo("  " + "  ".join(meta_parts))
 if item.wd:
     typer.echo(f"  WD: {item.wd}")
+if item.worktree:
+    typer.echo(f"  Worktree: {item.worktree}")
 if item.command:
     typer.echo(f"  Command: {item.command}")
 if item.github:
@@ -6779,7 +6916,8 @@ the explicit escape hatch.
 Without [[-E]], the command updates individual fields directly.  We
 reuse the same context-capture options as [[add]]: [[--who]] changes
 ownership, [[--wd]] stores an explicit working directory,
-[[--env]] refreshes the stored environment,
+[[--worktree]] stores the git worktree name (an empty string clears
+it), [[--env]] refreshes the stored environment,
 [[--here]] captures the current directory and environment, and
 [[--command]] updates the default command to launch when the task is
 started.  If any of those three remain unset on the item, runtime lookup
@@ -6847,6 +6985,8 @@ def edit(
                    edit_who_opt] = None,
     wd_path: Annotated[str | None,
                        wd_opt] = None,
+    worktree: Annotated[str | None,
+                        worktree_opt] = None,
     capture_env: Annotated[bool, env_opt] = False,
     here: Annotated[bool, here_opt] = False,
     run_command: Annotated[str | None,
@@ -6916,8 +7056,85 @@ else:
         item.wd = canonicalize_wd(wd_path)
     if capture_env:
         item.env = dict(os.environ)
+if worktree is not None:
+    item.worktree = normalize_worktree_name(worktree)
 if run_command is not None:
     item.command = run_command
+@
+
+Editing the worktree must leave [[wd]] and [[env]] alone, and the
+empty string must clear it so a task can go back to running directly
+in [[wd]]:
+
+<<test functions>>=
+def test_edit_worktree_flag_sets_and_clears(temp_todo_dir):
+    """Edit --worktree sets the name; an empty value clears it."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            wd="/tmp/project",
+            env={"PATH": "/usr/local/bin"},
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["edit", "1", "--worktree", "fix-42"],
+    )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].worktree == "fix-42"
+    assert todos[0].wd == "/tmp/project"
+    assert todos[0].env == {"PATH": "/usr/local/bin"}
+
+    result = runner.invoke(
+        cli, ["edit", "1", "--worktree", ""],
+    )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].worktree is None
+
+
+def test_view_shows_worktree(temp_todo_dir):
+    """View lists the worktree next to the working directory."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            wd="/tmp/project", worktree="fix-42",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(cli, ["view", "1"])
+    assert result.exit_code == 0, result.output
+    assert "WD: /tmp/project" in result.stdout
+    assert "Worktree: fix-42" in result.stdout
+
+
+def test_edit_yaml_worktree_round_trips(temp_todo_dir):
+    """The editor shows worktree in front matter and reads it back."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            wd="/tmp/project", worktree="fix-42",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    seen = {}
+
+    def fake_editor(text):
+        seen["text"] = text
+        return text.replace(
+            "worktree: fix-42", "worktree: fix-43",
+        )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+    assert "worktree: fix-42" in seen["text"]
+    _, todos = load_todos()
+    assert todos[0].worktree == "fix-43"
 @
 
 Labels accept three flags whose interaction we resolved earlier:
@@ -7015,6 +7232,10 @@ item.notes = parsed.notes
 meta = parsed.metadata
 if "wd" in meta:
     item.wd = canonicalize_wd(meta["wd"])
+if "worktree" in meta:
+    item.worktree = normalize_worktree_name(
+        meta["worktree"]
+    )
 if "command" in meta:
     item.command = meta["command"]
 if "labels" in meta:
@@ -7161,6 +7382,10 @@ for parsed_child in parsed_children:
         child_meta = parsed_child.metadata
         if "wd" in child_meta:
             child.wd = canonicalize_wd(child_meta["wd"])
+        if "worktree" in child_meta:
+            child.worktree = normalize_worktree_name(
+                child_meta["worktree"]
+            )
         if "command" in child_meta:
             child.command = child_meta["command"]
         if "labels" in child_meta:
@@ -7196,6 +7421,9 @@ for parsed_child in parsed_children:
             who=child_meta.get("who", parent.who),
             notes=parsed_child.notes,
             wd=canonicalize_wd(child_meta.get("wd")),
+            worktree=normalize_worktree_name(
+                child_meta.get("worktree")
+            ),
             command=child_meta.get("command"),
         )
         todos.append(child)
@@ -9954,6 +10182,7 @@ def start(
 
     <<resolve tmux context sync policy>>
     <<auto-activate ancestors>>
+    <<resolve worktree for todo start>>
     <<start tracking via track module>>
 
     typer.echo(
@@ -9986,6 +10215,30 @@ def test_start_ctx_has_no_default():
   assert (
     sig.parameters["ctx"].default is inspect.Parameter.empty
   )
+@
+
+A todo with a worktree---stored on the item or given as the one-off
+[[--worktree]] override---runs in that worktree instead of directly in
+[[wd]].  We create or reuse it \emph{before} tracking starts, for the
+same reason [[track start]] validates [[--wd]] early: a base directory
+outside any git repository must fail before anything is recorded, not
+after a tracking entry has been opened.  The base directory is the
+item's [[wd]] (which may itself come from the worker config) or the
+current directory, exactly as the launch itself would have used.
+Because [[ensure_worktree]] reuses an existing worktree, restarting the
+todo lands in the same checkout with whatever was left there.
+
+<<resolve worktree for todo start>>=
+worktree_dir = None
+worktree_name = worktree or item.worktree
+if worktree_name:
+    try:
+        worktree_dir = ensure_worktree(
+            item.wd or os.getcwd(), worktree_name,
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
 @
 
 Detached tmux cleanup happens after the pane process exits, so it cannot
@@ -10228,6 +10481,18 @@ run: Annotated[str | None,
                command_opt] = None,
 @
 
+Likewise [[--worktree]] overrides the stored worktree name for this
+one start, without editing the item.  This is the one-off counterpart
+of [[todo add --worktree]]: a task normally lives in the same worktree
+across restarts, but sometimes the user wants to try it on a fresh
+checkout, or run a task that has no stored worktree in one just this
+once.
+
+<<start command options>>=
+worktree: Annotated[str | None,
+                    worktree_opt] = None,
+@
+
 For cron and agent workflows, we need a non-interactive mode that
 skips the [[typer.confirm]] prompt after subprocess exit.  In headless
 mode, the logic is: if the subprocess (e.g.\ [[claude]]) already called
@@ -10422,7 +10687,10 @@ fallible auto-suspend lookup earlier keeps it outside that window so a
 failure there cannot leak the file.
 
 <<spawn subprocess when the todo has work to launch>>=
-if item.wd or run or pane or window or item.command:
+if (
+    item.wd or worktree_dir or run or pane or window
+    or item.command
+):
     <<validate tmux options>>
     <<prepare subprocess environment>>
     <<resolve todo auto-suspend>>
@@ -10431,10 +10699,258 @@ if item.wd or run or pane or window or item.command:
     if pane or window:
         <<run in tmux>>
         if block:
+            <<remove worktree after todo run>>
             <<handle subprocess exit>>
     else:
         <<run subprocess>>
+        <<remove worktree after todo run>>
         <<handle subprocess exit>>
+@
+
+A worktree makes the todo launchable on its own, just as a stored
+[[wd]] does; otherwise a todo carrying only a worktree would silently
+start tracking without opening the checkout it was meant to run in.
+
+The worktree cleanup (\cref{track:worktrees}) sits after the run and
+before [[<<handle subprocess exit>>]] in both blocking arms: the exit
+handler may [[return]] early when the item has vanished, and it may
+prompt the user, and neither should stop an untouched worktree from
+being tidied away.  A worktree with work in it is kept, so the next
+[[todo start]] resumes there.
+
+<<remove worktree after todo run>>=
+if worktree_dir:
+    if remove_worktree_if_unchanged(worktree_dir):
+        typer.echo(
+            f"Removed unchanged worktree {worktree_dir}"
+        )
+    else:
+        typer.echo(
+            f"Kept worktree {worktree_dir} (has changes)"
+        )
+@
+
+Let us verify the worktree lifecycle of [[todo start]] against a real
+repository: a stored worktree is created off [[wd]] and the command
+runs inside it; an untouched worktree is removed afterwards while a
+modified one is kept for the next start; the [[--worktree]] flag
+overrides the stored name; a base directory outside git fails before
+tracking starts; and a detached launch hands cleanup to the finalize
+command.  As in the [[track]] tests, git subprocesses run for real
+while the launched command is mocked.
+
+<<test functions>>=
+TEST_GIT_CONFIG = [
+  "-c", "user.name=Test",
+  "-c", "user.email=t@example.com",
+  "-c", "commit.gpgsign=false",
+]
+REAL_SUBPROCESS_RUN = subprocess.run
+
+
+def make_git_repo(path):
+  """Initialise a git repository with one commit at `path`."""
+  path = str(path)
+  os.makedirs(path, exist_ok=True)
+  subprocess.run(["git", "init", "-q", path], check=True)
+  git = ["git", "-C", path] + TEST_GIT_CONFIG
+  with open(os.path.join(path, "README"), "w") as f:
+    f.write("hello\n")
+  subprocess.run(git + ["add", "README"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+  return path
+
+
+def run_only_git(*args, **kwargs):
+  """Forward git subprocesses; mock everything else."""
+  if args and args[0] and args[0][0] == "git":
+    return REAL_SUBPROCESS_RUN(*args, **kwargs)
+  fake = MagicMock()
+  fake.returncode = 0
+  fake.stdout = ""
+  run_only_git.calls.append((args, kwargs))
+  return fake
+
+
+def test_start_uses_stored_worktree(temp_todo_dir, tmp_path):
+  """A stored worktree is created off wd and the command runs there."""
+  repo = make_git_repo(tmp_path / "repo")
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=repo, worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(repo, ".claude", "worktrees", "fix-42")
+  assert len(run_only_git.calls) == 1
+  assert run_only_git.calls[0][1]["cwd"] == expected
+  assert "Removed unchanged worktree" in result.stdout
+  assert not os.path.isdir(expected)
+
+
+def test_start_keeps_and_resumes_changed_worktree(
+  temp_todo_dir, tmp_path,
+):
+  """A modified worktree survives and is reused on restart."""
+  repo = make_git_repo(tmp_path / "repo")
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=repo, worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  expected = os.path.join(repo, ".claude", "worktrees", "fix-42")
+
+  def touch_in_worktree(*args, **kwargs):
+    fake = run_only_git(*args, **kwargs)
+    if args[0][0] != "git":
+      with open(os.path.join(kwargs["cwd"], "wip"), "w") as f:
+        f.write("half done\n")
+    return fake
+
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=touch_in_worktree,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 0, result.output
+  assert "Kept worktree" in result.stdout
+  assert os.path.exists(os.path.join(expected, "wip"))
+
+  # Restarting lands in the same checkout, work still there.
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 0, result.output
+  assert run_only_git.calls[0][1]["cwd"] == expected
+  assert os.path.exists(os.path.join(expected, "wip"))
+
+
+def test_start_worktree_flag_overrides_stored(
+  temp_todo_dir, tmp_path,
+):
+  """--worktree at start time wins over the stored name."""
+  repo = make_git_repo(tmp_path / "repo")
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=repo, worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true",
+            "--worktree", "scratch"],
+    )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(repo, ".claude", "worktrees", "scratch")
+  assert run_only_git.calls[0][1]["cwd"] == expected
+  _, todos = load_todos()
+  assert todos[0].worktree == "fix-42"
+
+
+def test_start_worktree_without_wd_uses_cwd(
+  temp_todo_dir, tmp_path, monkeypatch,
+):
+  """Without wd, the worktree is forked off the current directory."""
+  repo = make_git_repo(tmp_path / "repo")
+  monkeypatch.chdir(repo)
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(
+    os.path.realpath(repo), ".claude", "worktrees", "fix-42",
+  )
+  assert os.path.realpath(
+    run_only_git.calls[0][1]["cwd"]
+  ) == expected
+
+
+def test_start_worktree_outside_git_fails_before_tracking(
+  temp_todo_dir, tmp_path,
+):
+  """A worktree on a non-repository wd fails before tracking starts."""
+  from nytid.cli.track import load_active_session
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=str(tmp_path), worktree="x",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  run_only_git.calls = []
+  with patch(
+    "nytid.cli.todo.subprocess.run", side_effect=run_only_git,
+  ):
+    result = runner.invoke(
+      cli, ["start", "1", "--headless", "--command", "true"],
+    )
+  assert result.exit_code == 1
+  assert "requires a git repository" in result.output
+  assert run_only_git.calls == []
+  assert load_active_session().get_active_labels() == []
+
+
+def test_start_pane_worktree_appends_detached_cleanup(
+  temp_todo_dir, tmp_path,
+):
+  """A detached worktree launch cleans up via the finalize command."""
+  repo = make_git_repo(tmp_path / "repo")
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Fix bug", wd=repo, worktree="fix-42",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  with patch.dict(
+    os.environ, {"TMUX": "session", "SHELL": "/bin/bash"},
+    clear=True,
+  ):
+    with patch(
+      "nytid.cli.todo.run_todo_tmux_command", return_value=0,
+    ) as mock_run, patch(
+      "nytid.cli.track.build_detached_nytid_prefix",
+      return_value="nytid track",
+    ):
+      result = runner.invoke(cli, ["start", "1", "--pane"])
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(repo, ".claude", "worktrees", "fix-42")
+  call_kwargs = mock_run.call_args.kwargs
+  assert call_kwargs["cwd"] == expected
+  on_exit = call_kwargs["on_exit_shell"]
+  assert on_exit.index("_finalize-detached") < on_exit.index(
+    "_cleanup-worktree-detached"
+  )
+  assert shlex.quote(expected) in on_exit
+  assert os.path.isdir(expected)
 @
 
 [[<<handle subprocess exit>>]] is shared by both arms of that branch,
@@ -10452,7 +10968,10 @@ timed_out = False
 Todo launches now follow the same context-building path as track launches.
 We compute the textual todo context once and reuse it both as the prompt
 marker (seeded when we build the shell) and as the tmux window name.  That
-keeps direct shells and [[-W]] windows visually consistent.
+keeps direct shells and [[-W]] windows visually consistent.  The
+working directory prefers the resolved worktree over the stored [[wd]]:
+the worktree was derived from [[wd]] in the first place, so it is the
+more specific answer to \enquote{where does this task run?}.
 
 <<prepare subprocess environment>>=
 from nytid.cli.track import (
@@ -10473,7 +10992,7 @@ if item.env:
 todo_context = build_context_name(
     "todo", [str(todo_id)]
 )
-proc_wd = item.wd or os.getcwd()
+proc_wd = worktree_dir or item.wd or os.getcwd()
 prompt_file = None
 prompt_dir = None
 @
@@ -10534,7 +11053,10 @@ else:
 Tmux gives the subprocess its own terminal while keeping the launch
 under our control.  We reuse the [[track]] module's helper so both
 commands share the same pane startup handshake, exit-status recording,
-and blocking semantics.  For detached todo runs we swap the blocking
+and blocking semantics.  A detached worktree run appends the shared
+worktree cleanup segment (\cref{track:worktrees}) to the finalize
+command, since by the time the pane dies this process is long gone.
+For detached todo runs we swap the blocking
 wait channel for a follow-up shell command that re-enters [[todo]] and
 applies the pending/done cleanup policy after the pane process exits.
 Blocked launches now rejoin the same post-exit path as direct
@@ -10622,6 +11144,11 @@ try:
             todo_id, proc_wd, exit_code_file,
             reassign_to,
         )
+        if worktree_dir:
+            finalize_cmd += \
+                build_detached_worktree_cleanup_command(
+                    worktree_dir
+                )
         run_todo_tmux_command(
             cmd,
             cwd=proc_wd,
@@ -12147,6 +12674,7 @@ def import_github(
     Examples:
       nytid todo import dbosk/prgi24-issues
       nytid todo import dbosk/prgi24-issues --wd ~/courses/DD1310/labs
+      nytid todo import dbosk/nytid -n 42 --wd ~/devel/nytid --worktree fix-42
       nytid todo import dbosk/prgi24-issues --top-level --github-labels
     """
     require_gh()
@@ -12177,6 +12705,7 @@ estimate: Annotated[str | None,
 description: Annotated[str | None,
                        description_opt] = "",
 wd_path: Annotated[str | None, wd_opt] = None,
+worktree: Annotated[str | None, worktree_opt] = None,
 capture_env: Annotated[bool, env_opt] = False,
 here: Annotated[bool, here_opt] = False,
 run_command: Annotated[str | None,
@@ -12396,6 +12925,7 @@ for gh_item in new_items:
         description=description or "",
         parent_id=resolved_parent,
         wd=resolved_wd,
+        worktree=normalize_worktree_name(worktree),
         env=resolved_env,
         command=run_command,
         github={
@@ -12686,6 +13216,39 @@ def test_import_applies_parent_and_wd(temp_todo_dir):
     assert child.env is None
     assert child.deadline == "2026-03-01"
     assert child.labels == ["DD1310", "owner/repo"]
+
+
+def test_import_applies_worktree(temp_todo_dir):
+    """Import stores the worktree name on every imported item."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps([
+        {
+            "number": 2,
+            "title": "Imported",
+            "state": "OPEN",
+            "labels": [],
+            "createdAt": "2026-02-01T00:00:00Z",
+        },
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority",
+                "--top-level",
+                "--wd", "project",
+                "--worktree", "issue-2",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].worktree == "issue-2"
 @
 
 An unranked parent has no child interval yet, so imported children must
@@ -13575,6 +14138,8 @@ import datetime
 import json
 import os
 import pathlib
+import shlex
+import subprocess
 import tempfile
 import pytest
 import typer
@@ -13591,6 +14156,8 @@ from nytid.cli.todo import (
     ParsedItem,
     ParsedTodo,
     canonicalize_wd,
+    normalize_worktree_name,
+    ensure_worktree,
     naive_local_datetime,
     normalize_deadline,
     effective_priority,
