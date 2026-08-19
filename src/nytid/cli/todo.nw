@@ -12745,6 +12745,7 @@ def import_github(
     <<create todos from github items>>
 
     save_todos(next_id, todos)
+    <<report skipped duplicates>>
     typer.echo(f"Imported {imported_count} items.")
 @
 
@@ -12873,10 +12874,26 @@ if item_type in ("all", "pr"):
 @
 
 We skip items that already exist locally by matching on repo,
-type, and number---preventing duplicate imports:
+type, and number---preventing duplicate imports.  The match is on the
+GitHub identity only, never on the local item's placement or status: an
+issue imported a month ago as a forgotten top-level item is still the
+same issue, and importing it again under today's parent would leave two
+local todos claiming the same GitHub number, with [[done]] closing the
+issue from whichever one the user happens to finish first.
+
+Skipping silently, however, turned out to be a trap.  After
+[[import owner/repo -n 127]] printed nothing but
+[[Imported 0 items.]], the user concluded the import was broken, while
+in fact the issue already lived as an unrelated, long-forgotten local
+item.  The information that would have resolved the confusion is the
+local ID: with it, the user can [[todo show]] the existing item or
+[[todo edit N --parent M]] it into place; without it, the only visible
+fact is that nothing happened.  We therefore remember which local item
+each skipped GitHub item collided with, so that the command can report
+the collision below instead of swallowing it.
 
 <<filter already imported>>=
-existing = set()
+existing = {}
 for t in todos:
     if t.github:
         key = (
@@ -12884,16 +12901,19 @@ for t in todos:
             t.github.get("type", "issue"),
             t.github["number"],
         )
-        existing.add(key)
+        existing[key] = t
 
 new_items = []
+skipped_items = []
 for gh_item in gh_items:
     key = (
         repo,
         gh_item["_type"],
         str(gh_item["number"]),
     )
-    if key not in existing:
+    if key in existing:
+        skipped_items.append((gh_item, existing[key]))
+    else:
         new_items.append(gh_item)
 @
 
@@ -13027,6 +13047,51 @@ The footer stays a plain [[typer.echo]].
 It is a sentence rather than a row, and it must still appear when
 [[imported_rows]] is empty, whereas [[print_rows]] deliberately prints
 nothing at all when there is nothing to report.
+
+The skipped items collected by [[<<filter already imported>>]] get the
+same treatment as the imported ones: a table of the same four columns,
+except that the first column now holds the ID of the local item that
+already carries the GitHub number---that ID is the whole point of the
+report.  The table is preceded by its own heading line so that a
+receipt listing both imported and skipped items does not read as one
+long list, and it is followed by a footer of its own for the same
+reason the import footer exists: it must still say something when the
+table is empty of imports but full of skips.
+
+When the user named one specific item with [[--number]] and it was
+skipped, we know exactly what they were trying to achieve---get that
+one issue into their list, usually under the current parent---so we
+add the one-line hint that does it.  For a batch import without
+[[--number]], a long list of skips is the expected steady state of
+re-running the import to pick up new issues, and the hint would be
+noise.
+
+<<report skipped duplicates>>=
+if skipped_items:
+    typer.echo("Already imported (skipped):")
+    print_rows(
+        ["Local", "Title", "Type", "GH #"],
+        [
+            (
+                f"#{local.id}",
+                local.title,
+                gh_item["_type"],
+                f"#{gh_item['number']}",
+            )
+            for gh_item, local in skipped_items
+        ],
+    )
+    typer.echo(
+        f"Skipped {len(skipped_items)} already imported."
+    )
+    if number is not None:
+        local = skipped_items[0][1]
+        typer.echo(
+            f"Hint: use 'nytid todo edit {local.id} "
+            f"--parent <id>' to move it, "
+            f"or 'nytid todo show {local.id}' to inspect it."
+        )
+@
 
 Unlike its sibling modules, this one keeps every import in the module
 chunk of \cref{sec:todo-code-outline} rather than in a bucket chunk
@@ -13171,11 +13236,63 @@ def test_import_skips_duplicates(temp_todo_dir):
             ],
         )
         assert result.exit_code == 0
-        assert "1 items" in result.output
+        assert "Imported 1 items" in result.output
+        assert "Skipped 1 already imported" in result.output
+        assert "#1" in result.output
+        assert "Hint:" not in result.output
         _, todos = load_todos()
         assert len(todos) == 2
         assert todos[1].title == "New issue"
         assert todos[1].github["number"] == "2"
+@
+
+When the user asks for one specific issue that is already present, the
+output must name the local item and offer the reparenting hint, since
+that is the situation that prompted the report in the first place:
+
+<<test functions>>=
+def test_import_number_already_imported_reports_local_id(
+    temp_todo_dir,
+):
+    """-n on an already imported issue names the local item."""
+    save_todos(6, [
+        TodoItem(
+            id=5, title="Old import",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "7",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps({
+        "title": "Old import",
+        "state": "OPEN",
+        "labels": [],
+        "body": "",
+        "url": "https://github.com/owner/repo/issues/7",
+    })
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "-n", "7", "--skip-priority",
+            ],
+        )
+    assert result.exit_code == 0
+    assert "Imported 0 items" in result.output
+    assert "#5" in result.output
+    assert "Skipped 1 already imported" in result.output
+    assert "todo edit 5 --parent" in result.output
+    _, todos = load_todos()
+    assert len(todos) == 1
 @
 
 Using [[--number]] bypasses the list API and calls the view
