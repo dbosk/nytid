@@ -2675,7 +2675,8 @@ the primary context indicator for pane and window launches.
 
 <<prepare launch mode>>=
 launch_requested = (
-    command_args is not None or pane or window or bool(wd_path)
+    command_args is not None or pane or window
+    or bool(wd_path) or bool(worktree)
 )
 tracking_labels = list(labels)
 explicit_launch_labels = list(tracking_labels)
@@ -2685,6 +2686,7 @@ launch_owned_labels = list(tracking_labels)
 launch_cleanup_labels = list(tracking_labels)
 proc_env = None
 proc_cwd = os.getcwd()
+worktree_dir = None
 prompt_file = None
 prompt_dir = None
 launch_context = None
@@ -2723,6 +2725,7 @@ if launch_requested:
 
     <<resolve working directory>>
     proc_cwd = wd_path if wd_path else proc_cwd
+    <<fork the launch into a worktree>>
     proc_env = os.environ.copy()
 
     if inherit_labels:
@@ -3298,6 +3301,188 @@ def test_start_wd_only_seeds_single_prompt_prefix(
   assert result.exit_code == 0
   env = mock_run.call_args.kwargs["env"]
   assert env["PS1"] == "track:work \\w\\n$ "
+@
+
+\subsubsection{Git Worktree}
+
+The [[--worktree]] option (\cref{track:worktrees}) refines [[--wd]]:
+the launch still starts from the [[--wd]] directory (or the current
+one), but runs in the named worktree of the repository containing it.
+Like a bare [[--wd]], a bare [[--worktree]] launches a tracked shell in
+the current terminal---the user wants to \emph{be} in the worktree, and
+a subshell is the only way to put them there.
+
+<<start command options>>=
+worktree: Annotated[str | None, worktree_opt] = None,
+@
+
+<<start command docstring examples>>=
+nytid track start fix-42 -C ~/devel/nytid --worktree fix-42 -- claude
+nytid track start fix-42 --worktree fix-42       # tracked shell there
+@
+
+The worktree is created (or reused) before tracking starts, right
+after the [[--wd]] validation, so that a directory outside any
+repository fails as cleanly as a nonexistent one.  We remember the
+worktree directory separately from [[proc_cwd]]; the launch code
+treats [[proc_cwd]] like any other working directory, and only the
+cleanup step needs to know that it was a worktree.  The launch lands
+in the same \emph{relative} place inside the worktree as [[--wd]]
+was inside the repository (\cref{track:worktrees}), so
+[[-C repo/src --worktree x]] runs in [[.../worktrees/x/src]] just as
+the same command without [[--worktree]] runs in [[repo/src]].
+
+<<fork the launch into a worktree>>=
+if worktree:
+    try:
+        worktree_dir = ensure_worktree(proc_cwd, worktree)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    proc_cwd = worktree_launch_dir(proc_cwd, worktree_dir)
+@
+
+Let us verify that a bare [[--worktree]] launches the shell inside a
+freshly created worktree, and that the unchanged worktree is removed
+again once the shell exits.  The shell must not really run, but git
+must, so the patched [[subprocess.run]] forwards [[git]] invocations to
+the real function and mocks everything else.
+
+<<test functions>>=
+def run_only_git(*args, **kwargs):
+  """Forward git subprocesses; mock everything else."""
+  from unittest.mock import MagicMock
+  if args and args[0] and args[0][0] == "git":
+    return REAL_SUBPROCESS_RUN(*args, **kwargs)
+  fake = MagicMock()
+  fake.returncode = 0
+  run_only_git.calls.append((args, kwargs))
+  return fake
+
+
+def test_start_worktree_alone_spawns_shell_in_worktree(
+  temp_tracking_dir, tmp_path,
+):
+  """--worktree alone opens a tracked shell in the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  run_only_git.calls = []
+  with patch.dict(
+    os.environ, {"SHELL": "/bin/bash"},
+  ):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+      side_effect=run_only_git,
+    ):
+      result = runner.invoke(
+        cli,
+        ["start", "work", "-C", repo, "--worktree", "x"],
+      )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(repo, ".claude", "worktrees", "x")
+  assert expected in result.stdout
+  assert len(run_only_git.calls) == 1
+  args, kwargs = run_only_git.calls[0]
+  assert kwargs["cwd"] == expected
+  assert args[0][0] == "/bin/bash"
+  # Nothing changed in the worktree, so it is removed again.
+  assert not os.path.isdir(expected)
+  assert "Removed unchanged worktree" in result.stdout
+
+
+def test_start_worktree_without_wd_uses_cwd(
+  temp_tracking_dir, tmp_path, monkeypatch,
+):
+  """Without --wd the worktree is forked off the current directory."""
+  repo = make_git_repo(tmp_path / "repo")
+  monkeypatch.chdir(repo)
+  run_only_git.calls = []
+  with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+      side_effect=run_only_git,
+    ):
+      result = runner.invoke(
+        cli, ["start", "work", "--worktree", "x"],
+      )
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(
+    os.path.realpath(repo), ".claude", "worktrees", "x",
+  )
+  assert os.path.realpath(
+    run_only_git.calls[0][1]["cwd"]
+  ) == expected
+
+
+def test_start_worktree_kept_when_changed(
+  temp_tracking_dir, tmp_path,
+):
+  """A worktree the command modified survives the exit."""
+  repo = make_git_repo(tmp_path / "repo")
+  expected = os.path.join(repo, ".claude", "worktrees", "x")
+
+  def touch_in_worktree(*args, **kwargs):
+    fake = run_only_git(*args, **kwargs)
+    if args[0][0] != "git":
+      with open(os.path.join(kwargs["cwd"], "new"), "w") as f:
+        f.write("x\n")
+    return fake
+
+  run_only_git.calls = []
+  with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+      side_effect=touch_in_worktree,
+    ):
+      result = runner.invoke(
+        cli,
+        ["start", "work", "-C", repo, "--worktree", "x"],
+      )
+  assert result.exit_code == 0, result.output
+  assert os.path.isdir(expected)
+  assert "Kept worktree" in result.stdout
+
+
+def test_start_worktree_reuses_existing(
+  temp_tracking_dir, tmp_path,
+):
+  """Restarting with the same name lands in the existing worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "x")
+  marker = os.path.join(wt, "in-progress")
+  with open(marker, "w") as f:
+    f.write("resume me\n")
+  run_only_git.calls = []
+  with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+    with patch(
+      "nytid.cli.track.subprocess.run",
+      side_effect=run_only_git,
+    ):
+      result = runner.invoke(
+        cli,
+        ["start", "work", "-C", repo, "--worktree", "x"],
+      )
+  assert result.exit_code == 0, result.output
+  assert run_only_git.calls[0][1]["cwd"] == wt
+  assert os.path.exists(marker)
+
+
+def test_start_worktree_non_git_errors_before_launch(
+  temp_tracking_dir, tmp_path,
+):
+  """--worktree outside a repository fails before launching."""
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=run_only_git,
+  ):
+    run_only_git.calls = []
+    result = runner.invoke(
+      cli,
+      ["start", "work", "-C", str(tmp_path), "--worktree", "x"],
+    )
+  assert result.exit_code == 1
+  assert "requires a git repository" in result.output
+  assert run_only_git.calls == []
+  assert load_active_session().get_active_labels() == []
 @
 
 \subsubsection{Calculating Start Time}
@@ -4898,6 +5083,636 @@ auto_suspend_opt = typer.Option(
          "then track.auto-suspend.default, "
          "then true.",
 )
+@
+
+\subsubsection{Git Worktrees}
+\label{track:worktrees}
+
+The [[--wd]] option decides \emph{where} a launched command runs.  When
+that directory is a git repository, the natural next question is
+\emph{on what checkout}: an agent asked to fix a bug, or a grading
+session that edits a lab skeleton, should not scribble on the branch the
+teacher has checked out in the main working tree.  Git worktrees give
+each such session its own checkout of the same repository, so the
+[[--worktree]] option complements [[--wd]]: the base directory is still
+[[--wd]] (or the current directory when [[--wd]] is absent), but the
+launch is forked off into a worktree of the repository containing that
+base directory.
+
+We mirror the layout of [[claude --worktree]] exactly---the worktree
+lives at [[<repo>/.claude/worktrees/<name>]] on a branch named
+[[worktree-<name>]]---rather than inventing a nytid-specific one.  The
+two tools then interoperate: a todo whose command is [[claude]] lands in
+a checkout that Claude Code recognises as one of its own worktrees, and
+a worktree left behind by either tool is picked up by the other.  The
+repository root comes from [[git rev-parse --show-toplevel]] of the base
+directory, not from [[--git-common-dir]]: if the base directory is
+itself a worktree we nest under it, which is what a user who deliberately
+launched from a worktree would expect.
+
+<<argument and option definitions>>=
+worktree_opt = typer.Option(
+    "--worktree",
+    help="Run in git worktree NAME "
+         "(<repo>/.claude/worktrees/NAME on "
+         "branch worktree-NAME) of the repo "
+         "containing --wd or the current "
+         "directory; removed on exit if "
+         "left unchanged",
+)
+@
+
+Only the long form exists: [[-w]] already means [[--who]] and [[-W]]
+means [[--window]] on the same commands.
+
+Every git question below is a subprocess call.  We keep the wrapper
+minimal---capture output, never raise---and let each caller decide what
+a failure means, because the same command (\enquote{is this a
+repository?}) is an error at launch time but merely \enquote{nothing to
+clean up} at exit time.  A missing [[git]] binary is treated like any
+other failure so the callers need only one branch.
+
+<<helper functions>>=
+def run_git(*args, cwd=None):
+    """Run `git ARGS` in `cwd`; return the CompletedProcess or None.
+
+    Returns None when git cannot be executed at all.  A non-zero
+    exit is returned as-is so callers can inspect stderr.
+    """
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+@
+
+The worktree name is a user-supplied string that we join onto a path
+and onto a branch name, so it must not contain path separators (which
+would escape [[.claude/worktrees/]]) and it must not be empty.  We
+validate it once here and every entry point---[[track start]], and the
+[[todo]] commands that persist the name---calls this instead of
+re-checking.
+
+<<helper functions>>=
+def validate_worktree_name(name):
+    """Return `name` if it is a usable worktree name.
+
+    Raises ValueError for empty names or names containing a path
+    separator, which would escape the worktrees directory.
+    """
+    if not name or not name.strip():
+        raise ValueError("worktree name must not be empty")
+    if os.sep in name or (os.altsep and os.altsep in name):
+        raise ValueError(
+            f"worktree name must not contain "
+            f"path separators: {name!r}"
+        )
+    return name.strip()
+@
+
+The path and branch conventions live in one function so that creation
+and cleanup cannot drift apart.
+
+<<constants>>=
+WORKTREES_SUBDIR = os.path.join(".claude", "worktrees")
+WORKTREE_BRANCH_PREFIX = "worktree-"
+<<helper functions>>=
+def worktree_location(toplevel, name):
+    """Return `(worktree_dir, branch)` for `name` under `toplevel`."""
+    return (
+        os.path.join(toplevel, WORKTREES_SUBDIR, name),
+        f"{WORKTREE_BRANCH_PREFIX}{name}",
+    )
+@
+
+Creating the worktree has to be idempotent, because [[todo start]]
+runs it every time a todo with a stored worktree is (re)started, and
+because a previous session may have kept the worktree (it had changes)
+or removed the directory but kept the branch (the user ran
+[[git worktree remove]] by hand).  Reuse is the whole point: a task
+that was interrupted must be restartable and resume exactly where it
+left off, so an existing worktree is never recreated or reset.  We
+therefore distinguish three states.  If the directory is already a
+checkout whose toplevel is itself, we simply reuse it.  Otherwise, if
+the branch exists we attach a new worktree to that branch, so the
+user's earlier commits are what they land on; only when neither exists
+do we create the branch from the repository's current [[HEAD]].  A
+directory that exists but is not a worktree is an error rather than
+something to overwrite: it is either the user's data or a broken
+checkout, and both deserve a look.
+
+The directory-gone case has a trap: git remembers every worktree it
+added, and refuses to add one at a path it still has on record as
+\enquote{missing but registered}.  A [[git worktree remove]] clears
+that record, but an [[rm -rf]]---a tmp cleaner, an interrupted removal,
+a user tidying by hand---does not.  We therefore run
+[[git worktree prune]] before adding; it drops only records whose
+directory is gone, so live worktrees are untouched, and it makes the
+restart succeed instead of demanding that the user know about
+[[prune]].
+
+<<helper functions>>=
+def ensure_worktree(base_dir, name):
+    """Create or reuse worktree `name` for the repo containing `base_dir`.
+
+    Returns the worktree directory.  Raises ValueError with a
+    user-facing message when `base_dir` is not inside a git
+    repository or git refuses to create the worktree.
+    """
+    name = validate_worktree_name(name)
+    <<resolve the repository toplevel>>
+    worktree_dir, branch = worktree_location(toplevel, name)
+    <<reuse an existing worktree checkout>>
+    <<attach or create the worktree branch>>
+    return worktree_dir
+@
+
+<<resolve the repository toplevel>>=
+result = run_git(
+    "rev-parse", "--show-toplevel", cwd=base_dir,
+)
+if result is None or result.returncode != 0:
+    raise ValueError(
+        f"--worktree requires a git repository, "
+        f"but {base_dir} is not inside one"
+    )
+toplevel = result.stdout.strip()
+@
+
+We compare real paths because git prints the toplevel with symlinks
+resolved, while [[worktree_dir]] was built from whatever the user
+typed for [[--wd]].
+
+<<reuse an existing worktree checkout>>=
+if os.path.isdir(worktree_dir):
+    probe = run_git(
+        "rev-parse", "--show-toplevel", cwd=worktree_dir,
+    )
+    if (
+        probe is not None and probe.returncode == 0
+        and os.path.realpath(probe.stdout.strip())
+        == os.path.realpath(worktree_dir)
+    ):
+        return worktree_dir
+    raise ValueError(
+        f"{worktree_dir} exists but is not a git worktree"
+    )
+@
+
+<<attach or create the worktree branch>>=
+run_git("worktree", "prune", cwd=toplevel)
+os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+branch_exists = run_git(
+    "rev-parse", "--verify", "--quiet",
+    f"refs/heads/{branch}", cwd=toplevel,
+)
+if branch_exists is not None and branch_exists.returncode == 0:
+    add_args = ["worktree", "add", worktree_dir, branch]
+else:
+    add_args = ["worktree", "add", "-b", branch, worktree_dir]
+added = run_git(*add_args, cwd=toplevel)
+if added is None or added.returncode != 0:
+    detail = (added.stderr.strip() if added else "git not found")
+    raise ValueError(
+        f"could not create worktree {worktree_dir}: {detail}"
+    )
+@
+
+Let us verify the three creation states against a real repository.  Git
+is a hard requirement of the feature, so the tests use it directly
+rather than mocking; a scratch repository with one commit is enough.
+The commits are made with an explicit identity and with signing turned
+off, so the tests do not depend on the developer's global git
+configuration.
+
+<<test functions>>=
+TEST_GIT_CONFIG = [
+  "-c", "user.name=Test",
+  "-c", "user.email=t@example.com",
+  "-c", "commit.gpgsign=false",
+]
+
+
+def make_git_repo(path):
+  """Initialise a git repository with one commit at `path`."""
+  path = str(path)
+  os.makedirs(path, exist_ok=True)
+  subprocess.run(["git", "init", "-q", path], check=True)
+  git = ["git", "-C", path] + TEST_GIT_CONFIG
+  with open(os.path.join(path, "README"), "w") as f:
+    f.write("hello\n")
+  subprocess.run(git + ["add", "README"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+  return path
+
+
+def test_ensure_worktree_creates_dir_and_branch(tmp_path):
+  """A fresh name creates .claude/worktrees/NAME on worktree-NAME."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  assert wt == os.path.join(repo, ".claude", "worktrees", "feat")
+  assert os.path.isdir(wt)
+  branch = subprocess.run(
+    ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+    capture_output=True, text=True, check=True,
+  ).stdout.strip()
+  assert branch == "worktree-feat"
+
+
+def test_ensure_worktree_reuses_existing(tmp_path):
+  """Calling twice returns the same worktree without error."""
+  repo = make_git_repo(tmp_path / "repo")
+  first = ensure_worktree(repo, "feat")
+  second = ensure_worktree(repo, "feat")
+  assert first == second
+
+
+def test_ensure_worktree_reattaches_existing_branch(tmp_path):
+  """A surviving branch is reused when the directory is gone."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  subprocess.run(
+    ["git", "-C", repo, "worktree", "remove", wt], check=True,
+  )
+  assert not os.path.isdir(wt)
+  wt2 = ensure_worktree(repo, "feat")
+  assert wt2 == wt and os.path.isdir(wt2)
+  branches = subprocess.run(
+    ["git", "-C", repo, "branch", "--list", "worktree-feat"],
+    capture_output=True, text=True, check=True,
+  ).stdout
+  assert branches.count("worktree-feat") == 1
+
+
+def test_ensure_worktree_survives_rm_rf(tmp_path):
+  """A worktree deleted with rm -rf is recreated on the old branch."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  shutil.rmtree(wt)
+  wt2 = ensure_worktree(repo, "feat")
+  assert wt2 == wt and os.path.isdir(wt2)
+
+
+def test_ensure_worktree_from_subdirectory(tmp_path):
+  """The base directory may be anywhere inside the repository."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "src", "deep")
+  os.makedirs(sub)
+  wt = ensure_worktree(sub, "feat")
+  assert wt == os.path.join(repo, ".claude", "worktrees", "feat")
+
+
+def test_ensure_worktree_rejects_non_git_dir(tmp_path):
+  """Outside a repository we refuse with a clear message."""
+  with pytest.raises(ValueError, match="not inside one"):
+    ensure_worktree(str(tmp_path), "feat")
+
+
+def test_ensure_worktree_rejects_bad_names(tmp_path):
+  """Empty names and path separators are rejected."""
+  repo = make_git_repo(tmp_path / "repo")
+  with pytest.raises(ValueError):
+    ensure_worktree(repo, "")
+  with pytest.raises(ValueError):
+    ensure_worktree(repo, "a/b")
+
+
+def test_ensure_worktree_rejects_foreign_directory(tmp_path):
+  """A plain directory at the worktree path is not overwritten."""
+  repo = make_git_repo(tmp_path / "repo")
+  foreign = os.path.join(repo, ".claude", "worktrees", "feat")
+  os.makedirs(foreign)
+  with pytest.raises(ValueError, match="not a git worktree"):
+    ensure_worktree(repo, "feat")
+@
+
+\paragraph{Where in the worktree.}
+[[--wd]] may point below the repository root, and without
+[[--worktree]] the launch would run exactly there.  Dropping the user
+at the worktree root instead would make [[--worktree]] change the
+working directory in a way that has nothing to do with worktrees, so
+we carry the relative path over.  If that subdirectory does not exist
+in the checkout (the branch predates it), the worktree root is the
+only sensible fallback.
+
+<<helper functions>>=
+def worktree_launch_dir(base_dir, worktree_dir):
+    """Return the directory inside `worktree_dir` matching `base_dir`.
+
+    `base_dir` is where the launch would have run without a
+    worktree; its path relative to the repository toplevel is
+    reapplied inside the worktree, falling back to the worktree
+    root when that subdirectory does not exist there.
+    """
+    toplevel = run_git(
+        "rev-parse", "--show-toplevel", cwd=base_dir,
+    )
+    if toplevel is None or toplevel.returncode != 0:
+        return worktree_dir
+    rel = os.path.relpath(
+        os.path.realpath(base_dir),
+        os.path.realpath(toplevel.stdout.strip()),
+    )
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return worktree_dir
+    candidate = os.path.join(worktree_dir, rel)
+    if os.path.isdir(candidate):
+        return candidate
+    return worktree_dir
+@
+
+<<test functions>>=
+def test_worktree_launch_dir_keeps_subdirectory(tmp_path):
+  """A --wd below the toplevel maps to the same place in the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "src", "deep")
+  os.makedirs(sub)
+  git = ["git", "-C", repo] + TEST_GIT_CONFIG
+  with open(os.path.join(sub, "f"), "w") as f:
+    f.write("x\n")
+  subprocess.run(git + ["add", "src"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "sub"], check=True)
+  wt = ensure_worktree(sub, "feat")
+  assert worktree_launch_dir(sub, wt) == os.path.join(
+    wt, "src", "deep",
+  )
+  assert worktree_launch_dir(repo, wt) == wt
+
+
+def test_worktree_launch_dir_falls_back_to_root(tmp_path):
+  """A subdirectory absent from the checkout maps to the root."""
+  repo = make_git_repo(tmp_path / "repo")
+  sub = os.path.join(repo, "untracked-dir")
+  os.makedirs(sub)
+  wt = ensure_worktree(sub, "feat")
+  assert worktree_launch_dir(sub, wt) == wt
+@
+
+\paragraph{Cleaning up.}
+A worktree that the session never touched is clutter: an untracked
+directory in the main checkout and a branch that points at the same
+commit as where it started.  We remove it automatically---but only
+then.  \enquote{Unchanged} means two things at once: the working tree
+is clean ([[git status --porcelain]] prints nothing---untracked
+\emph{and ignored} files included, since [[git worktree remove]] would
+delete an ignored [[.env]] or agent scratch file without a word), and
+the branch has no commits of its own, i.e.\ every commit reachable
+from it is also reachable from some other branch.  Either
+condition alone is not enough: a clean tree may sit on top of committed
+work, and an unchanged branch may carry uncommitted edits.  When both
+hold, removing the worktree and deleting the branch loses nothing that
+[[HEAD]] of some other branch does not still have.
+
+We ask git for the commits reachable from our branch but from no other
+branch ([[--not --branches]] with our own branch excluded; the
+[[--exclude]] glob is matched against the short name, without
+[[refs/heads/]]) rather than comparing against a recorded base commit:
+nothing has to be persisted between launch and cleanup, which matters
+for the detached tmux path where cleanup runs in a fresh process.
+
+<<helper functions>>=
+def worktree_is_unchanged(worktree_dir):
+    """Return whether `worktree_dir` is clean and has no own commits."""
+    status = run_git(
+        "status", "--porcelain", "--ignored=traditional",
+        cwd=worktree_dir,
+    )
+    if status is None or status.returncode != 0:
+        return False
+    if status.stdout.strip():
+        return False
+    branch = run_git(
+        "rev-parse", "--abbrev-ref", "HEAD", cwd=worktree_dir,
+    )
+    if branch is None or branch.returncode != 0:
+        return False
+    branch = branch.stdout.strip()
+    own = run_git(
+        "rev-list", "--count", branch,
+        "--not", f"--exclude={branch}", "--branches",
+        cwd=worktree_dir,
+    )
+    if own is None or own.returncode != 0:
+        return False
+    return own.stdout.strip() == "0"
+@
+
+Cleanup must never disturb the tracking bookkeeping that follows it,
+so this helper swallows every failure and merely reports whether the
+worktree went away.  The [[git worktree remove]] must run from the
+main checkout, not from inside the directory being removed, so we
+locate the main repository through [[--git-common-dir]] (made absolute
+against the worktree, since git may print it relative to its cwd).  A
+worktree that has already vanished (the user removed it during the
+session) counts as nothing to do.  Branch deletion uses [[-D]] because
+our own check has already established the branch is fully merged;
+git's [[-d]] would compare against the current [[HEAD]] only and refuse
+in perfectly safe situations.
+
+<<helper functions>>=
+def remove_worktree_if_unchanged(worktree_dir):
+    """Remove `worktree_dir` and its branch if nothing changed.
+
+    Returns True if the worktree was removed.  Never raises;
+    a worktree with changes, or one that is already gone, is
+    left alone and False is returned.
+    """
+    if not os.path.isdir(worktree_dir):
+        return False
+    if not worktree_is_unchanged(worktree_dir):
+        return False
+    branch = run_git(
+        "rev-parse", "--abbrev-ref", "HEAD", cwd=worktree_dir,
+    )
+    toplevel = run_git(
+        "rev-parse", "--git-common-dir", cwd=worktree_dir,
+    )
+    if (
+        branch is None or branch.returncode != 0
+        or toplevel is None or toplevel.returncode != 0
+    ):
+        return False
+    branch = branch.stdout.strip()
+    common = toplevel.stdout.strip()
+    if not os.path.isabs(common):
+        common = os.path.join(worktree_dir, common)
+    common = os.path.dirname(os.path.abspath(common))
+    removed = run_git(
+        "worktree", "remove", worktree_dir, cwd=common,
+    )
+    if removed is None or removed.returncode != 0:
+        return False
+    run_git("branch", "-D", branch, cwd=common)
+    return True
+@
+
+Both [[track start]] and [[todo start]] end a worktree launch by
+calling this and telling the user what happened.  The wording matters,
+because there are three different situations and the user's next move
+differs: a removed worktree must not be looked for, a kept one must be
+returned to, and one that could not be examined (already gone, or git
+failed) is worth a glance.  We keep the message in one helper so both
+commands say the same thing.
+
+<<helper functions>>=
+def report_worktree_cleanup(worktree_dir):
+    """Remove `worktree_dir` if unchanged and describe the outcome."""
+    if not os.path.isdir(worktree_dir):
+        typer.echo(
+            f"Worktree {worktree_dir} is already gone"
+        )
+        return
+    if remove_worktree_if_unchanged(worktree_dir):
+        typer.echo(
+            f"Removed unchanged worktree {worktree_dir}"
+        )
+    elif worktree_is_unchanged(worktree_dir):
+        typer.echo(
+            f"Could not remove worktree {worktree_dir}",
+            err=True,
+        )
+    else:
+        typer.echo(
+            f"Kept worktree {worktree_dir} (has changes)"
+        )
+@
+
+<<test functions>>=
+def test_report_worktree_cleanup_messages(tmp_path):
+  """The three outcomes get three different messages."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  with open(os.path.join(wt, "x"), "w") as f:
+    f.write("x\n")
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "Kept worktree" in echo.call_args.args[0]
+  os.remove(os.path.join(wt, "x"))
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "Removed unchanged" in echo.call_args.args[0]
+  with patch("nytid.cli.track.typer.echo") as echo:
+    report_worktree_cleanup(wt)
+  assert "already gone" in echo.call_args.args[0]
+
+
+def test_remove_worktree_removes_unchanged(tmp_path):
+  """A clean worktree with no own commits is removed with its branch."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  assert remove_worktree_if_unchanged(wt) is True
+  assert not os.path.isdir(wt)
+  branches = subprocess.run(
+    ["git", "-C", repo, "branch", "--list", "worktree-feat"],
+    capture_output=True, text=True, check=True,
+  ).stdout
+  assert "worktree-feat" not in branches
+
+
+def test_remove_worktree_keeps_dirty(tmp_path):
+  """Uncommitted changes keep the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  with open(os.path.join(wt, "new.txt"), "w") as f:
+    f.write("x\n")
+  assert remove_worktree_if_unchanged(wt) is False
+  assert os.path.isdir(wt)
+
+
+def test_remove_worktree_keeps_ignored_files(tmp_path):
+  """Even gitignored files count as changes worth keeping."""
+  repo = make_git_repo(tmp_path / "repo")
+  with open(os.path.join(repo, ".gitignore"), "w") as f:
+    f.write("*.log\n")
+  git = ["git", "-C", repo] + TEST_GIT_CONFIG
+  subprocess.run(git + ["add", ".gitignore"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "ignore"], check=True)
+  wt = ensure_worktree(repo, "feat")
+  with open(os.path.join(wt, "agent.log"), "w") as f:
+    f.write("state\n")
+  assert remove_worktree_if_unchanged(wt) is False
+  assert os.path.isdir(wt)
+
+
+def test_remove_worktree_keeps_committed(tmp_path):
+  """Commits unique to the branch keep the worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  git = ["git", "-C", wt] + TEST_GIT_CONFIG
+  with open(os.path.join(wt, "new.txt"), "w") as f:
+    f.write("x\n")
+  subprocess.run(git + ["add", "new.txt"], check=True)
+  subprocess.run(git + ["commit", "-q", "-m", "work"], check=True)
+  assert remove_worktree_if_unchanged(wt) is False
+  assert os.path.isdir(wt)
+
+
+def test_remove_worktree_missing_is_noop(tmp_path):
+  """A directory that no longer exists is simply reported as kept."""
+  assert remove_worktree_if_unchanged(
+    str(tmp_path / "nowhere")
+  ) is False
+@
+
+For a detached tmux launch the process that created the worktree has
+long since exited when the pane dies, so the cleanup has to travel
+through the finalize shell string like the rest of detached cleanup
+(\cref{track:detached-launch-dir}).  We expose it as a hidden command
+and a builder that returns the shell segment to append.  The builder
+returns the segment with its leading semicolon so callers can append it
+verbatim; [[todo]] reuses both, which keeps worktree cleanup a single
+implementation for both modules.
+
+<<argument and option definitions>>=
+worktree_path_arg = typer.Argument(
+    help="Worktree directory to clean up (internal use)",
+)
+<<detached finalize command>>=
+@cli.command(
+    name="_cleanup-worktree-detached", hidden=True
+)
+def cleanup_worktree_detached(
+    worktree_dir: Annotated[str, worktree_path_arg],
+):
+    """Remove a launch worktree if it is unchanged (detached)."""
+    remove_worktree_if_unchanged(worktree_dir)
+<<helper functions>>=
+def build_detached_worktree_cleanup_command(worktree_dir):
+    """Return `; nytid track _cleanup-worktree-detached DIR`."""
+    prefix = build_detached_nytid_prefix()
+    return (
+        f"; {prefix} _cleanup-worktree-detached "
+        f"{shlex.quote(worktree_dir)}"
+    )
+@
+
+<<test functions>>=
+def test_detached_worktree_cleanup_command_quotes_path():
+  """The detached cleanup segment names the hidden command and path."""
+  with patch(
+    "nytid.cli.track.build_detached_nytid_prefix",
+    return_value="nytid track",
+  ):
+    cmd = build_detached_worktree_cleanup_command(
+      "/tmp/my repo/.claude/worktrees/x"
+    )
+  assert cmd.startswith("; nytid track _cleanup-worktree-detached ")
+  assert "'/tmp/my repo/.claude/worktrees/x'" in cmd
+
+
+def test_cleanup_worktree_detached_command_removes(tmp_path):
+  """The hidden command removes an unchanged worktree."""
+  repo = make_git_repo(tmp_path / "repo")
+  wt = ensure_worktree(repo, "feat")
+  result = runner.invoke(
+    cli, ["_cleanup-worktree-detached", wt],
+  )
+  assert result.exit_code == 0
+  assert not os.path.isdir(wt)
 @
 
 Several options ([[--timeout]], [[--duration]], [[--estimate]]) accept
@@ -9311,7 +10126,19 @@ if launch_requested:
     <<stop launched labels>>
     <<unregister launched labels from tracked tmux context>>
     <<report launch result>>
+    <<remove the launch worktree if unchanged>>
     raise typer.Exit(exit_code)
+@
+
+A worktree launch ends with the cleanup rule of \cref{track:worktrees}:
+an untouched worktree disappears again, one with work in it stays, and
+[[report_worktree_cleanup]] says which.  The cleanup runs after the
+tracking bookkeeping so that a slow or failing git cannot delay the
+stop.
+
+<<remove the launch worktree if unchanged>>=
+if worktree_dir:
+    report_worktree_cleanup(worktree_dir)
 @
 
 We tell the user where the launch went, and the four destinations are
@@ -9424,7 +10251,9 @@ launch that has already finished.
 
 The ordering inside the finalize command matters: the directory must go
 last, after the tracking state has been updated, since removing it is
-what closes the launch.
+what closes the launch.  A worktree launch slots its cleanup segment
+(\cref{track:worktrees}) between the two, after tracking has stopped
+and before the launch is closed.
 
 <<set up non-blocking tmux launch>>=
 launch_state_dir = tempfile.mkdtemp(
@@ -9437,6 +10266,11 @@ finalize_cmd = \
     build_detached_track_finalize_command(
         launch_cleanup_labels, who
     )
+if worktree_dir:
+    finalize_cmd += \
+        build_detached_worktree_cleanup_command(
+            worktree_dir
+        )
 finalize_cmd += (
     f"; rm -rf {shlex.quote(launch_state_dir)}"
 )
@@ -9455,6 +10289,46 @@ run_tmux_command(
     auto_suspend=use_auto_suspend,
 )
 exit_code = None
+@
+
+The detached case cannot remove the worktree from this process, so the
+finalize string must carry the cleanup and it must sit between the
+tracking stop and the state-directory removal.
+
+<<test functions>>=
+def test_start_worktree_detached_appends_cleanup(
+  temp_tracking_dir, tmp_path,
+):
+  """A detached worktree launch cleans up via the finalize command."""
+  repo = make_git_repo(tmp_path / "repo")
+  with patch.dict(
+    os.environ,
+    {"TMUX": "session", "SHELL": "/bin/bash",
+     "PATH": os.environ["PATH"]},
+    clear=True,
+  ):
+    with patch(
+      "nytid.cli.track.run_tmux_command", return_value=0,
+    ) as mock_tmux, patch(
+      "nytid.cli.track.build_detached_nytid_prefix",
+      return_value="nytid track",
+    ):
+      result = runner.invoke(cli, [
+        "start", "work", "--window", "--no-block",
+        "-C", repo, "--worktree", "x",
+      ])
+  assert result.exit_code == 0, result.output
+  expected = os.path.join(repo, ".claude", "worktrees", "x")
+  call_kwargs = mock_tmux.call_args.kwargs
+  assert call_kwargs["cwd"] == expected
+  on_exit = call_kwargs["on_exit_shell"]
+  stop_at = on_exit.index("_stop-detached")
+  clean_at = on_exit.index("_cleanup-worktree-detached")
+  rm_at = on_exit.index("rm -rf")
+  assert stop_at < clean_at < rm_at
+  assert shlex.quote(expected) in on_exit
+  # The launching process leaves the worktree for the finalizer.
+  assert os.path.isdir(expected)
 @
 
 For the direct subprocess branch, we ignore [[SIGINT]] in the
@@ -11646,6 +12520,8 @@ import datetime
 import json
 import logging
 import os
+import shlex
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -11732,10 +12608,17 @@ from nytid.cli.track import (
     build_detached_window_cleanup_command,
     install_tmux_window_sync_hooks,
     install_tmux_window_cleanup_hook,
+    ensure_worktree,
+    worktree_launch_dir,
+    worktree_is_unchanged,
+    remove_worktree_if_unchanged,
+    report_worktree_cleanup,
+    build_detached_worktree_cleanup_command,
     default_username
 )
 
 runner = CliRunner()
+REAL_SUBPROCESS_RUN = subprocess.run
 TEST_SERVER_KEY = build_tmux_server_key(
     socket.gethostname(), "/tmp/tmux.sock", "123-1700000000",
 )
