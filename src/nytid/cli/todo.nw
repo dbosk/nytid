@@ -4507,6 +4507,7 @@ exporting to calendars.
 
 <<tracking commands>>=
 <<start command>>
+<<adopt command>>
 <<stop command>>
 <<detached finalize command>>
 @
@@ -10647,6 +10648,18 @@ ensure_ancestors_active(
 )
 @
 
+A task's tracking label set---its own labels plus the
+[[todo:<id>]] marker---is needed at three sites: starting,
+auto-suspend publication, and adoption.  One function keeps the
+three from drifting apart; the id goes in, not the title, because
+titles change and ids do not.
+
+<<helpers>>=
+def todo_track_labels(item, todo_id):
+    """Return the track labels for working on a todo."""
+    return list(item.labels) + [f"todo:{todo_id}"]
+@
+
 <<start tracking via track module>>=
 try:
     from nytid.cli.track import (
@@ -10655,9 +10668,7 @@ try:
 
     worker = item.who or default_username
 
-    track_labels = list(item.labels) + [
-        f"todo:{todo_id}"
-    ]
+    track_labels = todo_track_labels(item, todo_id)
     started, _, _ = start_tracking_labels(
         track_labels,
         start_time=datetime.datetime.now(),
@@ -11131,9 +11142,7 @@ been skipped if the [[track]] module was unavailable.
 
 <<resolve todo auto-suspend>>=
 worker = item.who or default_username
-track_labels = list(item.labels) + [
-    f"todo:{todo_id}"
-]
+track_labels = todo_track_labels(item, todo_id)
 use_auto_suspend = should_auto_suspend(
     worker, auto_suspend,
 )
@@ -12320,6 +12329,358 @@ def test_start_headless_reassigns_on_failure(
     item = todos[0]
     assert item.who == "teacher"
     assert item.status == "pending"
+@
+
+\subsection{The [[adopt]] Command}
+\label{todo:adopt}
+
+[[todo start --window]] always creates the window it tracks.  The
+[[adopt]] command covers the windows it cannot: a shell the user
+already has open and now wants to count as work on a task, and a
+task window that lost its tracked status (state-file loss, see the
+recovery discussion in \cref{track:adopt}).  It is to
+[[todo start --window]] what [[track adopt]] is to
+[[track start --window]]---and it is built on exactly that
+machinery: the [[track]] module's [[adopt_current_window]] helper
+does all window-state work, while this command adds the todo-side
+bookkeeping around it: activating the task and its ancestors,
+deriving the label set, the [[todo:<id>]] window-name convention,
+and the finalize-on-exit hook.
+
+The ID is required, unlike other todo commands.  Their ID-less
+forms resolve the task from the current window's tracked
+labels---precisely what does not exist in a window that adopt is
+about to fix.
+
+<<argument and option definitions>>=
+adopt_id_arg = typer.Argument(
+    ..., help="Todo ID to work on in this window",
+    autocompletion=complete_todo_ids)
+adopt_rename_opt = typer.Option(
+    "--rename",
+    help="Rename the window to the todo:<id> "
+         "naming used by start --window")
+@
+
+<<adopt command>>=
+@cli.command()
+def adopt(
+    todo_id: Annotated[int, adopt_id_arg],
+    auto_suspend: Annotated[
+        bool | None, auto_suspend_opt
+    ] = None,
+    rename: Annotated[bool, adopt_rename_opt] = False,
+):
+    """Adopt the current tmux window as work on a todo.
+
+    Marks the window as tracked with the task's labels and starts
+    them, activating the task (and its ancestors) if needed --
+    like `todo start --window`, but for a window that already
+    exists.  Also the recovery path when a task's window lost its
+    tracked status.
+    """
+    <<fail adopt early outside tmux>>
+    <<decide whether to arm the finalize hook>>
+    <<activate adopted todo and ancestors>>
+    <<adopt window via track module>>
+    <<arm todo finalize hook for adopted window>>
+    typer.echo(
+        f"Adopted window for: #{todo_id} {item.title}"
+    )
+@
+
+The tmux check comes before any state change: adoption of the
+stack and labels is not atomic with window adoption, so a doomed
+invocation must fail before it mutates anything.
+
+<<fail adopt early outside tmux>>=
+if not (
+    os.environ.get("TMUX")
+    and os.environ.get("TMUX_PANE")
+):
+    typer.echo(
+        "Not inside a tmux pane; "
+        "run adopt in the window to use.",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Whether adopt should arm a finalize hook depends on the window's
+history, and must be decided \emph{now}, before adoption installs
+its own pane-exit hooks and muddies the evidence.  A window that
+[[todo start]] or [[track start]] launched already carries
+exit machinery installed at launch: a wrapper around the command
+plus pane-exit hooks, sharing one completion guard so finalize
+runs exactly once.  That pair survived whatever state loss brought
+the user here (it lives in the pane and its hooks, not in nytid's
+state files), so re-arming would make finalize run twice---the
+fresh hook cannot share the launch-time guard.  A manually created
+window, by contrast, has no pane-exit hooks at all.  So the pane's
+exit hooks are the discriminator.
+
+<<helpers>>=
+def pane_has_exit_hooks(pane_id):
+    """Return whether a pane carries pane-exit hooks."""
+    result = subprocess.run(
+        ["tmux", "show-hooks", "-p", "-t", pane_id],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if not isinstance(result.stdout, str):
+        return False
+    return (
+        "pane-exited" in result.stdout
+        or "pane-died" in result.stdout
+    )
+<<decide whether to arm the finalize hook>>=
+arm_finalize = not pane_has_exit_hooks(
+    os.environ["TMUX_PANE"]
+)
+@
+
+Activation precedes publication, mirroring [[todo start]]: the
+stack must name the task before any window state points at it.
+[[activate_todo_state]] tolerates an already active task (no
+duplicate stack entry), so adopting mid-recovery is idempotent.
+Ancestor activation keeps parents' time running, exactly as a
+fresh [[start]] would; window publication below carries only the
+task's own labels, again exactly as [[todo start --window]] does.
+
+<<activate adopted todo and ancestors>>=
+todo_id, item, next_id, todos, stack = (
+    activate_todo_state(
+        todo_id, who=default_username,
+    )
+)
+ensure_ancestors_active(
+    item, todos, stack,
+    update_tmux_context=False,
+)
+worker = item.who or default_username
+@
+
+The window work is one call into [[track]].  If the tmux context
+cannot be resolved after all (the server died between our early
+check and now), the task stays active---the same state a plain
+[[todo start]] outside tmux produces---and we say so rather than
+pretending nothing happened.
+
+<<adopt window via track module>>=
+from nytid.cli.track import (
+    adopt_current_window,
+    build_context_name,
+)
+
+adopted = adopt_current_window(
+    todo_track_labels(item, todo_id),
+    worker,
+    auto_suspend,
+    rename_to=(
+        build_context_name("todo", [str(todo_id)])
+        if rename else None
+    ),
+)
+if adopted is None:
+    typer.echo(
+        "Could not resolve the tmux window; "
+        f"#{todo_id} is active but the window "
+        "is not tracked.",
+        err=True,
+    )
+    raise typer.Exit(1)
+if adopted["started"]:
+    typer.echo(
+        f"  Tracking: "
+        f"{', '.join(sorted(adopted['started']))}"
+    )
+if adopted["already_tracking"]:
+    typer.echo(
+        f"  Already tracking: "
+        f"{', '.join(sorted(adopted['already_tracking']))}"
+    )
+@
+
+For a hook-virgin window we arm the finalize half that a launch
+would have installed.  Only the hook half is retrofittable: the
+wrapper half wraps the launched command, and this window's shell
+is already running.  The hook alone suffices---it records the exit
+status from tmux's [[#{pane_dead_status}]] formats instead of the
+wrapper's [[$?]]---so when the adopted shell exits, the task is
+finalized just as if [[todo start --window]] had created it.
+
+<<arm todo finalize hook for adopted window>>=
+if arm_finalize:
+    from nytid.cli.track import (
+        build_tmux_hook_command,
+        install_tmux_exit_hooks,
+        make_tmux_completion_guard,
+    )
+    exit_fd, exit_code_file = tempfile.mkstemp(
+        prefix="nytid-todo-",
+        suffix=".status",
+    )
+    os.close(exit_fd)
+    finalize_cmd = (
+        build_detached_todo_finalize_command(
+            todo_id, os.getcwd(), exit_code_file,
+        )
+    )
+    hook_command = build_tmux_hook_command(
+        status_file=exit_code_file,
+        on_exit_shell=finalize_cmd,
+        completion_guard=(
+            make_tmux_completion_guard(exit_code_file)
+        ),
+    )
+    install_tmux_exit_hooks(
+        adopted["pane_id"], hook_command,
+    )
+@
+
+Let's verify the failure mode, the delegation to [[track]], and
+both finalize decisions:
+
+<<test functions>>=
+ADOPTED_WINDOW = {
+    "pane_id": "%3",
+    "window_id": "@7",
+    "session_id": "$1",
+    "tmux_server_key": "key",
+    "started": ["devel", "todo:1"],
+    "already_tracking": [],
+}
+
+def invoke_todo_adopt(args, adopted=None):
+    """Invoke todo adopt with tmux and track mocked."""
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "TMUX_PANE": "%3"},
+        clear=True,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=(
+            adopted if adopted is not None
+            else dict(ADOPTED_WINDOW)
+        ),
+    ) as adopt_mock:
+        result = runner.invoke(cli, ["adopt"] + args)
+    return result, adopt_mock
+
+def test_adopt_requires_tmux(temp_todo_dir):
+    """Outside tmux, adopt fails before touching the stack."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patch.dict(os.environ, {}, clear=True):
+        result = runner.invoke(cli, ["adopt", "1"])
+    assert result.exit_code == 1
+    assert load_active_stack_raw() == []
+
+def test_adopt_activates_and_adopts(temp_todo_dir):
+    """Adopt pushes the task and delegates to track."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+    ])
+
+    result, adopt_mock = invoke_todo_adopt(["1"])
+
+    assert result.exit_code == 0
+    assert "#1 Review PR" in result.output
+    assert 1 in load_active_stack_raw()
+    args = adopt_mock.call_args.args
+    assert args[0] == ["devel", "todo:1"]
+    assert adopt_mock.call_args.kwargs[
+        "rename_to"
+    ] is None
+
+def test_adopt_rename_uses_todo_convention(temp_todo_dir):
+    """--rename names the window todo:<id>, not track:..."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result, adopt_mock = invoke_todo_adopt(
+        ["1", "--rename"],
+    )
+
+    assert result.exit_code == 0
+    assert adopt_mock.call_args.kwargs[
+        "rename_to"
+    ] == "todo:1"
+
+def test_adopt_arms_finalize_for_hookless_pane(
+    temp_todo_dir,
+):
+    """A pane without exit hooks gets a finalize hook."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "TMUX_PANE": "%3"},
+        clear=True,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=False,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ), patch(
+        "nytid.cli.track.install_tmux_exit_hooks",
+    ) as install_mock:
+        result = runner.invoke(cli, ["adopt", "1"])
+
+    assert result.exit_code == 0
+    install_mock.assert_called_once()
+    pane_id, hook_command = install_mock.call_args.args
+    assert pane_id == "%3"
+    assert "_finalize-detached 1 " in hook_command
+
+def test_adopt_skips_finalize_for_launched_pane(
+    temp_todo_dir,
+):
+    """A pane with launch-time hooks keeps them untouched."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "TMUX_PANE": "%3"},
+        clear=True,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ), patch(
+        "nytid.cli.track.install_tmux_exit_hooks",
+    ) as install_mock:
+        result = runner.invoke(cli, ["adopt", "1"])
+
+    assert result.exit_code == 0
+    install_mock.assert_not_called()
 @
 
 \subsection{The [[stop]] Command}
@@ -14369,6 +14730,9 @@ from nytid.cli.todo import (
     load_active_stack,
     save_active_stack,
     get_active_stack_file,
+    load_active_stack_raw,
+    todo_track_labels,
+    pane_has_exit_hooks,
     find_pending_by_priority,
     finalize_detached_todo,
     build_detached_todo_finalize_command,
