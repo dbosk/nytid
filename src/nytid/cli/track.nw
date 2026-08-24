@@ -9511,6 +9511,43 @@ adopt_rename_opt = typer.Option(
 )
 @
 
+The adoption machinery is split the same way as
+[[start_tracking_labels]] and [[run_tmux_command]]: a plain helper
+owns the state changes, and the CLI command is a thin wrapper that
+talks to the user.  The split exists for [[cli.todo]]: adopting a
+window as work on a task needs exactly these state changes plus
+todo-side bookkeeping, and needs the resolved pane, window, and
+key afterwards to arm its own hooks---so the helper returns them.
+
+<<helper functions>>=
+def adopt_current_window(
+    labels: list[str],
+    who: str,
+    auto_suspend: bool | None,
+    rename_to: str | None = None,
+):
+    """Adopt the current tmux window as a tracked window.
+
+    Publishes `labels` on the window, starts them, and arms the
+    sync and cleanup hooks; `rename_to` optionally renames the
+    window.  Returns None outside a usable tmux context.
+    Otherwise returns a dict with the resolved `pane_id`,
+    `window_id`, `session_id` and `tmux_server_key`, plus the
+    `started` and `already_tracking` label lists.
+    """
+    <<resolve adopt tmux context or bail>>
+    <<publish adopted window state under lock>>
+    <<execute adopt label transition>>
+    <<install adopt hooks and optionally rename>>
+    return {
+        "pane_id": pane_id,
+        "window_id": window_id,
+        "session_id": session_id,
+        "tmux_server_key": tmux_server_key,
+        "started": started,
+        "already_tracking": already_tracking,
+    }
+
 <<adopt command>>=
 @cli.command()
 def adopt(
@@ -9529,16 +9566,40 @@ def adopt(
     `track start --window`.  This is also the recovery path for a
     window that lost its tracked status.
     """
-    <<resolve adopt tmux context or fail>>
-    <<publish adopted window state under lock>>
-    <<execute adopt label transition>>
-    <<install adopt hooks and optionally rename>>
+    adopted = adopt_current_window(
+        labels, who, auto_suspend,
+        rename_to=(
+            build_context_name("track", labels)
+            if rename else None
+        ),
+    )
+    if adopted is None:
+        typer.echo(
+            "Not inside a running tmux pane; "
+            "run adopt in the window to track.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if adopted["started"]:
+        typer.echo(
+            "Started tracking: "
+            + ", ".join(adopted["started"])
+        )
+    if adopted["already_tracking"]:
+        typer.echo(
+            "Already tracking: "
+            + ", ".join(adopted["already_tracking"])
+        )
+    typer.echo(
+        f"Window {adopted['window_id']} is now tracked."
+    )
 @
 
-Failing loudly outside tmux beats guessing: every later step needs
-the pane, the key, and the window.
+Every later step needs the pane, the key, and the window, so
+outside a usable context the helper bails with [[None]] and lets
+each caller phrase its own error.
 
-<<resolve adopt tmux context or fail>>=
+<<resolve adopt tmux context or bail>>=
 pane_id = os.environ.get("TMUX_PANE")
 tmux_server_key = compute_tmux_server_key(
     os.environ.get("TMUX")
@@ -9549,12 +9610,7 @@ context = (
     else None
 )
 if context is None:
-    typer.echo(
-        "Not inside a running tmux pane; "
-        "run adopt in the window to track.",
-        err=True,
-    )
-    raise typer.Exit(1)
+    return None
 window_id, session_id = context
 @
 
@@ -9604,8 +9660,9 @@ The transition mirrors [[needs_window_sync]] at launch: stop the
 source window's labels, start ours, both stamped with one
 transition time so the history has no gap or overlap.  Labels that
 were already running are fine---they simply become window-bound
-now---but we say so, because the user may be surprised that no new
-history entry starts.
+now---but the helper returns them separately so callers can say
+so, because the user may be surprised that no new history entry
+starts.
 
 <<execute adopt label transition>>=
 transition_time = datetime.datetime.now()
@@ -9623,15 +9680,6 @@ started, already_tracking, _ = start_tracking_labels(
     who=who,
     update_tmux_context=False,
 )
-if started:
-    typer.echo(
-        "Started tracking: " + ", ".join(started)
-    )
-if already_tracking:
-    typer.echo(
-        "Already tracking: "
-        + ", ".join(already_tracking)
-    )
 @
 
 Publication and cleanup are two halves of one act: the adopting
@@ -9639,9 +9687,12 @@ pane becomes the owner of the labels it contributed, so its exit
 must decrement them.  The session sync hook makes window switches
 drive the labels from now on---and, thanks to the replacement
 installer above, arms it while clearing any stale-key hooks, which
-makes adopt a complete one-command recovery.  Renaming is opt-in:
-an adopted window usually has a name its user chose, and
-overwriting it unasked would trade one inconsistency for another.
+makes adopt a complete one-command recovery.  Renaming is opt-in
+(the CLI's [[--rename]] flag): an adopted window usually has a
+name its user chose, and overwriting it unasked would trade one
+inconsistency for another.  The name is a caller-supplied string
+because track and todo adoption follow different naming
+conventions ([[track:<labels>]] versus [[todo:<id>]]).
 
 <<install adopt hooks and optionally rename>>=
 if resolved_auto_suspend:
@@ -9651,16 +9702,15 @@ if resolved_auto_suspend:
 install_tmux_window_cleanup_hook(
     pane_id, window_id, who, tmux_server_key, labels,
 )
-if rename:
+if rename_to is not None:
     subprocess.run(
         [
             "tmux", "rename-window",
             "-t", window_id,
-            build_context_name("track", labels),
+            rename_to,
         ],
         check=False,
     )
-typer.echo(f"Window {window_id} is now tracked.")
 @
 
 Let's verify the failure mode first, then the working paths:
@@ -13675,6 +13725,7 @@ from nytid.cli.track import (
     get_current_tracked_context_labels,
     install_tmux_hook_once,
     window_switch_hook_is_stale,
+    adopt_current_window,
     build_detached_nytid_prefix,
     build_detached_suspend_command,
     build_detached_resume_command,
