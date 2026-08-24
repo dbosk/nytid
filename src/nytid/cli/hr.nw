@@ -9,8 +9,11 @@
 %  code written by myself last year (2022).
 %}
 
-In this chapter we introduce the subommands found under [[nytid signupsheets]],
-it's the [[cli.signupsheets]] module.
+In this chapter we introduce the subcommands found under [[nytid hr]],
+it's the [[cli.hr]] module.
+They compute employment data from the completed sign-up sheets:
+amanuensis contracts, time sheets, hour summaries and the tracking of
+who is reported to HR as employed.
 <<[[hr.py]]>>=
 import csv
 import datetime
@@ -4009,6 +4012,836 @@ if removed_events:
 
 for event in removed_events:
   csvout.writerow(event.values())
+@
+
+
+\section{Tracking who is reported to HR as employed}%
+\label{EmployedTracking}
+
+Before a TA can work, we must report them to HR, who register them as
+an employee.
+For amanuenses that reporting leaves a trace in nytid: the stored
+contract covers a date range, so \enquote{is this TA known to HR?} is
+answered by looking for a current contract
+(\cref{contract-filtering}).
+Hourly TAs, however, are defined negatively---an hourly TA is simply a
+booked TA \emph{without} a contract---so nothing records that they were
+ever reported.
+The weekly cron script (\cref{CLIoverview}) used to fill this gap by diffing
+the output of [[nytid hr users --detailed]] against plain-text files,
+keyed on the whole rendered line: a changed email address made a TA
+look new again, and nothing recorded when or what was reported.
+
+We close the asymmetry by giving hourly TAs a positive record of their
+own: one JSON file per reporting event, in the same
+one-file-per-event, glob-to-query style as the contracts and the time
+sheets.
+A TA then counts as covered if they have a current or upcoming
+amanuensis contract, or a current employment record.
+Everything lives under its own subcommand group:
+\begin{description}
+\item[ [[missing]] ] lists the booked TAs who are covered by neither,
+  \ie who still need to be reported to HR.
+\item[ [[report]] ] does the same, but also records each TA as
+  reported and prints the identity line that goes to HR.
+\item[ [[list]] ] shows the stored records.
+\item[ [[ignore]] ] stores records that suppress reporting, \eg for
+  colleagues who sign up on the course but are already employed.
+\end{description}
+<<subcommands>>=
+employed = typer.Typer(name="employed",
+                       help="Track who is reported to HR as employed")
+cli.add_typer(employed)
+@
+
+\subsection{The employment record store}
+
+The records must be shared: any teacher on the course should be able
+to see that a TA is already reported.
+For the contracts and time sheets we get sharing by pointing the
+configured directory into AFS, and the same holds here.
+But unlike [[timesheets_directory]], which returns a bare
+[[pathlib.Path]], we access the store through [[storage.open_root]]
+(\cref{storage}).
+That function picks the storage backend from the path alone---plain
+directory, AFS, or a Git repository---so moving the store off AFS
+later (say, to GitHub) is a config change, not a code change.
+The price is small: callers open the root in a [[with]] statement and
+open files relative to it, instead of joining paths themselves.
+<<helper functions>>=
+def employment_storage():
+  """
+  Returns a StorageRoot for the employment record store.
+
+  The location is read from the config key
+  `hr.employment.employment_dir`; falls back to `./` with a warning
+  when the key isn't configured.
+  """
+  try:
+    path = typerconf.get(EMPLOYMENT_DIR_PATH)
+  except KeyError:
+    logging.warning(f"Can't find {EMPLOYMENT_DIR_PATH} in config, "
+                    f"using `./`. Set by running "
+                    f"`nytid config {EMPLOYMENT_DIR_PATH} -s <path>`.")
+    path = "./"
+  return storage.open_root(str(path))
+<<constants>>=
+EMPLOYMENT_DIR_PATH = "hr.employment.employment_dir"
+<<imports>>=
+from nytid import storage
+@
+
+The fallback mirrors [[timesheets_directory]]: warn, quote the
+[[nytid config]] invocation that sets the key, and use the working
+directory rather than crash on a fresh install.
+<<test functions>>=
+def test_employment_storage_falls_back_when_unconfigured(monkeypatch):
+  import typerconf
+
+  def unset(key):
+    raise KeyError(key)
+
+  monkeypatch.setattr(typerconf, "get", unset)
+
+  assert employment_storage().path == pathlib.Path("./")
+
+def test_employment_storage_uses_config(monkeypatch, tmp_path):
+  import typerconf
+  monkeypatch.setattr(typerconf, "get", lambda key: str(tmp_path))
+
+  assert employment_storage().path == tmp_path
+@
+
+Each record snapshots what we sent to HR and when.
+We store the rendered identity line (personnummer, name, email) rather
+than only the username: HR received exactly that line, and when a
+question comes up months later we want to answer \enquote{what did I
+send, and when?} without re-querying Canvas and LADOK, whose answers
+may have changed since.
+The [[valid_until]] date implements per-record staleness and is
+explained with [[record_is_current]] below; [[ignored]] marks records
+that exist only to suppress reporting.
+The filename follows the contracts and time sheets,
+[[user.timestamp.json]], so the same filename-based querying works:
+the username is recoverable without opening the file, and ISO
+timestamps sort lexicographically, so the newest record per user is
+the last one in filename order.
+<<helper functions>>=
+def store_employment_record(root, user, identity, courses,
+                            valid_until=None, ignored=False):
+  """
+  Records that `user` was reported to HR as employed.
+
+  Stores a JSON record in the StorageRoot `root`, named
+  `user.timestamp.json`. `identity` is the identity line sent to HR
+  (or None), `courses` the courses that triggered the report,
+  `valid_until` an optional expiry date (datetime.date) and `ignored`
+  marks a record that only suppresses reporting. Returns the filename
+  written.
+  """
+  now = datetime.datetime.now()
+  filename = f"{user}.{now.isoformat()}.json"
+
+  with root.open(filename, "w") as outfile:
+    json.dump({"user": user,
+               "reported": now.isoformat(),
+               "valid_until":
+                 valid_until.isoformat() if valid_until else None,
+               "identity": identity,
+               "courses": list(courses),
+               "ignored": ignored},
+              outfile,
+              indent=2)
+
+  return filename
+@
+
+We needn't create the directory ourselves the way [[store_timesheet]]
+must: opening a [[StorageRoot]] creates a missing root
+(\cref{storage}), so the first write on a fresh install works.
+Let's verify that, and that the schema round-trips:
+<<test functions>>=
+def test_store_employment_record_creates_missing_directory(tmp_path):
+  target = tmp_path / "does" / "not" / "exist"
+
+  with storage.open_root(str(target)) as root:
+    filename = store_employment_record(
+      root, "alice", "[123] Alice <alice@kth.se>", ["prgi26"],
+      valid_until=datetime.date(2027, 7, 1))
+
+  with open(target / filename) as infile:
+    stored = json.load(infile)
+
+  assert stored["user"] == "alice"
+  assert stored["identity"] == "[123] Alice <alice@kth.se>"
+  assert stored["courses"] == ["prgi26"]
+  assert stored["valid_until"] == "2027-07-01"
+  assert not stored["ignored"]
+@
+
+\subsection{When does a record go stale?}
+
+HR's registrations don't last forever: in practice they are reset over
+summer, so a TA reported in autumn 2025 who returns in autumn 2026
+must be reported again.
+On the other hand, sometimes one simply clears out the directory of
+old records (as one does with old contracts and time sheets), and an
+emptied store must just mean that everyone is unreported again.
+Both practices work because staleness is per record and the store is
+queried by globbing at call time---there is no index or cache that
+could disagree with the directory contents.
+
+A record with no [[valid_until]] never goes stale; deleting it is the
+only way to unreport such a TA.
+A malformed date is treated as expired: the conservative direction,
+since re-reporting an already-known TA is a minor annoyance while
+silently never reporting one means they can't get paid.
+<<helper functions>>=
+def record_is_current(record, today=None):
+  """
+  Returns True if the employment record `record` is still valid.
+
+  A record without a `valid_until` date never expires. `today`
+  defaults to today's date and exists mainly for testing.
+  """
+  if today is None:
+    today = datetime.date.today()
+
+  valid_until = record.get("valid_until")
+  if not valid_until:
+    return True
+
+  try:
+    return datetime.date.fromisoformat(valid_until) >= today
+  except ValueError as err:
+    logging.warning(f"Malformed valid_until in "
+                    f"{record.get('filename', record)}: {err}; "
+                    f"treating the record as expired.")
+    return False
+@
+
+Let's check both directions around the boundary, the no-expiry case
+and the malformed-date policy:
+<<test functions>>=
+def test_record_is_current_no_expiry():
+  assert record_is_current({"valid_until": None})
+  assert record_is_current({})
+
+def test_record_is_current_dates():
+  today = datetime.date(2026, 8, 24)
+
+  assert record_is_current({"valid_until": "2026-08-24"}, today=today)
+  assert record_is_current({"valid_until": "2027-07-01"}, today=today)
+  assert not record_is_current({"valid_until": "2026-07-01"},
+                               today=today)
+
+def test_record_is_current_malformed():
+  assert not record_is_current({"valid_until": "not-a-date"})
+@
+
+Since the reset happens annually at roughly the same time, we don't
+want to type the same [[--valid-until]] on every report.
+Instead a config key holds the reset as a month and day, \eg
+[[07-01]] for the first of July, and new records default to expiring
+at the \emph{next} occurrence of that date.
+We deliberately do not reuse the period machinery
+([[hr.amanuensis.periods]]): those periods are contract periods, five
+or so per year, and expiring records at period ends would flag every
+TA for re-reporting several times a year when HR only resets
+annually.
+A month-day key matches the actual semantics and needs no per-year
+maintenance.
+When the key is unset, new records get no expiry, which keeps the
+one-time interpretation for anyone who doesn't need staleness.
+<<helper functions>>=
+def default_valid_until(today=None):
+  """
+  Returns the default expiry date for a new employment record.
+
+  This is the next occurrence, strictly after `today`, of the
+  month-day in the config key `hr.employment.reset_date` (e.g.
+  `07-01`). Returns None---no expiry---when the key is unset or
+  malformed. `today` defaults to today's date.
+  """
+  if today is None:
+    today = datetime.date.today()
+
+  reset = default(EMPLOYMENT_RESET_DATE, None)
+  if not reset:
+    return None
+
+  try:
+    month, day = map(int, str(reset).split("-"))
+    candidate = datetime.date(today.year, month, day)
+    if candidate <= today:
+      candidate = datetime.date(today.year + 1, month, day)
+  except ValueError as err:
+    logging.warning(f"Malformed {EMPLOYMENT_RESET_DATE} `{reset}`: "
+                    f"{err}; new records get no expiry.")
+    return None
+
+  return candidate
+<<constants>>=
+EMPLOYMENT_RESET_DATE = "hr.employment.reset_date"
+@
+
+The interesting case is the year boundary: reporting in May expires
+this year's first of July, while reporting in August expires next
+year's.
+[[default]] reads the cached personal config, so the tests substitute
+it rather than the config file:
+<<test functions>>=
+def test_default_valid_until_unset(monkeypatch):
+  from nytid.cli import hr as hrcli
+  monkeypatch.setattr(hrcli, "default",
+                      lambda key, fallback, cast=None: fallback)
+
+  assert default_valid_until() is None
+
+def test_default_valid_until_year_boundary(monkeypatch):
+  from nytid.cli import hr as hrcli
+  monkeypatch.setattr(hrcli, "default",
+                      lambda key, fallback, cast=None: "07-01")
+
+  assert default_valid_until(today=datetime.date(2026, 5, 1)) \
+    == datetime.date(2026, 7, 1)
+  assert default_valid_until(today=datetime.date(2026, 8, 24)) \
+    == datetime.date(2027, 7, 1)
+@
+
+\subsection{Reading the records back}
+
+Querying works exactly like the contracts: the username is the first
+dot-separated component of the filename, so we can filter users
+without opening any file, and unreadable files are skipped with a
+warning rather than taking the whole listing down with them.
+We read through [[root.open]] so the storage backend stays
+interchangeable, but glob via [[root.path]]---listing is a read-only
+operation on the directory itself, which every backend exposes as a
+local path.
+<<helper functions>>=
+def get_employment_records(root, user_regex=".*"):
+  """
+  Returns the employment records in the StorageRoot `root` for users
+  matching `user_regex`.
+
+  The records are sorted by username and then by age, oldest first,
+  and each is augmented with its `filename`.
+  """
+  records = []
+  user_pattern = re.compile(user_regex)
+
+  for record_file in sorted(root.path.glob("*.json"),
+                            key=lambda x: x.name):
+    username = record_file.name.split(".")[0]
+    if not user_pattern.match(username):
+      continue
+
+    try:
+      with root.open(record_file.name) as infile:
+        record = json.load(infile)
+    except Exception as err:
+      logging.warning(f"Can't read {record_file}, skipping: {err}")
+      continue
+
+    record["filename"] = record_file.name
+    records.append(record)
+
+  return records
+@
+
+The question the rest of this section needs answered is \enquote{who
+is currently covered by an employment record?}.
+Only the newest record per user counts: a newer record supersedes an
+older one, so an old never-expiring record must not keep a user
+covered when a newer, now-expired record shows they were re-reported
+and reset since.
+Because [[get_employment_records]] sorts by filename, the newest
+record per user is simply the last one seen.
+An ignored record covers its user just like a real one---that is the
+whole point of ignoring---so we don't distinguish them here.
+<<helper functions>>=
+def employed_users(root, user_regex=".*", today=None):
+  """
+  Returns the set of users whose newest employment record in the
+  StorageRoot `root` is current.
+
+  Expired-newest counts the same as no record at all. Ignored records
+  count as covering their user. `today` is passed on to
+  `record_is_current`.
+  """
+  newest = {}
+  for record in get_employment_records(root, user_regex):
+    newest[record["user"]] = record
+
+  return {user for user, record in newest.items()
+          if record_is_current(record, today=today)}
+@
+
+The newest-record-wins rule and the emptied-store requirement are the
+two behaviours worth pinning:
+<<test functions>>=
+def test_employed_users_newest_record_wins(tmp_path):
+  with storage.open_root(str(tmp_path)) as root:
+    store_employment_record(root, "alice", None, [])
+    store_employment_record(root, "alice", None, [],
+                            valid_until=datetime.date(2020, 1, 1))
+
+    assert employed_users(root) == set()
+
+def test_employed_users_ignored_counts_as_covered(tmp_path):
+  with storage.open_root(str(tmp_path)) as root:
+    store_employment_record(root, "bob", None, [], ignored=True)
+
+    assert employed_users(root) == {"bob"}
+
+def test_employed_users_empty_store(tmp_path):
+  with storage.open_root(str(tmp_path)) as root:
+    assert employed_users(root) == set()
+@
+
+\subsection{Who is missing?}
+
+With both stores queryable, coverage is set arithmetic.
+The amanuensis side counts upcoming contracts too, not only current
+ones: a contract that starts next period has already been through HR,
+and flagging its holder would report them as hourly by mistake.
+<<helper functions>>=
+def contracted_users():
+  """
+  Returns the set of users covered by a current or upcoming
+  amanuensis contract.
+  """
+  contracts = get_valid_contracts(".*", ContractFilterMode.CURRENT) \
+            + get_valid_contracts(".*", ContractFilterMode.NEXT)
+  return {contract["user"] for contract in contracts}
+@
+
+The missing TAs are the booked ones covered by neither store.
+We keep this as a function of plain sets, so the rule is testable
+without any storage or network:
+<<helper functions>>=
+def compute_missing(booked, contracted, employed):
+  """
+  Returns the set of users in `booked` that are in neither
+  `contracted` nor `employed`.
+  """
+  return set(booked) - set(contracted) - set(employed)
+<<test functions>>=
+def test_compute_missing():
+  booked = {"alice", "bob", "charlie", "dave"}
+
+  assert compute_missing(booked, {"alice"}, {"bob"}) \
+    == {"charlie", "dave"}
+@
+
+The commands assemble the three sets the same way, so we share the
+assembly in a chunk.
+It expects [[booked]], [[user_regex]] and an open StorageRoot [[root]]
+in scope---a code path that includes it must set up all three first,
+or the tangled code fails at runtime rather than at build time.
+<<let [[missing_users]] be the booked TAs not covered>>=
+user_pattern = re.compile(user_regex)
+missing_users = {user
+                 for user in compute_missing(
+                   set(hr.hours_per_TA(booked).keys()),
+                   contracted_users(),
+                   employed_users(root))
+                 if user_pattern.match(user)}
+@
+
+The read-only command answers \enquote{who would be reported?}.
+It mirrors the [[users]] command: a single column, bare usernames
+when piped, with [[--detailed]] for the full identity lines.
+<<subcommands>>=
+@employed.command(name="missing")
+def cli_employed_missing(<<argument for matching courses>>,
+                         <<argument [[user_regex]] to match TAs>> = ".*",
+                         <<option for matching registers, default to mine>>,
+                         <<option to output detailed user data>> = False):
+  """
+  Lists booked TAs with neither an amanuensis contract (current or
+  upcoming) nor a current employment record, i.e. those that still
+  need to be reported to HR.
+
+  Piped, this is one username (or identity line, with `--detailed`)
+  per line.
+  """
+  <<set list [[courses]] to ((course, register), config)-pairs>>
+  <<let [[booked]] be all bookings from [[courses]]>>
+  with employment_storage() as root:
+    <<let [[missing_users]] be the booked TAs not covered>>
+
+  user_rows = []
+  for user in sorted(missing_users):
+    <<add [[user]]'s row to [[user_rows]]>>
+
+  print_rows(["User"], user_rows)
+@
+
+\subsection{Reporting}
+
+The [[report]] command is [[missing]] plus persistence: for each
+missing TA it prints the identity line that goes to HR and stores the
+record.
+The weekly cron script captures the printed lines and mails them
+(\cref{CLIoverview}), which dictates two design points.
+
+First, there is no plain output form.
+The record must snapshot exactly what HR receives, so the identity
+lookup is not optional; we fix [[detailed]] to [[True]] instead of
+offering an option that could silently store less.
+For a quick look without side effects, that is what [[missing]] is
+for.
+
+Second, a TA whose identity cannot be resolved is skipped, not
+stored.
+New TAs regularly aren't in UG and Canvas yet when they first appear
+in a sign-up sheet; the old script filtered such bare-username lines
+out of the mail so they would be retried the following week.
+Skipping the store keeps that retry behaviour, and it also covers a
+Canvas or LADOK outage in the cron context: nothing is falsely marked
+reported, and the next run heals.
+
+We print each line \emph{before} storing its record.
+If the command dies mid-run, the worst case is a TA that was mailed
+but not stored, who is then re-reported next week---a duplicate mail,
+the same benign failure the old script had.
+The opposite order would store without mailing: the TA silently never
+reaches HR, which is exactly the failure this feature exists to
+prevent.
+<<subcommands>>=
+@employed.command(name="report")
+def cli_employed_report(<<argument for matching courses>>,
+                        <<argument [[user_regex]] to match TAs>> = ".*",
+                        <<option for matching registers, default to mine>>,
+                        <<option [[valid_until]] for registration expiry>>):
+  """
+  Reports booked TAs to HR: prints the identity line of each TA not
+  already covered by a contract or employment record, and records
+  them as reported.
+
+  Piped, this is one identity line per newly reported TA; nothing at
+  all when no one is new.
+  """
+  <<set list [[courses]] to ((course, register), config)-pairs>>
+  <<let [[booked]] be all bookings from [[courses]]>>
+  <<determine the [[valid_until]] date>>
+
+  with employment_storage() as root:
+    <<let [[missing_users]] be the booked TAs not covered>>
+    for user in sorted(missing_users):
+      <<print and store employment record for [[user]]>>
+@
+
+The identity lookup and formatting reuse the chunks from the
+[[users]] command, so the mailed lines are identical to what
+[[nytid hr users --detailed]] prints.
+A failed lookup leaves [[user_obj]] as the bare username string,
+which is our skip signal.
+<<print and store employment record for [[user]]>>=
+<<set [[user_obj]] to most detailed version possible of [[user]]>>
+if isinstance(user_obj, str):
+  logging.warning(f"Can't resolve {user} in Canvas or LADOK, "
+                  f"not reporting them yet; retrying next run.")
+  continue
+
+detailed = True
+<<set [[user_text]] from [[user_obj]] and [[email]]>>
+print(user_text)
+store_employment_record(root, user, user_text,
+                        [course for course, register in courses],
+                        valid_until=valid_until)
+@
+
+The [[--valid-until]] option overrides the config-derived default per
+individual, \eg for a TA known to leave mid-year.
+<<determine the [[valid_until]] date>>=
+if valid_until:
+  valid_until = valid_until.date()
+else:
+  valid_until = default_valid_until()
+<<option [[valid_until]] for registration expiry>>=
+valid_until: Annotated[datetime.datetime, valid_until_opt] = None
+<<argument and option definitions>>=
+valid_until_opt = typer.Option(
+  help="Date until which the HR registration counts as valid. "
+       "Defaults to the next occurrence of the month-day in the "
+       "config key hr.employment.reset_date; no expiry when that "
+       "key is unset. Ignore records default to no expiry.")
+@
+
+Let's verify the two central behaviours end to end: an unresolvable
+TA is mailed nothing and stored nothing (but a resolvable one is
+both), and a second run reports no one anew.
+The course lookup, the hour summary and both identity lookups are
+substituted, keeping the test off the network:
+<<test functions>>=
+def test_cli_employed_report_stores_and_skips(temp_employment_dir,
+                                              monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  import typerconf
+
+  monkeypatch.setattr(
+    hrcli.coursescli, "get_courses_configs",
+    lambda *args, **kwargs: {
+      ("DD1310", "reg"): typerconf.Config({})})
+  monkeypatch.setattr(
+    hrcli.hr, "hours_per_TA",
+    lambda booked: {"alice": 10, "bob": 5})
+
+  class CanvasUser:
+    email = "alice@kth.se"
+
+    def __str__(self):
+      return "Alice Ason"
+
+  def lookup(user, course_regex):
+    if user == "bob":
+      raise KeyError("not in Canvas yet")
+    return CanvasUser()
+
+  monkeypatch.setattr(hrcli, "get_canvas_user", lookup)
+  monkeypatch.setattr(hrcli, "get_ladok_user",
+                      lambda user_obj: user_obj)
+  monkeypatch.setattr(hrcli, "default_valid_until", lambda: None)
+
+  result = CliRunner().invoke(hrcli.cli,
+                              ["employed", "report", "DD1310"])
+
+  assert result.exit_code == 0
+  assert "Alice Ason <alice@kth.se>" in result.stdout
+  assert "bob" not in result.stdout
+
+  with storage.open_root(str(temp_employment_dir)) as root:
+    reported = {record["user"]
+                for record in get_employment_records(root)}
+
+  assert reported == {"alice"}
+
+  rerun = CliRunner().invoke(hrcli.cli,
+                             ["employed", "report", "DD1310"])
+
+  assert rerun.exit_code == 0
+  assert "Alice" not in rerun.stdout
+@
+
+\subsection{Listing the records}
+
+For auditing---\enquote{did I report this TA, and what did I
+send?}---we list the stored records.
+By default we show the newest record per user, since that is the one
+that determines coverage; [[--all]] shows the full history.
+<<subcommands>>=
+@employed.command(name="list")
+def cli_employed_list(<<argument [[user_regex]] to match TAs>> = ".*",
+                      <<option [[all]] to show all employment records>>):
+  """
+  Lists stored employment records: who was reported to HR, when,
+  and until when the registration counts as valid.
+  """
+  with employment_storage() as root:
+    records = get_employment_records(root, user_regex)
+
+  if not all:
+    <<keep only the newest record per user in [[records]]>>
+
+  record_rows = []
+  for record in records:
+    <<add [[record]]'s row to [[record_rows]]>>
+
+  print_rows(["User", "Reported", "Valid until", "Status"],
+             record_rows)
+<<option [[all]] to show all employment records>>=
+all: Annotated[bool, all_records_opt] = False
+<<argument and option definitions>>=
+all_records_opt = typer.Option("--all/--newest",
+                               help="Show all employment records or "
+                                    "just the newest per user.")
+@
+
+The newest-per-user reduction is the same last-one-wins pass as in
+[[employed_users]]; here we keep the records rather than only the
+usernames.
+<<keep only the newest record per user in [[records]]>>=
+newest = {}
+for record in records:
+  newest[record["user"]] = record
+records = list(newest.values())
+@
+
+Each row summarizes one record.
+The reported timestamp is truncated to its date---the time of day
+never matters for coverage---and the status column spells out what
+[[record_is_current]] would conclude, so the listing answers the
+coverage question at a glance.
+An expired ignore is shown as expired: it no longer suppresses
+anything, and that is what the reader needs to see.
+<<add [[record]]'s row to [[record_rows]]>>=
+<<set [[status]] from [[record]]>>
+record_rows.append((record["user"],
+                    record.get("reported", "")[:10],
+                    record.get("valid_until") or "",
+                    status))
+<<set [[status]] from [[record]]>>=
+if not record_is_current(record):
+  status = "expired"
+elif record.get("ignored"):
+  status = "ignored"
+else:
+  status = "current"
+@
+
+<<test functions>>=
+def test_cli_employed_list_shows_status(temp_employment_dir):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+
+  with storage.open_root(str(temp_employment_dir)) as root:
+    store_employment_record(root, "alice",
+                            "[1] Alice <alice@kth.se>", ["prgi26"])
+    store_employment_record(root, "bob", None, [],
+                            valid_until=datetime.date(2020, 1, 1))
+
+  result = CliRunner().invoke(hrcli.cli, ["employed", "list"])
+
+  assert result.exit_code == 0
+  assert "alice" in result.stdout
+  assert "current" in result.stdout
+  assert "expired" in result.stdout
+@
+
+\subsection{Ignoring colleagues}
+
+Colleagues who sign up on the course must not be reported to HR as
+TAs, and external examiners may be employed elsewhere.
+Previously this was handled by [[nytid-ignore.sh]] appending lines to
+a file that the weekly script never read (\cref{CLIoverview}); now an ignore
+is just an employment record with [[ignored]] set, stored in the same
+place the coverage check reads.
+
+The user regex has no default: ignoring is deliberate, and
+defaulting to everyone would be a destructive typo away.
+We resolve the regex against the TAs actually booked on the matching
+courses, so a typo matches no one instead of storing a useless
+record, and we echo each ignored username so the caller sees exactly
+who matched.
+Unlike [[report]], we skip the identity lookup: the record only needs
+to suppress reporting, and an external colleague may not resolve in
+Canvas at all.
+For the same reason the config-derived expiry does not apply---a
+colleague is not reset over summer---so an ignore lasts until
+explicitly given a [[--valid-until]] or deleted.
+<<subcommands>>=
+@employed.command(name="ignore")
+def cli_employed_ignore(<<argument for matching courses>>,
+                        <<argument [[user_regex]] to match TAs>>,
+                        <<option for matching registers, default to mine>>,
+                        <<option [[valid_until]] for registration expiry>>):
+  """
+  Marks booked TAs matching `user_regex` as ignored in HR reporting,
+  e.g. colleagues who sign up but are already employed.
+
+  Prints each ignored username. Ignore records have no expiry unless
+  `--valid-until` is given.
+  """
+  <<set list [[courses]] to ((course, register), config)-pairs>>
+  <<let [[booked]] be all bookings from [[courses]]>>
+  user_pattern = re.compile(user_regex)
+
+  with employment_storage() as root:
+    for user in hr.hours_per_TA(booked):
+      <<skip if [[user_regex]] doesn't match [[user]]>>
+      print(user)
+      store_employment_record(
+        root, user, None,
+        [course for course, register in courses],
+        valid_until=valid_until.date() if valid_until else None,
+        ignored=True)
+@
+
+<<test functions>>=
+def test_cli_employed_ignore_stores_record(temp_employment_dir,
+                                           monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  import typerconf
+
+  monkeypatch.setattr(
+    hrcli.coursescli, "get_courses_configs",
+    lambda *args, **kwargs: {
+      ("DD1310", "reg"): typerconf.Config({})})
+  monkeypatch.setattr(
+    hrcli.hr, "hours_per_TA",
+    lambda booked: {"alice": 10, "bob": 5})
+
+  result = CliRunner().invoke(hrcli.cli,
+                              ["employed", "ignore", "DD1310",
+                               "alice"])
+
+  assert result.exit_code == 0
+
+  with storage.open_root(str(temp_employment_dir)) as root:
+    records = get_employment_records(root)
+
+  assert len(records) == 1
+  assert records[0]["user"] == "alice"
+  assert records[0]["ignored"]
+  assert records[0]["valid_until"] is None
+@
+
+\subsection{Test fixture for the employment store}
+
+The CLI tests need both stores configured: the coverage check in
+[[missing]] and [[report]] reads the contract store too, and letting
+that lookup fall back to the working directory would make the tests
+sensitive to whatever JSON files happen to be there.
+So the fixture serves both config keys, each backed by its own
+temporary directory, the contract one empty.
+<<test setup>>=
+@pytest.fixture
+def temp_employment_dir(monkeypatch):
+  """Creates temporary employment record and contract stores."""
+  with tempfile.TemporaryDirectory() as empdir, \
+       tempfile.TemporaryDirectory() as contractsdir:
+    employment_path = pathlib.Path(empdir)
+
+    def mock_config_get(key):
+      if key == "hr.employment.employment_dir":
+        return str(employment_path)
+      if key == "hr.amanuensis.contract_dir":
+        return str(contractsdir)
+      raise KeyError(f"Config key {key} not found")
+
+    import typerconf
+    monkeypatch.setattr(typerconf, "get", mock_config_get)
+
+    yield employment_path
+@
+
+Finally, [[missing]] keeps the piped single-column discipline of
+[[users]] and [[amanuensis list]]:
+<<test functions>>=
+def test_cli_employed_missing_pipes_bare_usernames(temp_employment_dir,
+                                                   monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  import typerconf
+
+  monkeypatch.setattr(
+    hrcli.coursescli, "get_courses_configs",
+    lambda *args, **kwargs: {
+      ("DD1310", "reg"): typerconf.Config({})})
+  monkeypatch.setattr(
+    hrcli.hr, "hours_per_TA",
+    lambda booked: {"alice": 10, "bob": 5})
+
+  result = CliRunner().invoke(hrcli.cli,
+                              ["employed", "missing", "DD1310"])
+
+  assert result.exit_code == 0
+  assert result.stdout == "alice\nbob\n"
 @
 
 
