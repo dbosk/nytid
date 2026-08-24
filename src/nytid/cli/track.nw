@@ -351,17 +351,30 @@ so the hook-based cleanup (\cref{track:detached-finalize}) never gets
 a chance to remove those files.
 
 We therefore extend the key with a \emph{generation}: the server's
-PID and start time.  The PID comes for free from [[$TMUX]]; the start
-time guards against a deterministic boot sequence handing a new
-server the same PID again.  The address part (the \emph{sockethash})
-and the generation are joined with hyphens---characters that
-[[sanitize_tmux_id]] passes through unchanged---so every state
-filename carries the key as a single underscore-free token from which
-the sockethash prefix is recoverable.  That recoverability is what
-makes sweeping possible: a socket path hosts at most one live server
-at a time, so a state file carrying the current sockethash but a
-different generation provably belongs to a dead server
-(\cref{track:server-sweep}).
+PID and start time.  The start time guards against a deterministic
+boot sequence handing a new server the same PID again.
+
+Crucially, both ingredients must come from the server itself, not
+from [[$TMUX]].  An earlier design read the PID out of [[$TMUX]],
+which looked free of charge but is subtly wrong: the PID field in
+[[$TMUX]] is whatever PID the client that \emph{created} the session
+observed.  The very first client records the PID of tmux's short-lived
+pre-daemonization fork, while every later client sees the real
+daemon PID---so two panes of the \emph{same live server} can
+disagree about the PID, and with it about the key.  The observed
+consequence was that windows launched from the original terminal and
+windows launched from a later terminal were keyed as if they belonged
+to two different servers, and each side treated the other's state as
+stale.  Every tracked window then \enquote{lost} its tracked status
+at once.  Asking the server for its own identity makes the key a
+function of the server alone, so all clients agree.
+
+The address part (the \emph{sockethash}) and the generation are
+joined with hyphens---characters that [[sanitize_tmux_id]] passes
+through unchanged---so every state filename carries the key as a
+single underscore-free token from which the sockethash prefix is
+recoverable, letting other code classify state files by the server
+they belong to (\cref{track:server-sweep}).
 
 <<configuration management>>=
 def build_tmux_sockethash(
@@ -386,8 +399,8 @@ def build_tmux_server_key(
     return f"{sockethash}-{generation}"
 @
 
-Both the socket path and the server PID live in [[$TMUX]], whose
-format is [[socket,server_pid,session_idx]].  We split from the right
+From [[$TMUX]], whose format is [[socket,server_pid,session_idx]],
+we take only the socket path---the address.  We split from the right
 because the socket path itself may contain commas.
 
 <<configuration management>>=
@@ -402,43 +415,31 @@ def parse_tmux_socket_path(
     except ValueError:
         return tmux_env or None
     return socket_path or None
-
-def parse_tmux_server_pid(
-    tmux_env: str | None,
-) -> str | None:
-    """Extract the tmux server PID from ``$TMUX`` if present."""
-    if not tmux_env:
-        return None
-    try:
-        _socket_path, server_pid, _session_idx = tmux_env.rsplit(",", 2)
-    except ValueError:
-        return None
-    return server_pid or None
 @
 
-The start time is not part of [[$TMUX]], so we have to ask the server
-itself.  One subprocess call per CLI process is acceptable, but hook
-subprocesses and nested commands may build several keys, so we
-memoize the answer per [[$TMUX]] value.  A failed query yields
-[[None]] rather than an exception: a server that cannot answer is
-dying or absent, and every caller already treats a missing key as
-\enquote{no tmux context}.
+For the generation we ask the server, in a single query for both
+facts, so they describe the same server instance.  One subprocess
+call per CLI process is acceptable, but hook subprocesses and nested
+commands may build several keys, so we memoize the answer per
+[[$TMUX]] value.  A failed query yields [[None]] rather than an
+exception: a server that cannot answer is dying or absent, and every
+caller already treats a missing key as \enquote{no tmux context}.
 
 <<configuration management>>=
-def get_tmux_server_start_time() -> str | None:
-    """Return the current tmux server's start time, or ``None``."""
+def get_tmux_server_generation() -> str | None:
+    """Return the tmux server's ``pid-start_time``, or ``None``."""
     tmux_env = os.environ.get("TMUX")
     if not tmux_env:
         return None
-    if tmux_env in _TMUX_START_TIME_CACHE:
-        return _TMUX_START_TIME_CACHE[tmux_env]
+    if tmux_env in _TMUX_GENERATION_CACHE:
+        return _TMUX_GENERATION_CACHE[tmux_env]
     try:
         result = subprocess.run(
             [
                 "tmux",
                 "display-message",
                 "-p",
-                "#{start_time}",
+                "#{pid}-#{start_time}",
             ],
             capture_output=True,
             text=True,
@@ -446,21 +447,21 @@ def get_tmux_server_start_time() -> str | None:
         )
     except (subprocess.CalledProcessError, OSError):
         return None
-    start_time = result.stdout.strip()
-    if not start_time:
+    generation = result.stdout.strip()
+    if not generation.strip("-"):
         return None
-    _TMUX_START_TIME_CACHE[tmux_env] = start_time
-    return start_time
+    _TMUX_GENERATION_CACHE[tmux_env] = generation
+    return generation
 <<constants>>=
-_TMUX_START_TIME_CACHE: dict[str, str] = {}
+_TMUX_GENERATION_CACHE: dict[str, str] = {}
 @
 
-Assembling a key combines all three ingredients.  The [[tmux_env]]
-parameter names the server whose namespace we are keying, while the
-start-time query always asks the ambient server---the two agree
-because tmux client commands themselves resolve the server from the
-process environment, which is also where callers obtain the
-[[tmux_env]] they pass in.
+Assembling a key combines the address and the generation.  The
+[[tmux_env]] parameter names the server whose namespace we are
+keying, while the generation query always asks the ambient
+server---the two agree because tmux client commands themselves
+resolve the server from the process environment, which is also where
+callers obtain the [[tmux_env]] they pass in.
 
 <<configuration management>>=
 def compute_tmux_server_key(
@@ -468,16 +469,15 @@ def compute_tmux_server_key(
 ) -> str | None:
     """Return the instance key for the server named by ``tmux_env``."""
     socket_path = parse_tmux_socket_path(tmux_env)
-    server_pid = parse_tmux_server_pid(tmux_env)
-    if not socket_path or not server_pid:
+    if not socket_path:
         return None
-    start_time = get_tmux_server_start_time()
-    if not start_time:
+    generation = get_tmux_server_generation()
+    if not generation:
         return None
     return build_tmux_server_key(
         socket.gethostname(),
         socket_path,
-        f"{server_pid}-{start_time}",
+        generation,
     )
 @
 
@@ -10028,15 +10028,42 @@ def test_parse_tmux_socket_path_reads_socket_path():
     assert parse_tmux_socket_path("malformed") == "malformed"
     assert parse_tmux_socket_path(None) is None
 
-def test_parse_tmux_server_pid_reads_pid():
-    """$TMUX parsing extracts the middle server-PID field."""
-    assert parse_tmux_server_pid("/tmp/tmux.sock,123,0") == "123"
-    assert parse_tmux_server_pid("/tmp/tmux,sock,123,0") == "123"
-    assert parse_tmux_server_pid("malformed") is None
-    assert parse_tmux_server_pid(None) is None
+def test_same_socket_two_pids_one_key():
+    """Clients disagreeing about the server PID share one key."""
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7393,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="7446-1700000000",
+    ):
+        first = compute_tmux_server_key(os.environ["TMUX"])
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7446,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="7446-1700000000",
+    ):
+        second = compute_tmux_server_key(os.environ["TMUX"])
+    assert first == second
+
+def test_generation_from_live_server():
+    """The generation is queried from tmux, not read from $TMUX."""
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout="7446-1700000000\n", stderr="",
+    )
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7393,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.subprocess.run", return_value=completed,
+    ) as run_mock:
+        assert get_tmux_server_generation() == "7446-1700000000"
+    assert run_mock.call_args.args[0] == [
+        "tmux", "display-message", "-p", "#{pid}-#{start_time}",
+    ]
 
 def test_get_current_tmux_server_key_from_env(temp_tracking_dir):
-    """Current server key composes sockethash, PID and start time."""
+    """Current server key composes sockethash and generation."""
     temp_tracking_dir.mkdir(parents=True, exist_ok=True)
     expected = build_tmux_server_key(
         "host", "/tmp/tmux.sock", "123-1700000000",
@@ -10049,8 +10076,8 @@ def test_get_current_tmux_server_key_from_env(temp_tracking_dir):
     ), patch(
         "nytid.cli.track.socket.gethostname", return_value="host",
     ), patch(
-        "nytid.cli.track.get_tmux_server_start_time",
-        return_value="1700000000",
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="123-1700000000",
     ):
         assert get_current_tmux_server_key() == expected
 
@@ -10061,7 +10088,7 @@ def test_get_current_tmux_server_key_skips_tmux_without_state(
     with patch.dict(
         os.environ, {"TMUX": "/tmp/tmux.sock,123,0"}, clear=True,
     ), patch(
-        "nytid.cli.track.get_tmux_server_start_time",
+        "nytid.cli.track.get_tmux_server_generation",
         side_effect=AssertionError("tmux queried"),
     ):
         assert get_current_tmux_server_key() is None
@@ -12555,9 +12582,8 @@ from nytid.cli.track import (
     build_tmux_sockethash,
     build_tmux_server_key,
     parse_tmux_socket_path,
-    parse_tmux_server_pid,
     compute_tmux_server_key,
-    get_tmux_server_start_time,
+    get_tmux_server_generation,
     get_current_tmux_server_key,
     get_tracking_dir,
     parse_state_file_server_key,
