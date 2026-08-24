@@ -312,11 +312,6 @@ def get_tracking_lock_file() -> pathlib.Path:
     """Get the path to the tracking history lock file."""
     return get_tracking_dir() / "tracking_data.lock"
 
-
-def get_tmux_context_lock_file() -> pathlib.Path:
-    """Return the lock file guarding tmux context state."""
-    return get_tracking_dir() / "tmux_context.lock"
-
 def sanitize_who(who: str) -> str:
     """Sanitize a worker name for use in filenames.
 
@@ -337,31 +332,149 @@ def sanitize_tmux_id(value: str) -> str:
 
 @
 
+\subsection{Tmux-Scoped Runtime State}
+\label{track:tmux-state-dir}
+
+The tracking directory above holds \emph{persistent} data: time
+entries and session state that must survive reboots.  Tmux-scoped
+state---window labels, pane labels, suspend state, the last-selected
+window---is different in kind: it describes windows and panes of a
+running tmux server, and those referents die with the machine.  An
+earlier design kept both kinds in the persistent tracking directory,
+which meant tmux-scoped files \emph{outlived} the windows they
+described.  After a reboot, a fresh server reuses the same socket
+path and restarts window numbering at [[@0]], so a surviving state
+file could resurrect a dead window's labels in a brand-new, never
+tracked window the moment their [[@N]] identifiers coincided.
+
+We instead store tmux-scoped state where tmux stores its own
+sockets: on the temporary filesystem, in [[nytid-<uid>]] next to
+tmux's [[tmux-<uid>]].  A reboot then clears the state in the same
+stroke that kills the windows it describes, so state can never
+outlive its referents across reboots---the resurrection hazard
+disappears structurally instead of needing cleanup code.
+
+Three design issues deserve spelling out, because each of the
+obvious alternatives is subtly wrong.
+
+\begin{description}
+\item[Why not [[$XDG_RUNTIME_DIR]]?]  It looks like the canonical
+  choice for per-user runtime state, but systemd removes it when the
+  user's last login session ends, while a tmux server routinely
+  outlives the login session that started it.  Our state files would
+  vanish under still-living windows---exactly the
+  all-windows-lose-tracking failure this design exists to prevent.
+  tmux itself keeps its sockets in [[/tmp]] for the same reason, and
+  we follow it.  We honor [[$TMPDIR]] via
+  [[tempfile.gettempdir()]], as tmux honors [[$TMUX_TMPDIR]].
+\item[Why does the key still need a generation?]  The temporary
+  filesystem is only cleared by a \emph{reboot}.  A server killed
+  and restarted without one ([[tmux kill-server]], a crash) leaves
+  the state files in place while the new server restarts window
+  numbering at [[@0]], so the per-instance generation in the server
+  key remains what keeps a predecessor's files inert (see the
+  keying discussion below).  The two mechanisms are complementary:
+  the location bounds the files' lifetime by the machine's uptime,
+  the key scopes them to one server instance within it.
+\item[Aging of temporary files]  Some systems periodically delete
+  temporary files that have not been touched for a week or two.  A
+  tracked window that nobody switches to for that long could lose
+  its state file.  We accept this: the hooks rewrite state on every
+  window switch, so only long-idle windows are exposed, tmux lives
+  with the same exposure for its sockets, and [[nytid track adopt]]
+  re-tracks an affected window in one command
+  (\cref{track:adopt}).
+\end{description}
+
+Because the temporary directory is world-writable, another user
+could squat our path before we first create it.  Like tmux, we
+create the directory mode [[0700]] and refuse one owned by somebody
+else---failing loudly beats silently sharing state with a stranger.
+The location can be overridden through configuration (for tests and
+unusual setups); the default is derived from the machine and user,
+so we do not persist it back into the configuration the way
+[[get_tracking_storage]] does.
+
+<<constants>>=
+TMUX_STATE_DIR_CONFIG = "track.tmux_state_dir"
+<<configuration management>>=
+def get_tmux_state_dir() -> pathlib.Path:
+    """Return the directory holding tmux-scoped state files.
+
+    Defaults to nytid-<uid> under the system temporary directory,
+    creating it with mode 0700.  Raises PermissionError if the
+    directory is owned by another user.
+    """
+    try:
+        state_dir = pathlib.Path(
+            config.get(TMUX_STATE_DIR_CONFIG)
+        )
+    except KeyError:
+        state_dir = (
+            pathlib.Path(tempfile.gettempdir())
+            / f"nytid-{os.getuid()}"
+        )
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if state_dir.stat().st_uid != os.getuid():
+        raise PermissionError(
+            f"{state_dir} is not owned by the current user"
+        )
+    return state_dir
+@
+
+The lock guarding tmux context state protects only files that live
+here, so it lives here too.
+
+<<configuration management>>=
+def get_tmux_context_lock_file() -> pathlib.Path:
+    """Return the lock file guarding tmux context state."""
+    return get_tmux_state_dir() / "tmux_context.lock"
+@
+
+\subsection{Keying State by Server Instance}
+\label{track:server-key}
+
 Tmux-scoped state files---window labels, pane labels, suspend state,
 the last-selected window---embed a \emph{server key} in their
 filenames.  The key must identify a server \emph{instance}, not merely
 a server address.  Hostname and socket path alone are not enough:
-after a reboot, a fresh tmux server listens on the very same default
-socket path, and its window numbering restarts at [[@0]].  Under an
-address-only key, a brand-new window would collide with a dead
-server's state file for the same [[@N]] identifier, and nytid would
-resurrect the dead window's labels in a window that was never tracked.
-The reboot also kills tmux without firing any [[pane-exited]] hooks,
-so the hook-based cleanup (\cref{track:detached-finalize}) never gets
-a chance to remove those files.
+a server killed and restarted without a reboot ([[tmux
+kill-server]], a crash) listens on the very same socket path, and
+its window numbering restarts at [[@0]].  Under an address-only
+key, a brand-new window would collide with the dead server's state
+file for the same [[@N]] identifier, and nytid would resurrect the
+dead window's labels in a window that was never tracked.  The
+runtime-state location (\cref{track:tmux-state-dir}) covers only
+the reboot variant of this hazard; a server death that keeps the
+machine up also fires no [[pane-exited]] hooks, so the hook-based
+cleanup (\cref{track:detached-finalize}) never gets a chance to
+remove the files either.
 
 We therefore extend the key with a \emph{generation}: the server's
-PID and start time.  The PID comes for free from [[$TMUX]]; the start
-time guards against a deterministic boot sequence handing a new
-server the same PID again.  The address part (the \emph{sockethash})
-and the generation are joined with hyphens---characters that
-[[sanitize_tmux_id]] passes through unchanged---so every state
-filename carries the key as a single underscore-free token from which
-the sockethash prefix is recoverable.  That recoverability is what
-makes sweeping possible: a socket path hosts at most one live server
-at a time, so a state file carrying the current sockethash but a
-different generation provably belongs to a dead server
-(\cref{track:server-sweep}).
+PID and start time.  The start time guards against a deterministic
+boot sequence handing a new server the same PID again.
+
+Crucially, both ingredients must come from the server itself, not
+from [[$TMUX]].  An earlier design read the PID out of [[$TMUX]],
+which looked free of charge but is subtly wrong: the PID field in
+[[$TMUX]] is whatever PID the client that \emph{created} the session
+observed.  The very first client records the PID of tmux's short-lived
+pre-daemonization fork, while every later client sees the real
+daemon PID---so two panes of the \emph{same live server} can
+disagree about the PID, and with it about the key.  The observed
+consequence was that windows launched from the original terminal and
+windows launched from a later terminal were keyed as if they belonged
+to two different servers, and each side treated the other's state as
+stale.  Every tracked window then \enquote{lost} its tracked status
+at once.  Asking the server for its own identity makes the key a
+function of the server alone, so all clients agree.
+
+The address part (the \emph{sockethash}) and the generation are
+joined with hyphens---characters that [[sanitize_tmux_id]] passes
+through unchanged---so every state filename carries the key as a
+single underscore-free token from which the sockethash prefix is
+recoverable, letting other code classify state files by the server
+they belong to (\cref{track:server-sweep}).
 
 <<configuration management>>=
 def build_tmux_sockethash(
@@ -386,8 +499,8 @@ def build_tmux_server_key(
     return f"{sockethash}-{generation}"
 @
 
-Both the socket path and the server PID live in [[$TMUX]], whose
-format is [[socket,server_pid,session_idx]].  We split from the right
+From [[$TMUX]], whose format is [[socket,server_pid,session_idx]],
+we take only the socket path---the address.  We split from the right
 because the socket path itself may contain commas.
 
 <<configuration management>>=
@@ -402,43 +515,31 @@ def parse_tmux_socket_path(
     except ValueError:
         return tmux_env or None
     return socket_path or None
-
-def parse_tmux_server_pid(
-    tmux_env: str | None,
-) -> str | None:
-    """Extract the tmux server PID from ``$TMUX`` if present."""
-    if not tmux_env:
-        return None
-    try:
-        _socket_path, server_pid, _session_idx = tmux_env.rsplit(",", 2)
-    except ValueError:
-        return None
-    return server_pid or None
 @
 
-The start time is not part of [[$TMUX]], so we have to ask the server
-itself.  One subprocess call per CLI process is acceptable, but hook
-subprocesses and nested commands may build several keys, so we
-memoize the answer per [[$TMUX]] value.  A failed query yields
-[[None]] rather than an exception: a server that cannot answer is
-dying or absent, and every caller already treats a missing key as
-\enquote{no tmux context}.
+For the generation we ask the server, in a single query for both
+facts, so they describe the same server instance.  One subprocess
+call per CLI process is acceptable, but hook subprocesses and nested
+commands may build several keys, so we memoize the answer per
+[[$TMUX]] value.  A failed query yields [[None]] rather than an
+exception: a server that cannot answer is dying or absent, and every
+caller already treats a missing key as \enquote{no tmux context}.
 
 <<configuration management>>=
-def get_tmux_server_start_time() -> str | None:
-    """Return the current tmux server's start time, or ``None``."""
+def get_tmux_server_generation() -> str | None:
+    """Return the tmux server's ``pid-start_time``, or ``None``."""
     tmux_env = os.environ.get("TMUX")
     if not tmux_env:
         return None
-    if tmux_env in _TMUX_START_TIME_CACHE:
-        return _TMUX_START_TIME_CACHE[tmux_env]
+    if tmux_env in _TMUX_GENERATION_CACHE:
+        return _TMUX_GENERATION_CACHE[tmux_env]
     try:
         result = subprocess.run(
             [
                 "tmux",
                 "display-message",
                 "-p",
-                "#{start_time}",
+                "#{pid}-#{start_time}",
             ],
             capture_output=True,
             text=True,
@@ -446,21 +547,21 @@ def get_tmux_server_start_time() -> str | None:
         )
     except (subprocess.CalledProcessError, OSError):
         return None
-    start_time = result.stdout.strip()
-    if not start_time:
+    generation = result.stdout.strip()
+    if not generation.strip("-"):
         return None
-    _TMUX_START_TIME_CACHE[tmux_env] = start_time
-    return start_time
+    _TMUX_GENERATION_CACHE[tmux_env] = generation
+    return generation
 <<constants>>=
-_TMUX_START_TIME_CACHE: dict[str, str] = {}
+_TMUX_GENERATION_CACHE: dict[str, str] = {}
 @
 
-Assembling a key combines all three ingredients.  The [[tmux_env]]
-parameter names the server whose namespace we are keying, while the
-start-time query always asks the ambient server---the two agree
-because tmux client commands themselves resolve the server from the
-process environment, which is also where callers obtain the
-[[tmux_env]] they pass in.
+Assembling a key combines the address and the generation.  The
+[[tmux_env]] parameter names the server whose namespace we are
+keying, while the generation query always asks the ambient
+server---the two agree because tmux client commands themselves
+resolve the server from the process environment, which is also where
+callers obtain the [[tmux_env]] they pass in.
 
 <<configuration management>>=
 def compute_tmux_server_key(
@@ -468,16 +569,15 @@ def compute_tmux_server_key(
 ) -> str | None:
     """Return the instance key for the server named by ``tmux_env``."""
     socket_path = parse_tmux_socket_path(tmux_env)
-    server_pid = parse_tmux_server_pid(tmux_env)
-    if not socket_path or not server_pid:
+    if not socket_path:
         return None
-    start_time = get_tmux_server_start_time()
-    if not start_time:
+    generation = get_tmux_server_generation()
+    if not generation:
         return None
     return build_tmux_server_key(
         socket.gethostname(),
         socket_path,
-        f"{server_pid}-{start_time}",
+        generation,
     )
 @
 
@@ -509,7 +609,7 @@ def get_current_tmux_server_key() -> str | None:
         socket.gethostname(), socket_path,
     )
     if not any(
-        get_tracking_dir().glob(f"*_{sockethash}-*")
+        get_tmux_state_dir().glob(f"*_{sockethash}-*")
     ):
         return None
     return compute_tmux_server_key(tmux_env)
@@ -6402,7 +6502,7 @@ def run_tmux_command(
             env.get("TMUX")
         )
         if tmux_server_key:
-            sweep_stale_server_state(tmux_server_key)
+            migrate_tmux_state_files(tmux_server_key)
         <<launch tmux command and install hooks>>
         subprocess.run(
             ["tmux", "wait-for", "-S", ready_channel],
@@ -6462,15 +6562,15 @@ hooks a clean slate to re-claim.  Detached launches instead let their
 own cleanup remove the throwaway directory that holds guard and status
 alike (see \cref{track:detached-launch-dir}).
 
-A tracked launch is also the natural moment to amortize cleanup of
-state left behind by dead tmux servers.  Hook-based cleanup cannot
-fire when the whole server dies---a reboot takes every pane with it
-before any [[pane-exited]] hook runs---so before publishing this
-launch's state we sweep files whose key names a dead instance of the
-current server (\cref{track:server-sweep}).  The sweep runs outside
-[[with_tmux_context_lock]] deliberately: the files it removes belong
-to server instances that no longer exist, so no live hook can race
-it, and keeping it outside the lock avoids nesting with the
+A tracked launch is also the natural moment to repair state written
+by an older nytid under a wrong or outdated server key---files that
+this server's windows still own but that today's key computation can
+no longer address (\cref{track:server-sweep}).  The migration only
+renames files, never deletes, and it costs nothing in the common
+case: with no candidate files on disk it does not even query tmux.
+It runs outside [[with_tmux_context_lock]] deliberately: the files
+it moves are unaddressable under the current key, so no live hook
+reads them, and keeping it outside the lock avoids nesting with the
 hook-observability critical section below.
 
 Tracked window launches need one stronger serialization guarantee than
@@ -6689,8 +6789,9 @@ identifying the labels that were suspended.  The filename encodes the
 tmux server key, the tmux pane ID (with the leading [[%]] replaced by
 [[pane_]]), and the worker identity so that parallel workers or
 independent tmux server instances sharing the same filesystem do not
-collide---including a dead pre-reboot server whose pane numbering the
-current server has begun reusing (\cref{track:server-sweep}).
+collide---including a dead predecessor on the same socket whose pane
+numbering the current server has begun reusing
+(\cref{track:server-key}).
 
 <<helper functions>>=
 def suspend_state_path(
@@ -6705,7 +6806,7 @@ def suspend_state_path(
     """
     safe_pane = pane_id.replace("%", "pane_")
     return (
-        get_tracking_dir()
+        get_tmux_state_dir()
         / f"suspend_{sanitize_tmux_id(tmux_server_key)}"
         f"_{safe_pane}_{sanitize_who(who)}.json"
     )
@@ -6788,7 +6889,7 @@ def pane_labels_path(
     """
     safe_pane = pane_id.replace("%", "pane_")
     return (
-        get_tracking_dir()
+        get_tmux_state_dir()
         / f"pane_labels_{sanitize_tmux_id(tmux_server_key)}_{safe_pane}"
         f"_{sanitize_who(who)}.json"
     )
@@ -7025,11 +7126,13 @@ window-scoped labels file analogous to the pane labels file.  As with
 pane state, the filename includes the tmux server key so two different
 tmux server instances sharing a filesystem do not reuse the same
 window-state path for identical [[@...]] identifiers.  The instance
-distinction matters most across reboots: a fresh server reuses the
-same socket path \emph{and} restarts window numbering at [[@0]], so
-only the generation part of the key keeps a dead server's files from
-being mistaken for the new server's windows
-(\cref{track:server-sweep}).
+distinction matters when a server is killed and restarted without a
+reboot: the new server reuses the same socket path \emph{and}
+restarts window numbering at [[@0]], so only the generation part of
+the key keeps the dead server's files from being mistaken for the
+new server's windows (\cref{track:server-key}).  A reboot instead
+clears the runtime state directory itself
+(\cref{track:tmux-state-dir}).
 
 <<helper functions>>=
 def window_labels_path(
@@ -7040,7 +7143,7 @@ def window_labels_path(
     """Return path to a tracked window's labels file."""
     safe_window = window_id.replace("@", "window_")
     return (
-        get_tracking_dir()
+        get_tmux_state_dir()
         / f"window_labels_{sanitize_tmux_id(tmux_server_key)}_{safe_window}"
         f"_{sanitize_who(who)}.json"
     )
@@ -7065,7 +7168,7 @@ def last_selected_window_path(
 ) -> pathlib.Path:
     """Return path to the last-selected-window state file."""
     return (
-        get_tracking_dir()
+        get_tmux_state_dir()
         / f"last_window"
         f"_{sanitize_tmux_id(tmux_server_key)}"
         f"_{sanitize_tmux_id(session_id)}"
@@ -7099,7 +7202,6 @@ def write_last_selected_window(
     path = last_selected_window_path(
         who, tmux_server_key, session_id,
     )
-    ensure_tracking_dir()
     tmp = path.with_suffix(".tmp")
     tmp.write_text(window_id + "\n")
     tmp.rename(path)
@@ -7337,7 +7439,6 @@ see one coherent view.
 <<helper functions>>=
 def with_tmux_context_lock(callback):
     """Run ``callback`` while holding the tmux context lock."""
-    ensure_tracking_dir()
     lock_file = get_tmux_context_lock_file()
     with open(lock_file, "w") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
@@ -7376,7 +7477,7 @@ providing a chronological record across detached tmux hooks.
 <<helper functions>>=
 def window_event_debug_log_path() -> pathlib.Path:
     """Return the debug log path for window transitions."""
-    return get_tracking_dir() / "window_event_debug.log"
+    return get_tmux_state_dir() / "window_event_debug.log"
 @
 
 The diagnostics become clearer if they report the actual transition we
@@ -7419,7 +7520,6 @@ def emit_window_event_debug(
     if not track_debug_enabled():
         return
 
-    ensure_tracking_dir()
     timestamp = datetime.datetime.now().isoformat(sep=" ")
     summary = summary_text.strip() or "(none)"
     log_line = (
@@ -7575,7 +7675,7 @@ def has_tracked_window_state(
         f"window_labels_{sanitize_tmux_id(tmux_server_key)}_*"
         f"_{sanitize_who(who)}.json"
     )
-    return any(get_tracking_dir().glob(pattern))
+    return any(get_tmux_state_dir().glob(pattern))
 @
 
 The main entry point for nested commands combines the guards above: it
@@ -8124,13 +8224,32 @@ must avoid appending duplicate hook entries.  The
 [[install_tmux_hook_once]] helper queries existing hooks first and skips
 the append when the exact command string is already registered.
 
+Exact-string deduplication alone has a failure mode, though: the hook
+command bakes in the [[--server-key]], so whenever the key computation
+changes---an upgrade, or the [[$TMUX]]-PID instability of
+\cref{track:server-key}---the new command no longer matches the old
+line and gets \emph{appended} next to it.  The old hooks keep firing
+forever, rewriting state files under keys nothing reads anymore.
+Observed in the wild: dozens of accumulated hooks carrying three
+different key formats on one session.  The installer therefore takes
+an optional [[is_stale]] predicate identifying hook lines that this
+command \emph{supersedes}; matching lines are unset by their array
+index before the append.  Unsetting one index of a tmux array option
+leaves the other indices in place, so unrelated hooks (and other
+workers' hooks, which the predicate must not match) survive.
+
 <<helper functions>>=
 def install_tmux_hook_once(
     target: str,
     hook_name: str,
     command: str,
+    is_stale=None,
 ) -> None:
-    """Append a tmux hook command once without clobbering others."""
+    """Append a tmux hook command once without clobbering others.
+
+    Existing hook lines that `is_stale` classifies as superseded
+    (and that differ from `command`) are unset first.
+    """
     show_result = subprocess.run(
         ["tmux", "show-hooks", "-t", target],
         capture_output=True,
@@ -8142,6 +8261,7 @@ def install_tmux_hook_once(
         if line.startswith(f"{hook_name}[")
         or line.startswith(f"{hook_name} ")
     ]
+    <<unset superseded hook lines>>
     if any(command in line for line in existing_lines):
         return
     subprocess.run(
@@ -8155,12 +8275,55 @@ def install_tmux_hook_once(
     )
 @
 
+Unsetting is best effort ([[check=False]]): a hook that cannot be
+unset merely keeps wasting a [[run-shell]] per event, which is the
+status quo we are improving on, not a reason to fail the launch.
+
+<<unset superseded hook lines>>=
+if is_stale is not None:
+    for line in existing_lines:
+        if command in line or not is_stale(line):
+            continue
+        match = re.match(
+            rf"^{re.escape(hook_name)}\[(\d+)\]", line,
+        )
+        if not match:
+            continue
+        subprocess.run(
+            [
+                "tmux", "set-hook", "-u",
+                "-t", target,
+                f"{hook_name}[{match.group(1)}]",
+            ],
+            check=False,
+        )
+@
+
 With the idempotent installer in hand, we only need the authoritative
 [[session-window-changed]] hook for window tracking.  The hook remains
 session-scoped so multiple tracked windows in the same session share the
 same selected-window transition stream.
 
+A window-switch hook line is superseded when it drives the same
+entry point for the same worker in this session---then the current
+command is its replacement, whatever key or nytid path the old line
+baked in.  The worker check matters because two workers sharing one
+tmux session each own a hook: [[build_detached_window_switch_command]]
+only emits [[--who]] for non-default workers, so the default worker's
+lines are exactly those without a [[--who]].
+
 <<helper functions>>=
+def window_switch_hook_is_stale(
+    line: str,
+    who: str,
+) -> bool:
+    """Return whether a hook line is a superseded switch hook."""
+    if "_window-switch-detached" not in line:
+        return False
+    if who == default_username:
+        return "--who" not in line
+    return f"--who {shlex.quote(who)}" in line
+
 def install_tmux_window_sync_hooks(
     session_id: str,
     who: str,
@@ -8175,7 +8338,103 @@ def install_tmux_window_sync_hooks(
         session_id,
         "session-window-changed",
         switch_hook,
+        is_stale=lambda line: window_switch_hook_is_stale(
+            line, who,
+        ),
     )
+@
+
+Let's verify the replacement behaviour: a stale-key line is unset
+and the new command appended, an exact match leaves everything
+alone, and another worker's hook is not ours to touch:
+
+<<test functions>>=
+def test_hook_install_replaces_stale_key():
+    """A superseded switch hook is unset before the append."""
+    old_line = (
+        "session-window-changed[3] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key oldkey --session-id $1'"
+    )
+    new_cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key newkey --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=old_line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show, None, None],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", new_cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    unset_call = mock_run.call_args_list[1].args[0]
+    assert unset_call == [
+        "tmux", "set-hook", "-u", "-t", "$1",
+        "session-window-changed[3]",
+    ]
+    append_call = mock_run.call_args_list[2].args[0]
+    assert append_call[-1] == new_cmd
+
+def test_hook_install_exact_match_is_noop():
+    """An already-installed identical hook is left untouched."""
+    line = (
+        "session-window-changed[3] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key key --session-id $1'"
+    )
+    cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key key --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    assert len(mock_run.call_args_list) == 1
+
+def test_hook_install_spares_other_workers():
+    """Another worker's switch hook is not superseded."""
+    other_line = (
+        "session-window-changed[2] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key oldkey --session-id $1 --who colleague'"
+    )
+    new_cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key newkey --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=other_line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show, None],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", new_cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    assert len(mock_run.call_args_list) == 2
+    append_call = mock_run.call_args_list[1].args[0]
+    assert append_call[1:3] == ["set-hook", "-a"]
 @
 
 \subsubsection{Cleaning Up Suspend State on Pane Exit}
@@ -8360,46 +8619,50 @@ def cleanup_window_detached(
     with_tmux_context_lock(cleanup)
 @
 
-\subsubsection{Sweeping State from Dead Server Instances}
+\subsubsection{Migrating and Cleaning State Files}
 \label{track:server-sweep}
 
-The pane-exit hooks above share one blind spot: they need the tmux
-server alive to fire.  A reboot (or [[tmux kill-server]]) destroys
-every pane and window without running a single [[pane-exited]] hook,
-so all tmux-scoped state files survive in the persistent tracking
-directory.  These leftovers are worse than clutter.  The next server
-on the same socket restarts window numbering at [[@0]], so a
-generation-less key would let a brand-new, untracked window inherit a
-dead window's labels the moment their [[@N]] identifiers coincide.
-The generation in the server key (\cref{track:configuration})
-prevents that resurrection, but the dead files still accumulate
-forever unless something removes them.  That something is a sweep,
-run at every tracked tmux launch and on demand via
-[[nytid track clean]].
+Two kinds of state files can end up unaddressable by the current
+code: files written by an older nytid---under the persistent
+tracking directory (before \cref{track:tmux-state-dir}) or under a
+key computed from the unreliable [[$TMUX]] PID field (before
+\cref{track:server-key})---and files left behind by a server that
+was killed and restarted without a reboot, which fires no
+[[pane-exited]] hooks and does not clear the runtime directory.
 
-What makes the sweep safe is that staleness is \emph{provable} rather
-than guessed.  Every state filename carries the server key as one
-hyphen-joined token, so the sockethash is recoverable from the
-filename alone.  A socket path hosts at most one live server at a
-time; hence a file whose token shares the current server's sockethash
-but differs in generation belongs to a server that provably no longer
-exists.  No boot-time detection or file-age heuristic is needed.  The
-converse also holds: a file keyed to a \emph{different} sockethash
-may belong to a live server we simply are not attached to (a
-[[tmux -L work]] side server, or another host sharing this home
-directory over NFS), so the sweep must never touch it.
+An earlier design \emph{deleted} the second kind at every tracked
+launch, reasoning that a file whose key token shares the current
+sockethash but differs in generation must belong to a dead server:
+a socket hosts at most one live server at a time.  That inference is
+subtly wrong, and expensively so.  The generation was computed from
+the [[$TMUX]] PID field, which different clients of the same live
+server disagree about (\cref{track:server-key})---so the
+\enquote{provably dead} files being deleted were the \emph{live}
+server's own state, written moments earlier under its other alias.
+One launch from the wrong terminal was enough to destroy the
+tracked status of every open window.  The lesson we draw from that
+failure is a rule: \emph{never delete state on an inference}.  What
+runs automatically now only \emph{renames} files, and actual
+removal happens solely in the explicit [[nytid track clean]],
+guarded by what the live server itself reports.
 
-Two legacy name formats are also provably dead, because no current
-code can ever address them: files from before the server key existed
-(their token is the literal [[window]] or [[pane]] from the sanitized
-tmux identifier, or empty for old last-window files), and files whose
-token is a bare generation-less sockethash (the key format that this
-sweep's design replaced---the glob in
-[[get_current_tmux_server_key]] requires a hyphen after the
-sockethash, so such files can never be matched again).  The
+Routine accumulation no longer needs any cleanup at all: dead
+generations from server restarts sit inert---their key never
+matches---until the next reboot clears the runtime directory
+(\cref{track:tmux-state-dir}).
+
+Every state filename carries the server key as one hyphen-joined
+token, so files can be classified from their names alone.  A file
+keyed to a \emph{different} sockethash may belong to a live server
+we simply are not attached to (a [[tmux -L work]] side server, or
+another host sharing this home directory over NFS), so neither
+migration nor [[clean]] may touch it.  Two legacy name formats,
+finally, can no longer be produced: files from before the server
+key existed (their token is the literal [[window]] or [[pane]] from
+the sanitized tmux identifier, or empty for old last-window files),
+and files whose token is a bare generation-less sockethash.  The
 [[window_events_]] prefix covers debug state files from a since
-removed design; nothing writes them anymore, so any survivor is
-swept as legacy.
+removed design.
 
 <<constants>>=
 TMUX_STATE_FILE_PREFIXES = (
@@ -8432,6 +8695,262 @@ def parse_state_file_server_key(
     return None
 @
 
+Both migration and [[clean]] ask the live server what actually
+exists, in one [[list-panes -a]] call that yields every window and
+pane id.  A failed listing returns [[None]] rather than empty sets:
+the callers must be able to distinguish \enquote{the server has no
+windows} from \enquote{we could not ask}, because acting on the
+latter as if it were the former is precisely the
+delete-on-inference mistake this design retires.  The same
+motivation puts liveness above [[tmux_window_exists]]: that helper
+maps a failed query to [[False]], which is fine for its hook-side
+callers but would count as \enquote{dead} here.
+
+<<helper functions>>=
+def list_live_tmux_ids() -> tuple[set[str], set[str]] | None:
+    """Return the live server's window and pane id sets.
+
+    Returns ``None`` when the server cannot be listed.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a",
+             "-F", "#{window_id} #{pane_id}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    if not isinstance(result.stdout, str):
+        return None
+    windows: set[str] = set()
+    panes: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            windows.add(parts[0])
+            panes.add(parts[1])
+    return windows, panes
+@
+
+To match a state file against that listing we need the window or
+pane id embedded in its name.  The ids are numeric, which is what
+lets one regular expression find them even in the legacy key-less
+formats: a key token never puts an underscore directly after a run
+of digits, so the pattern cannot misfire on the key itself.
+
+<<helper functions>>=
+_STATE_FILE_ID_RE = re.compile(r"_(window|pane)_(\d+)_")
+
+def parse_state_file_tmux_id(
+    filename: str,
+) -> str | None:
+    """Return the tmux window/pane id named in a state filename."""
+    match = _STATE_FILE_ID_RE.search(filename)
+    if not match:
+        return None
+    sigil = "@" if match.group(1) == "window" else "%"
+    return sigil + match.group(2)
+@
+
+State files may sit in two places: the runtime directory, and the
+persistent tracking directory where older nytid versions kept them.
+The test fixtures point both helpers at one directory, so we
+deduplicate rather than assume they differ.
+
+<<helper functions>>=
+def _tmux_state_dirs() -> list[pathlib.Path]:
+    """Return the directories that may hold tmux state files."""
+    dirs = [get_tmux_state_dir()]
+    tracking_dir = get_tracking_dir()
+    if tracking_dir != dirs[0]:
+        dirs.append(tracking_dir)
+    return dirs
+@
+
+\paragraph{Migration.}
+Migration rescues files that belong to \emph{this very server} but
+are filed where the current code cannot find them: under an
+outdated key alias, or in the persistent tracking directory.  What
+makes the rescue safe is that same-server identity is provable from
+the filename.  The start time in the generation comes from the
+server itself, and one socket cannot host two servers at
+once---so a key with the current sockethash and the current start
+time but a different PID is not another server, it is this server
+under its old [[$TMUX]] alias.  (A restarted server would need to
+start within the same second to forge this; we accept that
+coincidence, which is why the window must additionally still be
+live.)  Only the label-bearing kinds are worth moving; the
+last-window pointer is rewritten on the next window switch anyway,
+and nothing reads the debug log.
+
+<<constants>>=
+MIGRATABLE_STATE_FILE_PREFIXES = (
+    "window_labels_",
+    "pane_labels_",
+    "suspend_",
+)
+<<helper functions>>=
+def migrate_tmux_state_files(
+    current_server_key: str,
+    dry_run: bool = False,
+) -> list[tuple[pathlib.Path, pathlib.Path]]:
+    """Move this server's misfiled state into the runtime dir.
+
+    Renames files provably belonging to the current tmux server,
+    but filed under an outdated key or in the persistent tracking
+    directory, so the current code finds them again.  Only files
+    naming a window or pane the live server still has are moved;
+    nothing is ever deleted.  Returns (source, target) pairs.
+    """
+    sockethash = current_server_key.split("-", 1)[0]
+    start_time = current_server_key.rsplit("-", 1)[-1]
+    runtime_dir = get_tmux_state_dir()
+    moved = []
+    live_ids: set[str] | None = None
+    for state_dir in _tmux_state_dirs():
+        for prefix in MIGRATABLE_STATE_FILE_PREFIXES:
+            for path in state_dir.glob(prefix + "*"):
+                token = parse_state_file_server_key(path.name)
+                <<skip files not provably this server's>>
+                <<skip live-server check when tmux is unlistable>>
+                <<move the file under the current key>>
+    return moved
+@
+
+A candidate is either keyed to this server exactly (then only its
+directory is wrong) or shares both sockethash and start time (then
+its PID is a [[$TMUX]] alias).  Everything else---other sockets,
+other start times, the legacy key-less tokens---stays untouched:
+we cannot prove those files belong to a live window, and migration
+inherits the never-act-on-inference rule.
+
+<<skip files not provably this server's>>=
+if token != current_server_key and not (
+    token.startswith(f"{sockethash}-")
+    and token.rsplit("-", 1)[-1] == start_time
+):
+    continue
+if (
+    token == current_server_key
+    and path.parent == runtime_dir
+):
+    continue
+@
+
+The live listing is fetched lazily, so a launch with nothing to
+migrate---the steady state---costs no tmux subprocess at all.  If
+the listing fails we stop migrating rather than guess.
+
+<<skip live-server check when tmux is unlistable>>=
+if live_ids is None:
+    listed = list_live_tmux_ids()
+    if listed is None:
+        return moved
+    live_ids = listed[0] | listed[1]
+if parse_state_file_tmux_id(path.name) not in live_ids:
+    continue
+@
+
+The move rewrites the key token to the current key and lands the
+file in the runtime directory; [[shutil.move]] handles the
+cross-filesystem step from the home directory onto the temporary
+filesystem.  An existing target wins: it was written by the live
+server under its correct name, so it is at least as fresh as the
+alias we would move over it, and leaving the source in place keeps
+the no-deletion promise---the leftover is [[clean]]'s business,
+with the user's say-so.
+
+<<move the file under the current key>>=
+tail = path.name[len(prefix):]
+if token:
+    tail = tail[len(token) + 1:]
+target = runtime_dir / (
+    f"{prefix}"
+    f"{sanitize_tmux_id(current_server_key)}_{tail}"
+)
+if target.exists():
+    continue
+moved.append((path, target))
+if not dry_run:
+    try:
+        shutil.move(str(path), target)
+    except OSError:
+        moved.pop()
+@
+
+\paragraph{Cleaning.}
+Explicit removal keeps the old classification by key token, but
+adds the guard the old design lacked: a label-bearing file naming a
+window or pane the live server still lists is never removed, no
+matter what its key claims, and when the server cannot be listed
+nothing is removed at all.  In the persistent tracking directory
+the guard is unnecessary---no current code addresses files there,
+migration has already rescued the live ones, so files matching this
+server's socket are plain leftovers.  Transient kinds (the
+last-window pointer, debug logs) carry no labels worth protecting.
+
+<<helper functions>>=
+def _sweep_state_files(
+    should_remove,
+    dry_run: bool,
+) -> list[pathlib.Path]:
+    removed = []
+    for state_dir in _tmux_state_dirs():
+        for prefix in TMUX_STATE_FILE_PREFIXES:
+            for path in state_dir.glob(prefix + "*"):
+                token = parse_state_file_server_key(path.name)
+                if token is None or not should_remove(path, token):
+                    continue
+                removed.append(path)
+                if not dry_run:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+    return removed
+
+def sweep_stale_server_state(
+    current_server_key: str,
+    dry_run: bool = False,
+) -> list[pathlib.Path]:
+    """Remove this socket's unaddressable tmux state files.
+
+    Never removes a label-bearing file naming a window or pane the
+    live server still has, and removes nothing at all when the
+    server cannot be listed.  Files keyed to other sockets are
+    kept.  Returns the affected paths; with ``dry_run`` nothing is
+    removed, but the same paths are returned.
+    """
+    listed = list_live_tmux_ids()
+    if listed is None:
+        return []
+    live_ids = listed[0] | listed[1]
+    sockethash = current_server_key.split("-", 1)[0]
+    runtime_dir = get_tmux_state_dir()
+
+    def should_remove(path, token):
+        stale_socket = token != current_server_key and (
+            token.startswith(sockethash)
+            or token in LEGACY_STATE_KEY_TOKENS
+        )
+        if path.parent != runtime_dir:
+            return stale_socket or token == current_server_key
+        if not stale_socket:
+            return False
+        if not path.name.startswith(
+            MIGRATABLE_STATE_FILE_PREFIXES
+        ):
+            return True
+        return (
+            parse_state_file_tmux_id(path.name)
+            not in live_ids
+        )
+
+    return _sweep_state_files(should_remove, dry_run)
+@
+
 Let's verify the token recovery on all the name formats the sweep
 must classify:
 
@@ -8457,65 +8976,6 @@ def test_parse_state_file_server_key():
   assert parse_state_file_server_key(
     "tracking_data.json"
   ) is None
-@
-
-The two sweep entry points share one walk over the state files and
-differ only in which key tokens they condemn.  The walk returns the
-removed paths so [[nytid track clean --dry-run]] can reuse the exact
-same classification without unlinking anything.  Removal is
-idempotent: a hook or concurrent sweep may have unlinked a file
-between the glob and the unlink, and a dead file that is already gone
-is success, not failure.
-
-<<helper functions>>=
-def _sweep_state_files(
-    should_remove,
-    dry_run: bool,
-) -> list[pathlib.Path]:
-    removed = []
-    tracking_dir = get_tracking_dir()
-    for prefix in TMUX_STATE_FILE_PREFIXES:
-        for path in tracking_dir.glob(prefix + "*"):
-            token = parse_state_file_server_key(path.name)
-            if token is None or not should_remove(token):
-                continue
-            removed.append(path)
-            if not dry_run:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-    return removed
-@
-
-The regular sweep condemns exactly the provably dead: same
-sockethash with a different (or no) generation, plus the legacy
-formats.  Everything keyed to another socket survives.
-
-<<helper functions>>=
-def sweep_stale_server_state(
-    current_server_key: str,
-    dry_run: bool = False,
-) -> list[pathlib.Path]:
-    """Remove tmux state files from dead instances of this server.
-
-    Removes files keyed to the current server's socket but another
-    generation, plus files in legacy name formats that no current
-    code can address.  Files keyed to other sockets are kept.
-    Returns the affected paths; with ``dry_run`` nothing is
-    removed, but the same paths are returned.
-    """
-    sockethash = current_server_key.split("-", 1)[0]
-
-    def is_stale(token: str) -> bool:
-        if token == current_server_key:
-            return False
-        return (
-            token.startswith(sockethash)
-            or token in LEGACY_STATE_KEY_TOKENS
-        )
-
-    return _sweep_state_files(is_stale, dry_run)
 @
 
 Let's first verify the scenario that motivated all of this: after a
@@ -8545,8 +9005,139 @@ def test_reboot_collision_not_read_as_tracked(temp_tracking_dir):
     ) is None
 @
 
-The sweep itself must remove every state-file kind for a dead
-generation while keeping the live generation's files:
+Migration must rekey exactly the [[$TMUX]]-alias files---same
+socket, same start time, live window---and refuse everything it
+cannot prove: dead windows, other generations, an unlistable
+server, and names already taken.  With no candidates on disk it
+must not even ask tmux.
+
+<<test functions>>=
+def test_migrate_rekeys_same_server_files(temp_tracking_dir):
+  """A wrong-PID alias of the live server's file is rekeyed."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  alias_key = f"{sockethash}-999-1700000000"
+  source = (
+    temp_tracking_dir
+    / f"window_labels_{alias_key}_window_1_me.json"
+  )
+  source.write_text('{"devel": 1}')
+  target = (
+    temp_tracking_dir
+    / f"window_labels_{TEST_SERVER_KEY}_window_1_me.json"
+  )
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@1"}, set()),
+  ):
+    moved = migrate_tmux_state_files(TEST_SERVER_KEY)
+
+  assert moved == [(source, target)]
+  assert not source.exists()
+  assert target.read_text() == '{"devel": 1}'
+
+def test_migrate_leaves_dead_windows(temp_tracking_dir):
+  """An alias file whose window is gone stays where it is."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  alias_key = f"{sockethash}-999-1700000000"
+  name = f"window_labels_{alias_key}_window_1_me.json"
+  (temp_tracking_dir / name).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@2"}, set()),
+  ):
+    assert migrate_tmux_state_files(TEST_SERVER_KEY) == []
+  assert (temp_tracking_dir / name).exists()
+
+def test_migrate_leaves_other_generations(temp_tracking_dir):
+  """Other start times and sockets are no candidates; no tmux call."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  other = build_tmux_sockethash("host", "/tmp/other.sock")
+  kept = [
+    f"window_labels_{sockethash}-111-1000_window_1_me.json",
+    f"window_labels_{sockethash}_window_3_me.json",
+    f"window_labels_{other}-333-4000_window_1_me.json",
+  ]
+  for name in kept:
+    (temp_tracking_dir / name).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    side_effect=AssertionError("tmux queried"),
+  ):
+    assert migrate_tmux_state_files(TEST_SERVER_KEY) == []
+  for name in kept:
+    assert (temp_tracking_dir / name).exists()
+
+def test_migrate_skips_collisions(temp_tracking_dir):
+  """An existing current-key file wins over its alias."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  alias_key = f"{sockethash}-999-1700000000"
+  source = (
+    temp_tracking_dir
+    / f"window_labels_{alias_key}_window_1_me.json"
+  )
+  source.write_text('{"old": 1}')
+  target = (
+    temp_tracking_dir
+    / f"window_labels_{TEST_SERVER_KEY}_window_1_me.json"
+  )
+  target.write_text('{"new": 1}')
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@1"}, set()),
+  ):
+    assert migrate_tmux_state_files(TEST_SERVER_KEY) == []
+  assert source.read_text() == '{"old": 1}'
+  assert target.read_text() == '{"new": 1}'
+
+def test_migrate_moves_old_location_files(temp_tracking_dir):
+  """Correctly keyed files move from the old tracking location."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  old_dir = temp_tracking_dir / "old_location"
+  old_dir.mkdir()
+  name = f"window_labels_{TEST_SERVER_KEY}_window_1_me.json"
+  (old_dir / name).write_text('{"devel": 1}')
+
+  with patch(
+    "nytid.cli.track.get_tracking_dir",
+    return_value=old_dir,
+  ), patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@1"}, set()),
+  ):
+    moved = migrate_tmux_state_files(TEST_SERVER_KEY)
+
+  assert moved == [(old_dir / name, temp_tracking_dir / name)]
+  assert not (old_dir / name).exists()
+  assert (temp_tracking_dir / name).read_text() == '{"devel": 1}'
+
+def test_migrate_aborts_when_tmux_unlistable(temp_tracking_dir):
+  """An unlistable server stops migration entirely."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  alias_key = f"{sockethash}-999-1700000000"
+  name = f"window_labels_{alias_key}_window_1_me.json"
+  (temp_tracking_dir / name).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=None,
+  ):
+    assert migrate_tmux_state_files(TEST_SERVER_KEY) == []
+  assert (temp_tracking_dir / name).exists()
+@
+
+[[clean]]'s removal must take every state-file kind of a dead
+generation while keeping the live generation's files, spare any
+file naming a still-live window, and stand down entirely when the
+server cannot be listed:
 
 <<test functions>>=
 def test_sweep_removes_dead_generation(temp_tracking_dir):
@@ -8568,7 +9159,11 @@ def test_sweep_removes_dead_generation(temp_tracking_dir):
   for name in dead_files + live_files:
     (temp_tracking_dir / name).write_text("{}")
 
-  removed = sweep_stale_server_state(TEST_SERVER_KEY)
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=(set(), set()),
+  ):
+    removed = sweep_stale_server_state(TEST_SERVER_KEY)
 
   assert sorted(p.name for p in removed) == sorted(dead_files)
   for name in dead_files:
@@ -8590,11 +9185,49 @@ def test_sweep_removes_legacy_names(temp_tracking_dir):
   for name in legacy_files:
     (temp_tracking_dir / name).write_text("{}")
 
-  removed = sweep_stale_server_state(TEST_SERVER_KEY)
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=(set(), set()),
+  ):
+    removed = sweep_stale_server_state(TEST_SERVER_KEY)
 
   assert sorted(p.name for p in removed) == sorted(legacy_files)
   for name in legacy_files:
     assert not (temp_tracking_dir / name).exists()
+
+def test_sweep_spares_live_windows(temp_tracking_dir):
+  """A stale-keyed file naming a live window is never removed."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  dead_key = f"{sockethash}-111-1000"
+  live_file = f"window_labels_{dead_key}_window_1_me.json"
+  dead_file = f"window_labels_{dead_key}_window_2_me.json"
+  for name in (live_file, dead_file):
+    (temp_tracking_dir / name).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@1"}, set()),
+  ):
+    removed = sweep_stale_server_state(TEST_SERVER_KEY)
+
+  assert [p.name for p in removed] == [dead_file]
+  assert (temp_tracking_dir / live_file).exists()
+  assert not (temp_tracking_dir / dead_file).exists()
+
+def test_sweep_aborts_when_tmux_unlistable(temp_tracking_dir):
+  """An unlistable server means nothing gets removed."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  name = f"window_labels_{sockethash}-111-1000_window_1_me.json"
+  (temp_tracking_dir / name).write_text("{}")
+
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=None,
+  ):
+    assert sweep_stale_server_state(TEST_SERVER_KEY) == []
+  assert (temp_tracking_dir / name).exists()
 
 def test_sweep_keeps_other_sockets(temp_tracking_dir):
   """State keyed to other sockets may be alive and survives."""
@@ -8607,7 +9240,11 @@ def test_sweep_keeps_other_sockets(temp_tracking_dir):
   for name in kept:
     (temp_tracking_dir / name).write_text("{}")
 
-  assert sweep_stale_server_state(TEST_SERVER_KEY) == []
+  with patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=(set(), set()),
+  ):
+    assert sweep_stale_server_state(TEST_SERVER_KEY) == []
   for name in kept:
     assert (temp_tracking_dir / name).exists()
 
@@ -8627,10 +9264,10 @@ def test_stale_last_window_not_used(temp_tracking_dir):
 @
 
 The [[--all]] variant condemns every state file regardless of
-socket.  We cannot prove other sockets' servers dead from here, so
-this variant exists only behind an explicit user assertion in
-[[nytid track clean --all]]: \enquote{no tracked tmux work is in
-flight anywhere on this filesystem}.
+socket or liveness.  We cannot prove other sockets' servers dead
+from here, so this variant exists only behind an explicit user
+assertion in [[nytid track clean --all]]: \enquote{no tracked tmux
+work is in flight anywhere on this filesystem}.
 
 <<helper functions>>=
 def sweep_all_server_state(
@@ -8641,23 +9278,27 @@ def sweep_all_server_state(
     Returns the affected paths; with ``dry_run`` nothing is
     removed, but the same paths are returned.
     """
-    return _sweep_state_files(lambda token: True, dry_run)
+    return _sweep_state_files(
+        lambda path, token: True, dry_run,
+    )
 @
 
-The user-facing command wraps the two sweeps.  The default scope is
-the current server because that is the only scope where staleness is
-provable; anything wider needs the user's [[--all]] assertion.
-Since deletion is irreversible, [[--dry-run]] lets the user inspect
-the verdict first using the very same classification.  We bypass
+The user-facing command first migrates, then removes: repairing a
+misfiled live file both rescues it and clears the way for the
+removal pass to classify what remains.  The default scope is the
+current server's socket, guarded by the live listing; anything
+wider needs the user's [[--all]] assertion.  Since deletion is
+irreversible, [[--dry-run]] lets the user inspect the verdict
+first using the very same classification.  We bypass
 [[get_current_tmux_server_key]] here on purpose: its no-state glob
-guard only recognizes current-format keys, which would make the
-command refuse to run right when only legacy files are left to
-clean.
+guard returns [[None]] when the runtime directory holds no
+current-format files, which would make the command refuse to run
+right when only misfiled or legacy files are left to handle.
 
 <<argument and option definitions>>=
 clean_dry_run_opt = typer.Option(
     "--dry-run", "-n",
-    help="Only list the files that would be removed")
+    help="Only list the files that would be moved or removed")
 clean_all_opt = typer.Option(
     "--all",
     help="Remove tmux state for all servers, not only "
@@ -8671,12 +9312,14 @@ def clean(
     all_servers: Annotated[bool, clean_all_opt] = False,
 ):
     """
-    Remove stale tmux tracking state files.
+    Repair and remove stale tmux tracking state files.
 
-    Tracked tmux launches sweep automatically; this command covers
-    cleaning up without launching anything, and wiping other
-    servers' state with --all.
+    Moves the live server's misfiled state files back into reach,
+    then removes files of dead instances of the current server.
+    Files naming still-open windows are never removed.  Use --all
+    to wipe all servers' state instead.
     """
+    moved = []
     if all_servers:
         removed = sweep_all_server_state(dry_run=dry_run)
     else:
@@ -8690,13 +9333,21 @@ def clean(
                 err=True,
             )
             raise typer.Exit(1)
+        moved = migrate_tmux_state_files(
+            server_key, dry_run=dry_run,
+        )
         removed = sweep_stale_server_state(
             server_key, dry_run=dry_run,
+        )
+    move_verb = "Would move" if dry_run else "Moved"
+    for source, target in moved:
+        typer.echo(
+            f"{move_verb} {source.name} -> {target.name}"
         )
     verb = "Would remove" if dry_run else "Removed"
     for path in removed:
         typer.echo(f"{verb} {path.name}")
-    if not removed:
+    if not moved and not removed:
         typer.echo("No stale tmux state files found.")
 @
 
@@ -8713,6 +9364,9 @@ def test_clean_removes_stale_files(temp_tracking_dir):
   with patch(
     "nytid.cli.track.compute_tmux_server_key",
     return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=(set(), set()),
   ):
     result = runner.invoke(cli, ["clean"])
 
@@ -8730,12 +9384,38 @@ def test_clean_dry_run_keeps_files(temp_tracking_dir):
   with patch(
     "nytid.cli.track.compute_tmux_server_key",
     return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=(set(), set()),
   ):
     result = runner.invoke(cli, ["clean", "--dry-run"])
 
   assert result.exit_code == 0
   assert stale in result.stdout
   assert (temp_tracking_dir / stale).exists()
+
+def test_clean_reports_migrations(temp_tracking_dir):
+  """clean repairs a live window's alias file and says so."""
+  temp_tracking_dir.mkdir(parents=True, exist_ok=True)
+  sockethash = TEST_SERVER_KEY.split("-", 1)[0]
+  alias_key = f"{sockethash}-999-1700000000"
+  alias = f"window_labels_{alias_key}_window_1_me.json"
+  (temp_tracking_dir / alias).write_text('{"devel": 1}')
+  target = f"window_labels_{TEST_SERVER_KEY}_window_1_me.json"
+
+  with patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.list_live_tmux_ids",
+    return_value=({"@1"}, set()),
+  ):
+    result = runner.invoke(cli, ["clean"])
+
+  assert result.exit_code == 0
+  assert "Moved" in result.stdout
+  assert not (temp_tracking_dir / alias).exists()
+  assert (temp_tracking_dir / target).exists()
 
 def test_clean_all_clears_other_sockets(temp_tracking_dir):
   """clean --all also removes other sockets' state files."""
@@ -8755,6 +9435,418 @@ def test_clean_outside_tmux_requires_all(temp_tracking_dir):
     result = runner.invoke(cli, ["clean"])
 
   assert result.exit_code == 1
+@
+
+\subsubsection{Adopting an Untracked Window}
+\label{track:adopt}
+
+Window tracking so far only begins at [[track start --window]],
+which creates the window itself.  That leaves no way to track a
+window that already exists: one created with tmux's own
+[[new-window]], or one that lost its state file (the historical
+sweeping bug above, or temporary-file aging,
+\cref{track:tmux-state-dir}).  The [[adopt]] command fills that
+gap: it is [[start --window]] minus the launch, run from inside
+the window to adopt.
+
+Adoption both marks the window tracked \emph{and} starts its
+labels.  The two must not be separable: the user demonstrably sits
+in this window (they typed the command here), and a
+tracked-but-idle selected window is exactly the inconsistent state
+the window machinery works to prevent---the next window switch
+away would try to stop labels that never ran.  For the same
+consistency reason, adoption mirrors a launch's context switch:
+when auto-suspend is on and the previously selected window was
+tracked, that window's labels stop as ours start.
+
+We resolve the server key with [[compute_tmux_server_key]] rather
+than [[get_current_tmux_server_key]], for the same reason
+[[clean]] does (\cref{track:server-sweep}): the latter's no-state
+guard returns [[None]] precisely when no windows are tracked
+yet---the very situation adopt exists to fix.  The window and
+session ids come from the live pane in one query; an inherited
+[[TMUX_WINDOW_ID]] could be stale, the pane's actual position
+cannot.
+
+<<helper functions>>=
+def get_tmux_pane_context(
+    pane_id: str,
+) -> tuple[str, str] | None:
+    """Return (window id, session id) of ``pane_id``, or ``None``."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{window_id} #{session_id}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+@
+
+The command itself follows the launch path's phases: resolve the
+tmux context, publish window state under the context lock, run the
+label transition outside it, then arm the hooks.
+
+<<argument and option definitions>>=
+adopt_labels_arg = typer.Argument(
+    ..., help="Labels to track in this window",
+    autocompletion=complete_historical_labels,
+)
+adopt_rename_opt = typer.Option(
+    "--rename",
+    help="Rename the window to the track:<labels> "
+         "naming used by start --window",
+)
+@
+
+The adoption machinery is split the same way as
+[[start_tracking_labels]] and [[run_tmux_command]]: a plain helper
+owns the state changes, and the CLI command is a thin wrapper that
+talks to the user.  The split exists for [[cli.todo]]: adopting a
+window as work on a task needs exactly these state changes plus
+todo-side bookkeeping, and needs the resolved pane, window, and
+key afterwards to arm its own hooks---so the helper returns them.
+
+<<helper functions>>=
+def adopt_current_window(
+    labels: list[str],
+    who: str,
+    auto_suspend: bool | None,
+    rename_to: str | None = None,
+):
+    """Adopt the current tmux window as a tracked window.
+
+    Publishes `labels` on the window, starts them, and arms the
+    sync and cleanup hooks; `rename_to` optionally renames the
+    window.  Returns None outside a usable tmux context.
+    Otherwise returns a dict with the resolved `pane_id`,
+    `window_id`, `session_id` and `tmux_server_key`, plus the
+    `started` and `already_tracking` label lists.
+    """
+    <<resolve adopt tmux context or bail>>
+    <<publish adopted window state under lock>>
+    <<execute adopt label transition>>
+    <<install adopt hooks and optionally rename>>
+    return {
+        "pane_id": pane_id,
+        "window_id": window_id,
+        "session_id": session_id,
+        "tmux_server_key": tmux_server_key,
+        "started": started,
+        "already_tracking": already_tracking,
+    }
+
+<<adopt command>>=
+@cli.command()
+def adopt(
+    labels: Annotated[list[str], adopt_labels_arg],
+    who: Annotated[str, who_opt] = default_username,
+    auto_suspend: Annotated[
+        bool | None, auto_suspend_opt
+    ] = None,
+    rename: Annotated[bool, adopt_rename_opt] = False,
+):
+    """
+    Adopt the current tmux window as a tracked window.
+
+    Marks the window as tracked with the given labels and starts
+    tracking them, as if the window had been created by
+    `track start --window`.  This is also the recovery path for a
+    window that lost its tracked status.
+    """
+    adopted = adopt_current_window(
+        labels, who, auto_suspend,
+        rename_to=(
+            build_context_name("track", labels)
+            if rename else None
+        ),
+    )
+    if adopted is None:
+        typer.echo(
+            "Not inside a running tmux pane; "
+            "run adopt in the window to track.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if adopted["started"]:
+        typer.echo(
+            "Started tracking: "
+            + ", ".join(adopted["started"])
+        )
+    if adopted["already_tracking"]:
+        typer.echo(
+            "Already tracking: "
+            + ", ".join(adopted["already_tracking"])
+        )
+    typer.echo(
+        f"Window {adopted['window_id']} is now tracked."
+    )
+@
+
+Every later step needs the pane, the key, and the window, so
+outside a usable context the helper bails with [[None]] and lets
+each caller phrase its own error.
+
+<<resolve adopt tmux context or bail>>=
+pane_id = os.environ.get("TMUX_PANE")
+tmux_server_key = compute_tmux_server_key(
+    os.environ.get("TMUX")
+)
+context = (
+    get_tmux_pane_context(pane_id)
+    if pane_id and tmux_server_key
+    else None
+)
+if context is None:
+    return None
+window_id, session_id = context
+@
+
+Publication uses [[add_window_labels]] rather than
+[[write_window_labels]]: an already tracked window is not an
+error, its counts merge, and re-running adopt after a partial
+failure converges instead of clobbering.  As at launch, the lock
+covers exactly what hooks observe---the labels file and the
+last-selected pointer---so the very next [[session-window-changed]]
+sees one coherent source/target pair.  The previous window's
+labels are read under the same lock to serve as the stop set of
+the transition below.
+
+<<publish adopted window state under lock>>=
+resolved_auto_suspend = should_auto_suspend(
+    who, auto_suspend,
+)
+
+def publish():
+    add_window_labels(
+        window_id, who, tmux_server_key, labels,
+    )
+    prev_window_id = None
+    prev_labels = None
+    if resolved_auto_suspend:
+        prev_window_id = read_last_selected_window(
+            who, tmux_server_key, session_id,
+        )
+        if (
+            prev_window_id is not None
+            and prev_window_id != window_id
+        ):
+            prev_labels = read_window_labels(
+                prev_window_id, who, tmux_server_key,
+            )
+    write_last_selected_window(
+        who, tmux_server_key, session_id, window_id,
+    )
+    return prev_window_id, prev_labels
+
+source_window_id, source_labels = (
+    with_tmux_context_lock(publish)
+)
+@
+
+The transition mirrors [[needs_window_sync]] at launch: stop the
+source window's labels, start ours, both stamped with one
+transition time so the history has no gap or overlap.  Labels that
+were already running are fine---they simply become window-bound
+now---but the helper returns them separately so callers can say
+so, because the user may be surprised that no new history entry
+starts.
+
+<<execute adopt label transition>>=
+transition_time = datetime.datetime.now()
+if source_labels:
+    stop_tracking_labels(
+        who=who,
+        labels=source_labels,
+        end_time=transition_time,
+        quiet_if_missing=True,
+        update_tmux_context=False,
+    )
+started, already_tracking, _ = start_tracking_labels(
+    labels,
+    start_time=transition_time,
+    who=who,
+    update_tmux_context=False,
+)
+@
+
+Publication and cleanup are two halves of one act: the adopting
+pane becomes the owner of the labels it contributed, so its exit
+must decrement them.  The session sync hook makes window switches
+drive the labels from now on---and, thanks to the replacement
+installer above, arms it while clearing any stale-key hooks, which
+makes adopt a complete one-command recovery.  Renaming is opt-in
+(the CLI's [[--rename]] flag): an adopted window usually has a
+name its user chose, and overwriting it unasked would trade one
+inconsistency for another.  The name is a caller-supplied string
+because track and todo adoption follow different naming
+conventions ([[track:<labels>]] versus [[todo:<id>]]).
+
+<<install adopt hooks and optionally rename>>=
+if resolved_auto_suspend:
+    install_tmux_window_sync_hooks(
+        session_id, who, tmux_server_key,
+    )
+install_tmux_window_cleanup_hook(
+    pane_id, window_id, who, tmux_server_key, labels,
+)
+if rename_to is not None:
+    subprocess.run(
+        [
+            "tmux", "rename-window",
+            "-t", window_id,
+            rename_to,
+        ],
+        check=False,
+    )
+@
+
+Let's verify the failure mode first, then the working paths:
+adoption from scratch, merging into an already tracked window,
+reporting labels that were already running, the auto-suspend
+context switch, and the optional rename.
+
+<<test functions>>=
+ADOPT_TMUX_ENV = {
+  "TMUX": "/tmp/tmux.sock,123,0",
+  "TMUX_PANE": "%3",
+}
+
+def invoke_adopt(args):
+  """Invoke adopt with tmux context and hook installers mocked."""
+  with patch.dict(
+    os.environ, ADOPT_TMUX_ENV, clear=True,
+  ), patch(
+    "nytid.cli.track.get_tmux_pane_context",
+    return_value=("@7", "$1"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_sync_hooks",
+  ) as sync_mock, patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+  ) as cleanup_mock:
+    result = runner.invoke(cli, ["adopt"] + args)
+  return result, sync_mock, cleanup_mock
+
+def test_adopt_outside_tmux_fails(temp_tracking_dir):
+  """Without a tmux context, adopt explains and fails."""
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["adopt", "devel"])
+  assert result.exit_code == 1
+
+def test_adopt_marks_window_tracked(temp_tracking_dir):
+  """Adopt publishes window labels and starts them."""
+  result, sync_mock, cleanup_mock = invoke_adopt(
+    ["devel", "--who", "me", "--auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  assert "Started tracking: devel" in result.stdout
+  assert read_window_labels(
+    "@7", "me", TEST_SERVER_KEY,
+  ) == ["devel"]
+  assert read_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1",
+  ) == "@7"
+  sync_mock.assert_called_once_with(
+    "$1", "me", TEST_SERVER_KEY,
+  )
+  cleanup_mock.assert_called_once_with(
+    "%3", "@7", "me", TEST_SERVER_KEY, ["devel"],
+  )
+
+def test_adopt_merges_into_tracked_window(temp_tracking_dir):
+  """Adopting an already tracked window merges its labels."""
+  write_window_labels(
+    "@7", "me", TEST_SERVER_KEY, ["old"],
+  )
+
+  result, _, _ = invoke_adopt(
+    ["new", "--who", "me", "--no-auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  assert read_window_labels(
+    "@7", "me", TEST_SERVER_KEY,
+  ) == ["old", "new"]
+
+def test_adopt_reports_already_active_labels(temp_tracking_dir):
+  """Labels already running are reported, not restarted."""
+  first, _, _ = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+  assert "Started tracking: devel" in first.stdout
+
+  second, _, _ = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+  assert second.exit_code == 0
+  assert "Already tracking: devel" in second.stdout
+
+def test_adopt_stops_previous_window_labels(temp_tracking_dir):
+  """With auto-suspend, the previous tracked window stops."""
+  write_window_labels(
+    "@1", "me", TEST_SERVER_KEY, ["old"],
+  )
+  write_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1", "@1",
+  )
+
+  with patch(
+    "nytid.cli.track.stop_tracking_labels",
+  ) as stop_mock:
+    result, _, _ = invoke_adopt(
+      ["new", "--who", "me", "--auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  assert stop_mock.call_args.kwargs["labels"] == ["old"]
+  assert read_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1",
+  ) == "@7"
+
+def test_adopt_no_auto_suspend_skips_sync_hook(temp_tracking_dir):
+  """--no-auto-suspend leaves the session sync hook alone."""
+  result, sync_mock, cleanup_mock = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  sync_mock.assert_not_called()
+  cleanup_mock.assert_called_once()
+
+def test_adopt_rename(temp_tracking_dir):
+  """--rename applies the track:<labels> naming convention."""
+  with patch(
+    "nytid.cli.track.subprocess.run",
+  ) as run_mock:
+    result, _, _ = invoke_adopt(
+      ["devel", "nytid", "--who", "me",
+       "--no-auto-suspend", "--rename"],
+    )
+
+  assert result.exit_code == 0
+  rename_calls = [
+    call.args[0] for call in run_mock.call_args_list
+    if call.args and call.args[0][:2] == [
+      "tmux", "rename-window",
+    ]
+  ]
+  assert rename_calls == [[
+    "tmux", "rename-window", "-t", "@7",
+    "track:devel nytid",
+  ]]
 @
 
 \subsubsection{Focus-Events Validation}
@@ -10028,15 +11120,42 @@ def test_parse_tmux_socket_path_reads_socket_path():
     assert parse_tmux_socket_path("malformed") == "malformed"
     assert parse_tmux_socket_path(None) is None
 
-def test_parse_tmux_server_pid_reads_pid():
-    """$TMUX parsing extracts the middle server-PID field."""
-    assert parse_tmux_server_pid("/tmp/tmux.sock,123,0") == "123"
-    assert parse_tmux_server_pid("/tmp/tmux,sock,123,0") == "123"
-    assert parse_tmux_server_pid("malformed") is None
-    assert parse_tmux_server_pid(None) is None
+def test_same_socket_two_pids_one_key():
+    """Clients disagreeing about the server PID share one key."""
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7393,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="7446-1700000000",
+    ):
+        first = compute_tmux_server_key(os.environ["TMUX"])
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7446,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="7446-1700000000",
+    ):
+        second = compute_tmux_server_key(os.environ["TMUX"])
+    assert first == second
+
+def test_generation_from_live_server():
+    """The generation is queried from tmux, not read from $TMUX."""
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout="7446-1700000000\n", stderr="",
+    )
+    with patch.dict(
+        os.environ, {"TMUX": "/tmp/tmux.sock,7393,0"}, clear=True,
+    ), patch(
+        "nytid.cli.track.subprocess.run", return_value=completed,
+    ) as run_mock:
+        assert get_tmux_server_generation() == "7446-1700000000"
+    assert run_mock.call_args.args[0] == [
+        "tmux", "display-message", "-p", "#{pid}-#{start_time}",
+    ]
 
 def test_get_current_tmux_server_key_from_env(temp_tracking_dir):
-    """Current server key composes sockethash, PID and start time."""
+    """Current server key composes sockethash and generation."""
     temp_tracking_dir.mkdir(parents=True, exist_ok=True)
     expected = build_tmux_server_key(
         "host", "/tmp/tmux.sock", "123-1700000000",
@@ -10049,8 +11168,8 @@ def test_get_current_tmux_server_key_from_env(temp_tracking_dir):
     ), patch(
         "nytid.cli.track.socket.gethostname", return_value="host",
     ), patch(
-        "nytid.cli.track.get_tmux_server_start_time",
-        return_value="1700000000",
+        "nytid.cli.track.get_tmux_server_generation",
+        return_value="123-1700000000",
     ):
         assert get_current_tmux_server_key() == expected
 
@@ -10061,7 +11180,7 @@ def test_get_current_tmux_server_key_skips_tmux_without_state(
     with patch.dict(
         os.environ, {"TMUX": "/tmp/tmux.sock,123,0"}, clear=True,
     ), patch(
-        "nytid.cli.track.get_tmux_server_start_time",
+        "nytid.cli.track.get_tmux_server_generation",
         side_effect=AssertionError("tmux queried"),
     ):
         assert get_current_tmux_server_key() is None
@@ -12404,6 +13523,7 @@ and checking the status of active tracking sessions:
 <<start command>>
 <<stop command>>
 <<switch command>>
+<<adopt command>>
 <<clean command>>
 <<detached finalize command>>
 <<detached suspend command>>
@@ -12555,12 +13675,15 @@ from nytid.cli.track import (
     build_tmux_sockethash,
     build_tmux_server_key,
     parse_tmux_socket_path,
-    parse_tmux_server_pid,
     compute_tmux_server_key,
-    get_tmux_server_start_time,
+    get_tmux_server_generation,
     get_current_tmux_server_key,
     get_tracking_dir,
+    get_tmux_state_dir,
     parse_state_file_server_key,
+    parse_state_file_tmux_id,
+    list_live_tmux_ids,
+    migrate_tmux_state_files,
     sweep_stale_server_state,
     sweep_all_server_state,
     sanitize_who, complete_workers,
@@ -12601,6 +13724,8 @@ from nytid.cli.track import (
     get_current_tracked_window_id,
     get_current_tracked_context_labels,
     install_tmux_hook_once,
+    window_switch_hook_is_stale,
+    adopt_current_window,
     build_detached_nytid_prefix,
     build_detached_suspend_command,
     build_detached_resume_command,
