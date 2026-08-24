@@ -8223,13 +8223,32 @@ must avoid appending duplicate hook entries.  The
 [[install_tmux_hook_once]] helper queries existing hooks first and skips
 the append when the exact command string is already registered.
 
+Exact-string deduplication alone has a failure mode, though: the hook
+command bakes in the [[--server-key]], so whenever the key computation
+changes---an upgrade, or the [[$TMUX]]-PID instability of
+\cref{track:server-key}---the new command no longer matches the old
+line and gets \emph{appended} next to it.  The old hooks keep firing
+forever, rewriting state files under keys nothing reads anymore.
+Observed in the wild: dozens of accumulated hooks carrying three
+different key formats on one session.  The installer therefore takes
+an optional [[is_stale]] predicate identifying hook lines that this
+command \emph{supersedes}; matching lines are unset by their array
+index before the append.  Unsetting one index of a tmux array option
+leaves the other indices in place, so unrelated hooks (and other
+workers' hooks, which the predicate must not match) survive.
+
 <<helper functions>>=
 def install_tmux_hook_once(
     target: str,
     hook_name: str,
     command: str,
+    is_stale=None,
 ) -> None:
-    """Append a tmux hook command once without clobbering others."""
+    """Append a tmux hook command once without clobbering others.
+
+    Existing hook lines that `is_stale` classifies as superseded
+    (and that differ from `command`) are unset first.
+    """
     show_result = subprocess.run(
         ["tmux", "show-hooks", "-t", target],
         capture_output=True,
@@ -8241,6 +8260,7 @@ def install_tmux_hook_once(
         if line.startswith(f"{hook_name}[")
         or line.startswith(f"{hook_name} ")
     ]
+    <<unset superseded hook lines>>
     if any(command in line for line in existing_lines):
         return
     subprocess.run(
@@ -8254,12 +8274,55 @@ def install_tmux_hook_once(
     )
 @
 
+Unsetting is best effort ([[check=False]]): a hook that cannot be
+unset merely keeps wasting a [[run-shell]] per event, which is the
+status quo we are improving on, not a reason to fail the launch.
+
+<<unset superseded hook lines>>=
+if is_stale is not None:
+    for line in existing_lines:
+        if command in line or not is_stale(line):
+            continue
+        match = re.match(
+            rf"^{re.escape(hook_name)}\[(\d+)\]", line,
+        )
+        if not match:
+            continue
+        subprocess.run(
+            [
+                "tmux", "set-hook", "-u",
+                "-t", target,
+                f"{hook_name}[{match.group(1)}]",
+            ],
+            check=False,
+        )
+@
+
 With the idempotent installer in hand, we only need the authoritative
 [[session-window-changed]] hook for window tracking.  The hook remains
 session-scoped so multiple tracked windows in the same session share the
 same selected-window transition stream.
 
+A window-switch hook line is superseded when it drives the same
+entry point for the same worker in this session---then the current
+command is its replacement, whatever key or nytid path the old line
+baked in.  The worker check matters because two workers sharing one
+tmux session each own a hook: [[build_detached_window_switch_command]]
+only emits [[--who]] for non-default workers, so the default worker's
+lines are exactly those without a [[--who]].
+
 <<helper functions>>=
+def window_switch_hook_is_stale(
+    line: str,
+    who: str,
+) -> bool:
+    """Return whether a hook line is a superseded switch hook."""
+    if "_window-switch-detached" not in line:
+        return False
+    if who == default_username:
+        return "--who" not in line
+    return f"--who {shlex.quote(who)}" in line
+
 def install_tmux_window_sync_hooks(
     session_id: str,
     who: str,
@@ -8274,7 +8337,103 @@ def install_tmux_window_sync_hooks(
         session_id,
         "session-window-changed",
         switch_hook,
+        is_stale=lambda line: window_switch_hook_is_stale(
+            line, who,
+        ),
     )
+@
+
+Let's verify the replacement behaviour: a stale-key line is unset
+and the new command appended, an exact match leaves everything
+alone, and another worker's hook is not ours to touch:
+
+<<test functions>>=
+def test_hook_install_replaces_stale_key():
+    """A superseded switch hook is unset before the append."""
+    old_line = (
+        "session-window-changed[3] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key oldkey --session-id $1'"
+    )
+    new_cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key newkey --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=old_line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show, None, None],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", new_cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    unset_call = mock_run.call_args_list[1].args[0]
+    assert unset_call == [
+        "tmux", "set-hook", "-u", "-t", "$1",
+        "session-window-changed[3]",
+    ]
+    append_call = mock_run.call_args_list[2].args[0]
+    assert append_call[-1] == new_cmd
+
+def test_hook_install_exact_match_is_noop():
+    """An already-installed identical hook is left untouched."""
+    line = (
+        "session-window-changed[3] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key key --session-id $1'"
+    )
+    cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key key --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    assert len(mock_run.call_args_list) == 1
+
+def test_hook_install_spares_other_workers():
+    """Another worker's switch hook is not superseded."""
+    other_line = (
+        "session-window-changed[2] run-shell -b "
+        "'nytid track _window-switch-detached "
+        "--server-key oldkey --session-id $1 --who colleague'"
+    )
+    new_cmd = (
+        "run-shell -b 'nytid track _window-switch-detached "
+        "--server-key newkey --session-id $1'"
+    )
+    show = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=other_line + "\n", stderr="",
+    )
+    with patch(
+        "nytid.cli.track.subprocess.run",
+        side_effect=[show, None],
+    ) as mock_run:
+        install_tmux_hook_once(
+            "$1", "session-window-changed", new_cmd,
+            is_stale=lambda line: window_switch_hook_is_stale(
+                line, default_username,
+            ),
+        )
+    assert len(mock_run.call_args_list) == 2
+    append_call = mock_run.call_args_list[1].args[0]
+    assert append_call[1:3] == ["set-hook", "-a"]
 @
 
 \subsubsection{Cleaning Up Suspend State on Pane Exit}
@@ -13151,6 +13310,7 @@ from nytid.cli.track import (
     get_current_tracked_window_id,
     get_current_tracked_context_labels,
     install_tmux_hook_once,
+    window_switch_hook_is_stale,
     build_detached_nytid_prefix,
     build_detached_suspend_command,
     build_detached_resume_command,
