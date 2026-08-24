@@ -382,7 +382,8 @@ obvious alternatives is subtly wrong.
   its state file.  We accept this: the hooks rewrite state on every
   window switch, so only long-idle windows are exposed, tmux lives
   with the same exposure for its sockets, and [[nytid track adopt]]
-  re-tracks an affected window in one command.
+  re-tracks an affected window in one command
+  (\cref{track:adopt}).
 \end{description}
 
 Because the temporary directory is world-writable, another user
@@ -9436,6 +9437,368 @@ def test_clean_outside_tmux_requires_all(temp_tracking_dir):
   assert result.exit_code == 1
 @
 
+\subsubsection{Adopting an Untracked Window}
+\label{track:adopt}
+
+Window tracking so far only begins at [[track start --window]],
+which creates the window itself.  That leaves no way to track a
+window that already exists: one created with tmux's own
+[[new-window]], or one that lost its state file (the historical
+sweeping bug above, or temporary-file aging,
+\cref{track:tmux-state-dir}).  The [[adopt]] command fills that
+gap: it is [[start --window]] minus the launch, run from inside
+the window to adopt.
+
+Adoption both marks the window tracked \emph{and} starts its
+labels.  The two must not be separable: the user demonstrably sits
+in this window (they typed the command here), and a
+tracked-but-idle selected window is exactly the inconsistent state
+the window machinery works to prevent---the next window switch
+away would try to stop labels that never ran.  For the same
+consistency reason, adoption mirrors a launch's context switch:
+when auto-suspend is on and the previously selected window was
+tracked, that window's labels stop as ours start.
+
+We resolve the server key with [[compute_tmux_server_key]] rather
+than [[get_current_tmux_server_key]], for the same reason
+[[clean]] does (\cref{track:server-sweep}): the latter's no-state
+guard returns [[None]] precisely when no windows are tracked
+yet---the very situation adopt exists to fix.  The window and
+session ids come from the live pane in one query; an inherited
+[[TMUX_WINDOW_ID]] could be stale, the pane's actual position
+cannot.
+
+<<helper functions>>=
+def get_tmux_pane_context(
+    pane_id: str,
+) -> tuple[str, str] | None:
+    """Return (window id, session id) of ``pane_id``, or ``None``."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{window_id} #{session_id}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+@
+
+The command itself follows the launch path's phases: resolve the
+tmux context, publish window state under the context lock, run the
+label transition outside it, then arm the hooks.
+
+<<argument and option definitions>>=
+adopt_labels_arg = typer.Argument(
+    ..., help="Labels to track in this window",
+    autocompletion=complete_historical_labels,
+)
+adopt_rename_opt = typer.Option(
+    "--rename",
+    help="Rename the window to the track:<labels> "
+         "naming used by start --window",
+)
+@
+
+<<adopt command>>=
+@cli.command()
+def adopt(
+    labels: Annotated[list[str], adopt_labels_arg],
+    who: Annotated[str, who_opt] = default_username,
+    auto_suspend: Annotated[
+        bool | None, auto_suspend_opt
+    ] = None,
+    rename: Annotated[bool, adopt_rename_opt] = False,
+):
+    """
+    Adopt the current tmux window as a tracked window.
+
+    Marks the window as tracked with the given labels and starts
+    tracking them, as if the window had been created by
+    `track start --window`.  This is also the recovery path for a
+    window that lost its tracked status.
+    """
+    <<resolve adopt tmux context or fail>>
+    <<publish adopted window state under lock>>
+    <<execute adopt label transition>>
+    <<install adopt hooks and optionally rename>>
+@
+
+Failing loudly outside tmux beats guessing: every later step needs
+the pane, the key, and the window.
+
+<<resolve adopt tmux context or fail>>=
+pane_id = os.environ.get("TMUX_PANE")
+tmux_server_key = compute_tmux_server_key(
+    os.environ.get("TMUX")
+)
+context = (
+    get_tmux_pane_context(pane_id)
+    if pane_id and tmux_server_key
+    else None
+)
+if context is None:
+    typer.echo(
+        "Not inside a running tmux pane; "
+        "run adopt in the window to track.",
+        err=True,
+    )
+    raise typer.Exit(1)
+window_id, session_id = context
+@
+
+Publication uses [[add_window_labels]] rather than
+[[write_window_labels]]: an already tracked window is not an
+error, its counts merge, and re-running adopt after a partial
+failure converges instead of clobbering.  As at launch, the lock
+covers exactly what hooks observe---the labels file and the
+last-selected pointer---so the very next [[session-window-changed]]
+sees one coherent source/target pair.  The previous window's
+labels are read under the same lock to serve as the stop set of
+the transition below.
+
+<<publish adopted window state under lock>>=
+resolved_auto_suspend = should_auto_suspend(
+    who, auto_suspend,
+)
+
+def publish():
+    add_window_labels(
+        window_id, who, tmux_server_key, labels,
+    )
+    prev_window_id = None
+    prev_labels = None
+    if resolved_auto_suspend:
+        prev_window_id = read_last_selected_window(
+            who, tmux_server_key, session_id,
+        )
+        if (
+            prev_window_id is not None
+            and prev_window_id != window_id
+        ):
+            prev_labels = read_window_labels(
+                prev_window_id, who, tmux_server_key,
+            )
+    write_last_selected_window(
+        who, tmux_server_key, session_id, window_id,
+    )
+    return prev_window_id, prev_labels
+
+source_window_id, source_labels = (
+    with_tmux_context_lock(publish)
+)
+@
+
+The transition mirrors [[needs_window_sync]] at launch: stop the
+source window's labels, start ours, both stamped with one
+transition time so the history has no gap or overlap.  Labels that
+were already running are fine---they simply become window-bound
+now---but we say so, because the user may be surprised that no new
+history entry starts.
+
+<<execute adopt label transition>>=
+transition_time = datetime.datetime.now()
+if source_labels:
+    stop_tracking_labels(
+        who=who,
+        labels=source_labels,
+        end_time=transition_time,
+        quiet_if_missing=True,
+        update_tmux_context=False,
+    )
+started, already_tracking, _ = start_tracking_labels(
+    labels,
+    start_time=transition_time,
+    who=who,
+    update_tmux_context=False,
+)
+if started:
+    typer.echo(
+        "Started tracking: " + ", ".join(started)
+    )
+if already_tracking:
+    typer.echo(
+        "Already tracking: "
+        + ", ".join(already_tracking)
+    )
+@
+
+Publication and cleanup are two halves of one act: the adopting
+pane becomes the owner of the labels it contributed, so its exit
+must decrement them.  The session sync hook makes window switches
+drive the labels from now on---and, thanks to the replacement
+installer above, arms it while clearing any stale-key hooks, which
+makes adopt a complete one-command recovery.  Renaming is opt-in:
+an adopted window usually has a name its user chose, and
+overwriting it unasked would trade one inconsistency for another.
+
+<<install adopt hooks and optionally rename>>=
+if resolved_auto_suspend:
+    install_tmux_window_sync_hooks(
+        session_id, who, tmux_server_key,
+    )
+install_tmux_window_cleanup_hook(
+    pane_id, window_id, who, tmux_server_key, labels,
+)
+if rename:
+    subprocess.run(
+        [
+            "tmux", "rename-window",
+            "-t", window_id,
+            build_context_name("track", labels),
+        ],
+        check=False,
+    )
+typer.echo(f"Window {window_id} is now tracked.")
+@
+
+Let's verify the failure mode first, then the working paths:
+adoption from scratch, merging into an already tracked window,
+reporting labels that were already running, the auto-suspend
+context switch, and the optional rename.
+
+<<test functions>>=
+ADOPT_TMUX_ENV = {
+  "TMUX": "/tmp/tmux.sock,123,0",
+  "TMUX_PANE": "%3",
+}
+
+def invoke_adopt(args):
+  """Invoke adopt with tmux context and hook installers mocked."""
+  with patch.dict(
+    os.environ, ADOPT_TMUX_ENV, clear=True,
+  ), patch(
+    "nytid.cli.track.get_tmux_pane_context",
+    return_value=("@7", "$1"),
+  ), patch(
+    "nytid.cli.track.install_tmux_window_sync_hooks",
+  ) as sync_mock, patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+  ) as cleanup_mock:
+    result = runner.invoke(cli, ["adopt"] + args)
+  return result, sync_mock, cleanup_mock
+
+def test_adopt_outside_tmux_fails(temp_tracking_dir):
+  """Without a tmux context, adopt explains and fails."""
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["adopt", "devel"])
+  assert result.exit_code == 1
+
+def test_adopt_marks_window_tracked(temp_tracking_dir):
+  """Adopt publishes window labels and starts them."""
+  result, sync_mock, cleanup_mock = invoke_adopt(
+    ["devel", "--who", "me", "--auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  assert "Started tracking: devel" in result.stdout
+  assert read_window_labels(
+    "@7", "me", TEST_SERVER_KEY,
+  ) == ["devel"]
+  assert read_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1",
+  ) == "@7"
+  sync_mock.assert_called_once_with(
+    "$1", "me", TEST_SERVER_KEY,
+  )
+  cleanup_mock.assert_called_once_with(
+    "%3", "@7", "me", TEST_SERVER_KEY, ["devel"],
+  )
+
+def test_adopt_merges_into_tracked_window(temp_tracking_dir):
+  """Adopting an already tracked window merges its labels."""
+  write_window_labels(
+    "@7", "me", TEST_SERVER_KEY, ["old"],
+  )
+
+  result, _, _ = invoke_adopt(
+    ["new", "--who", "me", "--no-auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  assert read_window_labels(
+    "@7", "me", TEST_SERVER_KEY,
+  ) == ["old", "new"]
+
+def test_adopt_reports_already_active_labels(temp_tracking_dir):
+  """Labels already running are reported, not restarted."""
+  first, _, _ = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+  assert "Started tracking: devel" in first.stdout
+
+  second, _, _ = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+  assert second.exit_code == 0
+  assert "Already tracking: devel" in second.stdout
+
+def test_adopt_stops_previous_window_labels(temp_tracking_dir):
+  """With auto-suspend, the previous tracked window stops."""
+  write_window_labels(
+    "@1", "me", TEST_SERVER_KEY, ["old"],
+  )
+  write_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1", "@1",
+  )
+
+  with patch(
+    "nytid.cli.track.stop_tracking_labels",
+  ) as stop_mock:
+    result, _, _ = invoke_adopt(
+      ["new", "--who", "me", "--auto-suspend"],
+    )
+
+  assert result.exit_code == 0
+  assert stop_mock.call_args.kwargs["labels"] == ["old"]
+  assert read_last_selected_window(
+    "me", TEST_SERVER_KEY, "$1",
+  ) == "@7"
+
+def test_adopt_no_auto_suspend_skips_sync_hook(temp_tracking_dir):
+  """--no-auto-suspend leaves the session sync hook alone."""
+  result, sync_mock, cleanup_mock = invoke_adopt(
+    ["devel", "--who", "me", "--no-auto-suspend"],
+  )
+
+  assert result.exit_code == 0
+  sync_mock.assert_not_called()
+  cleanup_mock.assert_called_once()
+
+def test_adopt_rename(temp_tracking_dir):
+  """--rename applies the track:<labels> naming convention."""
+  with patch(
+    "nytid.cli.track.subprocess.run",
+  ) as run_mock:
+    result, _, _ = invoke_adopt(
+      ["devel", "nytid", "--who", "me",
+       "--no-auto-suspend", "--rename"],
+    )
+
+  assert result.exit_code == 0
+  rename_calls = [
+    call.args[0] for call in run_mock.call_args_list
+    if call.args and call.args[0][:2] == [
+      "tmux", "rename-window",
+    ]
+  ]
+  assert rename_calls == [[
+    "tmux", "rename-window", "-t", "@7",
+    "track:devel nytid",
+  ]]
+@
+
 \subsubsection{Focus-Events Validation}
 
 The pane [[pane-focus-out]]/[[pane-focus-in]] hooks require tmux's
@@ -13110,6 +13473,7 @@ and checking the status of active tracking sessions:
 <<start command>>
 <<stop command>>
 <<switch command>>
+<<adopt command>>
 <<clean command>>
 <<detached finalize command>>
 <<detached suspend command>>
