@@ -9,24 +9,42 @@ write to another module's real storage if only its own
 paths are patched.
 
 Rather than duplicating the patching logic in every test
-file, we collect shared fixtures in a single
+file, we collect the shared isolation in a single
 [[conftest.py]] that pytest discovers automatically.
-Currently the only shared fixture is
-[[temp_tracking_dir]], which isolates the tracking storage
-layer; any test module whose commands touch tracking data
-can request it---either directly or via fixture
-composition (as [[temp_todo_dir]] does).
+It has to guard two rather different kinds of leakage.
+
+\begin{description}
+\item[Per-test storage] Tracking data lives in files whose
+  paths a fixture can patch for the duration of one test.
+  [[temp_tracking_dir]] does that; any test module whose
+  commands touch tracking data can request it---either
+  directly or via fixture composition (as
+  [[temp_todo_dir]] does).
+\item[The persistent configuration] Course registers,
+  tracking preferences and form definitions live in one
+  [[typerconf]] configuration file shared by the whole
+  process.  No fixture can protect it, because test
+  modules write to it while they are being \emph{imported}
+  (\cref{sec:isolating-the-config}).
+\end{description}
+
+The order of the module body follows that split: the
+configuration must be redirected before the first
+[[nytid]] import, whereas the fixtures only have to exist
+before the first test runs.
 
 <<[[conftest.py]]>>=
-"""Shared pytest fixtures for CLI tests.
+"""Shared pytest isolation for CLI tests.
 
-Provides temporary-directory fixtures that patch storage
-functions so tests never touch real user data.
+Redirects the persistent configuration to a throw-away
+directory and provides temporary-directory fixtures that
+patch storage functions, so tests never touch real user
+data.
 
 Manual debugging outside pytest must apply the same
-patching or point [[track.data_dir]] at a temporary
+patching or point `track.data_dir` at a temporary
 location first; otherwise ad-hoc commands will use
-[[~/.nytid/tracking]].
+`~/.nytid/tracking`.
 """
 import pathlib
 import tempfile
@@ -35,6 +53,8 @@ from unittest.mock import patch
 
 import sys
 sys.path.insert(0, "../src")
+
+<<redirect the persistent config into a sandbox>>
 
 from nytid.cli.track import (
     get_tracking_dir,
@@ -48,6 +68,122 @@ from nytid.cli.track import (
 
 
 <<tracking fixture>>
+@
+
+\section{Isolating the persistent configuration}%
+\label{sec:isolating-the-config}
+
+[[typerconf]] derives the location of its configuration
+file from [[sys.argv[0]]]: under pytest that is the
+[[pytest]] executable, so the whole test suite reads and
+writes [[~/.config/pytest/config.json]].  That file is
+real, it is the user's, and it survives the session.
+
+The consequences are not hypothetical.  A test that adds
+a course register and forgets to remove it leaves a name
+in that file pointing at a [[mkdtemp]] directory; once
+the system reclaims the directory, \emph{every later
+session} starts with a register whose path does not
+exist, and the failure shows up in a test that never
+touched the registry---long after the run that caused it,
+which is what makes such a failure look intermittent.
+The [[try]]--[[finally]] blocks in the test modules are
+only half a defence: they rely on every author
+remembering.
+
+A pytest fixture cannot close the hole, not even a
+session-scoped autouse one.  Fixtures run when the first
+test runs, and by then the damage is done: several test
+modules invoke [[registry add]] at \emph{module scope}
+to build their harness (\cref{sec:courses-test-harness}),
+which pytest executes during collection.  The redirection
+therefore has to happen while [[conftest.py]] itself is
+being imported---pytest imports it before it imports any
+test module---and before this file imports anything from
+[[nytid]].
+
+\subsection{The sandbox}
+
+Each session gets its own empty directory, so nothing
+carries over from the previous run and a leaked register
+dies with the session that created it.
+
+<<redirect the persistent config into a sandbox>>=
+import atexit
+import shutil
+import typerconf
+
+CONFIG_SANDBOX = tempfile.mkdtemp(prefix="nytid-tests-")
+atexit.register(shutil.rmtree, CONFIG_SANDBOX,
+                ignore_errors=True)
+@
+
+\subsection{Redirecting \texttt{typerconf}}
+
+[[typerconf]] computes [[dirs]] once at import time and
+then bakes the resulting path into the \emph{default
+arguments} of [[Config.read_config]] and
+[[Config.write_config]].  A default argument is evaluated
+when the [[def]] executes, so by the time we get control
+the path is already captured in each function's
+[[__defaults__]] tuple.  Reassigning [[typerconf.dirs]]
+alone changes nothing, and neither does patching [[HOME]]
+or [[XDG_CONFIG_HOME]]---those are read before we are.
+We have to overwrite the captured value itself.
+
+Doing that blindly would be a poor trade: if a future
+[[typerconf]] moves the path out of the first default
+slot, the assignment would quietly succeed and the suite
+would go back to writing the user's real config.  So we
+check what we are about to replace and refuse to guess.
+
+<<redirect the persistent config into a sandbox>>=
+def redirect_config_default(method, conf_file):
+    """Point `method`'s captured default config path at
+    `conf_file`."""
+    defaults = method.__defaults__
+    if not defaults or not str(defaults[0]).endswith(
+        "config.json"
+    ):
+        raise RuntimeError(
+            f"typerconf.{method.__qualname__} no longer "
+            f"captures its config path as its first "
+            f"default argument; the test suite's "
+            f"isolation needs updating"
+        )
+    method.__defaults__ = (conf_file,) + defaults[1:]
+@
+
+We still replace [[typerconf.dirs]], for the code that
+has not been written yet.  Any attribute of a
+[[platformdirs.AppDirs]] names a directory, so a
+stand-in that answers every [[*_dir]] query with the
+sandbox keeps future lookups inside it rather than
+letting one escape unnoticed.
+
+<<redirect the persistent config into a sandbox>>=
+class SandboxDirs:
+    """Stand-in for `platformdirs.AppDirs` that resolves
+    every directory to one sandbox."""
+
+    def __init__(self, root):
+        self.root = str(root)
+
+    def __getattr__(self, name):
+        if name.endswith("_dir"):
+            return self.root
+        raise AttributeError(name)
+
+
+typerconf.dirs = SandboxDirs(CONFIG_SANDBOX)
+redirect_config_default(
+    typerconf.Config.read_config,
+    str(pathlib.Path(CONFIG_SANDBOX) / "config.json"),
+)
+redirect_config_default(
+    typerconf.Config.write_config,
+    str(pathlib.Path(CONFIG_SANDBOX) / "config.json"),
+)
 @
 
 \section{Tracking Storage Fixture}

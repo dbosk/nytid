@@ -26,7 +26,6 @@ clean:
 	${RM} -Rf __pycache__
 	${RM} test_*.py
 	${RM} conftest.py conftest.tex
-	${RM} ~/.config/pytest/config.json
 
 .PHONY: distclean
 distclean:
