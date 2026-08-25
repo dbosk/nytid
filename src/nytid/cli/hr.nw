@@ -14,6 +14,35 @@ it's the [[cli.hr]] module.
 They compute employment data from the completed sign-up sheets:
 amanuensis contracts, time sheets, hour summaries and the tracking of
 who is reported to HR as employed.
+
+Much of that data lives in Canvas and LADOK, so this module talks to
+both.
+It does not, however, \emph{authenticate} against either: the
+[[canvaslms]] and [[ladok3]] libraries own authentication entirely,
+including which sources a credential may be resolved from.
+Our side of that division is deliberately narrow --- ask those libraries
+for a session, use exactly what they hand back, and degrade gracefully
+when they hand back nothing.
+Every time we have been tempted to shortcut it, by guessing where the
+credentials \emph{really} live, we have been wrong.
+
+Deferring costs is a theme in this module: the Canvas and LADOK
+sessions below are already created lazily by [[get_canvas_session]]
+and [[get_ladok_session]], because most invocations never talk to
+either service.
+The same reasoning applies to the module's own dependencies.
+The CLI loads every subcommand module at start-up, and top-level
+imports of [[nytid.signup.hr]], [[nytid.signup.sheets]] and
+[[nytid.signup.hr.timesheet]]---the last dragging in [[openpyxl]]
+and PIL---cost about 70\,ms on every nytid invocation.
+We therefore import them inside the functions that use them,
+module-style ([[from nytid.signup import hr]]), so that tests
+patching attributes on the source modules still take effect at call
+time.
+The module-scope code---config-key constants and option
+defaults---uses none of them, and the names imported from
+[[signupsheets]] stay at the top since that module keeps its own
+heavy imports function-local.
 <<[[hr.py]]>>=
 import csv
 import datetime
@@ -21,24 +50,17 @@ from enum import Enum
 import json
 import logging
 import pathlib
-import os
 import sys
 import typer
 import typerconf as config
 from nytid.cli.utils.defaults import default
 from typing import Annotated
 
-from nytid.signup import hr
-from nytid.signup import sheets
-from nytid.signup.hr import timesheet
 import operator
 
 from nytid.cli import courses as coursescli
 from nytid.cli.signupsheets import SIGNUPSHEET_URL_PATH
 from nytid.cli.signupsheets import complete_signup_users
-from nytid import schedules as schedutils
-from nytid.signup import hr
-from nytid.signup import sheets
 
 <<imports>>
 <<constants>>
@@ -145,6 +167,34 @@ We also need to query user information from Canvas to find the LADOK ID.
 So we should also set up Canvas.
 We'll create a function to lazily set up a [[canvas_session]] object.
 This way, we only try to load credentials when they're actually needed.
+
+The delegation principle from the chapter introduction becomes concrete
+here.
+[[canvaslms.cli.login.load_credentials]] resolves a server and a token
+from whatever sources [[canvaslms]] currently supports, and we
+deliberately do not know which those are, nor in what order it consults
+them.
+That is an implementation detail of [[canvaslms]], free to change between
+releases.
+What we get back is a pair, and that pair is the \emph{only} thing we are
+entitled to build a session from.
+
+The contrast with the previous version of this function is instructive,
+because it looked almost right.
+It also called [[load_credentials]] and also checked that the returned
+pair was non-empty --- but it then built the session from the environment
+variables [[CANVAS_SERVER]] and [[CANVAS_TOKEN]], read out of
+[[os.environ]].
+That works only when the environment happens to be the source
+[[canvaslms]] picked.
+With the credentials in the system keyring or in [[canvaslms]]'s own
+configuration file, those variables are unset and the lookup raises
+[[KeyError]]; the catch-all below turned that into a [[None]] session,
+and the callers then told the user to run [[canvaslms login]] --- advice
+that was both useless and wrong, since the login had already been done.
+Passing on the returned pair removes the entire class of mismatch,
+because there is no longer a second source that can disagree with the
+first.
 <<import and set up Canvas>>=
 # Global variable to cache the canvas session
 _canvas_session = None
@@ -154,47 +204,203 @@ def get_canvas_session():
   global _canvas_session
   if _canvas_session is not None:
     return _canvas_session
-  
+
   try:
     import canvasapi
     import canvaslms.cli
+    import canvaslms.cli.login
 
-    dirs_canvas = canvaslms.cli.dirs                                   
-
-    canvaslms_config = canvaslms.cli.read_configuration(
-                          f"{dirs_canvas.user_config_dir}/config.json")
-
-    CANVAS_SERVER, CANVAS_TOKEN = canvaslms.cli.login.load_credentials(
-                                      canvaslms_config)
-
-    if CANVAS_SERVER and CANVAS_TOKEN:
-      _canvas_session = canvasapi.Canvas(os.environ["CANVAS_SERVER"], 
-                                        os.environ["CANVAS_TOKEN"])
-    else:
-      _canvas_session = None
-      logging.warning("Can't load Canvas credentials, run `canvaslms login`")
+    <<ask [[canvaslms]] for credentials>>
+    <<build the session from the credentials>>
   <<handle canvas setup errors>>
-  
+
   return _canvas_session
 @
 
-The first error that can occur here is that we can't import any of the modules
-[[canvasapi]] or [[canvaslms]].
-Any other exception concerns the credentials.
+We import [[canvaslms.cli.login]] explicitly.
+Importing only [[canvaslms.cli]] happens to make the [[login]] submodule
+reachable today, since [[canvaslms.cli]] imports it for its own purposes,
+but that is an accident of their import graph rather than a promise made
+to us --- exactly the kind of assumption this change is about removing.
+
+Where [[canvaslms]] keeps its configuration is likewise its business, so
+we ask it for the directory instead of constructing a path ourselves.
+<<ask [[canvaslms]] for credentials>>=
+canvaslms_config = canvaslms.cli.read_configuration(
+    f"{canvaslms.cli.dirs.user_config_dir}/config.json")
+
+server, token = canvaslms.cli.login.load_credentials(canvaslms_config)
+@
+
+A falsy pair is [[canvaslms]] telling us that it found nothing anywhere.
+That is not an error, it is the normal state of a fresh installation, so
+we log the one action that fixes it and leave the session as [[None]] for
+the callers to handle.
+<<build the session from the credentials>>=
+if server and token:
+  _canvas_session = canvasapi.Canvas(server, token)
+else:
+  _canvas_session = None
+  logging.warning("Can't load Canvas credentials, run `canvaslms login`")
+@
+
+Two kinds of failure are expected here.
+The first is that [[canvasapi]] or [[canvaslms]] can't be imported at
+all, which means the Canvas extras aren't installed; then there is
+nothing to log in to.
+The second is that [[canvaslms]]'s configuration file can't be read: it
+may be unreadable ([[OSError]] covers a missing file and a permission
+problem alike) or contain malformed JSON.
+Reading that file is the one step of the delegation we perform ourselves,
+so it is the one step whose failures we may interpret --- and we
+interpret them exactly as we interpret an empty pair, namely as
+\enquote{no credentials}.
+
+Everything else propagates.
+[[load_credentials]] signals absence by returning a falsy pair rather
+than by raising, so an exception escaping it is a genuine bug or an
+outage, and turning that into \enquote{run [[canvaslms login]]} tells the
+user to fix something that isn't broken.
+The previous [[except Exception]] did precisely that, which is how the
+environment-variable bug above survived unnoticed for so long.
 <<handle canvas setup errors>>=
 except ImportError as err:
   logging.warning(f"Can't import Canvas: {err}")
   _canvas_session = None
-except Exception as err:
+except (OSError, json.JSONDecodeError) as err:
   logging.warning(f"Can't load Canvas credentials: {err}")
   _canvas_session = None
 @
 
+Verifying all this needs a Canvas that isn't there, so we stub both
+packages in [[sys.modules]] before [[get_canvas_session]] imports them.
+Stubs, rather than patches of the real packages, keep the tests honest
+about the delegation: the fixture exposes nothing but
+[[load_credentials]], [[read_configuration]] and [[canvasapi.Canvas]], so
+no test can come to depend on how [[canvaslms]] resolves anything.
+The fixture also clears the cached [[_canvas_session]], since a session
+built by one test would otherwise be handed straight back to the next.
+Two of the tests inspect the warnings we log, and [[caplog]] wants a
+level constant to do that, so we bring in [[logging]] as well.
+<<test imports>>=
+import logging
+<<test setup>>=
+@pytest.fixture
+def canvas_stubs(monkeypatch):
+  """Replaces canvasapi and canvaslms with recording stubs."""
+  import sys
+  import types
+  from nytid.cli import hr as hrcli
+
+  canvasapi = types.ModuleType("canvasapi")
+  canvasapi.sessions = []
+
+  def Canvas(server, token):
+    canvasapi.sessions.append((server, token))
+    return f"canvas session for {server}"
+
+  canvasapi.Canvas = Canvas
+
+  canvaslms = types.ModuleType("canvaslms")
+  canvaslms.cli = types.ModuleType("canvaslms.cli")
+  canvaslms.cli.dirs = types.SimpleNamespace(
+    user_config_dir="/nonexistent")
+  canvaslms.cli.read_configuration = lambda config_file: {}
+  canvaslms.cli.login = types.ModuleType("canvaslms.cli.login")
+  canvaslms.cli.login.load_credentials = lambda config: (None, None)
+
+  for name, module in [("canvasapi", canvasapi),
+                       ("canvaslms", canvaslms),
+                       ("canvaslms.cli", canvaslms.cli),
+                       ("canvaslms.cli.login", canvaslms.cli.login)]:
+    monkeypatch.setitem(sys.modules, name, module)
+
+  monkeypatch.setattr(hrcli, "_canvas_session", None)
+
+  return types.SimpleNamespace(canvasapi=canvasapi, canvaslms=canvaslms)
+@
+
+The regression itself.
+[[load_credentials]] hands back a usable pair while the environment
+variables are absent, which is precisely the situation the old code
+turned into a [[KeyError]].
+The session must be built from the returned pair and from nothing else:
+<<test functions>>=
+def test_canvas_session_uses_returned_credentials(canvas_stubs,
+                                                  monkeypatch):
+  """The session comes from what canvaslms returns, not the environment."""
+  from nytid.cli import hr as hrcli
+
+  monkeypatch.delenv("CANVAS_SERVER", raising=False)
+  monkeypatch.delenv("CANVAS_TOKEN", raising=False)
+  canvas_stubs.canvaslms.cli.login.load_credentials = lambda config: (
+    "https://example.instructure.com", "token123")
+
+  assert hrcli.get_canvas_session() is not None
+  assert canvas_stubs.canvasapi.sessions == [
+    ("https://example.instructure.com", "token123")]
+@
+
+When there are no credentials at all we must not construct a session, and
+the warning has to name the command that fixes it:
+<<test functions>>=
+def test_canvas_session_without_credentials_warns(canvas_stubs, caplog):
+  """A falsy credential pair yields no session, but says what to do."""
+  from nytid.cli import hr as hrcli
+
+  with caplog.at_level(logging.WARNING):
+    assert hrcli.get_canvas_session() is None
+
+  assert canvas_stubs.canvasapi.sessions == []
+  assert "canvaslms login" in caplog.text
+@
+
+An unreadable configuration file is the other expected failure, and it
+means the same thing to us as no credentials:
+<<test functions>>=
+def test_canvas_session_survives_unreadable_config(canvas_stubs, caplog):
+  """A config file we can't read is treated as no credentials."""
+  from nytid.cli import hr as hrcli
+
+  def unreadable(config_file):
+    raise PermissionError(config_file)
+
+  canvas_stubs.canvaslms.cli.read_configuration = unreadable
+
+  with caplog.at_level(logging.WARNING):
+    assert hrcli.get_canvas_session() is None
+
+  assert canvas_stubs.canvasapi.sessions == []
+@
+
+Anything else has to reach the caller.
+A crash inside [[load_credentials]] is not a missing login, and hiding it
+behind a [[None]] session is what made the original bug invisible:
+<<test functions>>=
+def test_canvas_session_propagates_unexpected_errors(canvas_stubs):
+  """Surprises from canvaslms surface instead of becoming None."""
+  from nytid.cli import hr as hrcli
+
+  def explode(config):
+    raise RuntimeError("keyring backend crashed")
+
+  canvas_stubs.canvaslms.cli.login.load_credentials = explode
+
+  with pytest.raises(RuntimeError):
+    hrcli.get_canvas_session()
+@
+
 \subsection{Looking up usernames in Canvas and LADOK}
 
-Now that we have a (hopefully) working [[canvas_session]] and 
+Now that we have a (hopefully) working [[canvas_session]] and
 [[ladok_session]], we can look up a username in Canvas and then from that user
 object we can look up the LADOK data.
+Both getters return [[None]] when there is nothing to authenticate with,
+and the consumers below turn that into a [[RuntimeError]] telling the
+user to run [[canvaslms login]].
+That is honest advice now only because the session is built from the
+credentials [[canvaslms]] actually resolved; a session we drop on the
+floor while valid credentials exist makes the same message a lie.
 To do this, we'll introduce two helper functions:
 One to look up the username in Canvas, to get a Canvas user object.
 Another to look up the LADOK ID from the Canvas user object.
@@ -327,6 +533,15 @@ We want a list of the usernames of who is booked on the course.
 We'll simply read the sign-up sheet and extract all usernames.
 However, we'll add an option for detailed information that looks the username up
 in Canvas and LADOK to print more detailed information.
+Like every command in this module that reads sign-up sheets, this
+one starts by importing the sign-up machinery deferred from module
+scope (see the introduction of this chapter); the shared chunk keeps
+the commands' import lists identical.
+<<signup machinery imports>>=
+from nytid.signup import hr
+from nytid.signup import sheets
+@
+
 <<subcommands>>=
 @cli.command()
 def users(<<argument for matching courses>>,
@@ -335,6 +550,7 @@ def users(<<argument for matching courses>>,
   """
   Prints the list of all usernames booked on the course.
   """
+  <<signup machinery imports>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] be all bookings from [[courses]]>>
 
@@ -463,7 +679,7 @@ def test_users_pipes_bare_usernames(monkeypatch, capsys):
     lambda *args, **kwargs: {
       ("DD1310", "reg"): typerconf.Config({})})
   monkeypatch.setattr(
-    hrcli.hr, "hours_per_TA",
+    nytid.signup.hr, "hours_per_TA",
     lambda booked: {"alice": 10, "bob": 5})
 
   hrcli.users("DD1310", "reg", False)
@@ -484,6 +700,7 @@ def time(<<argument for matching courses>>,
   """
   Summarizes the time spent on teaching the course(s).
   """
+  <<signup machinery imports>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] be all bookings from [[courses]]>>
   <<print summary of [[booked]]>>
@@ -512,9 +729,11 @@ except KeyError as err:
 else:
   <<convert [[url]] to Google Sheet CSV-export URL if necessary>>
   course_bookings = sheets.read_signup_sheet_from_url(url)
-<<imports>>=
-from nytid.signup import sheets
 @
+
+The name [[sheets]] here resolves to the function-local
+[[<<signup machinery imports>>]] of whichever command includes this
+chunk.
 
 If it's a Google Sheets sharing URL, we want to convert it to the export-CSV 
 URL.
@@ -557,8 +776,6 @@ if course_summary:
 <<helper functions>>=
 def to_hours(td):
   return td.total_seconds()/60/60
-<<imports>>=
-from nytid.signup import hr
 @
 
 \subsubsection{Summary of the amanuensis}
@@ -846,6 +1063,8 @@ def cli_amanuens_create(<<option for TAs to filter for>>,
   """
   Computes amanuensis data for a TA.
   """
+  <<signup machinery imports>>
+  from nytid.signup.hr import timesheet
   <<make all dates timezone aware>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] and [[booked_by_course]] be all bookings from [[courses]]>>
@@ -1543,8 +1762,9 @@ def cli_amanuens_show(<<argument [[user_regex]] to match TAs>> = ".*",
                       <<option [[events]] to include events>>,
                       <<options for which contracts to show>>):
   """
-  Shows stored amanuesis contracts for TAs.
+  Shows stored amanuensis contracts for TAs.
   """
+  <<signup machinery imports>>
   <<let [[contracts_path]] be the configured path for storing contracts>>
   <<let [[contracts]] be the valid contracts matching [[user_regex]]>>
 
@@ -2231,7 +2451,7 @@ def test_filter_contracts_by_time_both_dates(temp_contracts_dir):
 
 To print the data, we can do the same as when we generated the contract.
 We just need to set up the same variables and then do
-[[<<print [[amanuesis]] data for [[user]]>>]].
+[[<<print [[amanuensis]] data for [[user]]>>]].
 <<print [[contract]]>>=
 user = contract["user"]
 booked = contract["events"]
@@ -2247,7 +2467,7 @@ end = datetime.datetime.fromisoformat(contract["end"]) \
 set_end = datetime.datetime.fromisoformat(contract["set_end"]) \
           if "set_end" in contract and contract["set_end"] else None
 
-<<let [[amanuesis]] be the recomputed data from [[booked]] between [[start]] and [[end]]>>
+<<let [[amanuensis]] be the recomputed data from [[booked]] between [[start]] and [[end]]>>
 
 try:
   course_regex = contract["course_regex"]
@@ -2261,7 +2481,7 @@ except KeyError:
 When we recompute the amanuensis data, we want to set the low percentage and 
 minimum days to zero so that those settings don't interfere.
 Maybe those settings have changed, but then we still have a contract.
-<<let [[amanuesis]] be the recomputed data from [[booked]] between [[start]] and [[end]]>>=
+<<let [[amanuensis]] be the recomputed data from [[booked]] between [[start]] and [[end]]>>=
 amanuensis = hr.compute_amanuensis_data(booked,
                                         begin_date=start,
                                         end_date=end,
@@ -2685,6 +2905,8 @@ def cli_generate_timesheets(<<option for TAs to filter for>>,
   """
   Generates time sheets for TAs in courses.
   """
+  <<signup machinery imports>>
+  from nytid.signup.hr import timesheet
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<try to get [[manager]], [[organization]] and [[project]] from [[courses]]>>
   <<let [[booked]] be all bookings from [[courses]]>>
@@ -2914,8 +3136,6 @@ timesheet.make_xlsx(personnummer,
                     course_leader_signature=course_responsible_signature \
                       if sign else None,
                     output=output_filename)
-<<imports>>=
-from nytid.signup.hr import timesheet
 <<options for time sheet data>>=
 course_responsible: Annotated[str, course_responsible_opt]
   = default_course_responsible,
@@ -3097,6 +3317,7 @@ def summarize_user(user, course_events,
   - Optional `amanuensis` selects the amanuensis prep-time policy instead
     of the hourly one (affects `koeff` and `omr_tid`).
   """
+  <<signup machinery imports>>
   <<[[summarize_user]] variables>>
   <<let [[events]] be a list of events for [[user]], sorted by date>>
 
@@ -3456,13 +3677,13 @@ def test_cli_amanuens_create_xlsx_uses_pushed_dates(tmp_path, monkeypatch):
 
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
                       lambda *a, **k: {("DD1310", "reg"): config})
-  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
                       lambda url: booked)
   monkeypatch.setattr(hrcli, "get_canvas_user", _no_canvas)
   # Pin the contract to known dates so the date assertion is deterministic.
   # Aware local datetimes, matching what compute_amanuensis_data returns.
   monkeypatch.setattr(
-    hrcli.hr, "compute_amanuensis_data",
+    nytid.signup.hr, "compute_amanuensis_data",
     lambda *a, **k: {
       "alice": (datetime.datetime(2024, 9, 1).astimezone(),
                 datetime.datetime(2024, 12, 1).astimezone(),
@@ -3519,12 +3740,12 @@ def test_cli_amanuens_create_xlsx_no_details_skips_ladok(tmp_path, monkeypatch):
 
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
                       lambda *a, **k: {("DD1310", "reg"): config})
-  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
                       lambda url: booked)
   monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: _CanvasUser())
   monkeypatch.setattr(hrcli, "get_ladok_user", _no_ladok)
   monkeypatch.setattr(
-    hrcli.hr, "compute_amanuensis_data",
+    nytid.signup.hr, "compute_amanuensis_data",
     lambda *a, **k: {
       "alice": (datetime.datetime(2024, 9, 1).astimezone(),
                 datetime.datetime(2024, 12, 1).astimezone(),
@@ -3575,13 +3796,13 @@ def test_cli_amanuens_create_xlsx_tcs_filename(tmp_path, monkeypatch):
 
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
                       lambda *a, **k: {("prgwv26", "reg"): config})
-  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
                       lambda url: booked)
   monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: _CanvasUser())
   monkeypatch.setattr(hrcli, "get_all_periods", lambda: {
     "25/26-4": {"start": "2026-03-16", "end": "2026-06-07"}})
   monkeypatch.setattr(
-    hrcli.hr, "compute_amanuensis_data",
+    nytid.signup.hr, "compute_amanuensis_data",
     lambda *a, **k: {
       "emmar": (datetime.datetime(2026, 3, 16).astimezone(),
                 datetime.datetime(2026, 6, 7).astimezone(),
@@ -3630,12 +3851,12 @@ def test_cli_amanuens_create_detailed_uses_canvas_email(tmp_path,
 
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
                       lambda *a, **k: {("DD1310", "reg"): config})
-  monkeypatch.setattr(hrcli.sheets, "read_signup_sheet_from_url",
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
                       lambda url: booked)
   monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: _CanvasUser())
   monkeypatch.setattr(hrcli, "get_ladok_user", lambda *a, **k: _LadokStudent())
   monkeypatch.setattr(
-    hrcli.hr, "compute_amanuensis_data",
+    nytid.signup.hr, "compute_amanuensis_data",
     lambda *a, **k: {
       "alice": (datetime.datetime(2024, 9, 1).astimezone(),
                 datetime.datetime(2024, 12, 1).astimezone(),
@@ -4467,6 +4688,7 @@ def cli_employed_missing(<<argument for matching courses>>,
   Piped, this is one username (or identity line, with `--detailed`)
   per line.
   """
+  <<signup machinery imports>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] be all bookings from [[courses]]>>
   with employment_storage() as root:
@@ -4524,6 +4746,7 @@ def cli_employed_report(<<argument for matching courses>>,
   Piped, this is one identity line per newly reported TA; nothing at
   all when no one is new.
   """
+  <<signup machinery imports>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] be all bookings from [[courses]]>>
   <<determine the [[valid_until]] date>>
@@ -4588,7 +4811,7 @@ def test_cli_employed_report_stores_and_skips(temp_employment_dir,
     lambda *args, **kwargs: {
       ("DD1310", "reg"): typerconf.Config({})})
   monkeypatch.setattr(
-    hrcli.hr, "hours_per_TA",
+    nytid.signup.hr, "hours_per_TA",
     lambda booked: {"alice": 10, "bob": 5})
 
   class CanvasUser:
@@ -4746,6 +4969,7 @@ def cli_employed_ignore(<<argument for matching courses>>,
   Prints each ignored username. Ignore records have no expiry unless
   `--valid-until` is given.
   """
+  <<signup machinery imports>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
   <<let [[booked]] be all bookings from [[courses]]>>
   user_pattern = re.compile(user_regex)
@@ -4773,7 +4997,7 @@ def test_cli_employed_ignore_stores_record(temp_employment_dir,
     lambda *args, **kwargs: {
       ("DD1310", "reg"): typerconf.Config({})})
   monkeypatch.setattr(
-    hrcli.hr, "hours_per_TA",
+    nytid.signup.hr, "hours_per_TA",
     lambda booked: {"alice": 10, "bob": 5})
 
   result = CliRunner().invoke(hrcli.cli,
@@ -4834,7 +5058,7 @@ def test_cli_employed_missing_pipes_bare_usernames(temp_employment_dir,
     lambda *args, **kwargs: {
       ("DD1310", "reg"): typerconf.Config({})})
   monkeypatch.setattr(
-    hrcli.hr, "hours_per_TA",
+    nytid.signup.hr, "hours_per_TA",
     lambda booked: {"alice": 10, "bob": 5})
 
   result = CliRunner().invoke(hrcli.cli,
@@ -4861,12 +5085,20 @@ from nytid.cli.hr import *
 \subsection{Test imports}
 
 We need to import the necessary modules for testing.
+We import [[nytid.signup.hr]] and [[nytid.signup.sheets]] explicitly
+because the tests patch attributes on those source modules---the
+[[cli.hr]] module no longer holds them as attributes, since it defers
+the imports to call time; the commands' function-local module-style
+imports pick the patches up when they run.
 <<test imports>>=
 import datetime
 import json
 import pathlib
 import tempfile
 import pytest
+
+import nytid.signup.hr
+import nytid.signup.sheets
 @
 
 \subsection{Test setup}

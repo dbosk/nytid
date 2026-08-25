@@ -6,6 +6,7 @@ SUBDIR+=	courses
 SUBDIR+=	signup
 
 MODULES+=	schedules.py
+MODULES+=	prompt.py
 
 .PHONY: all
 all: ${MODULES}

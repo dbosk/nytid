@@ -282,22 +282,42 @@ one distant global block.
 TRACKING_DIR_CONFIG = "track.data_dir"
 @
 
+Every path in the track module is derived from this one helper, so it
+runs on every invocation---including the ones that only read, such as
+[[nytid track ls]], [[nytid track status]] and the shell completions
+behind them.  It must therefore be free of side effects.  An earlier
+version persisted the default location back into the configuration
+file the first time the key was missing, which turned a listing into
+a configuration write; it also re-read the configuration file from
+disk for each of the four path helpers below.
+
+We instead read through [[default]] (\cref{cli.utils.defaults.cache}),
+which answers from a process-lifetime cache built by a [[Config]]
+object constructed \emph{without} a [[conf_file]] argument.  Such an
+object has nowhere to write, so the read-only property is structural
+rather than a matter of discipline, and the file is read at most once
+per process.
+
+The consequence is that the default location is no longer recorded in
+the configuration.  We recompute it from [[pathlib.Path.home()]] on
+each call instead, which keeps the answer correct when [[HOME]] moves
+after import.  Since [[default]] casts the stored value but not the
+fallback, we pass a string and convert once, so a configured and a
+default location reach [[StorageRoot]] by the same route.
+
 <<configuration management>>=
 def get_tracking_storage() -> storage.StorageRoot:
     """
     Get the StorageRoot for tracking data.
-    
+
     Uses nytid's StorageRoot system for consistent file management.
     Returns a StorageRoot object that can be used to open tracking data files.
     """
-    try:
-        tracking_dir = pathlib.Path(config.get(TRACKING_DIR_CONFIG))
-    except KeyError:
-        # Fallback to default location in user's home directory
-        tracking_dir = pathlib.Path.home() / ".nytid" / "tracking"
-        # Set the default in config for future use
-        config.set(TRACKING_DIR_CONFIG, str(tracking_dir))
-    
+    fallback = pathlib.Path.home() / ".nytid" / "tracking"
+    tracking_dir = pathlib.Path(
+        default(TRACKING_DIR_CONFIG, str(fallback))
+    )
+
     return storage.StorageRoot(tracking_dir)
 
 def get_tracking_dir() -> pathlib.Path:
@@ -330,6 +350,64 @@ def sanitize_tmux_id(value: str) -> str:
         for c in value
     )
 
+@
+
+Let's verify that the fallback really is read-only.  We make the
+cached config raise [[KeyError]] for every key, so the lookup takes
+the fallback path, and install a [[config.set]] that fails loudly if
+anything calls it.  Pointing [[pathlib.Path.home]] at a temporary
+directory makes the expected fallback unambiguous.
+
+<<test functions>>=
+def test_get_tracking_storage_never_writes_config(
+    monkeypatch, tmp_path
+):
+    """A missing config key must not be persisted."""
+    fake = MagicMock()
+    fake.get.side_effect = KeyError(TRACKING_DIR_CONFIG)
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    monkeypatch.setattr(
+        "nytid.cli.track.config.set",
+        MagicMock(side_effect=AssertionError(
+            "get_tracking_storage wrote the config file"
+        )),
+    )
+    monkeypatch.setattr(
+        pathlib.Path, "home", lambda: tmp_path
+    )
+    try:
+        assert get_tracking_storage().path == (
+            tmp_path / ".nytid" / "tracking"
+        )
+    finally:
+        defaults._reset_cache()
+@
+
+The four path helpers above all funnel through
+[[get_tracking_storage]], so a single command resolves it several
+times.  With the cache in place those repeats cost nothing: the
+configuration file is read once per process, not once per lookup.
+
+<<test functions>>=
+def test_tracking_paths_read_config_once(
+    monkeypatch, tmp_path
+):
+    """Repeated path lookups share the cached config."""
+    fake = MagicMock()
+    fake.get.return_value = str(tmp_path / "tracking")
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    try:
+        get_tracking_data_file()
+        get_tracking_lock_file()
+        assert fake.read_config.call_count == 1
+    finally:
+        defaults._reset_cache()
 @
 
 \subsection{Tmux-Scoped Runtime State}
@@ -391,9 +469,18 @@ could squat our path before we first create it.  Like tmux, we
 create the directory mode [[0700]] and refuse one owned by somebody
 else---failing loudly beats silently sharing state with a stranger.
 The location can be overridden through configuration (for tests and
-unusual setups); the default is derived from the machine and user,
-so we do not persist it back into the configuration the way
-[[get_tracking_storage]] does.
+unusual setups); the default is derived from the machine and user and
+recomputed on each call rather than written back, so this helper
+shares [[get_tracking_storage]]'s read-only property above.
+
+It does not yet share the caching.  The lookup below goes straight to
+[[typerconf]], so each of the eleven call sites re-reads the
+configuration file from disk---and several of them sit on the tmux
+window-event hook path, which runs on every window switch.  Moving
+this helper to [[default]] as well is worth doing, but it is a
+different change from removing the write-back: the write-back was a
+correctness bug, whereas this is a cost, and the two are easier to
+review apart.  We leave it for a follow-up.
 
 <<constants>>=
 TMUX_STATE_DIR_CONFIG = "track.tmux_state_dir"
@@ -725,9 +812,15 @@ used a different default---the original hard-coded
 To eliminate this mismatch we derive the default worker
 identity from the same environment variable.
 
+We pass no fallback, because the shared helper
+(\cref{cli:default-username}) now defaults to the very
+\enquote{me} this module used to ask for by name.  Naming it
+here again would say that [[track]] has its own convention,
+which is exactly the impression this section exists to dispel.
+
 <<initialise [[default_username]]>>=
 from nytid.cli import get_default_username
-default_username = get_default_username(fallback="me")
+default_username = get_default_username()
 @
 
 <<constants>>=
@@ -1947,6 +2040,7 @@ def ensure_tracking_dir():
 @
 
 \subsection{Historical Data Management}
+\label{track:history-helpers}
 
 Historical tracking data is stored in JSON format for all completed time entries.
 
@@ -1957,6 +2051,23 @@ same [[content_hash()]] and cannot be addressed independently.  We solve
 this by collapsing duplicates automatically and emitting a
 [[logging.warning()]] so the anomaly is visible without forcing the user
 through a repair workflow.
+
+Detecting a duplicate only requires an \emph{equality} relation, not a
+printable digest.  [[content_hash()]] is a pure function of exactly
+five fields---the two timestamps as [[isoformat()]] strings, the
+(sorted, duplicate-free) label list, the description and the
+worker---so a tuple of those same values partitions the history into
+precisely the same equivalence classes as the digest, minus the
+SHA-256 pass.  Since normalization runs on \emph{every} load and twice
+per mutation cycle, hashing thousands of entries just to compare them
+for equality dominated the cost of loading a large history.  We
+therefore dedup on the cheap tuple and reserve [[content_hash()]] for
+what actually needs a digest: the user-facing entry identifiers.
+
+We deliberately do \emph{not} offer a way to skip normalization on
+read-only paths: a [[dedupe=False]] fast path would let a display or
+statistics command double-count the durations of duplicated rows, so
+every reader sees the normalized view.
 
 Concurrent history writers create a second hazard.  Commands such as
 [[stop]], launch-enabled [[start]], and the history-editing commands all use a
@@ -1979,14 +2090,20 @@ def normalize_tracking_entries(
 ) -> tuple[list[TrackingEntry], int]:
     """Collapse exact duplicate historical entries."""
     merged = []
-    seen_hashes = set()
+    seen_keys = set()
     duplicate_count = 0
     for entry in entries:
-        entry_hash = entry.content_hash()
-        if entry_hash in seen_hashes:
+        key = (
+            entry.start_time.isoformat(),
+            entry.end_time.isoformat(),
+            tuple(entry.labels),
+            entry.description,
+            entry.who,
+        )
+        if key in seen_keys:
             duplicate_count += 1
             continue
-        seen_hashes.add(entry_hash)
+        seen_keys.add(key)
         merged.append(entry)
 
     if duplicate_count:
@@ -2069,6 +2186,21 @@ def mutate_tracking_history(callback):
         finally:
             fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
+@
+
+The [[show]], [[edit]] and [[rm]] commands all name their entry by a
+hash prefix, which this helper turns back into the one entry it
+identifies.  Prefix matching is deliberate: it is what lets the
+abbreviated ids of [[track ls --id]] (\cref{sec:track-ls}) be typed
+back, and it is why widening a displayed id never invalidates a
+shorter prefix a user already copied.
+
+The price of prefix matching is that a prefix can be ambiguous, and
+the user cannot see why: the ids they were shown were unique in the
+listing they were looking at.  The error therefore says how many
+entries the prefix matches and what to do about it---a longer
+prefix always exists, since the full hashes differ.
+
 <<history entry helpers>>=
 def resolve_tracking_entry(
     entries: list[TrackingEntry],
@@ -2083,10 +2215,43 @@ def resolve_tracking_entry(
         raise ValueError(f"No tracking entry matches '{hash_prefix}'")
     if len(matches) > 1:
         raise ValueError(
-            f"Tracking entry hash '{hash_prefix}' is ambiguous"
+            f"Tracking entry hash '{hash_prefix}' is ambiguous: "
+            f"{len(matches)} entries match; "
+            f"use a longer prefix"
         )
     return matches[0]
+@
 
+Let's verify the ambiguous case says enough to act on.  Real SHA256
+digests do not collide on demand, so we substitute [[content_hash]]
+with one derived from [[who]]---the resolver only ever asks entries
+for their hash, so a stand-in that collides on the first six
+characters exercises exactly the branch we care about.
+
+<<test functions>>=
+def test_resolve_ambiguous_prefix_reports_count(monkeypatch):
+    """An ambiguous prefix says how many entries match."""
+    entries = [
+        TrackingEntry(
+            start_time=datetime.datetime(2026, 3, 12, 10),
+            end_time=datetime.datetime(2026, 3, 12, 11),
+            labels=["DD1310"],
+            who=who,
+        )
+        for who in ("alice", "bob")
+    ]
+    monkeypatch.setattr(
+        TrackingEntry, "content_hash",
+        lambda self: "abcdef" + self.who,
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        resolve_tracking_entry(entries, "abcdef")
+
+    message = str(excinfo.value)
+    assert "2 entries match" in message
+    assert "longer prefix" in message
+<<history entry helpers>>=
 def replace_tracking_entry(
     entries: list[TrackingEntry],
     original: TrackingEntry,
@@ -11810,7 +11975,44 @@ def test_normalize_tracking_entries_reports_duplicate_count(caplog):
     assert "Merged 1 duplicate tracking entry" in caplog.text
 @
 
+The tuple key inside [[normalize_tracking_entries]] is only correct if
+it partitions entries exactly like [[content_hash()]] does.  We pin
+that equivalence with a mixed batch---duplicates, near-duplicates
+differing in a single field, and label lists given in different
+orders---and check that tuple-based dedup keeps precisely the entries
+that digest-based dedup would keep:
+
+<<test functions>>=
+def test_normalize_dedup_matches_content_hash():
+    """Tuple-key dedup selects the same survivors as hash dedup."""
+    start = datetime.datetime(2026, 3, 12, 10, 0, 0)
+    end = datetime.datetime(2026, 3, 12, 11, 0, 0)
+    entries = [
+        TrackingEntry(start, end, ["DD1310", "lecture"], "prep"),
+        TrackingEntry(start, end, ["lecture", "DD1310"], "prep"),
+        TrackingEntry(start, end, ["DD1310", "lecture"], "grading"),
+        TrackingEntry(start, end, ["DD1310"], "prep"),
+        TrackingEntry(start, end, ["DD1310"], "prep", who="alice"),
+        TrackingEntry(start, end, ["DD1310"], "prep", who="alice"),
+    ]
+
+    merged, duplicate_count = normalize_tracking_entries(entries)
+
+    expected = []
+    seen_hashes = set()
+    for entry in entries:
+        entry_hash = entry.content_hash()
+        if entry_hash in seen_hashes:
+            continue
+        seen_hashes.add(entry_hash)
+        expected.append(entry)
+
+    assert merged == expected
+    assert duplicate_count == len(entries) - len(expected)
+@
+
 \subsection{Listing Tracked Sessions}
+\label{sec:track-ls}
 
 The [[ls]] command fills a gap between [[status]] (which shows only the
 \emph{currently active} session) and [[stats]] (which shows
@@ -11827,9 +12029,9 @@ requested (or fewer if the history is shorter).
 
 When the user wants to repair history, though, a bare timestamp line is
 not enough: they need a stable way to name one specific entry.  The
-optional [[--id]] flag (which is actually default now) prepends a short, unique
-prefix of each entry's [[content_hash()]], giving us Git-style identification
-without storing a separate persistent identifier.
+[[--id]] flag, on by default, prepends a short, unique prefix of each
+entry's [[content_hash()]], giving us Git-style identification without
+storing a separate persistent identifier.
 
 Both the default row count and the default for the id column are worth
 configuring, since users tend to settle on a personal preference.  We
@@ -11959,6 +12161,34 @@ module-level binding of that name would be shadowed inside it; the
 import itself sits in the module chunk of \cref{sec:track-code-outline}
 with all the others, which is where this file keeps them.
 
+The id prefixes are the only consumer of [[content_hash()]] in this
+listing, so we compute them only when the id column is requested:
+with [[--no-id]] the command never hashes at all, which matters once
+the history holds thousands of entries.
+
+When the column \emph{is} requested, the set we abbreviate against
+has to be the \emph{whole history}, not the rows on screen.  An id is
+only useful because [[show]], [[edit]] and [[rm]] accept it, and
+those commands resolve it against everything
+[[load_tracking_data]] returns (\cref{track:history-helpers}).  A
+prefix unique among the rows we print need not be unique there: two
+entries can share their first six hex digits and differ only in
+[[who]], in which case [[--who]] hides one of them from the listing
+while [[rm]] still sees both and refuses the id we just printed.
+Hashing the whole history closes that gap---the printed id is by
+construction unique in the set it will be resolved against.  This is
+the same rule [[complete_entry_hashes]] follows for shell
+completion, and for the same reason.
+
+The rows we print stay the filtered, sliced ones; only the
+\emph{abbreviation set} widens.  When no filter is in effect the
+listing already covers the whole history, so we reuse the entries we
+have rather than reading the history file a second time.  That
+shortcut restates, at the call site, the condition under which
+[[filter_entries]] returns its input untouched---if a third filter
+dimension is ever added to the [[ls]] call, this test has to learn
+about it too, or the abbreviation set silently narrows again.
+
 <<display ls entries>>=
 entries.sort(
     key=lambda e: (
@@ -11968,9 +12198,17 @@ entries.sort(
     ),
     reverse=True,
 )
-hash_prefixes = abbreviate_hashes(
-    [entry.content_hash() for entry in entries]
-)
+if show_id:
+    history = (
+        entries
+        if who is None and not labels
+        else load_tracking_data()
+    )
+    hash_prefixes = abbreviate_hashes(
+        [entry.content_hash() for entry in history]
+    )
+else:
+    hash_prefixes = {}
 <<collect the ls rows>>
 <<print the ls listing>>
 @
@@ -11988,6 +12226,14 @@ same [[if show_id]] shape appear here and in the column list, so the two
 decisions that have to agree---is there an id field, is there an id
 column---are written the same way and are awkward to change apart.
 
+The prefix lookup is a [[get]] rather than an index because the
+filtered branch above abbreviates a \emph{second} read of the history
+file: a [[track stop]] landing between the two reads leaves a
+displayed entry out of the map, and a listing that dies with a
+[[KeyError]] traceback serves the reader worse than one that prints
+the plain minimum-length prefix and lets [[resolve_tracking_entry]]
+explain any resulting ambiguity in words.
+
 <<collect the ls rows>>=
 rows = []
 for entry in entries[:n]:
@@ -12003,8 +12249,14 @@ for entry in entries[:n]:
         entry.description or "",
     )
     if show_id:
+        full_hash = entry.content_hash()
         row = (
-            hash_prefixes[entry.content_hash()],
+            hash_prefixes.get(
+                full_hash,
+                full_hash[
+                    :TRACKING_HASH_PREFIX_MIN_LENGTH
+                ],
+            ),
         ) + row
     rows.append(row)
 @
@@ -12543,7 +12795,83 @@ def test_ls_show_id_includes_hash_prefix(temp_tracking_dir):
     assert result.exit_code == 0
     first_field = result.stdout.strip().split()[0]
     assert len(first_field) >= TRACKING_HASH_PREFIX_MIN_LENGTH
+@
 
+The [[--no-id]] fast path is easy to lose to a refactor that hoists
+the prefix computation back out of the [[if]], so we pin it by
+counting [[content_hash()]] calls through a wrapping monkeypatch:
+a listing without the id column must compute no digests at all.
+
+<<test functions>>=
+def test_ls_without_id_never_hashes(temp_tracking_dir, monkeypatch):
+    """A --no-id listing computes no content hashes at all."""
+    for hour in range(5):
+        runner.invoke(cli, [
+            "add", "DD1310",
+            "--duration", "30m",
+            "--at", f"2026-03-12 {8 + hour:02d}:00"
+        ])
+
+    calls = []
+    original_hash = TrackingEntry.content_hash
+
+    def counting_hash(self):
+        calls.append(self)
+        return original_hash(self)
+
+    monkeypatch.setattr(
+        TrackingEntry, "content_hash", counting_hash
+    )
+
+    result = runner.invoke(cli, ["ls", "--no-id"])
+
+    assert result.exit_code == 0
+    assert calls == []
+@
+
+The filter is the interesting case for the abbreviation set.  We
+stand in for [[content_hash]] with two digests that agree on the
+first six characters and differ in the seventh, so the minimum
+length is ambiguous while one more character is not.  Listing only
+[[alice]]'s entry must still print the seven-character id, because
+that is the one [[rm]] and [[edit]] can resolve against the whole
+history.
+
+<<test functions>>=
+def test_ls_id_prefix_resolves_against_full_history(
+    temp_tracking_dir, monkeypatch
+):
+    """A filtered listing prints resolvable ids."""
+    runner.invoke(cli, [
+        "add", "DD1310", "--duration", "1",
+        "--at", "2026-03-12 10:00", "--who", "alice",
+    ])
+    runner.invoke(cli, [
+        "add", "DD1310", "--duration", "1",
+        "--at", "2026-03-12 12:00", "--who", "bob",
+    ])
+
+    digests = {
+        "alice": "abcdef" + "1" * 58,
+        "bob": "abcdef" + "2" * 58,
+    }
+    monkeypatch.setattr(
+        TrackingEntry, "content_hash",
+        lambda self: digests[self.who],
+    )
+
+    result = runner.invoke(
+        cli, ["ls", "--id", "--who", "alice"]
+    )
+
+    assert result.exit_code == 0
+    printed = result.stdout.strip().split()[0]
+    assert printed == "abcdef1"
+    resolved = resolve_tracking_entry(
+        load_tracking_data(), printed
+    )
+    assert resolved.who == "alice"
+<<test functions>>=
 def test_show_tracking_entry_by_hash(temp_tracking_dir):
     """show prints the selected historical entry."""
     runner.invoke(cli, [
@@ -13640,6 +13968,7 @@ import datetime
 import json
 import logging
 import os
+import pathlib
 import shlex
 import shutil
 import socket
@@ -13647,13 +13976,15 @@ import subprocess
 import tempfile
 import pytest
 from typer.testing import CliRunner
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import sys
 sys.path.insert(0, '../src')
 
+from nytid.cli.utils import defaults
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
+    TRACKING_DIR_CONFIG,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
     TRACK_STATS_DAYS_CONFIG,
     AUTO_SUSPEND_CONFIG,
@@ -13678,7 +14009,10 @@ from nytid.cli.track import (
     compute_tmux_server_key,
     get_tmux_server_generation,
     get_current_tmux_server_key,
+    get_tracking_storage,
     get_tracking_dir,
+    get_tracking_data_file,
+    get_tracking_lock_file,
     get_tmux_state_dir,
     parse_state_file_server_key,
     parse_state_file_tmux_id,
@@ -13688,6 +14022,7 @@ from nytid.cli.track import (
     sweep_all_server_state,
     sanitize_who, complete_workers,
     complete_entry_hashes,
+    resolve_tracking_entry,
     should_auto_suspend,
     suspend_state_path,
     write_suspend_state,

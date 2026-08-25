@@ -1,3 +1,9 @@
+# How to invoke pytest.  Override to run the suite with another
+# interpreter, e.g. in a git worktree or in CI where the Poetry venv
+# isn't the one under test:
+#   make test PYTEST="PYTHONPATH=../src /path/to/python -m pytest"
+PYTEST?=	poetry run pytest
+
 define find_tests
 find ../src -type f | xargs grep "<<test \[\[[^.-]*\.py\]\]>>" | \
 	sed -En "s/^(.*):.*<<test \[\[([^.-]*).py\]\]>>.*/test_\2.py:\1/p" | sort -u
@@ -18,7 +24,7 @@ $(foreach files,${TESTS},$(eval $(call def_target, ${files})))
 
 .PHONY: test
 test: all
-	poetry run pytest ${PYTEST_FLAGS}
+	${PYTEST} ${PYTEST_FLAGS}
 
 .PHONY: clean
 clean:
@@ -26,7 +32,6 @@ clean:
 	${RM} -Rf __pycache__
 	${RM} test_*.py
 	${RM} conftest.py conftest.tex
-	${RM} ~/.config/pytest/config.json
 
 .PHONY: distclean
 distclean:
