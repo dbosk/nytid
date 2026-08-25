@@ -46,6 +46,8 @@ poetry run nytid --help
 - `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
 - `make clean all` — Clean rebuild of everything (source **and** docs). `make -C <dir> clean all` scopes a clean rebuild to one subdirectory, e.g. `make -C doc clean all` rebuilds only the documentation PDF.
 
+`make test` runs `${PYTEST}`, which defaults to `poetry run pytest`. Override it where the Poetry venv isn't the interpreter under test (a git worktree, CI): `make -C tests test PYTEST="PYTHONPATH=$PWD/src /path/to/python -m pytest"`.
+
 **`make all` does NOT re-weave existing `.tex` files.** Like the test-file
 situation below, `all` only (re)builds the `.py` MODULES and any *missing*
 `.tex`; it will **not** re-weave a `.tex` that already exists. A change to the
