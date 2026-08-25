@@ -134,31 +134,176 @@ construct a [[LadokSession]].
 Since version 5.12, [[ladok3]] provides a module-level lazy session via
 [[ladok3.session]] that handles credential loading and session creation
 internally.
-We just wrap the access in a function with error handling so that a
-missing [[ladok3]] installation degrades gracefully.
+That attribute is the LADOK end of the delegation described in the
+chapter introduction: behind it, [[ladok3]] consults the environment, its
+own configuration file and the system keyring, in an order we neither
+know nor are entitled to encode.
+
+The dependency is correspondingly narrow, and narrower than the Canvas
+one.
+There we import [[canvaslms.cli.login]] explicitly because we call into
+that submodule ourselves; here we touch nothing but an attribute of the
+top-level package, and [[ladok3]] pulls in its own [[cli]] submodule when
+it needs it.
+So [[import ladok3]] is the whole of what we depend on, which also means
+a broken sub-dependency of [[ladok3]] surfaces as an [[ImportError]]
+raised from inside the attribute access --- still \enquote{there is no
+LADOK here}, and handled as such below.
 <<define [[get_ladok_session]]>>=
 def get_ladok_session():
   """Return the LADOK session, or None if unavailable."""
   try:
     import ladok3
+
     return ladok3.session
   <<handle ladok setup errors>>
 
   return None
 @
 
-There are two errors that can occur here.
-The first is that we can't import the [[ladok3]] module.
-The second is that the session can't be created (missing credentials,
-network errors, etc.).
-In either case, we return [[None]].
+Two failures are expected here, and the second is where LADOK differs
+from Canvas in shape while agreeing in substance.
+The first is the familiar one: [[ladok3]] can't be imported at all, which
+means the LADOK extras aren't installed and there is nothing to log in
+to.
+
+The second is the absence of credentials.
+[[canvaslms.cli.login.load_credentials]] signals that by returning a
+falsy pair, which is why the Canvas code tests for it with an [[if]];
+[[ladok3]] signals it by raising [[RuntimeError]] from the module-level
+[[__getattr__]] that serves [[ladok3.session]], with a message that
+already names [[ladok login]].
+Same rule, different shape: we answer the library's own
+\enquote{nothing here} with a warning and a [[None]] session, and we
+answer nothing else.
+
+Catching [[RuntimeError]] is therefore not the old [[except Exception]]
+in disguise, even though [[ladok3]] happens, today, to funnel everything
+its credential resolution can raise into that one exception.
+What we write down is the contract we rely on, not the implementation we
+are installed against.
+Should a later release let a decryption failure or a network error out
+unwrapped, [[except Exception]] would absorb it and go on advising
+[[ladok login]] --- the same lie the Canvas code used to tell, and the
+same reason its bug survived so long.
+The narrow catch lets such an error reach the user instead, which is the
+whole point of this section.
 <<handle ladok setup errors>>=
 except ImportError as err:
   logging.warning(
     f"Can't import ladok3, not using LADOK data: {err}")
-except Exception as err:
+except RuntimeError as err:
   logging.warning(
-    f"Can't set up LADOK session: {err}")
+    f"Can't load LADOK credentials, run `ladok login`: {err}")
+@
+
+Verifying this needs a LADOK that isn't there, so we stub [[ladok3]] in
+[[sys.modules]] the way the Canvas tests stub [[canvaslms]].
+The stub reproduces only the interface we rely on: a [[session]]
+attribute served by a module-level [[__getattr__]], which either hands
+back a session or raises.
+Behind it sits a replaceable [[get_session]], and that is where each test
+decides what [[ladok3]] found --- so no test can come to depend on how
+[[ladok3]] resolves anything, any more than the Canvas tests can.
+The tests below read the warnings we log, and [[caplog]] wants a level
+constant for that, so the test module brings in [[logging]].
+<<test imports>>=
+import logging
+@
+
+Unlike the Canvas fixture, this one has no cached session to clear.
+The cache that matters lives inside [[ladok3]] rather than in this
+module, and each test gets a fresh stub --- which doubles as a check that
+we have not quietly started caching sessions on our side.
+<<test setup>>=
+@pytest.fixture
+def ladok_stubs(monkeypatch):
+  """Replaces ladok3 with a stub whose session the test controls."""
+  import sys
+  import types
+
+  ladok3 = types.ModuleType("ladok3")
+
+  def get_session():
+    raise RuntimeError("No LADOK credentials found. "
+                       "Run `ladok login` first.")
+
+  ladok3.get_session = get_session
+
+  def module_getattr(name):
+    if name != "session":
+      raise AttributeError(name)
+    return ladok3.get_session()
+
+  ladok3.__getattr__ = module_getattr
+
+  monkeypatch.setitem(sys.modules, "ladok3", ladok3)
+
+  return types.SimpleNamespace(ladok3=ladok3)
+@
+
+With credentials in place we must hand back exactly what [[ladok3]] gave
+us, and not a session of our own making:
+<<test functions>>=
+def test_ladok_session_comes_from_ladok3(ladok_stubs):
+  """The session is whatever ladok3 hands back, unmodified."""
+  from nytid.cli import hr as hrcli
+
+  ladok_stubs.ladok3.get_session = lambda: "ladok session for dbosk"
+
+  assert hrcli.get_ladok_session() == "ladok session for dbosk"
+@
+
+Without credentials there is no session, and the warning has to name the
+command that fixes it.
+The stub raises the message [[ladok3]] really raises, and that message
+mentions [[ladok login]] too --- so the test asserts our whole phrasing
+rather than the two words both share.
+Otherwise it would pass just as happily on a version of the code that
+merely forwarded [[ladok3]]'s text, which is what the catch-all used to
+do:
+<<test functions>>=
+def test_ladok_session_without_credentials_warns(ladok_stubs, caplog):
+  """Absent credentials yield no session, but say what to do."""
+  from nytid.cli import hr as hrcli
+
+  with caplog.at_level(logging.WARNING):
+    assert hrcli.get_ladok_session() is None
+
+  assert "Can't load LADOK credentials, run `ladok login`" in caplog.text
+@
+
+A missing [[ladok3]] is the other expected failure, and it must still
+degrade rather than crash: plenty of nytid runs never touch LADOK.
+<<test functions>>=
+def test_ladok_session_without_ladok3_warns(monkeypatch, caplog):
+  """A missing ladok3 degrades to no session instead of crashing."""
+  import sys
+  from nytid.cli import hr as hrcli
+
+  monkeypatch.setitem(sys.modules, "ladok3", None)
+
+  with caplog.at_level(logging.WARNING):
+    assert hrcli.get_ladok_session() is None
+
+  assert "ladok3" in caplog.text
+@
+
+Anything else has to reach the caller.
+This is the test that the old [[except Exception]] cannot pass, and the
+one that keeps the narrow catch honest:
+<<test functions>>=
+def test_ladok_session_propagates_unexpected_errors(ladok_stubs):
+  """Surprises from ladok3 surface instead of becoming None."""
+  from nytid.cli import hr as hrcli
+
+  def explode():
+    raise OSError("session cache is corrupt")
+
+  ladok_stubs.ladok3.get_session = explode
+
+  with pytest.raises(OSError):
+    hrcli.get_ladok_session()
 @
 
 \subsection{Setting up Canvas}
@@ -280,10 +425,6 @@ about the delegation: the fixture exposes nothing but
 no test can come to depend on how [[canvaslms]] resolves anything.
 The fixture also clears the cached [[_canvas_session]], since a session
 built by one test would otherwise be handed straight back to the next.
-Two of the tests inspect the warnings we log, and [[caplog]] wants a
-level constant to do that, so we bring in [[logging]] as well.
-<<test imports>>=
-import logging
 <<test setup>>=
 @pytest.fixture
 def canvas_stubs(monkeypatch):
