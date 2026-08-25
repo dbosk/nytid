@@ -164,20 +164,42 @@ TODO_MAX_BOOST_CONFIG = "todo.max_boost"
 TODO_WORK_START_CONFIG = "todo.work_start"
 TODO_WORK_END_CONFIG = "todo.work_end"
 TODO_WORK_DAYS_CONFIG = "todo.work_days"
+@
 
+Resolving that directory must be free of side effects.  Almost every
+subcommand asks for it---including the ones that only read, such as
+[[nytid todo status]] and the shell completions that run on every
+prompt.  An earlier version wrote the default back into the
+configuration file the first time the key was missing, so merely
+listing todos rewrote the user's configuration; it also re-read the
+configuration file from disk on every single path lookup.
 
+Routing the lookup through [[default]]
+(\cref{cli.utils.defaults.cache}) removes both problems at once.
+That helper answers from a process-lifetime cache built by a
+[[Config]] object constructed \emph{without} a [[conf_file]]
+argument, so it cannot write back even in principle, and the file is
+read at most once per process.  The default location is consequently
+no longer persisted: we recompute it from [[pathlib.Path.home()]] on
+each call, which also keeps the answer correct for tests and scripts
+that move [[HOME]] after import.
+
+[[default]] applies its [[cast]] argument to the \emph{stored} value
+only, never to the fallback, so passing [[cast=pathlib.Path]] would
+leave the fallback a [[Path]] and the configured value a [[Path]] by
+a different route.  We instead hand it a string and convert once,
+which makes both branches take the same path through
+[[pathlib.Path]].
+
+<<configuration>>=
 def get_todo_dir() -> pathlib.Path:
     """Get the todo data directory path."""
-    try:
-        return pathlib.Path(
-            config.get(TODO_DIR_CONFIG)
-        )
-    except KeyError:
-        todo_dir = (
-            pathlib.Path.home() / ".nytid" / "todos"
-        )
-        config.set(TODO_DIR_CONFIG, str(todo_dir))
-        return todo_dir
+    fallback = (
+        pathlib.Path.home() / ".nytid" / "todos"
+    )
+    return pathlib.Path(
+        default(TODO_DIR_CONFIG, str(fallback))
+    )
 
 
 def get_todo_file() -> pathlib.Path:
@@ -268,6 +290,63 @@ def get_worker_default(worker, attribute):
             for key, val in value.items()
         }
     return value
+@
+
+Let's verify that the read-only promise holds.  We give the cached
+config a [[get]] that always raises [[KeyError]], so the lookup takes
+the fallback path, and install a [[config.set]] that fails loudly if
+anything calls it.  Pointing [[pathlib.Path.home]] at a temporary
+directory makes the expected fallback unambiguous.
+
+<<test functions>>=
+def test_get_todo_dir_never_writes_config(
+    monkeypatch, tmp_path
+):
+    """A missing config key must not be persisted."""
+    fake = MagicMock()
+    fake.get.side_effect = KeyError(TODO_DIR_CONFIG)
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    monkeypatch.setattr(
+        "nytid.cli.todo.config.set",
+        MagicMock(side_effect=AssertionError(
+            "get_todo_dir wrote to the config file"
+        )),
+    )
+    monkeypatch.setattr(
+        pathlib.Path, "home", lambda: tmp_path
+    )
+    try:
+        assert get_todo_dir() == (
+            tmp_path / ".nytid" / "todos"
+        )
+    finally:
+        defaults._reset_cache()
+@
+
+The cache also means the configuration file is read once, not once
+per lookup.  Two calls in a row must therefore hit the underlying
+[[Config]] object only once.
+
+<<test functions>>=
+def test_get_todo_dir_reads_config_once(
+    monkeypatch, tmp_path
+):
+    """Repeated lookups share the cached config."""
+    fake = MagicMock()
+    fake.get.return_value = str(tmp_path / "todos")
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    try:
+        get_todo_dir()
+        get_todo_dir()
+        assert fake.read_config.call_count == 1
+    finally:
+        defaults._reset_cache()
 @
 
 \section{Data Model}
@@ -4684,6 +4763,23 @@ convention in [[schedule show --user]], where an empty string means
 \enquote{all workers.}%
 \label{todo:default-username}
 
+Without [[\$USER]]---in a [[cron]] job, say---the shared helper
+answers [["me"]] (\cref{cli:default-username}), the same name
+[[track]] has always persisted for that case.  That is what makes
+the normalisation
+[[item.who or default_username]] used throughout this module safe:
+an item created before the [[who]] field existed, or by an
+environment with no [[\$USER]], resolves to a real name that
+[[re.search]] and [[==]] can work with rather than to [[None]].
+
+Under the old [[None]] fallback that normalisation hid a crash
+waiting for the right environment.  [[find_pending_by_priority]] and
+[[get_top_level_pending_by_priority]] pass its result straight to
+[[re.search]], which raises [[TypeError]] on [[None]]: an explicit
+[[--who]] on a machine without [[\$USER]] would abort on the first
+ownerless item.  A string fallback removes the failure mode rather
+than guarding against it at each call.
+
 <<constants>>=
 from nytid.cli import get_default_username
 default_username = get_default_username()
@@ -5618,8 +5714,27 @@ not have to retype the same flag on every invocation: the row cap
 We read each from [[typerconf]] once at module import via the shared
 [[default]] helper (\cref{cli.utils.defaults}), giving Typer a
 resolved value to display in [[--help]].
-The [[--who]] fallback is [[default_username]] (that is, [[\$USER]]),
-matching the pre-existing behaviour.
+The [[--who]] fallback is [[default_username]]
+(\cref{cli:default-username}): the [[\$USER]] the shell provides,
+and otherwise the shared [["me"]].
+
+That second case changes what a bare [[nytid todo ls]] lists in an
+environment with no [[\$USER]]---a [[cron]] job, an entry point in a
+container.  The filter below is applied under a truthiness guard, so
+the earlier [[None]] fallback meant \emph{no filter at all} and
+listed every worker's items; [["me"]] is truthy, so the same command
+now filters, and what it lists is the work that such an environment
+also \emph{writes} under that name.  We consider the filtered
+listing the more useful answer, and the unfiltered one is still one
+flag away: [[--who ""]] is the documented spelling for
+\enquote{all workers}.
+
+One property of that filter is worth stating plainly while we are
+here, because a short default word makes it easy to meet: [[--who]]
+is a \emph{regular expression} matched with [[re.search]], not an
+equality test, so [["me"]] also matches [[ja-me-s]] and
+[[car-me-n]].  That is how every [[--who]] value has always
+behaved---the fallback change only makes it easier to notice.
 
 The format default needs care: it comes from configuration as a bare
 string, but the option is now typed as [[LsFormat]].  We coerce the
@@ -14764,8 +14879,10 @@ import sys
 
 sys.path.insert(0, "../src")
 
+from nytid.cli.utils import defaults
 from nytid.cli.todo import (
     cli,
+    TODO_DIR_CONFIG,
     TodoItem,
     ParsedItem,
     ParsedTodo,
