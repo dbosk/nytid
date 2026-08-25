@@ -1958,6 +1958,23 @@ this by collapsing duplicates automatically and emitting a
 [[logging.warning()]] so the anomaly is visible without forcing the user
 through a repair workflow.
 
+Detecting a duplicate only requires an \emph{equality} relation, not a
+printable digest.  [[content_hash()]] is a pure function of exactly
+five fields---the two timestamps as [[isoformat()]] strings, the
+(sorted, duplicate-free) label list, the description and the
+worker---so a tuple of those same values partitions the history into
+precisely the same equivalence classes as the digest, minus the
+SHA-256 pass.  Since normalization runs on \emph{every} load and twice
+per mutation cycle, hashing thousands of entries just to compare them
+for equality dominated the cost of loading a large history.  We
+therefore dedup on the cheap tuple and reserve [[content_hash()]] for
+what actually needs a digest: the user-facing entry identifiers.
+
+We deliberately do \emph{not} offer a way to skip normalization on
+read-only paths: a [[dedupe=False]] fast path would let a display or
+statistics command double-count the durations of duplicated rows, so
+every reader sees the normalized view.
+
 Concurrent history writers create a second hazard.  Commands such as
 [[stop]], launch-enabled [[start]], and the history-editing commands all use a
 read-modify-write cycle; without coordination, one process can silently
@@ -1979,14 +1996,20 @@ def normalize_tracking_entries(
 ) -> tuple[list[TrackingEntry], int]:
     """Collapse exact duplicate historical entries."""
     merged = []
-    seen_hashes = set()
+    seen_keys = set()
     duplicate_count = 0
     for entry in entries:
-        entry_hash = entry.content_hash()
-        if entry_hash in seen_hashes:
+        key = (
+            entry.start_time.isoformat(),
+            entry.end_time.isoformat(),
+            tuple(entry.labels),
+            entry.description,
+            entry.who,
+        )
+        if key in seen_keys:
             duplicate_count += 1
             continue
-        seen_hashes.add(entry_hash)
+        seen_keys.add(key)
         merged.append(entry)
 
     if duplicate_count:
@@ -11810,6 +11833,42 @@ def test_normalize_tracking_entries_reports_duplicate_count(caplog):
     assert "Merged 1 duplicate tracking entry" in caplog.text
 @
 
+The tuple key inside [[normalize_tracking_entries]] is only correct if
+it partitions entries exactly like [[content_hash()]] does.  We pin
+that equivalence with a mixed batch---duplicates, near-duplicates
+differing in a single field, and label lists given in different
+orders---and check that tuple-based dedup keeps precisely the entries
+that digest-based dedup would keep:
+
+<<test functions>>=
+def test_normalize_dedup_matches_content_hash():
+    """Tuple-key dedup selects the same survivors as hash dedup."""
+    start = datetime.datetime(2026, 3, 12, 10, 0, 0)
+    end = datetime.datetime(2026, 3, 12, 11, 0, 0)
+    entries = [
+        TrackingEntry(start, end, ["DD1310", "lecture"], "prep"),
+        TrackingEntry(start, end, ["lecture", "DD1310"], "prep"),
+        TrackingEntry(start, end, ["DD1310", "lecture"], "grading"),
+        TrackingEntry(start, end, ["DD1310"], "prep"),
+        TrackingEntry(start, end, ["DD1310"], "prep", who="alice"),
+        TrackingEntry(start, end, ["DD1310"], "prep", who="alice"),
+    ]
+
+    merged, duplicate_count = normalize_tracking_entries(entries)
+
+    expected = []
+    seen_hashes = set()
+    for entry in entries:
+        entry_hash = entry.content_hash()
+        if entry_hash in seen_hashes:
+            continue
+        seen_hashes.add(entry_hash)
+        expected.append(entry)
+
+    assert merged == expected
+    assert duplicate_count == len(entries) - len(expected)
+@
+
 \subsection{Listing Tracked Sessions}
 
 The [[ls]] command fills a gap between [[status]] (which shows only the
@@ -11959,6 +12018,17 @@ module-level binding of that name would be shadowed inside it; the
 import itself sits in the module chunk of \cref{sec:track-code-outline}
 with all the others, which is where this file keeps them.
 
+The id prefixes are the only consumer of [[content_hash()]] in this
+listing, so we compute them only when the id column is requested:
+with [[--no-id]] the command never hashes at all, which matters once
+the history holds thousands of entries.  When the column \emph{is}
+requested we still hash the \emph{full} filtered set rather than just
+the [[n]] displayed rows.  Abbreviation picks the shortest prefix
+unique within the hashed set, and the set these prefixes must be
+unique in is the one [[edit]] and [[rm]] resolve against---hashing
+only the displayed slice could print a prefix that is ambiguous
+there.
+
 <<display ls entries>>=
 entries.sort(
     key=lambda e: (
@@ -11968,9 +12038,12 @@ entries.sort(
     ),
     reverse=True,
 )
-hash_prefixes = abbreviate_hashes(
-    [entry.content_hash() for entry in entries]
-)
+if show_id:
+    hash_prefixes = abbreviate_hashes(
+        [entry.content_hash() for entry in entries]
+    )
+else:
+    hash_prefixes = {}
 <<collect the ls rows>>
 <<print the ls listing>>
 @
@@ -12543,6 +12616,38 @@ def test_ls_show_id_includes_hash_prefix(temp_tracking_dir):
     assert result.exit_code == 0
     first_field = result.stdout.strip().split()[0]
     assert len(first_field) >= TRACKING_HASH_PREFIX_MIN_LENGTH
+@
+
+The [[--no-id]] fast path is easy to lose to a refactor that hoists
+the prefix computation back out of the [[if]], so we pin it by
+counting [[content_hash()]] calls through a wrapping monkeypatch:
+a listing without the id column must compute no digests at all.
+
+<<test functions>>=
+def test_ls_without_id_never_hashes(temp_tracking_dir, monkeypatch):
+    """A --no-id listing computes no content hashes at all."""
+    for hour in range(5):
+        runner.invoke(cli, [
+            "add", "DD1310",
+            "--duration", "30m",
+            "--at", f"2026-03-12 {8 + hour:02d}:00"
+        ])
+
+    calls = []
+    original_hash = TrackingEntry.content_hash
+
+    def counting_hash(self):
+        calls.append(self)
+        return original_hash(self)
+
+    monkeypatch.setattr(
+        TrackingEntry, "content_hash", counting_hash
+    )
+
+    result = runner.invoke(cli, ["ls", "--no-id"])
+
+    assert result.exit_code == 0
+    assert calls == []
 
 def test_show_tracking_entry_by_hash(temp_tracking_dir):
     """show prints the selected historical entry."""
