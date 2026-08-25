@@ -282,22 +282,42 @@ one distant global block.
 TRACKING_DIR_CONFIG = "track.data_dir"
 @
 
+Every path in the track module is derived from this one helper, so it
+runs on every invocation---including the ones that only read, such as
+[[nytid track ls]], [[nytid track status]] and the shell completions
+behind them.  It must therefore be free of side effects.  An earlier
+version persisted the default location back into the configuration
+file the first time the key was missing, which turned a listing into
+a configuration write; it also re-read the configuration file from
+disk for each of the four path helpers below.
+
+We instead read through [[default]] (\cref{cli.utils.defaults.cache}),
+which answers from a process-lifetime cache built by a [[Config]]
+object constructed \emph{without} a [[conf_file]] argument.  Such an
+object has nowhere to write, so the read-only property is structural
+rather than a matter of discipline, and the file is read at most once
+per process.
+
+The consequence is that the default location is no longer recorded in
+the configuration.  We recompute it from [[pathlib.Path.home()]] on
+each call instead, which keeps the answer correct when [[HOME]] moves
+after import.  Since [[default]] casts the stored value but not the
+fallback, we pass a string and convert once, so a configured and a
+default location reach [[StorageRoot]] by the same route.
+
 <<configuration management>>=
 def get_tracking_storage() -> storage.StorageRoot:
     """
     Get the StorageRoot for tracking data.
-    
+
     Uses nytid's StorageRoot system for consistent file management.
     Returns a StorageRoot object that can be used to open tracking data files.
     """
-    try:
-        tracking_dir = pathlib.Path(config.get(TRACKING_DIR_CONFIG))
-    except KeyError:
-        # Fallback to default location in user's home directory
-        tracking_dir = pathlib.Path.home() / ".nytid" / "tracking"
-        # Set the default in config for future use
-        config.set(TRACKING_DIR_CONFIG, str(tracking_dir))
-    
+    fallback = pathlib.Path.home() / ".nytid" / "tracking"
+    tracking_dir = pathlib.Path(
+        default(TRACKING_DIR_CONFIG, str(fallback))
+    )
+
     return storage.StorageRoot(tracking_dir)
 
 def get_tracking_dir() -> pathlib.Path:
@@ -330,6 +350,64 @@ def sanitize_tmux_id(value: str) -> str:
         for c in value
     )
 
+@
+
+Let's verify that the fallback really is read-only.  We make the
+cached config raise [[KeyError]] for every key, so the lookup takes
+the fallback path, and install a [[config.set]] that fails loudly if
+anything calls it.  Pointing [[pathlib.Path.home]] at a temporary
+directory makes the expected fallback unambiguous.
+
+<<test functions>>=
+def test_get_tracking_storage_never_writes_config(
+    monkeypatch, tmp_path
+):
+    """A missing config key must not be persisted."""
+    fake = MagicMock()
+    fake.get.side_effect = KeyError(TRACKING_DIR_CONFIG)
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    monkeypatch.setattr(
+        "nytid.cli.track.config.set",
+        MagicMock(side_effect=AssertionError(
+            "get_tracking_storage wrote the config file"
+        )),
+    )
+    monkeypatch.setattr(
+        pathlib.Path, "home", lambda: tmp_path
+    )
+    try:
+        assert get_tracking_storage().path == (
+            tmp_path / ".nytid" / "tracking"
+        )
+    finally:
+        defaults._reset_cache()
+@
+
+The four path helpers above all funnel through
+[[get_tracking_storage]], so a single command resolves it several
+times.  With the cache in place those repeats cost nothing: the
+configuration file is read once per process, not once per lookup.
+
+<<test functions>>=
+def test_tracking_paths_read_config_once(
+    monkeypatch, tmp_path
+):
+    """Repeated path lookups share the cached config."""
+    fake = MagicMock()
+    fake.get.return_value = str(tmp_path / "tracking")
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    try:
+        get_tracking_data_file()
+        get_tracking_lock_file()
+        assert fake.read_config.call_count == 1
+    finally:
+        defaults._reset_cache()
 @
 
 \subsection{Tmux-Scoped Runtime State}
@@ -391,9 +469,18 @@ could squat our path before we first create it.  Like tmux, we
 create the directory mode [[0700]] and refuse one owned by somebody
 else---failing loudly beats silently sharing state with a stranger.
 The location can be overridden through configuration (for tests and
-unusual setups); the default is derived from the machine and user,
-so we do not persist it back into the configuration the way
-[[get_tracking_storage]] does.
+unusual setups); the default is derived from the machine and user and
+recomputed on each call rather than written back, so this helper
+shares [[get_tracking_storage]]'s read-only property above.
+
+It does not yet share the caching.  The lookup below goes straight to
+[[typerconf]], so each of the eleven call sites re-reads the
+configuration file from disk---and several of them sit on the tmux
+window-event hook path, which runs on every window switch.  Moving
+this helper to [[default]] as well is worth doing, but it is a
+different change from removing the write-back: the write-back was a
+correctness bug, whereas this is a cost, and the two are easier to
+review apart.  We leave it for a follow-up.
 
 <<constants>>=
 TMUX_STATE_DIR_CONFIG = "track.tmux_state_dir"
@@ -13745,6 +13832,7 @@ import datetime
 import json
 import logging
 import os
+import pathlib
 import shlex
 import shutil
 import socket
@@ -13752,13 +13840,15 @@ import subprocess
 import tempfile
 import pytest
 from typer.testing import CliRunner
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import sys
 sys.path.insert(0, '../src')
 
+from nytid.cli.utils import defaults
 from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
+    TRACKING_DIR_CONFIG,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
     TRACK_STATS_DAYS_CONFIG,
     AUTO_SUSPEND_CONFIG,
@@ -13783,7 +13873,10 @@ from nytid.cli.track import (
     compute_tmux_server_key,
     get_tmux_server_generation,
     get_current_tmux_server_key,
+    get_tracking_storage,
     get_tracking_dir,
+    get_tracking_data_file,
+    get_tracking_lock_file,
     get_tmux_state_dir,
     parse_state_file_server_key,
     parse_state_file_tmux_id,
