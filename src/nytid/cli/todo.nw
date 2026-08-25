@@ -263,6 +263,18 @@ the corresponding attribute unset, so explicit task metadata still wins.
 For [[env]] the config value should be a JSON object so it maps cleanly
 to a Python dictionary.
 
+Lazy here means \emph{often}, not \emph{rarely}.  The lookup hangs off
+attribute access, through [[TodoItem.__getattribute__]] below, so
+listing a hundred unassigned todos and reading each one's [[command]],
+[[wd]] and [[env]] asks the configuration three hundred
+questions.  Answering each
+from disk, as [[typerconf.get]] does, is what makes that shape
+expensive; answering them from the cached, write-free [[Config]] behind
+[[default]] (\cref{cli.utils.defaults.cache}) makes the count
+irrelevant.  Passing [[None]] as the fallback keeps the contract the
+callers already rely on---a missing key still reads as
+\enquote{no default}---so only the cost changes, not the meaning.
+
 <<configuration>>=
 WORKER_DEFAULT_ATTRIBUTES = (
     "command",
@@ -275,12 +287,9 @@ def get_worker_default(worker, attribute):
     """Return the configured default for one worker attribute."""
     if not worker or not attribute:
         return None
-    try:
-        value = config.get(
-            f"todo.worker.{worker}.{attribute}"
-        )
-    except KeyError:
-        return None
+    value = default(
+        f"todo.worker.{worker}.{attribute}", None
+    )
 
     if attribute == "env":
         if not isinstance(value, dict):
@@ -290,6 +299,32 @@ def get_worker_default(worker, attribute):
             for key, val in value.items()
         }
     return value
+@
+
+Let's verify that the many lookups really do collapse into one read.
+Two attributes of the same worker are the smallest case that would
+have cost two disk reads before, and the count must stay at one no
+matter how many attributes we ask about.
+
+<<test functions>>=
+def test_get_worker_default_reads_config_once(
+    monkeypatch,
+):
+    """Repeated worker-default lookups share the cached config."""
+    fake = MagicMock()
+    fake.get.return_value = "opencode"
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    try:
+        assert get_worker_default(
+            "dan-claude", "command"
+        ) == "opencode"
+        get_worker_default("dan-claude", "wd")
+        assert fake.read_config.call_count == 1
+    finally:
+        defaults._reset_cache()
 @
 
 Let's verify that the read-only promise holds.  We give the cached
@@ -397,6 +432,13 @@ This keeps worker defaults memory-only even when a loaded todo passes
 through a save cycle.  In other words, loading applies policy, while
 saving preserves only what the item explicitly stored before the load.
 
+The local holding the resolved value is called [[configured]] rather
+than the [[default]] the name would suggest, because
+[[get_worker_default]] reaches the configuration through a
+module-level helper of exactly that name; binding it locally here
+would shadow that helper for anyone who later needs it in this method,
+and Python would resolve the call to a string instead of raising.
+
 <<data model>>=
 @dataclass
 class TodoItem:
@@ -445,11 +487,11 @@ class TodoItem:
                 worker = object.__getattribute__(
                     self, "__dict__"
                 ).get("who") or default_username
-                default = get_worker_default(
+                configured = get_worker_default(
                     worker, name
                 )
-                if default is not None:
-                    return default
+                if configured is not None:
+                    return configured
         return object.__getattribute__(self, name)
 
     <<normalize labels on assignment>>
@@ -1137,8 +1179,42 @@ def test_save_and_load(temp_todo_dir):
     assert next_id == 2
     assert len(todos) == 1
     assert todos[0].title == "Test"
+@
 
+The worker-default tests below have to stage configuration values, and
+where they stage them follows from where [[get_worker_default]] reads.
+Now that it reads through [[default]], the values must sit in the
+[[defaults]] cache rather than in [[config.get]]; patching the latter
+would leave the test asserting against whatever the real configuration
+file happens to hold.  Because the cache lives for the process, a test
+that fills it must also empty it afterwards, or it leaks staged values
+into every later test in the run.
 
+Both obligations belong together, so we express them as one context
+manager and let the tests read as a table of configuration values.
+
+<<test functions>>=
+@contextlib.contextmanager
+def patched_worker_config(values):
+    """Serve `values` from the defaults cache for one test."""
+    def config_get(path):
+        if path in values:
+            return values[path]
+        raise KeyError(path)
+
+    fake = MagicMock()
+    fake.get.side_effect = config_get
+    defaults._reset_cache()
+    try:
+        with patch.object(
+            defaults.typerconf, "Config", lambda: fake
+        ):
+            yield
+    finally:
+        defaults._reset_cache()
+@
+
+<<test functions>>=
 def test_load_applies_worker_defaults_in_memory(
     temp_todo_dir,
 ):
@@ -1152,22 +1228,16 @@ def test_load_applies_worker_defaults_in_memory(
         ),
     ])
 
-    def mock_get(path):
-        values = {
-            "todo.worker.dan-claude.command": (
-                "opencode run 'Use nytid todo.'"
-            ),
-            "todo.worker.dan-claude.wd": "/tmp/agent",
-            "todo.worker.dan-claude.env": {
-                "HOME": "/tmp/home",
-                "MODE": "agent",
-            },
-        }
-        if path in values:
-            return values[path]
-        raise KeyError(path)
-
-    with patch("nytid.cli.todo.config.get", mock_get):
+    with patched_worker_config({
+        "todo.worker.dan-claude.command": (
+            "opencode run 'Use nytid todo.'"
+        ),
+        "todo.worker.dan-claude.wd": "/tmp/agent",
+        "todo.worker.dan-claude.env": {
+            "HOME": "/tmp/home",
+            "MODE": "agent",
+        },
+    }):
         _, todos = load_todos()
         item = todos[0]
         assert item.command == (
@@ -1196,19 +1266,13 @@ def test_explicit_values_override_worker_defaults(
         ),
     ])
 
-    def mock_get(path):
-        values = {
-            "todo.worker.dan-claude.command": "opencode",
-            "todo.worker.dan-claude.wd": "/tmp/agent",
-            "todo.worker.dan-claude.env": {
-                "MODE": "default"
-            },
-        }
-        if path in values:
-            return values[path]
-        raise KeyError(path)
-
-    with patch("nytid.cli.todo.config.get", mock_get):
+    with patched_worker_config({
+        "todo.worker.dan-claude.command": "opencode",
+        "todo.worker.dan-claude.wd": "/tmp/agent",
+        "todo.worker.dan-claude.env": {
+            "MODE": "default"
+        },
+    }):
         _, todos = load_todos()
 
     item = todos[0]
@@ -1230,19 +1294,13 @@ def test_save_does_not_persist_worker_defaults(
         ),
     ])
 
-    def mock_get(path):
-        values = {
-            "todo.worker.dan-claude.command": "opencode",
-            "todo.worker.dan-claude.wd": "/tmp/agent",
-            "todo.worker.dan-claude.env": {
-                "MODE": "agent"
-            },
-        }
-        if path in values:
-            return values[path]
-        raise KeyError(path)
-
-    with patch("nytid.cli.todo.config.get", mock_get):
+    with patched_worker_config({
+        "todo.worker.dan-claude.command": "opencode",
+        "todo.worker.dan-claude.wd": "/tmp/agent",
+        "todo.worker.dan-claude.env": {
+            "MODE": "agent"
+        },
+    }):
         next_id, todos = load_todos()
         save_todos(next_id, todos)
 
@@ -14863,6 +14921,7 @@ write session files into the user's real [[~/.nytid/tracking/]]
 directory.
 
 <<test [[clitodo.py]]>>=
+import contextlib
 import datetime
 import json
 import os
@@ -14897,6 +14956,7 @@ from nytid.cli.todo import (
     save_todos,
     get_todo_dir,
     get_todo_file,
+    get_worker_default,
     get_children,
     get_descendants,
     get_siblings,
