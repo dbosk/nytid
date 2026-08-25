@@ -31,7 +31,7 @@ make all  # Generates src .py files from .nw files using notangle, formats with 
           # tangled test_*.py will NOT reflect the change.
 
 # 6. Run tests (this also regenerates tests/test_*.py from .nw chunks as a prerequisite)
-cd tests && make test  # Expected: 552 passing under Python 3.10+ (numbers grow as features land)
+cd tests && make test  # Expected: 945 passing under Python 3.10+ (numbers grow as features land)
 
 # 7. Run the CLI
 poetry run nytid --help
