@@ -473,14 +473,31 @@ unusual setups); the default is derived from the machine and user and
 recomputed on each call rather than written back, so this helper
 shares [[get_tracking_storage]]'s read-only property above.
 
-It does not yet share the caching.  The lookup below goes straight to
-[[typerconf]], so each of the eleven call sites re-reads the
-configuration file from disk---and several of them sit on the tmux
-window-event hook path, which runs on every window switch.  Moving
-this helper to [[default]] as well is worth doing, but it is a
-different change from removing the write-back: the write-back was a
-correctness bug, whereas this is a cost, and the two are easier to
-review apart.  We leave it for a follow-up.
+It shares the caching too.  The lookup below reads through [[default]]
+(\cref{cli.utils.defaults.cache}), so the eleven call sites answer from
+one process-lifetime read of the configuration file rather than each
+re-reading it from disk.  That saving is worth more here than for the
+tracking paths above: several of those call sites sit on the tmux
+window-event hook path, so under the old lookup every window switch
+paid for a fresh read---latency the user feels while merely moving
+around tmux.
+
+[[default]] takes its fallback as an ordinary argument, so handing it
+the derived location would evaluate that location on every call---and
+this fallback, unlike [[get_tracking_storage]]'s
+[[pathlib.Path.home()]], is not a pure computation.  The first
+[[tempfile.gettempdir()]] in a process searches the candidate
+directories by \emph{creating, writing and unlinking} a file in each,
+and raises [[FileNotFoundError]] if none of them works.  The user whose
+temporary directory is unusable is precisely the user who sets
+[[track.tmux_state_dir]], so deriving eagerly would fail before ever
+reading the setting meant to rescue them.
+
+We therefore ask [[default]] for [[None]] and derive the fallback
+ourselves only when [[None]] is what comes back, keeping the probe on
+the one path whose answer uses it.  This treats a configured
+[[null]] as a missing key, which is harmless here because neither
+names a directory.
 
 <<constants>>=
 TMUX_STATE_DIR_CONFIG = "track.tmux_state_dir"
@@ -492,15 +509,14 @@ def get_tmux_state_dir() -> pathlib.Path:
     creating it with mode 0700.  Raises PermissionError if the
     directory is owned by another user.
     """
-    try:
-        state_dir = pathlib.Path(
-            config.get(TMUX_STATE_DIR_CONFIG)
-        )
-    except KeyError:
+    configured = default(TMUX_STATE_DIR_CONFIG, None)
+    if configured is None:
         state_dir = (
             pathlib.Path(tempfile.gettempdir())
             / f"nytid-{os.getuid()}"
         )
+    else:
+        state_dir = pathlib.Path(configured)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.stat().st_uid != os.getuid():
         raise PermissionError(
@@ -516,6 +532,31 @@ here, so it lives here too.
 def get_tmux_context_lock_file() -> pathlib.Path:
     """Return the lock file guarding tmux context state."""
     return get_tmux_state_dir() / "tmux_context.lock"
+@
+
+Let's verify the sharing claim the same way we verified it for the
+tracking paths.  Resolving the state directory and then the lock file
+that lives inside it is the shortest realistic pair of lookups---the
+hook path does far more---and even that pair must touch the
+configuration file only once.
+
+<<test functions>>=
+def test_tmux_state_dir_reads_config_once(
+    monkeypatch, tmp_path
+):
+    """Repeated tmux-state lookups share the cached config."""
+    fake = MagicMock()
+    fake.get.return_value = str(tmp_path / "tmux-state")
+    monkeypatch.setattr(
+        defaults.typerconf, "Config", lambda: fake
+    )
+    defaults._reset_cache()
+    try:
+        get_tmux_state_dir()
+        get_tmux_context_lock_file()
+        assert fake.read_config.call_count == 1
+    finally:
+        defaults._reset_cache()
 @
 
 \subsection{Keying State by Server Instance}
@@ -14014,6 +14055,7 @@ from nytid.cli.track import (
     get_tracking_data_file,
     get_tracking_lock_file,
     get_tmux_state_dir,
+    get_tmux_context_lock_file,
     parse_state_file_server_key,
     parse_state_file_tmux_id,
     list_live_tmux_ids,
