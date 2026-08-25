@@ -423,8 +423,20 @@ Stubs, rather than patches of the real packages, keep the tests honest
 about the delegation: the fixture exposes nothing but
 [[load_credentials]], [[read_configuration]] and [[canvasapi.Canvas]], so
 no test can come to depend on how [[canvaslms]] resolves anything.
-The fixture also clears the cached [[_canvas_session]], since a session
-built by one test would otherwise be handed straight back to the next.
+The fixture also has to keep one test's Canvas out of the next, and three
+things would otherwise carry it across: the cached [[_canvas_session]]
+and the [[cachetools]] caches behind the two lookups below.
+[[monkeypatch]] handles the first on its own, since it restores what it
+patched once the test ends.
+The lookup caches have no such owner --- they are module-level
+dictionaries keyed on the regexes alone, so an entry computed against one
+stub answers just as readily for whatever comes next.
+
+That is why the fixture [[yield]]s rather than returns: it clears them on
+the way in \emph{and} on the way out.
+Clearing only on the way in would protect every test that uses the
+fixture and none that follows it, leaving the last one's stub-derived
+results in a cache the real lookups share for the rest of the session.
 <<test setup>>=
 @pytest.fixture
 def canvas_stubs(monkeypatch):
@@ -456,9 +468,16 @@ def canvas_stubs(monkeypatch):
                        ("canvaslms.cli.login", canvaslms.cli.login)]:
     monkeypatch.setitem(sys.modules, name, module)
 
-  monkeypatch.setattr(hrcli, "_canvas_session", None)
+  def clear_lookup_caches():
+    hrcli.get_canvas_courses.cache_clear()
+    hrcli.get_canvas_users.cache_clear()
 
-  return types.SimpleNamespace(canvasapi=canvasapi, canvaslms=canvaslms)
+  monkeypatch.setattr(hrcli, "_canvas_session", None)
+  clear_lookup_caches()
+
+  yield types.SimpleNamespace(canvasapi=canvasapi, canvaslms=canvaslms)
+
+  clear_lookup_caches()
 @
 
 The regression itself.
@@ -584,21 +603,94 @@ So we can simply call the right library functions.
 canvas_session = get_canvas_session()
 if canvas_session is None:
   raise RuntimeError("Canvas session not available, run `canvaslms login`")
-try:
-  import canvaslms.cli.courses
-  courses = list(canvaslms.cli.courses.filter_courses(canvas_session,
-                                                      course_regex))
-except ImportError as err:
-  logging.warning(f"Can't import Canvas: {err}")
-  courses = []
+import canvaslms.cli.courses
+courses = list(canvaslms.cli.courses.filter_courses(canvas_session,
+                                                    course_regex))
 <<filter [[users]] by looking for [[username_regex]] in [[courses]]>>=
-try:
-  import canvaslms.cli.users
-  users = list(canvaslms.cli.users.filter_users(courses,
-                                                username_regex))
-except ImportError as err:
-  logging.warning(f"Can't import Canvas: {err}")
-  users = []
+import canvaslms.cli.users
+users = list(canvaslms.cli.users.filter_users(courses,
+                                              username_regex))
+@
+
+Neither import is guarded, and that is the second half of the silent
+failures this section is about.
+Both used to catch [[ImportError]] and put an empty list in place of the
+result, which made a broken Canvas installation indistinguishable from a
+working one that matched nothing.
+An empty list is not a failure the callers can notice, it is an answer
+they act on: [[get_canvas_user]] turns it into \enquote{can't find dbosk
+in Canvas}, which reads as a TA who never joined the course, and the run
+continues quietly to the next one.
+
+Two things make the empty list wrong here rather than merely unhelpful.
+The first is that the line just above already treats the absence of
+Canvas as fatal --- a [[None]] session becomes a [[RuntimeError]] --- so
+one function gave the same condition two opposite outcomes.
+The second is that the [[None]]-session branch has already run by the
+time we reach the import.
+[[get_canvas_session]] imports [[canvasapi]] and [[canvaslms.cli]] itself
+and returns [[None]] if either is missing, so an absent Canvas
+installation never gets this far.
+What is left for [[ImportError]] to mean here is much narrower and much
+stranger: [[canvaslms]] is installed, we hold a session built from its
+credentials, and one of its submodules will not load.
+That is a broken installation, exactly the \enquote{unexpected} of the
+chapter introduction, and so it propagates.
+
+We let [[ImportError]] out unchanged rather than translating it into a
+[[RuntimeError]] the way the session check does, because that check has
+advice to add ([[canvaslms login]]) and here we have none to give.
+[[ImportError]] already names the submodule that would not load, which is
+the one thing anyone debugging this needs, and wrapping it would trade a
+precise message for a vaguer one.
+The callers need no change either way: each one wraps these lookups in a
+warning naming the user it was looking up, so the failure becomes visible
+without aborting a run over a whole course's TAs.
+
+The Canvas stubs from the session tests are enough to check this.
+We register the submodule as [[None]] in [[sys.modules]], which is how
+imports are spelled out of existence there; letting the import fail
+merely because a stub module has no [[__path__]] would leave the test
+passing for a reason it never states.
+<<test functions>>=
+def test_canvas_courses_do_not_hide_import_errors(canvas_stubs,
+                                                  monkeypatch):
+  """A submodule that won't load must not read as an empty course list."""
+  import sys
+  from nytid.cli import hr as hrcli
+
+  canvas_stubs.canvaslms.cli.login.load_credentials = lambda config: (
+    "https://example.instructure.com", "token123")
+  monkeypatch.setitem(sys.modules, "canvaslms.cli.courses", None)
+
+  with pytest.raises(ImportError):
+    hrcli.get_canvas_courses("DD1301")
+@
+
+The user filter is the same shape one call further in, and it hides
+behind the first: reaching it at all means [[canvaslms.cli.courses]]
+imported fine.
+So this test supplies a working course filter and breaks only the user
+one --- the partial installation that the empty list used to disguise.
+<<test functions>>=
+def test_canvas_users_do_not_hide_import_errors(canvas_stubs,
+                                                monkeypatch):
+  """The same must hold for the user filter one call further in."""
+  import sys
+  import types
+  from nytid.cli import hr as hrcli
+
+  canvas_stubs.canvaslms.cli.login.load_credentials = lambda config: (
+    "https://example.instructure.com", "token123")
+
+  courses = types.ModuleType("canvaslms.cli.courses")
+  courses.filter_courses = lambda session, course_regex: []
+  canvas_stubs.canvaslms.cli.courses = courses
+  monkeypatch.setitem(sys.modules, "canvaslms.cli.courses", courses)
+  monkeypatch.setitem(sys.modules, "canvaslms.cli.users", None)
+
+  with pytest.raises(ImportError):
+    hrcli.get_canvas_users("dbosk", "DD1302")
 @
 
 Now, to fully use these caches, we'll introduce another helper function.
