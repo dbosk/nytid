@@ -80,6 +80,17 @@ nytid todo done
 nytid todo sync
 ```
 
+### `prompt-nytid` — fast status for shell prompts
+
+A separate, minimal entry point that prints the active todo ids and the
+currently tracked labels as two machine-readable lines. It skips the CLI's
+import overhead so it is cheap enough to run on every shell prompt render:
+
+```bash
+readarray -t _nytid < <(prompt-nytid --who "$USER")
+# ${_nytid[0]} = active todo ids, ${_nytid[1]} = tracked labels
+```
+
 ### `utils` — room availability and other utilities
 
 ```bash

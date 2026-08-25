@@ -1,0 +1,780 @@
+\chapter{Fast status for shell prompts}%
+\label{prompt}
+
+A shell prompt that shows the active todos and the currently tracked
+labels must run on \emph{every} prompt render.
+The obvious implementation runs [[nytid todo status]] and
+[[nytid track status --who $USER]], which together take about
+1.2~seconds---long enough that pressing return feels sluggish.
+Profiling shows that roughly 90~percent of that time is import tax:
+importing \emph{anything} under [[nytid.cli]] triggers the
+subcommand-discovery loop (\cref{cli.py}), which imports every
+subcommand group and, transitively, [[typer]], [[rich]],
+[[icalendar]], [[requests]] and friends.
+The actual work---reading two or three small JSON files---takes
+milliseconds.
+
+This chapter provides [[nytid.prompt]], a module that answers exactly
+the two questions a prompt asks, without paying the import tax.
+The module lives \emph{outside} the [[nytid.cli]] package on purpose:
+[[nytid/__init__.py]] is an empty package marker, so
+[[import nytid.prompt]] pulls in almost nothing.
+The target is at most about 60~milliseconds per invocation, which is
+essentially the cost of starting the interpreter and parsing a few
+small JSON files.
+
+The price we pay is duplication: the module replicates about thirty
+lines of read logic from [[nytid.cli.todo]] and [[nytid.cli.track]]
+(\cref{cli.todo,cli.track}).
+Duplication drifts, so each replicated behaviour is pinned to the
+real implementation by a \emph{drift-guard} test: the test writes
+state through the real writers and asserts that our independent
+readers report exactly what the real readers report.
+If either side changes semantics, the guard fails.
+
+The installed script is named [[prompt-nytid]]---\emph{not}
+[[nytid-prompt]]---so that typing [[nyt]] followed by tab still
+completes uniquely to [[nytid]] in the shell.
+
+\section{Outline}
+
+The module tangles to the single file [[prompt.py]].
+Besides the standard library we import only [[platformdirs]], which
+we need to locate the configuration file the same way
+[[typerconf]] does (\cref{prompt:config}).
+
+<<[[prompt.py]]>>=
+"""Machine-readable nytid status for shell prompts.
+
+Prints two lines: the space-separated ids of the active
+(in-progress) todos, and the space-separated labels currently
+tracked by `nytid track`.  Designed to be cheap enough to run on
+every shell prompt render; it deliberately avoids importing
+`nytid.cli`, which would pull in the whole CLI dependency tree.
+
+Installed as the script `prompt-nytid`.
+"""
+
+<<imports>>
+<<constants>>
+<<functions>>
+
+if __name__ == "__main__":
+    main()
+@
+
+The [[__main__]] guard lets us run the module as
+[[python -m nytid.prompt]] as well, which is convenient for timing
+experiments and for the cheapness test below.
+
+<<imports>>=
+import json
+import os
+import pathlib
+import sys
+
+import platformdirs
+@
+
+
+\section{Reading the configuration}%
+\label{prompt:config}
+
+Both data directories can be relocated through nytid's
+configuration, so we must read the same configuration file that the
+CLI reads.
+The CLI's configuration is handled by [[typerconf]], which derives
+the location as
+[[platformdirs.AppDirs(basename(sys.argv[0])).user_config_dir]]
+plus [[config.json]].
+That derivation is a trap for us: our [[sys.argv[0]]] is
+[[prompt-nytid]], not [[nytid]], so calling [[typerconf]] directly
+would look in the wrong directory.
+We therefore hardcode the application name [[nytid]].
+
+<<functions>>=
+def config_file():
+    """Return the path to nytid's configuration file.
+
+    This is the same file `typerconf` reads for the `nytid`
+    command: `AppDirs("nytid").user_config_dir` plus
+    `config.json`.
+    """
+    dirs = platformdirs.AppDirs("nytid")
+    return pathlib.Path(dirs.user_config_dir) / "config.json"
+@
+
+Let's verify that we derive the same path [[typerconf]] would
+derive for the application name [[nytid]].
+We reconstruct [[typerconf]]'s formula in the test rather than
+importing [[typerconf]] itself, because under pytest
+[[sys.argv[0]]] is [[pytest]], which would poison [[typerconf]]'s
+module-level [[dirs]].
+
+<<test functions>>=
+def test_config_file_matches_typerconf():
+    """`config_file()` equals the path typerconf derives."""
+    expected = pathlib.Path(
+        platformdirs.AppDirs("nytid").user_config_dir
+    ) / "config.json"
+    assert nytid.prompt.config_file() == expected
+@
+
+To look up a value we walk the dot-separated key through the JSON
+structure, the same addressing scheme [[typerconf]] uses.
+Unlike the CLI helpers [[get_todo_dir]] and
+[[get_tracking_storage]], which \emph{write} the default back into
+the configuration on a missing key, we are strictly read-only: a
+prompt runs concurrently with everything else and at every prompt
+render, so it must never mutate shared state---and it does not need
+to, because it can simply fall back to the same default value every
+time.
+Any error at all---missing file, malformed JSON, missing
+key---yields the fallback, because for a prompt a default answer is
+always better than a traceback.
+
+<<functions>>=
+def config_value(key, fallback):
+    """Return the config value at dot-separated `key`.
+
+    Returns `fallback` on any error (missing file, malformed
+    JSON, missing key).  Never writes the configuration.
+    """
+    try:
+        with open(config_file()) as conf:
+            data = json.load(conf)
+        for part in key.split("."):
+            data = data[part]
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return fallback
+@
+
+Let's verify both the found and the fallback case, and that a
+corrupt configuration file degrades to the fallback.
+
+<<test functions>>=
+def test_config_value_walks_dotted_key(tmp_path, monkeypatch):
+    """A dotted key walks the nested JSON structure."""
+    conf = tmp_path / "config.json"
+    conf.write_text(json.dumps(
+        {"todo": {"data_dir": "/somewhere/todos"}}
+    ))
+    monkeypatch.setattr(
+        nytid.prompt, "config_file", lambda: conf
+    )
+    assert nytid.prompt.config_value(
+        "todo.data_dir", "fallback"
+    ) == "/somewhere/todos"
+    assert nytid.prompt.config_value(
+        "todo.missing", "fallback"
+    ) == "fallback"
+
+
+def test_config_value_corrupt_file(tmp_path, monkeypatch):
+    """A corrupt config file yields the fallback."""
+    conf = tmp_path / "config.json"
+    conf.write_text("{not json")
+    monkeypatch.setattr(
+        nytid.prompt, "config_file", lambda: conf
+    )
+    assert nytid.prompt.config_value(
+        "todo.data_dir", "fallback"
+    ) == "fallback"
+@
+
+
+\section{The data directories}
+
+The todo and tracking directories mirror [[get_todo_dir]]
+(\cref{cli.todo}) and [[get_tracking_storage]]
+(\cref{cli.track}): the configuration keys and the defaults under
+[[~/.nytid]] are the same, only the write-back of the default is
+dropped, as discussed in \cref{prompt:config}.
+
+<<functions>>=
+def todo_dir():
+    """Return the todo data directory.
+
+    Mirrors `get_todo_dir` in `nytid.cli.todo`, but read-only.
+    """
+    return pathlib.Path(config_value(
+        TODO_DIR_CONFIG,
+        pathlib.Path.home() / ".nytid" / "todos",
+    ))
+<<constants>>=
+TODO_DIR_CONFIG = "todo.data_dir"
+@
+
+<<functions>>=
+def tracking_dir():
+    """Return the tracking data directory.
+
+    Mirrors `get_tracking_storage` in `nytid.cli.track`, but
+    read-only.
+    """
+    return pathlib.Path(config_value(
+        TRACKING_DIR_CONFIG,
+        pathlib.Path.home() / ".nytid" / "tracking",
+    ))
+<<constants>>=
+TRACKING_DIR_CONFIG = "track.data_dir"
+@
+
+
+\section{Active todo ids}
+
+The todo state lives in two files in the todo directory
+(\cref{cli.todo}): [[todos.json]] holds
+[[{"next_id": ..., "todos": [...]}]] and [[active_stack.json]]
+holds a plain JSON list of todo ids, most recently started last.
+The stack on disk may be stale---it can reference ids that were
+deleted, ids whose todo has since been marked done, or contain
+duplicates---so the real reader, [[load_todo_state]], filters it
+through [[normalize_active_stack]] (the
+[[<<active stack helpers>>]] in \cref{cli.todo}): keep the stack
+order, drop ids missing from the todos, ids whose status is
+[[done]], and duplicates.
+We replicate exactly that filter; anything less and the prompt
+would show todos the CLI no longer considers active.
+
+<<functions>>=
+def active_todo_ids():
+    """Return the ids of the active todos, in stack order.
+
+    Replicates the semantics of `load_todo_state` and
+    `normalize_active_stack` in `nytid.cli.todo`: stack order is
+    kept; ids missing from `todos.json`, ids whose status is
+    `done`, and duplicates are dropped.  Missing or corrupt
+    files yield an empty list.
+    """
+    directory = todo_dir()
+    <<read the todo statuses>>
+    <<read and normalize the raw stack>>
+    return normalized
+@
+
+We only need each todo's status, so we index status by id rather
+than deserializing full todo items.
+The error handling matches the real reader's granularity: on any
+problem with [[todos.json]], [[load_todos_raw]] discards the whole
+file and returns no todos, whereupon normalization drops every
+stack id.
+An empty status map achieves the same.
+
+<<read the todo statuses>>=
+status_by_id = {}
+try:
+    with open(directory / TODO_FILE) as todo_file:
+        data = json.load(todo_file)
+    for item in data.get("todos", []):
+        status_by_id[int(item["id"])] = item.get(
+            "status", "pending"
+        )
+except (OSError, ValueError, KeyError, TypeError):
+    status_by_id = {}
+<<constants>>=
+TODO_FILE = "todos.json"
+@
+
+The stack file is a plain list of ints; the real reader,
+[[load_active_stack_raw]], returns an empty stack when the file is
+missing, not a list, or not parseable.
+Looking up a missing id with default [["done"]] folds the two drop
+conditions---id unknown and todo finished---into one test.
+
+<<read and normalize the raw stack>>=
+try:
+    with open(directory / ACTIVE_STACK_FILE) as stack_file:
+        raw_stack = json.load(stack_file)
+    if not isinstance(raw_stack, list):
+        raw_stack = []
+    raw_stack = [int(todo_id) for todo_id in raw_stack]
+except (OSError, ValueError, TypeError):
+    raw_stack = []
+
+normalized = []
+seen = set()
+for todo_id in raw_stack:
+    if status_by_id.get(todo_id, "done") == "done":
+        continue
+    if todo_id in seen:
+        continue
+    normalized.append(todo_id)
+    seen.add(todo_id)
+<<constants>>=
+ACTIVE_STACK_FILE = "active_stack.json"
+@
+
+Now the drift guard.
+We write the state through the \emph{real} writer
+[[save_todo_state_unlocked]] from [[nytid.cli.todo]] (importing
+the CLI is fine in tests---only the shipped prompt path must stay
+cheap), then overwrite the stack file with a raw list containing a
+done id, a deleted id and a duplicate.
+Both readers must then agree on the normalized result, and we
+additionally pin that result explicitly so the test cannot pass
+vacuously with two empty lists.
+
+<<test fixtures>>=
+@pytest.fixture
+def prompt_dirs(tmp_path, monkeypatch):
+    """Point both the real modules and `nytid.prompt` at
+    temporary todo and tracking directories.
+
+    Yields the pair (todo directory, tracking directory).
+    """
+    todo_path = tmp_path / "todos"
+    todo_path.mkdir()
+    tracking_path = tmp_path / "tracking"
+    tracking_path.mkdir()
+
+    monkeypatch.setattr(
+        real_todo, "get_todo_dir", lambda: todo_path
+    )
+    monkeypatch.setattr(
+        real_todo, "get_todo_file",
+        lambda: todo_path / "todos.json",
+    )
+    monkeypatch.setattr(
+        real_track, "get_tracking_dir", lambda: tracking_path
+    )
+    monkeypatch.setattr(
+        nytid.prompt, "todo_dir", lambda: todo_path
+    )
+    monkeypatch.setattr(
+        nytid.prompt, "tracking_dir", lambda: tracking_path
+    )
+    yield todo_path, tracking_path
+@
+
+<<test functions>>=
+def test_active_todo_ids_matches_real_reader(prompt_dirs):
+    """Drift guard: our reader agrees with `load_todo_state`."""
+    todo_path, _ = prompt_dirs
+    todos = [
+        real_todo.TodoItem(
+            id=1, title="pending one",
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=2, title="done one", status="done",
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=3, title="pending two",
+            created="2026-08-25T10:00:00",
+        ),
+    ]
+    real_todo.save_todo_state_unlocked(4, todos, [3, 1])
+    stale = [3, 2, 99, 3, 1]
+    with open(todo_path / "active_stack.json", "w") as f:
+        json.dump(stale, f)
+
+    _, _, real_stack = real_todo.load_todo_state()
+    assert nytid.prompt.active_todo_ids() == real_stack
+    assert nytid.prompt.active_todo_ids() == [3, 1]
+
+
+def test_active_todo_ids_missing_files(prompt_dirs):
+    """Missing state files yield an empty list."""
+    assert nytid.prompt.active_todo_ids() == []
+
+
+def test_active_todo_ids_corrupt_files(prompt_dirs):
+    """Corrupt state files yield an empty list."""
+    todo_path, _ = prompt_dirs
+    (todo_path / "todos.json").write_text("{not json")
+    (todo_path / "active_stack.json").write_text("[1, 2")
+    assert nytid.prompt.active_todo_ids() == []
+@
+
+
+\section{Active tracking labels}
+
+The track module stores each worker's current session as JSON in
+the tracking directory (\cref{cli.track}).
+Three details of the real reader matter to us.
+First, the filename embeds the worker name, sanitized for
+filesystem use by [[sanitize_who]]: lowercase, keep alphanumerics
+and hyphens, replace everything else with underscores.
+
+<<functions>>=
+def sanitize_who(who):
+    """Sanitize a worker name for use in filenames.
+
+    Replicates `sanitize_who` in `nytid.cli.track`: lowercase,
+    keep alphanumerics and hyphens, everything else becomes an
+    underscore.
+    """
+    return "".join(
+        c if c.isalnum() or c == "-" else "_"
+        for c in who.lower()
+    )
+@
+
+Second, the file rule of [[get_current_session_file]]: the session
+lives in [[current_session_<sanitized>.json]], but when [[who]] is
+the default user (the [[USER]] environment variable) and the
+suffixed file does not exist, the reader falls back to the legacy
+unsuffixed [[current_session.json]] from before sessions became
+per-worker.
+We replicate the fallback because a user who has not tracked since
+that migration would otherwise see an empty prompt while
+[[nytid track status]] still shows active labels.
+One divergence, on purpose: when [[USER]] is unset, the track
+module falls back to the literal worker name [[me]] while we use
+the empty string; a prompt only ever runs in an interactive shell,
+where [[USER]] is set.
+
+<<functions>>=
+def session_file(who):
+    """Return the session file for worker `who`.
+
+    Replicates `get_current_session_file` in `nytid.cli.track`,
+    including the fallback to the legacy unsuffixed
+    `current_session.json` for the default user.
+    """
+    directory = tracking_dir()
+    suffixed = directory / (
+        f"current_session_{sanitize_who(who)}.json"
+    )
+    if who == os.environ.get("USER", ""):
+        if not suffixed.exists():
+            legacy = directory / "current_session.json"
+            if legacy.exists():
+                return legacy
+    return suffixed
+@
+
+Third, the session JSON holds a dict [[active_labels]] mapping
+each label to its start time, notes and batch id; the real
+[[ActiveSession.get_active_labels]] returns the \emph{sorted}
+keys, which is also the order [[nytid track status]] prints.
+Sorting here keeps the prompt's line byte-for-byte comparable with
+the status command's output.
+We do not replicate [[ActiveSession.from_dict]]'s migration of the
+ancient [[label_stack]] format: that format predates the notes and
+batch features, and any session written by a current nytid uses
+[[active_labels]].
+
+<<functions>>=
+def active_labels(who):
+    """Return the sorted active tracking labels for `who`.
+
+    Replicates the reading side of
+    `ActiveSession.get_active_labels` in `nytid.cli.track`.
+    Missing or corrupt session files yield an empty list.
+    """
+    try:
+        with open(session_file(who)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    labels = data.get("active_labels", {})
+    if not isinstance(labels, dict):
+        return []
+    return sorted(labels.keys())
+@
+
+The drift guard writes the session through the real
+[[ActiveSession]] and [[save_active_session]] and compares both
+readers.
+
+<<test functions>>=
+def test_active_labels_matches_real_reader(
+    prompt_dirs, monkeypatch
+):
+    """Drift guard: we agree with `get_active_labels`."""
+    monkeypatch.setenv("USER", "alice")
+    session = real_track.ActiveSession()
+    session.start_labels(
+        ["zeta", "alpha DD1310"],
+        datetime.datetime(2026, 8, 25, 10, 0),
+    )
+    real_track.save_active_session(session, "Alice B")
+
+    labels = nytid.prompt.active_labels("Alice B")
+    assert labels == session.get_active_labels()
+    assert labels == ["alpha DD1310", "zeta"]
+
+
+def test_session_file_matches_real_rule(
+    prompt_dirs, monkeypatch
+):
+    """Drift guard: same file as the real path rule."""
+    _, tracking_path = prompt_dirs
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.setattr(
+        real_track, "default_username", "alice"
+    )
+    assert nytid.prompt.session_file("Alice B") \
+        == real_track.get_current_session_file("Alice B")
+    assert nytid.prompt.session_file("alice") \
+        == real_track.get_current_session_file("alice")
+
+
+def test_active_labels_legacy_fallback(
+    prompt_dirs, monkeypatch
+):
+    """The default user falls back to the unsuffixed file."""
+    _, tracking_path = prompt_dirs
+    monkeypatch.setenv("USER", "alice")
+    legacy = tracking_path / "current_session.json"
+    legacy.write_text(json.dumps({
+        "active_labels": {
+            "old": ("2026-08-25T10:00:00", "", 1),
+        },
+    }))
+    assert nytid.prompt.active_labels("alice") == ["old"]
+    assert nytid.prompt.active_labels("bob") == []
+
+    suffixed = tracking_path / "current_session_alice.json"
+    suffixed.write_text(json.dumps({
+        "active_labels": {
+            "new": ("2026-08-25T10:00:00", "", 1),
+        },
+    }))
+    assert nytid.prompt.active_labels("alice") == ["new"]
+
+
+def test_active_labels_missing_or_corrupt(prompt_dirs):
+    """Missing or corrupt session files yield no labels."""
+    _, tracking_path = prompt_dirs
+    assert nytid.prompt.active_labels("nobody") == []
+    bad = tracking_path / "current_session_nobody.json"
+    bad.write_text("{not json")
+    assert nytid.prompt.active_labels("nobody") == []
+@
+
+
+\section{The command line}
+
+The entry point prints, by default, two lines: the active todo ids
+and the active labels, each space-separated, an empty line when
+there is nothing.
+Two lines with a fixed meaning make the shell side trivial:
+\begin{minted}{bash}
+readarray -t _nytid < <(prompt-nytid --who "$USER")
+# ${_nytid[0]} = active todo ids
+# ${_nytid[1]} = tracked labels
+\end{minted}
+
+We parse [[sys.argv]] by hand instead of using [[argparse]] or
+[[typer]].
+[[typer]] is out for the same reason [[nytid.cli]] is: its import
+alone costs more than our entire time budget.
+[[argparse]] is cheaper but still measurable, and buys nothing
+here: there are three options, no values need validation, and a
+prompt helper should ignore rather than reject unknown
+arguments---[[argparse]]'s error path prints usage and exits~2,
+which is exactly the traceback-like behaviour a prompt must never
+exhibit.
+
+\begin{description}
+\item[The [[--who]] option] selects the worker; the default is the
+  [[USER]] environment variable, matching what the prompt snippet
+  above passes explicitly.
+\item[The [[--todos]] option] prints only the todo line.
+\item[The [[--labels]] option] prints only the label line.
+\end{description}
+
+<<functions>>=
+def main():
+    """Print machine-readable status lines for a prompt.
+
+    Line 1: space-separated active todo ids.
+    Line 2: space-separated tracked labels for `--who WHO`
+    (default: the `USER` environment variable).
+    `--todos` or `--labels` restricts output to that one line.
+    Never raises; on any error it prints the expected number of
+    empty lines and returns, so the caller always gets
+    well-formed output and exit code 0.
+    """
+    try:
+        <<parse the command line>>
+        <<print the requested lines>>
+    except Exception:
+        <<print empty lines as fallback>>
+@
+
+<<parse the command line>>=
+args = sys.argv[1:]
+who = os.environ.get("USER", "")
+only = None
+i = 0
+while i < len(args):
+    if args[i] == "--who" and i + 1 < len(args):
+        who = args[i + 1]
+        i += 1
+    elif args[i] == "--todos":
+        only = "todos"
+    elif args[i] == "--labels":
+        only = "labels"
+    i += 1
+@
+
+<<print the requested lines>>=
+if only != "labels":
+    print(" ".join(
+        str(todo_id) for todo_id in active_todo_ids()
+    ))
+if only != "todos":
+    print(" ".join(active_labels(who)))
+@
+
+The fallback must print as many lines as the caller expects, so it
+re-derives the line count from [[sys.argv]] alone---the parsed
+state may not exist if the failure happened during parsing.
+
+<<print empty lines as fallback>>=
+restricted = (
+    "--todos" in sys.argv[1:] or "--labels" in sys.argv[1:]
+)
+for _ in range(1 if restricted else 2):
+    print()
+@
+
+Let's verify the output contract: the default two lines, the
+restricted single lines, and that broken state files still
+produce empty, zero-exit output.
+
+<<test functions>>=
+def run_main(monkeypatch, capsys, argv):
+    """Run `main()` with `argv` and return captured stdout."""
+    monkeypatch.setattr(sys, "argv", ["prompt-nytid"] + argv)
+    nytid.prompt.main()
+    return capsys.readouterr().out
+
+
+def test_main_default_two_lines(
+    prompt_dirs, monkeypatch, capsys
+):
+    """Default output is the todo line then the label line."""
+    todo_path, tracking_path = prompt_dirs
+    monkeypatch.setenv("USER", "alice")
+    todos = [
+        real_todo.TodoItem(
+            id=1, title="one",
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=2, title="two",
+            created="2026-08-25T10:00:00",
+        ),
+    ]
+    real_todo.save_todo_state_unlocked(3, todos, [2, 1])
+    session = real_track.ActiveSession()
+    session.start_labels(
+        ["DD1310", "grading"],
+        datetime.datetime(2026, 8, 25, 10, 0),
+    )
+    real_track.save_active_session(session, "alice")
+
+    out = run_main(monkeypatch, capsys, ["--who", "alice"])
+    assert out == "2 1\nDD1310 grading\n"
+
+
+def test_main_restricted_lines(
+    prompt_dirs, monkeypatch, capsys
+):
+    """`--todos` and `--labels` each print exactly one line."""
+    monkeypatch.setenv("USER", "alice")
+    assert run_main(
+        monkeypatch, capsys, ["--todos"]
+    ) == "\n"
+    assert run_main(
+        monkeypatch, capsys, ["--labels", "--who", "alice"]
+    ) == "\n"
+
+
+def test_main_corrupt_state_prints_empty(
+    prompt_dirs, monkeypatch, capsys
+):
+    """Corrupt files yield empty lines, never a traceback."""
+    todo_path, tracking_path = prompt_dirs
+    monkeypatch.setenv("USER", "alice")
+    (todo_path / "todos.json").write_text("{not json")
+    (tracking_path / "current_session_alice.json").write_text(
+        "{not json"
+    )
+    out = run_main(monkeypatch, capsys, ["--who", "alice"])
+    assert out == "\n\n"
+
+
+def test_main_survives_reader_crash(
+    prompt_dirs, monkeypatch, capsys
+):
+    """An unexpected exception still yields empty lines."""
+
+    def boom():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(
+        nytid.prompt, "active_todo_ids", boom
+    )
+    assert run_main(monkeypatch, capsys, []) == "\n\n"
+    assert run_main(
+        monkeypatch, capsys, ["--todos"]
+    ) == "\n"
+@
+
+
+\section{Staying cheap}
+
+The whole point of the module is the import bill, so we guard it
+with a test: a fresh interpreter that imports [[nytid.prompt]]
+must not have loaded any of the heavyweight modules the CLI drags
+in, nor [[nytid.cli]] itself.
+A subprocess is essential here---inside the test process pytest
+and the drift guards have already imported everything, so
+[[sys.modules]] proves nothing.
+
+<<test functions>>=
+def test_import_is_cheap():
+    """Importing `nytid.prompt` avoids the CLI import tax."""
+    src_dir = pathlib.Path(
+        nytid.prompt.__file__
+    ).parent.parent
+    probe = (
+        "import sys, nytid.prompt;"
+        "print('\\n'.join(sorted(sys.modules)))"
+    )
+    env = dict(os.environ, PYTHONPATH=str(src_dir))
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, env=env, check=True,
+    )
+    loaded = set(result.stdout.split())
+    forbidden = {
+        "typer", "click", "rich", "icalendar",
+        "requests", "nytid.cli",
+    }
+    assert not loaded & forbidden
+@
+
+Finally the test file itself.
+The real CLI modules are imported here---at test time---to feed
+the drift guards; the fixtures live in
+[[<<test fixtures>>]] above.
+
+<<test [[prompt.py]]>>=
+import datetime
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+import platformdirs
+import pytest
+
+sys.path.insert(0, "../src")
+
+import nytid.prompt
+from nytid.cli import todo as real_todo
+from nytid.cli import track as real_track
+
+<<test fixtures>>
+<<test functions>>
+@
