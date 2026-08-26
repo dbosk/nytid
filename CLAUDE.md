@@ -76,8 +76,14 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 **Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`) **and all `tests/test_*.py` files**. The `.gitignore` (both root and `tests/.gitignore`) lists all generated paths. The only handwritten Python files are:
 - `src/nytid/__init__.py` (empty package marker)
 - `src/nytid/signup/__init__.py` (empty package marker)
+- `conftest.py` **at the repository root** — the build guard. It aborts the
+  pytest session (exit 4) when `tests/conftest.py`, which carries the suite's
+  configuration sandbox, is missing or older than `tests/conftest.nw`, or when
+  `typerconf`'s captured config path still points at the real user config dir.
+  It cannot be tangled: it has to work in a tree where `make` has not run.
+  See `tests/conftest.nw`, "When this file hasn't been built".
 
-**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`. **Never edit `tests/test_*.py` directly** — edits vanish the next time the tests Makefile runs, and they won't even appear in `git status` because they're gitignored.
+**Tests are literate too.** `tests/test_clitrack.py`, `tests/test_clitodo.py`, `tests/test_courses.py`, etc. are all **generated** by `notangle` from `<<test functions>>=` chunks inside the corresponding feature `.nw` files (e.g. `src/nytid/cli/track.nw`). The only handwritten literate test source is `tests/conftest.nw`. Other handwritten support files under `tests/` include `tests/Makefile`, `tests/.gitignore`, and `tests/CLAUDE.md`; the repository-root `conftest.py` guards against running the suite before `tests/conftest.py` has been tangled. **Never edit `tests/test_*.py` directly** — edits vanish the next time the tests Makefile runs, and they won't even appear in `git status` because they're gitignored.
 
 **CRITICAL: root `make all` does NOT regenerate `tests/test_*.py`.** The `tests/` directory has its own `Makefile` (see `tests/Makefile`) that calls `notangle` with the `-Rtest [[...]]` root chunk to extract test files. Running `make all` at the project root rebuilds source files only; tangling the test root happens via `make -C tests all` (or implicitly via `cd tests && make test`, which depends on `all`). Forgetting this leads to: you edit a test in `.nw`, rebuild with `make all`, run pytest, and see the old behavior — because the tangled test file is stale.
 
