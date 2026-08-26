@@ -12,11 +12,14 @@ nytid.pdf: ../src/nytid/cli/signupsheets.tex
 nytid.pdf: ../src/nytid/cli/hr.tex
 nytid.pdf: ../src/nytid/cli/track.tex
 nytid.pdf: ../src/nytid/cli/todo.tex
+nytid.pdf: ../src/nytid/prompt.tex
 nytid.pdf: ../src/nytid/cli/zulip.tex
 nytid.pdf: ../tests/conftest.tex
 nytid.pdf: ../src/nytid/cli/utils/init.tex
 nytid.pdf: ../src/nytid/cli/utils/defaults.tex
 nytid.pdf: ../src/nytid/cli/utils/rooms.tex
+nytid.pdf: ../src/nytid/cli/utils/labels.tex
+nytid.pdf: ../src/nytid/cli/utils/output.tex
 
 nytid.pdf: ../src/nytid/storage/init.tex
 nytid.pdf: ../src/nytid/storage/afs.tex
@@ -77,6 +80,20 @@ include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
 
 NOWEAVEFLAGS.tex+=-langrule 'sending signed time sheets=bash'
+
+# tex.mk offers two ways to build a .bbl: bibtex(u) from the .aux and
+# biber from the .bcf.  We are a biblatex+biber document, but latexmk
+# runs with -use-make (that delegation is what runs PythonTeX for us
+# with the interpreter in PYTHONTEXFLAGS), so on the first pass it asks
+# make for the not-yet-existing .bbl -- and GNU make answers with the
+# first matching pattern rule, the bibtex one, which then dies with "I
+# found no \bibdata command".  latexmk recovers by running biber
+# itself, so the build survives, but the log carries a bibtexu failure
+# and a make Error 2 on every clean build.  An explicit rule for our
+# own .bbl outranks both pattern rules and points the delegation at
+# biber.
+${TEX_OUTDIR}/nytid.bbl: ${TEX_OUTDIR}/nytid.bcf
+	${BIBLIOGRAPHY.bcf}
 
 INCLUDE_DIDACTIC=didactic
 include ${INCLUDE_DIDACTIC}/didactic.mk
