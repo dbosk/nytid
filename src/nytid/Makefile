@@ -5,8 +5,8 @@ SUBDIR+=	storage
 SUBDIR+=	courses
 SUBDIR+=	signup
 
-MODULES+=	schedules.py
-MODULES+=	prompt.py
+MODULES+=	schedules.py schedules.tex
+MODULES+=	prompt.py prompt.tex
 
 .PHONY: all
 all: ${MODULES}
