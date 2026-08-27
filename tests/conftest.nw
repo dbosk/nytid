@@ -11,7 +11,7 @@ paths are patched.
 Rather than duplicating the patching logic in every test
 file, we collect the shared isolation in a single
 [[conftest.py]] that pytest discovers automatically.
-It has to guard two rather different kinds of leakage.
+It has to guard three rather different kinds of leakage.
 
 \begin{description}
 \item[Per-test storage] Tracking data lives in files whose
@@ -30,20 +30,27 @@ It has to guard two rather different kinds of leakage.
   one hands a test back the configuration it started with,
   the other lets a test check that the move still holds
   (\cref{sec:config-fixtures}).
+\item[Home-derived paths] Where nothing is configured,
+  several modules fall back on a path beneath the user's
+  home---and create it.  A fixture is no help here
+  either, because the fallback is reached from ordinary
+  command code rather than through a storage function
+  anyone thought to patch, so the suite gives itself a
+  home of its own instead (\cref{sec:home-sandbox}).
 \end{description}
 
-The order of the module body follows that split: the
-configuration must be redirected before the first
-[[nytid]] import, whereas the fixtures only have to exist
-before the first test runs.
+The order of the module body follows that split: both
+redirections must happen before the first [[nytid]]
+import, whereas the fixtures only have to exist before
+the first test runs.
 
 <<[[conftest.py]]>>=
 """Shared pytest isolation for CLI tests.
 
-Redirects the persistent configuration to a throw-away
-directory and provides temporary-directory fixtures that
-patch storage functions, so tests never touch real user
-data.
+Redirects the persistent configuration and the home
+directory to throw-away locations, and provides
+temporary-directory fixtures that patch storage
+functions, so tests never touch real user data.
 
 Manual debugging outside pytest must apply the same
 patching or point `track.data_dir` at a temporary
@@ -60,6 +67,8 @@ sys.path.insert(0, "../src")
 
 <<redirect the persistent config into a sandbox>>
 
+<<redirect the home directory into a sandbox>>
+
 from nytid.cli.track import (
     get_tracking_dir,
     get_tracking_data_file,
@@ -74,6 +83,8 @@ from nytid.cli.track import (
 <<tracking fixture>>
 
 <<configuration fixtures>>
+
+<<home fixtures>>
 @
 
 \section{Isolating the persistent configuration}%
@@ -214,6 +225,49 @@ redirect_config_default(
 )
 @
 
+\subsection{When this file hasn't been built}%
+\label{sec:sandbox-build-guard}
+
+Everything above protects a session that \emph{has} this module.
+[[conftest.py]] is tangled from [[conftest.nw]] by
+[[make -C tests all]], which the root [[make all]] does not run, and
+the tangled file is gitignored---so in a fresh clone, or in a worktree
+where the test tree was never built, it is simply absent.  pytest does
+not mind.  It collects and runs the whole suite without it, and every
+configuration write lands in the user's own file.  The property this
+chapter exists to establish thus rests on remembering to build first,
+and forgetting costs nothing that anyone notices.
+
+Making that failure explicit needs a check that runs when this module
+does \emph{not} exist, which rules out putting it here.  It also rules
+out checking in a stub to stand in for the tangled file: the next
+build would overwrite the stub, leaving the working tree permanently
+dirty.  What is left is the conftest one directory up.  pytest loads
+conftest files from the rootdir downwards, so a handwritten
+[[conftest.py]] at the repository root is imported before this one,
+and its [[pytest_configure]] runs after both---still before the first
+test module is imported, which is where the module-scope
+[[registry add]] calls that opened \cref{sec:isolating-the-config}
+would write.
+
+That guard asks two questions.  The first is the diagnosis: is
+[[tests/conftest.py]] missing, or older than [[tests/conftest.nw]]?
+Both have the same remedy, so both produce the same instruction.
+The second question is the property itself, and it catches what a
+timestamp cannot---a [[conftest.py]] newer than its source that
+nevertheless sandboxes nothing.  That is not hypothetical: a merge
+resolution that glues prose onto a chunk-definition line makes
+[[notangle]] emit an empty file, with a perfectly fresh modification
+time.  So the guard reads back the same two default arguments the
+redirection above rewrites and refuses to start the session while
+they still name the user's real configuration directory.  It records
+that directory at its own import time, before this file replaces
+[[typerconf.dirs]]---asking afterwards would get the sandbox for an
+answer and mistake it for good news.
+
+Being handwritten Python in a repository whose Python is otherwise
+generated, that file is listed as such in the root [[CLAUDE.md]].
+
 \section{Fixtures for the sandboxed configuration}%
 \label{sec:config-fixtures}
 
@@ -306,6 +360,117 @@ def real_config_fingerprint():
             REAL_CONFIG_FILE.stat().st_mtime_ns,
             hashlib.sha256(content).hexdigest(),
         )
+
+    return fingerprint
+@
+
+\section{Isolating the home directory}%
+\label{sec:home-sandbox}
+
+The configuration file is not the only thing a test can reach outside
+itself.  Several modules fall back on a path beneath the user's home
+when no configured location is available---the [[mine]] register
+(\cref{mine}), the tracking directory (\cref{cli.track}), the todo
+store (\cref{cli.todo}), the calendar cache---and those fallbacks do
+not merely read.  They call [[os.makedirs]].  Redirecting
+[[typerconf]] does nothing about that: a test that reaches one of them
+creates a directory under the real [[~/.nytid]], which is the leak of
+\cref{sec:isolating-the-config} again with a different destination.
+
+As it happens, no test reaches one today.  Each of them points
+[[HOME]] somewhere temporary and registers what it needs in advance,
+so the fallback branches stay unvisited.  But that is a property of
+the tests rather than of the code, and it is exactly the kind of
+property a test written a year from now removes without anyone
+noticing---the same weakness as the [[try]]--[[finally]] blocks in
+\cref{sec:isolating-the-config}.  We would rather the containment not
+rest on it.
+
+\subsection{Why moving \texttt{HOME} is enough, and enough is all we move}
+
+One environment assignment covers the whole class, because
+[[pathlib.Path.home()]] caches nothing: it expands [[~]], and on POSIX
+that consults [[HOME]] on every call.  Pointing [[HOME]] at an empty
+directory therefore relocates every home-derived path in the process
+at once---including the ones nobody has written yet, which is the
+point.
+
+It is also the gentlest instrument available.  A test that sets
+[[HOME]] for its own purposes still wins for its duration, and
+[[monkeypatch]] afterwards restores it to the sandbox rather than to
+the user's home; a test that patches [[pathlib.Path.home]] outright is
+unaffected either way.  Patching [[Path.home]] here instead would
+quietly break the first of those---and it would leave subprocesses
+looking at the real home regardless, since they consult the
+environment, not this process's classmethod.
+
+That the environment reaches subprocesses is worth stating, because it
+is where a change this broad could plausibly hurt: the tests that
+drive a real [[git]] see the sandbox as their home and so cannot read
+the user's [[~/.gitconfig]].  They already pass [[user.name]],
+[[user.email]] and [[commit.gpgsign]] on the command line, so they
+were never reading it.
+
+We record the real home before overwriting it, for the reason
+\cref{sec:isolating-the-config} records the real configuration path
+before redirecting it: a location nothing names is a location no test
+can check.
+
+<<redirect the home directory into a sandbox>>=
+import os
+
+REAL_HOME = pathlib.Path.home()
+
+HOME_SANDBOX = tempfile.mkdtemp(prefix="nytid-tests-home-")
+atexit.register(shutil.rmtree, HOME_SANDBOX,
+                ignore_errors=True)
+
+os.environ["HOME"] = HOME_SANDBOX
+@
+
+\subsection{Fixtures for the sandboxed home}
+
+Two fixtures, answering the two questions a test can ask about this.
+The first hands back the recorded path, so a test can assert that the
+redirection is in force without importing this module's globals.
+
+<<home fixtures>>=
+@pytest.fixture
+def real_home():
+    """Return the user's real home, as it was before the suite
+    redirected `HOME`."""
+    return REAL_HOME
+@
+
+The second is the counterpart of [[real_config_fingerprint]]
+(\cref{sec:config-fixtures}): a way to prove afterwards that a test
+which \emph{could} have written the real home did not.
+
+Here the fingerprint is a list of names rather than a digest and a
+timestamp.  The reason is that the object being watched is a directory
+on a machine somebody is using: [[~/.nytid]] holds live tracking and
+todo state, and its modification time moves for reasons that have
+nothing to do with the suite, so a timestamp would convert that noise
+into intermittent failures.  What a leak does---the only thing it
+does---is put a name there that was not there before.  Returning
+[[None]] for an absent directory keeps the two cases apart, so
+[[~/.nytid]] springing into existence on a machine where nytid has
+never run is caught as well.
+
+<<home fixtures>>=
+@pytest.fixture
+def real_home_fingerprint():
+    """Return a callable listing what nytid has left in the real
+    home, or None if it has left nothing."""
+
+    def fingerprint():
+        try:
+            return sorted(
+                entry.name
+                for entry in (REAL_HOME / ".nytid").iterdir()
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            return None
 
     return fingerprint
 @
