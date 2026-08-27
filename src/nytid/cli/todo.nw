@@ -11261,19 +11261,156 @@ from nytid.cli.track import (
 proc_env = os.environ.copy()
 if item.env:
     proc_env = dict(item.env)
-    # Overlay terminal variables from current env
-    for key in os.environ:
-        if key in (
-            "TERM", "DISPLAY", "COLORTERM",
-            "TERM_PROGRAM",
-        ) or key.startswith("SSH_"):
-            proc_env[key] = os.environ[key]
+    <<mirror live session identity into [[proc_env]]>>
 todo_context = build_context_name(
     "todo", [str(todo_id)]
 )
 proc_wd = worktree_launch or item.wd or os.getcwd()
 prompt_file = None
 prompt_dir = None
+@
+
+A stored [[env]] \emph{replaces} the inherited environment rather than
+merging into it: capturing an environment (via [[--here]] or
+[[--capture-env]], or worker-scoped [[env]] defaults) is only useful
+if the task later runs in that environment, not in
+whatever the launching shell happens to have accumulated since.  But a
+captured snapshot also freezes variables that identify the
+\emph{session} the capture happened in, and those must not travel with
+the task.  The spawned shell runs ID-less [[nytid]] subcommands whose
+active-todo resolution reads [[USER]] (worker filtering in
+[[resolve_todo_id]]) and [[TMUX]]/[[TMUX_PANE]] (the pane and window
+[[todo:<id>]] labels in [[resolve_todo_from_tmux_context]]).  With
+capture-time values, that resolution consults the pane the todo was
+\emph{created} in---not the pane it was just started in, where the
+parent process wrote the labels moments earlier---so
+[[nytid todo view]] inside the spawned shell claimed there was no
+active todo.
+The same reasoning covers the terminal and forwarding variables
+([[TERM]], [[DISPLAY]], [[SSH_*]], \ldots): they describe the
+session in front of the user, never the task.
+
+We therefore \emph{mirror} the live values of these session-identity
+variables into the captured environment.  Mirroring works in both
+directions: a variable present in the live environment overrides the
+captured value, and a captured variable \emph{absent} from the live
+environment is dropped.  The deletion half matters as much as the
+override half---a stale [[TMUX]] alone convinces the child it is
+inside tmux, and a stale [[SSH_AUTH_SOCK]] points at a dead socket.
+
+<<mirror live session identity into [[proc_env]]>>=
+for key in list(proc_env):
+    if (
+        key in SESSION_ENV_VARS
+        or key.startswith("SSH_")
+    ) and key not in os.environ:
+        del proc_env[key]
+for key in os.environ:
+    if (
+        key in SESSION_ENV_VARS
+        or key.startswith("SSH_")
+    ):
+        proc_env[key] = os.environ[key]
+@
+
+The explicit list names the terminal identity an earlier version
+already overlaid, plus the tmux and worker identity whose omission
+caused the bug above.  [[SSH_*]] variables are matched by prefix
+instead, since agent forwarding uses several of them.
+
+<<constants>>=
+SESSION_ENV_VARS = (
+    "TERM", "DISPLAY", "COLORTERM",
+    "TERM_PROGRAM", "TMUX", "TMUX_PANE",
+    "USER",
+)
+@
+
+Let's verify both halves of the mirror on the direct spawn path.  A
+todo carrying a captured environment from another tmux pane must hand
+the spawned process the \emph{live} pane identity, while keeping the
+captured task variables:
+
+<<test functions>>=
+def test_start_env_mirrors_live_tmux_identity(
+  temp_todo_dir,
+):
+  """A captured env gets the live TMUX/USER identity."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      wd="/tmp/project",
+      env={
+        "MODE": "manual",
+        "TMUX": "old-server,1,0",
+        "TMUX_PANE": "%1",
+        "USER": "olduser",
+      },
+    ),
+  ])
+  live = {
+    "TMUX": "live-server,2,0",
+    "TMUX_PANE": "%7",
+    "USER": "liveuser",
+  }
+  with patch.dict(os.environ, live, clear=True):
+    with patch(
+      "nytid.cli.todo.subprocess.run",
+      return_value=subprocess.CompletedProcess(
+        ["true"], 0, stdout="",
+      ),
+    ) as mock_run:
+      result = runner.invoke(
+        cli,
+        ["start", "1", "--headless",
+         "--command", "true"],
+      )
+  assert result.exit_code == 0, result.stdout
+  spawn_env = mock_run.call_args.kwargs["env"]
+  assert spawn_env["TMUX"] == "live-server,2,0"
+  assert spawn_env["TMUX_PANE"] == "%7"
+  assert spawn_env["USER"] == "liveuser"
+  assert spawn_env["MODE"] == "manual"
+@
+
+And when the live session is not in tmux at all, the captured tmux
+identity must disappear instead of masquerading as a live one:
+
+<<test functions>>=
+def test_start_env_drops_stale_tmux_outside_tmux(
+  temp_todo_dir,
+):
+  """Captured TMUX vars vanish when spawning outside tmux."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      wd="/tmp/project",
+      env={
+        "MODE": "manual",
+        "TMUX": "old-server,1,0",
+        "TMUX_PANE": "%1",
+      },
+    ),
+  ])
+  with patch.dict(os.environ, {}, clear=True):
+    with patch(
+      "nytid.cli.todo.subprocess.run",
+      return_value=subprocess.CompletedProcess(
+        ["true"], 0, stdout="",
+      ),
+    ) as mock_run:
+      result = runner.invoke(
+        cli,
+        ["start", "1", "--headless",
+         "--command", "true"],
+      )
+  assert result.exit_code == 0, result.stdout
+  spawn_env = mock_run.call_args.kwargs["env"]
+  assert "TMUX" not in spawn_env
+  assert "TMUX_PANE" not in spawn_env
+  assert spawn_env["MODE"] == "manual"
 @
 
 The command resolution follows a priority chain: [[--command]] overrides
