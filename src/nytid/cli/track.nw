@@ -1983,6 +1983,214 @@ def test_discard_labels(temp_tracking_dir):
     assert entries[0].labels == ["labelB"]
 @
 
+\subsubsection{Relabeling an Active Batch}
+
+The user who starts tracking with the wrong labels has, until now, two
+bad options.  Stopping and restarting records a spurious short entry
+and loses the original start time.  [[start --replace]] preserves the
+start time via [[discard_labels]], but throws away any notes, and both
+routes disturb state that has nothing to do with the mistake: a
+detour through [[stop]] or [[switch]] rewrites [[last_stopped]] or the
+[[switch_other]] toggle.
+
+[[edit_batch]] instead performs the correction in place: it replaces
+one batch's label set while keeping the batch's identity---its start
+time, its notes, its [[batch_id]]---so nothing outside the batch
+notices.  The optional [[start_time]] and [[notes]] parameters let the
+same surgery also fix a wrong start or set the notes that
+[[stop_labels]] turns into the entry's description when the batch is
+eventually stopped.
+
+We validate before mutating, for the same reason [[stop_labels]]
+checks inverted intervals before popping: callers reach this method
+through [[mutate_worker_tracking_state]], which persists whatever the
+callback leaves behind, so a half-applied edit must never be
+constructible.  Two things can be wrong with the requested label set.
+An empty set would leave a batch that tracks nothing---the user wants
+[[stop]], not [[edit]].  And a label that is already active in
+\emph{another} batch would collide in [[active_labels]], silently
+stealing the label from that batch; this method is the only place
+labels join an \emph{existing} batch, so the one-batch-per-label
+invariant is enforced here.
+
+Removed labels do \emph{not} touch [[last_stopped]]: they were
+corrected away, not stopped, and a later bare [[start]] should resume
+what the user last \emph{stopped}, not a label they disowned as a
+typo.  Added labels append to [[label_order]], which keeps the edited
+batch the most recent one---so a bare [[stop]] right after the
+correction still ends the session that was just fixed.
+
+<<active session class>>=
+    def edit_batch(
+        self,
+        batch_id: int,
+        new_labels: list[str],
+        start_time: datetime.datetime = None,
+        notes: str = None,
+    ) -> tuple[list[str], list[str]]:
+        """Replace the label set of one active batch in place.
+
+        Kept labels retain their start time and notes unless
+        `start_time` or `notes` is given, in which case every label
+        of the batch gets the new value.  Added labels join the
+        batch with its (possibly updated) start time and the given
+        notes (empty if none).
+
+        Returns:
+            Tuple of (added, removed) label lists.
+
+        Raises:
+            ValueError: if the batch has no active labels, if
+                `new_labels` is empty after de-duplication, or if a
+                label to add is already active in another batch
+        """
+        old = [
+            l for l in self.batches.get(batch_id, [])
+            if l in self.active_labels
+        ]
+        <<validate the batch edit>>
+        <<drop corrected-away labels>>
+        <<rewrite kept labels in place>>
+        <<attach added labels to the batch>>
+        self.batches[batch_id] = kept + added
+        return added, removed
+
+@
+
+De-duplication preserves first occurrence, matching the order the user
+typed.  The effective start time is resolved here, while the old
+labels still carry it: after the removal step below, a full
+replacement would have no label left to read the batch's start from.
+
+<<validate the batch edit>>=
+if not old:
+    raise ValueError("No such active batch")
+deduped = list(dict.fromkeys(new_labels))
+if not deduped:
+    raise ValueError(
+        "Cannot remove every label from the active session; "
+        "use 'stop' instead"
+    )
+for label in deduped:
+    if label not in old and label in self.active_labels:
+        raise ValueError(
+            f"Label '{label}' is already being tracked"
+        )
+effective_start = (
+    start_time if start_time is not None
+    else self.active_labels[old[0]][0]
+)
+@
+
+<<drop corrected-away labels>>=
+removed = [l for l in old if l not in deduped]
+for label in removed:
+    del self.active_labels[label]
+    self.label_order.remove(label)
+@
+
+Kept labels are rewritten even when nothing about them changes: batch
+members share their start time by the [[start_labels]] invariant, so
+writing [[effective_start]] back is the identity unless [[--at]] moved
+it.
+
+<<rewrite kept labels in place>>=
+kept = [l for l in old if l in deduped]
+for label in kept:
+    _, old_notes, _ = self.active_labels[label]
+    self.active_labels[label] = (
+        effective_start,
+        notes if notes is not None else old_notes,
+        batch_id,
+    )
+@
+
+<<attach added labels to the batch>>=
+added = [l for l in deduped if l not in old]
+for label in added:
+    self.active_labels[label] = (
+        effective_start,
+        notes if notes is not None else "",
+        batch_id,
+    )
+    self.label_order.append(label)
+@
+
+Let's verify the surgery: swapping a sibling must leave the kept
+label's investment---notes, start time, batch membership---untouched,
+while the newcomer inherits the batch's start:
+
+<<test functions>>=
+def test_edit_batch_swaps_sibling():
+  """Kept labels keep notes and start when a sibling is swapped."""
+  session = ActiveSession()
+  t0 = datetime.datetime(2026, 3, 12, 10, 0)
+  session.start_labels(["keep", "wrong"], t0)
+  session.add_notes("keep", "important")
+
+  added, removed = session.edit_batch(1, ["keep", "right"])
+
+  assert added == ["right"]
+  assert removed == ["wrong"]
+  assert session.active_labels["keep"] == (t0, "important", 1)
+  assert session.active_labels["right"] == (t0, "", 1)
+  assert "wrong" not in session.active_labels
+  assert session.batches[1] == ["keep", "right"]
+
+def test_edit_batch_sets_start_and_notes():
+  """`start_time` and `notes` rewrite every label of the batch."""
+  session = ActiveSession()
+  t0 = datetime.datetime(2026, 3, 12, 10, 0)
+  t1 = datetime.datetime(2026, 3, 12, 9, 0)
+  session.start_labels(["A", "B"], t0)
+  session.add_notes("A", "old notes")
+
+  session.edit_batch(1, ["A", "B", "C"], start_time=t1,
+                     notes="new notes")
+
+  for label in ("A", "B", "C"):
+    assert session.active_labels[label] == (t1, "new notes", 1)
+@
+
+The failure cases must leave the session untouched---an exception from
+a half-applied edit would be persisted by the calling
+[[mutate_worker_tracking_state]] callback if it were swallowed
+upstream:
+
+<<test functions>>=
+def test_edit_batch_rejects_empty_result():
+  """Removing every label is refused; the session is unchanged."""
+  session = ActiveSession()
+  session.start_labels(["A"], datetime.datetime.now())
+
+  with pytest.raises(ValueError, match="use 'stop' instead"):
+    session.edit_batch(1, [])
+  assert "A" in session.active_labels
+
+def test_edit_batch_rejects_cross_batch_label():
+  """A label active in another batch cannot be stolen."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["A"], t0)
+  session.start_labels(["B"], t0)
+
+  with pytest.raises(ValueError, match="already being tracked"):
+    session.edit_batch(2, ["B", "A"])
+  assert session.active_labels["A"][2] == 1
+
+def test_edit_batch_leaves_unrelated_state():
+  """`switch_other` and `last_stopped` survive a relabeling."""
+  session = ActiveSession()
+  session.start_labels(["A"], datetime.datetime.now())
+  session.switch_other = ["saved"]
+  session.last_stopped = ["earlier"]
+
+  session.edit_batch(1, ["B"])
+
+  assert session.switch_other == ["saved"]
+  assert session.last_stopped == ["earlier"]
+@
+
 <<active session class>>=
     def add_notes(self, label: str, notes: str) -> bool:
         """
