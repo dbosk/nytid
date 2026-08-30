@@ -13164,10 +13164,17 @@ most likely means a forgotten hash, so it is an error too---unlike the
 historical mode, where an option-less [[edit HASH]] is a harmless
 identity rewrite.
 
-One known limitation: tmux pane-context files are not rewritten when a
-label is renamed, so a pane started with [[start -P]] whose label was
-corrected away will try to stop the old label on exit---a no-op, since
-that label is no longer active.
+Relabeling must also reach the tmux context.  A pane started with
+[[start -P wronglabel]] records that label in its pane-context file so
+the pane-exit hook can stop it.  If [[edit]] renamed the label only in
+the session, the hook would later stop [[wronglabel]]---a no-op---and
+the corrected label would keep running unnoticed.  So
+[[edit_active_batch]] syncs the current pane/window context in the
+same critical section, exactly as [[start_tracking_labels]] and
+[[stop_tracking_labels]] do.  Like those, it syncs the \emph{current}
+context: correcting from a different pane leaves the original pane's
+file stale, the same asymmetry a [[stop]] from elsewhere has always
+had.
 
 <<edit the active session>>=
 <<reject history-only options without a hash>>
@@ -13239,6 +13246,10 @@ def edit_active_batch(
     Returns the batch's new labels, any warnings, and the batch's
     (possibly updated) start time.
     """
+    resolved_who = (
+        who if who is not None
+        else default_username
+    )
     outcome = {}
 
     def update(session, history_entries):
@@ -13246,20 +13257,45 @@ def edit_active_batch(
         <<compute the session's new labels>>
         <<compute the session's new start time>>
         <<warn about discarded notes>>
-        session.edit_batch(
+        added, removed = session.edit_batch(
             batch_id, new_set,
             start_time=new_start, notes=description,
         )
+        outcome["added"] = added
+        outcome["removed"] = removed
         outcome["labels"] = list(session.batches[batch_id])
         outcome["warnings"] = warnings
         outcome["start"] = new_start
         return session, history_entries
 
-    mutate_worker_tracking_state(update, who)
+    def sync_tmux_context(session, history_entries):
+        <<rewrite the current tmux context>>
+
+    mutate_worker_tracking_state(
+        update, who,
+        post_update=sync_tmux_context,
+    )
     return (
         outcome["labels"],
         outcome["warnings"],
         outcome["start"],
+    )
+@
+
+Registration must come \emph{before} unregistration.  Removing a pane
+file's last label deletes the file, and registration only touches
+panes whose file already exists---so a pure rename processed in the
+other order would delete the pane file instead of renaming its
+content, silently unhooking the pane from tracking:
+
+<<rewrite the current tmux context>>=
+if outcome["added"]:
+    _register_tmux_context_labels_unlocked(
+        outcome["added"], resolved_who,
+    )
+if outcome["removed"]:
+    _unregister_tmux_context_labels_unlocked(
+        outcome["removed"], resolved_who,
     )
 @
 
@@ -13537,6 +13573,63 @@ def test_edit_no_hash_rejects_label_mix(temp_tracking_dir):
 
   assert result.exit_code == 1
   assert "cannot be combined" in result.output
+@
+
+The tmux context must follow the rename, or the pane-exit hook would
+stop the corrected-away label (a no-op) and leave the corrected one
+running.  A pure rename is the sharpest case: processed in the wrong
+order it would empty---and thereby delete---the pane file instead of
+rewriting it:
+
+<<test functions>>=
+def test_edit_no_hash_renames_pane_context_label(temp_tracking_dir):
+  """A relabeled session rewrites the current pane's context file."""
+  pane_id = "%31"
+  runner.invoke(cli, ["start", "wrong"])
+  write_pane_labels(
+    pane_id, default_username, TEST_SERVER_KEY,
+    ["wrong"],
+  )
+  with patch.dict(
+    os.environ,
+    {
+      "TMUX_PANE": pane_id,
+      "TMUX": "/tmp/tmux.sock,123,0",
+    },
+  ):
+    result = runner.invoke(cli, [
+      "edit", "-r", "wrong", "-a", "right",
+    ])
+  assert result.exit_code == 0
+  assert read_pane_labels(
+    pane_id, default_username, TEST_SERVER_KEY,
+  ) == ["right"]
+
+def test_edit_no_hash_renames_window_context_label(temp_tracking_dir):
+  """A relabeled session rewrites the tracked window's context file."""
+  window_id = "@17"
+  runner.invoke(cli, ["start", "wrong"])
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+    ["wrong"],
+  )
+  with patch.dict(
+    os.environ,
+    {
+      "TMUX_PANE": "%31",
+      "TMUX": "/tmp/tmux.sock,123,0",
+    },
+  ), patch(
+    "nytid.cli.track.get_current_tracked_window_id",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, [
+      "edit", "-l", "right",
+    ])
+  assert result.exit_code == 0
+  assert read_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) == ["right"]
 @
 
 <<argument and option definitions>>=
