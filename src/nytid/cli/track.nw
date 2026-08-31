@@ -13091,6 +13091,30 @@ edit_entry_hash_arg = typer.Argument(
     autocompletion=complete_entry_hashes)
 @
 
+Two further options exist only for the hashless mode.
+[[--containing]] selects the target batch by one of its labels instead
+of by recency: a scripted caller (the mutt-nytid integration in
+[[dbosk/edumail]] is the concrete consumer, issue~\#472) knows
+\emph{which} labels it started and must not have its correction land
+on whatever batch happens to be newest---tracking started meanwhile
+from another terminal would silently steal the default target.
+[[--discard]] confirms an edit that removes \emph{every} label of the
+batch: the batch is dropped without a history entry.  It is a
+deliberate extra flag rather than implicit behavior so an interactive
+typo cannot silently erase tracked time.
+
+<<argument and option definitions>>=
+containing_opt = typer.Option(
+    "--containing",
+    help="Target the active batch containing this label "
+         "instead of the most recent one (no-hash mode)",
+    autocompletion=complete_active_labels)
+discard_opt = typer.Option(
+    "--discard",
+    help="Allow removing every label of the batch; it is "
+         "dropped without a history entry (no-hash mode)")
+@
+
 <<edit command>>=
 @cli.command()
 def edit(
@@ -13112,14 +13136,21 @@ def edit(
                            edit_description_opt] = None,
     who: Annotated[str | None,
                    edit_who_opt] = None,
+    containing: Annotated[str | None,
+                          containing_opt] = None,
+    discard: Annotated[bool,
+                       discard_opt] = False,
 ):
     """
     Edit one historical tracking entry, or the active session.
 
     With a hash (from `track ls --id`), repair that historical entry.
-    Without a hash, correct the currently tracking session (the most
-    recently started labels) in place: fix wrong labels, move the start
-    time, or set the description, without stopping and restarting.
+    Without a hash, correct the currently tracking session in place:
+    fix wrong labels, move the start time, or set the description,
+    without stopping and restarting.  The target is the most recently
+    started labels, or the batch holding a given label with
+    --containing; --discard confirms removing every label (the session
+    is dropped without a history entry).
 
     \b
     Examples:
@@ -13129,8 +13160,11 @@ def edit(
       nytid track edit a1b2c3 -a urgent -r draft
       nytid track edit -r wronglabel -a rightlabel
       nytid track edit --at 09:30
+      nytid track edit --containing email -a admin
+      nytid track edit --containing wrong -r wrong --discard
     """
     <<reject mixing absolute and relative label edits>>
+    <<reject batch options with a hash>>
     if entry_hash is None:
         <<edit the active session>>
         return
@@ -13204,6 +13238,21 @@ if label is not None and (add_label or remove_label):
     raise typer.Exit(1)
 @
 
+The batch selectors are meaningless with a hash---a historical entry
+\emph{is} its own target, and nothing about it can be
+\enquote{discarded without a history entry}---so they are rejected in
+the same pre-dispatch spot:
+
+<<reject batch options with a hash>>=
+if entry_hash is not None and (containing is not None or discard):
+    typer.echo(
+        "Error: --containing and --discard only apply "
+        "without an entry hash",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
 Inside [[update_history]] we know the entry's [[original.labels]], so this
 is where the relative merge happens.  [[apply_label_edits]] may raise
 [[ValueError]] for the same-label-in-both case; that propagates out of
@@ -13240,9 +13289,15 @@ loses the notes; a detour through [[switch]] clobbers the
 [[switch_other]] toggle.  [[ActiveSession.edit_batch]] was built to do
 this correction in place, and here we wire it to the command line.
 
-The target is the most recent batch---[[most_recent_batch_labels]],
-the same selection a bare [[stop]] uses, so the session you [[edit]]
-is exactly the one a following [[stop]] would end.  Two options make
+The default target is the most recent batch---
+[[most_recent_batch_labels]], the same selection a bare [[stop]] uses,
+so the session you [[edit]] is exactly the one a following [[stop]]
+would end.  [[--containing]] overrides the default with an explicit
+selector, [[batch_labels_containing]]: it names the batch by one of
+its labels, which is what a scripted caller needs when recency cannot
+be trusted---tracking started meanwhile from another terminal steals
+the default target---or when the label to fix lives in an older
+batch.  Two options make
 no sense here and are rejected with guidance rather than silently
 ignored: [[--end-at]] and [[--duration]] describe an end time, and the
 running session has none yet.  A bare [[edit]] with no options at all
@@ -13265,21 +13320,29 @@ had.
 <<edit the active session>>=
 <<reject history-only options without a hash>>
 try:
-    new_labels, warnings, start_time = edit_active_batch(
+    new_labels, removed, warnings, start_time = edit_active_batch(
         who=who, at=at, labels=label,
         add=add_label, remove=remove_label,
         description=description,
+        containing=containing, discard=discard,
     )
 except ValueError as exc:
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(1)
 for warning in warnings:
     typer.echo(f"Warning: {warning}", err=True)
-typer.echo(
-    f"Updated active session: {get_labels_display(new_labels)}"
-)
-if at is not None:
-    typer.echo(f"New start time: {start_time:%Y-%m-%d %H:%M}")
+if new_labels:
+    typer.echo(
+        f"Updated active session: {get_labels_display(new_labels)}"
+    )
+    if at is not None:
+        typer.echo(
+            f"New start time: {start_time:%Y-%m-%d %H:%M}"
+        )
+else:
+    typer.echo(
+        f"Discarded active session: {get_labels_display(removed)}"
+    )
 @
 
 The rejections name the option that cannot work and what to do
@@ -13295,10 +13358,11 @@ if end_at is not None or duration is not None:
     )
     raise typer.Exit(1)
 if (at is None and label is None and description is None
-        and not add_label and not remove_label):
+        and not add_label and not remove_label
+        and not discard):
     typer.echo(
         "Error: nothing to edit for the active session; "
-        "give --at, --description, -l, -a or -r",
+        "give --at, --description, --discard, -l, -a or -r",
         err=True,
     )
     raise typer.Exit(1)
@@ -13326,11 +13390,18 @@ def edit_active_batch(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     description: str | None = None,
-) -> tuple[list[str], list[str], datetime.datetime]:
-    """Edit the most recent batch of `who`'s active session.
+    containing: str | None = None,
+    discard: bool = False,
+) -> tuple[list[str], list[str], list[str], datetime.datetime]:
+    """Edit one batch of `who`'s active session.
 
-    Returns the batch's new labels, any warnings, and the batch's
-    (possibly updated) start time.
+    The target is the batch containing the label `containing`, or
+    the most recent batch when `containing` is `None`.  `discard`
+    permits an edit that removes every label of the batch; the
+    batch is then dropped without recording a history entry.
+
+    Returns the batch's new labels, the removed labels, any
+    warnings, and the batch's (possibly updated) start time.
     """
     resolved_who = (
         who if who is not None
@@ -13343,13 +13414,13 @@ def edit_active_batch(
         <<compute the session's new labels>>
         <<compute the session's new start time>>
         <<warn about discarded notes>>
-        added, removed = session.edit_batch(
-            batch_id, new_set,
-            start_time=new_start, notes=description,
-        )
+        <<apply the edit or discard the batch>>
         outcome["added"] = added
         outcome["removed"] = removed
-        outcome["labels"] = list(session.batches[batch_id])
+        outcome["labels"] = [
+            l for l in session.batches.get(batch_id, [])
+            if l in session.active_labels
+        ]
         outcome["warnings"] = warnings
         outcome["start"] = new_start
         return session, history_entries
@@ -13363,6 +13434,7 @@ def edit_active_batch(
     )
     return (
         outcome["labels"],
+        outcome["removed"],
         outcome["warnings"],
         outcome["start"],
     )
@@ -13385,14 +13457,23 @@ if outcome["removed"]:
     )
 @
 
-Batch members share their start time and batch id by the
-[[start_labels]] invariant, so reading them off the first member is
-enough:
+The two selectors from \cref{sec:track-edit-active} meet here:
+[[--containing]] resolves through [[batch_labels_containing]], the
+default through [[most_recent_batch_labels]].  Batch members share
+their start time and batch id by the [[start_labels]] invariant, so
+reading them off the first member is enough:
 
 <<resolve the target batch>>=
-batch = session.most_recent_batch_labels()
-if not batch:
-    raise ValueError("No active tracking session")
+if containing is not None:
+    batch = session.batch_labels_containing(containing)
+    if not batch:
+        raise ValueError(
+            f"Label '{containing}' is not currently tracking"
+        )
+else:
+    batch = session.most_recent_batch_labels()
+    if not batch:
+        raise ValueError("No active tracking session")
 start_time, _, batch_id = session.active_labels[batch[0]]
 @
 
@@ -13402,6 +13483,10 @@ historical mode and [[todo edit]] follow: [[-l]] replaces wholesale,
 addition warns instead of failing, and the same label in both lists is
 a contradiction that raises:
 
+A bare [[discard]] with no label flags means \enquote{drop this whole
+batch}---the empty target set expresses that directly, and the
+discard branch below acts on it:
+
 <<compute the session's new labels>>=
 warnings = []
 if labels is not None:
@@ -13410,6 +13495,8 @@ elif add or remove:
     new_set, warnings = apply_label_edits(
         batch, add or [], remove or [],
     )
+elif discard:
+    new_set = []
 else:
     new_set = batch
 @
@@ -13438,6 +13525,34 @@ if description is None:
                 "discarded; pass --description to set the "
                 "session description"
             )
+@
+
+An empty result forks three ways.  Without [[discard]] it is refused,
+and the refusal is raised \emph{here} rather than left to
+[[edit_batch]]'s generic guard so the message can name the flag that
+confirms the intent.  With [[discard]], the batch goes through
+[[discard_labels]]---the same primitive [[start --replace]] uses---so
+no history entry is written: the labels were never right, and
+recording time under them is exactly what the caller is avoiding.
+[[discard_labels]] also cleans the batch record, and the tmux sync
+needs no special case since it acts on the [[removed]] list either
+way:
+
+<<apply the edit or discard the batch>>=
+if not new_set:
+    if not discard:
+        raise ValueError(
+            "Removing every label discards the session; "
+            "pass --discard to confirm (or use 'stop' "
+            "to record it)"
+        )
+    removed = session.discard_labels(batch)
+    added = []
+else:
+    added, removed = session.edit_batch(
+        batch_id, new_set,
+        start_time=new_start, notes=description,
+    )
 @
 
 Let's verify the core scenario first: correcting a wrong label keeps
@@ -13629,7 +13744,7 @@ def test_edit_no_hash_rejects_emptying_batch(temp_tracking_dir):
   result = runner.invoke(cli, ["edit", "-r", "A"])
 
   assert result.exit_code == 1
-  assert "use 'stop' instead" in result.output
+  assert "pass --discard to confirm" in result.output
   assert load_active_session().get_active_labels() == ["A"]
 
 def test_edit_no_hash_rejects_label_from_other_batch(temp_tracking_dir):
@@ -13716,6 +13831,159 @@ def test_edit_no_hash_renames_window_context_label(temp_tracking_dir):
   assert read_window_labels(
     window_id, default_username, TEST_SERVER_KEY,
   ) == ["right"]
+@
+
+The [[--containing]] selector must reach an older batch and leave
+recency alone: after correcting the older session, a bare [[stop]]
+still ends the newest one.  This is the consumer scenario from
+issue~\#472 end to end:
+
+<<test functions>>=
+def test_edit_containing_targets_older_batch(temp_tracking_dir):
+  """--containing picks the batch holding the label, not the newest."""
+  runner.invoke(cli, ["start", "email"])
+  runner.invoke(cli, ["start", "course"])
+  session = load_active_session()
+  email_start, _, email_batch = session.active_labels["email"]
+
+  result = runner.invoke(cli, [
+    "edit", "--containing", "email", "-a", "admin",
+  ])
+
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert session.active_labels["admin"] == \
+    (email_start, "", email_batch)
+
+  result = runner.invoke(cli, ["stop"])
+  assert result.exit_code == 0
+  active = load_active_session().get_active_labels()
+  assert "course" not in active
+  assert set(active) == {"admin", "email"}
+
+def test_edit_containing_inactive_label_errors(temp_tracking_dir):
+  """--containing an inactive label is an error."""
+  runner.invoke(cli, ["start", "A"])
+
+  result = runner.invoke(cli, [
+    "edit", "--containing", "ghost", "-a", "B",
+  ])
+
+  assert result.exit_code == 1
+  assert "not currently tracking" in result.output
+
+def test_edit_batch_options_rejected_with_hash(temp_tracking_dir):
+  """--containing and --discard require the hashless form."""
+  runner.invoke(cli, [
+    "add", "old", "--duration", "1", "--at", "2026-03-12 10:00",
+  ])
+  entry_hash = load_tracking_data()[0].content_hash()[:8]
+
+  for args in (["--containing", "old"], ["--discard"]):
+    result = runner.invoke(cli, ["edit", entry_hash] + args)
+    assert result.exit_code == 1
+    assert "without an entry hash" in result.output
+@
+
+Discarding: refusing without the flag (naming it), dropping the batch
+without a history entry with it, and a bare [[--discard]] taking the
+whole target batch:
+
+<<test functions>>=
+def test_edit_sole_label_removal_needs_discard(temp_tracking_dir):
+  """Emptying the batch without --discard errors, naming the flag."""
+  runner.invoke(cli, ["start", "wrong"])
+
+  result = runner.invoke(cli, [
+    "edit", "--containing", "wrong", "-r", "wrong",
+  ])
+
+  assert result.exit_code == 1
+  assert "--discard" in result.output
+  assert load_active_session().get_active_labels() == ["wrong"]
+
+def test_edit_discard_drops_sole_label_batch(temp_tracking_dir):
+  """--discard removes the batch without a history entry."""
+  runner.invoke(cli, ["start", "wrong"])
+
+  result = runner.invoke(cli, [
+    "edit", "--containing", "wrong", "-r", "wrong", "--discard",
+  ])
+
+  assert result.exit_code == 0
+  assert "Discarded active session: wrong" in result.stdout
+  session = load_active_session()
+  assert session.get_active_labels() == []
+  assert session.batches == {}
+  assert load_tracking_data() == []
+
+def test_edit_bare_discard_drops_most_recent_batch(temp_tracking_dir):
+  """`edit --discard` alone discards the whole target batch."""
+  runner.invoke(cli, ["start", "keepme"])
+  runner.invoke(cli, ["start", "oops", "typo"])
+
+  result = runner.invoke(cli, ["edit", "--discard"])
+
+  assert result.exit_code == 0
+  assert "Discarded" in result.stdout
+  assert load_active_session().get_active_labels() == ["keepme"]
+  assert load_tracking_data() == []
+@
+
+A discard must stay surgical---toggle, resume set, and other batches
+survive---and must reach the tmux context and the notes warning like
+any other removal:
+
+<<test functions>>=
+def test_edit_discard_leaves_unrelated_state(temp_tracking_dir):
+  """Discard leaves the toggle, resume set, and other batches."""
+  runner.invoke(cli, ["start", "A"])
+  runner.invoke(cli, ["switch", "B"])
+  runner.invoke(cli, ["start", "oops"])
+
+  result = runner.invoke(cli, [
+    "edit", "--containing", "oops", "--discard",
+  ])
+
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert session.get_active_labels() == ["B"]
+  assert session.switch_other == ["A"]
+  assert session.last_stopped == ["A"]
+
+def test_edit_discard_unregisters_pane_labels(temp_tracking_dir):
+  """A discarded batch leaves the pane context file."""
+  pane_id = "%44"
+  runner.invoke(cli, ["start", "keep"])
+  runner.invoke(cli, ["start", "oops"])
+  write_pane_labels(
+    pane_id, default_username, TEST_SERVER_KEY,
+    ["keep", "oops"],
+  )
+  with patch.dict(
+    os.environ,
+    {
+      "TMUX_PANE": pane_id,
+      "TMUX": "/tmp/tmux.sock,123,0",
+    },
+  ):
+    result = runner.invoke(cli, [
+      "edit", "--containing", "oops", "--discard",
+    ])
+  assert result.exit_code == 0
+  assert read_pane_labels(
+    pane_id, default_username, TEST_SERVER_KEY,
+  ) == ["keep"]
+
+def test_edit_discard_warns_on_discarded_notes(temp_tracking_dir):
+  """Notes vanishing with a discard still warn."""
+  runner.invoke(cli, ["start", "oops"])
+  runner.invoke(cli, ["notes", "oops", "half a report"])
+
+  result = runner.invoke(cli, ["edit", "--discard"])
+
+  assert result.exit_code == 0
+  assert "notes on removed label" in result.output
 @
 
 <<argument and option definitions>>=
