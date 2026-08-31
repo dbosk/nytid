@@ -1636,8 +1636,10 @@ class ActiveSession:
         self.batches: dict[int, list[str]] = {}
         # Next batch ID to use
         self.next_batch_id: int = 1
-        # Remember last stopped labels for resume functionality
-        self.last_stopped: list[str] = []
+        # Remember last stopped batches for resume: each group is
+        # {"labels": [...], "batch": id, "window": id or None,
+        #  "server_key": key or None}
+        self.last_stopped: list[dict] = []
         # The other side of the toggle for switch.
         # A forward switch saves stopped labels here; a bare
         # switch toggles between current and this saved set.
@@ -1686,7 +1688,8 @@ class ActiveSession:
         end_time: datetime.datetime = None,
         count: int = None,
         stop_batch: bool = True,
-        who: str = None
+        who: str = None,
+        among: set[int] = None,
     ) -> list[TrackingEntry]:
         """
         Stop tracking for specified labels and return completed entries.
@@ -1697,23 +1700,33 @@ class ActiveSession:
             count: Number of most recently started labels to stop. If None, uses batch logic.
             stop_batch: If True (default), stopping without arguments stops the most recent batch.
             who: Worker identity (default $USER).
+            among: Batch ids the batch selection may pick from;
+                None leaves the selection unrestricted.
 
         Returns:
             List of TrackingEntry objects for the stopped labels
 
         Raises:
             ValueError: if `end_time` is not after the start time of
-                every label that would be stopped
+                every label that would be stopped, or if `among`
+                excludes every batch while labels are active
         """
         if who is None:
             who = default_username
         if end_time is None:
             end_time = datetime.datetime.now()
-        
+
         # Determine which labels to stop
         if labels is None and count is None:
             if stop_batch and self.label_order:
-                labels = self.most_recent_batch_labels()
+                labels = self.most_recent_batch_labels(
+                    among=among,
+                )
+                if not labels:
+                    raise ValueError(
+                        "No labels are tracking "
+                        "in this window"
+                    )
             else:
                 # Stop most recently started label only
                 if not self.label_order:
@@ -1780,6 +1793,16 @@ entry.  Two labels started together cover the same wall-clock interval,
 so emitting them separately would double-count that time in every
 downstream total.
 
+The resume set records the same grouping.  A flat label list here
+would destroy structure the history preserves: [[stop --all]] across
+three batches followed by a bare [[start]] used to merge everything
+into one new batch, so the next bare [[stop]] no longer meant what it
+did before the break.  Each group also keeps its old batch id---ids
+never recur, so this is a safe correlation key for the window
+annotation in [[stop_tracking_labels]]---and two [[None]] slots for
+that annotation to fill in.  Group order follows [[label_order]], so
+recreating the groups in list order restores their relative recency.
+
 <<active session class>>=
         groups = {}
         stopped = []
@@ -1798,7 +1821,16 @@ downstream total.
                 groups[key][1].append(label)
 
         if stopped:
-            self.last_stopped = stopped
+            self.last_stopped = [
+                {
+                    "labels": list(grp_labels),
+                    "batch": key[1],
+                    "window": None,
+                    "server_key": None,
+                }
+                for key, (st, grp_labels, notes)
+                in groups.items()
+            ]
 
         entries = []
         for key, (st, grp_labels, notes) in (
@@ -1813,6 +1845,21 @@ downstream total.
         return entries
 @
 
+Most consumers of the resume set only care about the names---the
+resume announcement, tests, the resume path's fallback.  Rather than
+have each of them re-derive the flattening (and drift on ordering), we
+expose it once:
+
+<<active session class>>=
+    def last_stopped_labels(self) -> list[str]:
+        """Return the last stopped labels as a flat list."""
+        return [
+            label
+            for group in self.last_stopped
+            for label in group["labels"]
+        ]
+@
+
 Let's verify that a stop naming an unknown label leaves the resume set
 alone---first at the class level, then end-to-end through the CLI, where
 the failing exit code and the surviving resume set must coexist:
@@ -1823,10 +1870,10 @@ def test_failed_stop_keeps_last_stopped(temp_tracking_dir):
   session = ActiveSession()
   session.start_labels(["A", "B"], datetime.datetime.now())
   session.stop_labels()
-  assert set(session.last_stopped) == {"A", "B"}
+  assert set(session.last_stopped_labels()) == {"A", "B"}
 
   assert session.stop_labels(["TYPO"]) == []
-  assert set(session.last_stopped) == {"A", "B"}
+  assert set(session.last_stopped_labels()) == {"A", "B"}
 
 def test_failed_stop_does_not_break_resume(temp_tracking_dir):
   """A mistyped stop must not make bare start resume a phantom label."""
@@ -1836,12 +1883,50 @@ def test_failed_stop_does_not_break_resume(temp_tracking_dir):
   result = runner.invoke(cli, ["stop", "TYPO"])
   assert result.exit_code == 1
 
-  assert set(load_active_session().last_stopped) == {"A", "B"}
+  assert set(
+    load_active_session().last_stopped_labels()
+  ) == {"A", "B"}
 
   result = runner.invoke(cli, ["start"])
   assert result.exit_code == 0
   assert "TYPO" not in result.stdout
   assert set(load_active_session().get_active_labels()) == {"A", "B"}
+@
+
+The resume set's grouping and its migration from the old flat form are
+worth checking at the class level:
+
+<<test functions>>=
+def test_stop_all_groups_resume_set_by_batch(
+  temp_tracking_dir,
+):
+  """Stopping everything records one resume group per batch."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["a", "b"], t0)
+  session.start_labels(["c"], t0)
+  session.stop_labels(count=len(session.label_order))
+  assert [
+    g["labels"] for g in session.last_stopped
+  ] == [["a", "b"], ["c"]]
+  assert all(
+    g["window"] is None for g in session.last_stopped
+  )
+  assert session.last_stopped_labels() == ["a", "b", "c"]
+
+def test_from_dict_migrates_flat_last_stopped():
+  """A flat last_stopped list loads as one window-less group."""
+  session = ActiveSession()
+  session.start_labels(["x"], datetime.datetime.now())
+  data = session.to_dict()
+  data["last_stopped"] = ["a", "b"]
+  restored = ActiveSession.from_dict(data)
+  assert restored.last_stopped == [{
+    "labels": ["a", "b"], "batch": None,
+    "window": None, "server_key": None,
+  }]
+  data["last_stopped"] = []
+  assert ActiveSession.from_dict(data).last_stopped == []
 @
 
 \subsubsection{Selecting the Target Batch}
@@ -1859,24 +1944,39 @@ files may predate batch records, so when the batch id is unknown we
 degrade to that single label rather than failing---the same fallback
 [[stop_labels]] has always used for such files.
 
+The optional [[among]] restriction exists for window-scoped targeting
+(\cref{track:window-batch-scope}): a caller may pass the set of batch
+ids that qualify, and the walk simply skips more recent labels whose
+batch is outside the set.  The restriction is a \emph{filter}, not an
+alternative source of truth---membership and recency still come from
+the session itself, so a stale id in the candidate set (its batch long
+since stopped) matches no active label and costs nothing.  With
+[[among=None]] the first iteration inspects the last label in
+[[label_order]] and the behavior is exactly the unrestricted one.
+
 <<active session class>>=
-    def most_recent_batch_labels(self) -> list[str]:
+    def most_recent_batch_labels(
+        self,
+        among: set[int] | None = None,
+    ) -> list[str]:
         """Return the most recent batch's still-active labels.
 
         The most recent batch is the one containing the most
-        recently started label.  Labels come back in batch order;
-        the list is empty when nothing is being tracked.
+        recently started label; with `among`, only batches whose
+        id is in that set qualify.  Labels come back in batch
+        order; the list is empty when no batch qualifies.
         """
-        if not self.label_order:
-            return []
-        most_recent = self.label_order[-1]
-        _, _, batch_id = self.active_labels[most_recent]
-        if batch_id in self.batches:
-            return [
-                l for l in self.batches[batch_id]
-                if l in self.active_labels
-            ]
-        return [most_recent]
+        for label in reversed(self.label_order):
+            _, _, batch_id = self.active_labels[label]
+            if among is not None and batch_id not in among:
+                continue
+            if batch_id in self.batches:
+                return [
+                    l for l in self.batches[batch_id]
+                    if l in self.active_labels
+                ]
+            return [label]
+        return []
 
 @
 
@@ -1900,6 +2000,30 @@ def test_most_recent_batch_labels_without_batch_record():
   session.start_labels(["A", "B"], datetime.datetime.now())
   session.batches.clear()
   assert session.most_recent_batch_labels() == ["B"]
+@
+
+The restriction must skip past newer non-candidates, distinguish an
+empty candidate set (nothing qualifies) from no restriction at all,
+and shrug off ids that match nothing:
+
+<<test functions>>=
+def test_most_recent_batch_labels_among():
+  """among skips newer batches outside the candidate set."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["scoped"], t0)
+  scoped_id = session.active_labels["scoped"][2]
+  session.start_labels(["global"], t0)
+  assert session.most_recent_batch_labels() == ["global"]
+  assert session.most_recent_batch_labels(
+    among={scoped_id},
+  ) == ["scoped"]
+  assert session.most_recent_batch_labels(
+    among=set(),
+  ) == []
+  assert session.most_recent_batch_labels(
+    among={scoped_id + 999},
+  ) == []
 @
 
 Recency is the right default, but a caller that already knows
@@ -2269,12 +2393,16 @@ def test_edit_batch_leaves_unrelated_state():
   session = ActiveSession()
   session.start_labels(["A"], datetime.datetime.now())
   session.switch_other = ["saved"]
-  session.last_stopped = ["earlier"]
+  earlier = [{
+    "labels": ["earlier"], "batch": None,
+    "window": None, "server_key": None,
+  }]
+  session.last_stopped = list(earlier)
 
   session.edit_batch(1, ["B"])
 
   assert session.switch_other == ["saved"]
-  assert session.last_stopped == ["earlier"]
+  assert session.last_stopped == earlier
 @
 
 <<active session class>>=
@@ -2393,7 +2521,18 @@ def test_edit_batch_leaves_unrelated_state():
             if 'next_batch_id' in data:
                 session.next_batch_id = data['next_batch_id']
             if 'last_stopped' in data:
-                session.last_stopped = data['last_stopped']
+                stored = data['last_stopped']
+                if stored and isinstance(stored[0], str):
+                    # Old format: flat label list —
+                    # migrate to one window-less group.
+                    session.last_stopped = [{
+                        "labels": list(stored),
+                        "batch": None,
+                        "window": None,
+                        "server_key": None,
+                    }]
+                else:
+                    session.last_stopped = stored
             if 'switch_other' in data:
                 # New format: single saved set (toggle semantics)
                 session.switch_other = data['switch_other']
@@ -2991,6 +3130,7 @@ def start_tracking_labels(
         if update_tmux_context and started_labels:
             _register_tmux_context_labels_unlocked(
                 started_labels, resolved_who,
+                session=session,
             )
 
     _, _, started, already_tracking, discarded = (
@@ -3013,6 +3153,18 @@ Three modes are supported: stop specific [[labels]], stop
 matters when a caller has filtered a candidate list down to nothing;
 the empty list means \enquote{I chose these specific labels and there
 are zero}, not \enquote{please stop the batch}.
+
+Only the batch-stop path is window-scoped
+(\cref{track:window-batch-scope}).  Naming labels or passing
+[[--all]] is an explicit request that should mean the same thing in
+every shell; it is the \emph{implicit} \enquote{what I am doing now}
+that must not be stolen by tracking started elsewhere.  The scope is
+computed inside the [[update]] closure because that is where both
+requirements meet: the tmux-context lock is held (so the window file
+cannot change under us) and the freshly loaded session is at hand (to
+resolve legacy batchless entries).  Note that a bare [[switch]] closes
+its current context through this very function, so the scoping covers
+it without further wiring.
 
 The todo wrapper needs one more operation: stop a specific label and,
 optionally, a few companion labels, but only if they are currently
@@ -3078,8 +3230,15 @@ def stop_tracking_labels(
                 end_time=end_time,
                 stop_batch=True,
                 who=who,
+                among=current_window_batch_scope(
+                    session, resolved_who,
+                ),
             )
 
+        if completed_entries:
+            annotate_last_stopped_windows(
+                session, resolved_who,
+            )
         updated_entries = list(history_entries)
         updated_entries.extend(completed_entries)
         stopped_labels[:] = [
@@ -3145,6 +3304,10 @@ def stop_tracking_labels_if_active(
             who=who,
         )
         active_labels.extend(to_stop)
+        if completed_entries:
+            annotate_last_stopped_windows(
+                session, resolved_who,
+            )
         updated_entries = list(history_entries)
         updated_entries.extend(completed_entries)
         stopped_labels[:] = [
@@ -3182,6 +3345,358 @@ def update_switch_other_labels(
         return session, history_entries
 
     mutate_worker_tracking_state(update, who)
+@
+
+A bare [[start]] resumes the last stopped labels, and the resume set
+remembers its batch grouping (\cref{track:window-batch-scope}).
+Passing the flat label list to [[start_tracking_labels]] would merge
+every group into one fresh batch---precisely the structure loss the
+grouped resume set exists to prevent.  This function instead restarts
+one batch per group, inside a single
+[[mutate_worker_tracking_state]] call so the whole resume is atomic,
+and in list order, which restores the groups' relative recency (new
+batch ids grow monotonically).  It returns the same
+[[(started, already_tracking, discarded)]] triple as
+[[start_tracking_labels]] so the [[start]] command's reporting code
+serves both paths.
+
+<<session management>>=
+def resume_stopped_batches(
+    *,
+    who: str = None,
+    start_time: datetime.datetime = None,
+):
+    """Restart the last stopped batches, one batch per group."""
+    if start_time is None:
+        start_time = datetime.datetime.now()
+    resolved_who = (
+        who if who is not None
+        else default_username
+    )
+    started_labels = []
+    already_tracking = []
+    resumed_groups = []
+
+    def update(session, history_entries):
+        <<restart each stopped group as its own batch>>
+        return session, history_entries
+
+    def sync_tmux_context(session, history_entries):
+        <<register resumed groups into their windows>>
+
+    mutate_worker_tracking_state(
+        update, who,
+        post_update=sync_tmux_context,
+    )
+    return started_labels, already_tracking, []
+@
+
+A group's labels may have been restarted individually since the stop;
+[[start_labels]] skips active labels, and a group whose every label is
+already running contributes no new batch.  The freshly started labels
+share one batch id by the [[start_labels]] invariant, so reading it
+off the first suffices.
+
+<<restart each stopped group as its own batch>>=
+for group in list(session.last_stopped):
+    labels = list(group["labels"])
+    started = session.start_labels(labels, start_time)
+    if not started:
+        already_tracking.extend(labels)
+        continue
+    started_labels.extend(started)
+    already_tracking.extend(
+        label for label in labels
+        if label not in started
+    )
+    resumed_groups.append({
+        "labels": started,
+        "batch": session.active_labels[started[0]][2],
+        "window": group.get("window"),
+        "server_key": group.get("server_key"),
+    })
+@
+
+Re-registration is what makes the round trip complete: a window-tagged
+group returns to \emph{its} window's file, with its new batch id, even
+when the [[start]] was typed somewhere else.  The existence check is
+the \enquote{window still exists} test, and it deliberately accepts
+the empty tracked marker---stopping everything in a window keeps the
+file precisely so that this resume re-attaches the labels instead of
+degrading them to globals.  A group whose window is gone (file
+deleted, other server, never tagged) falls back to today's behavior:
+register into whatever pane/window context the command runs in.
+Window-tagged groups skip the current pane file on purpose---they
+belong to their window, not to the pane the user happened to type in.
+
+<<register resumed groups into their windows>>=
+for group in resumed_groups:
+    window_id = group["window"]
+    server_key = group["server_key"]
+    if (
+        window_id
+        and server_key
+        and read_window_labels(
+            window_id, resolved_who, server_key,
+        ) is not None
+    ):
+        add_window_labels(
+            window_id, resolved_who, server_key,
+            group["labels"],
+            batches={
+                label: group["batch"]
+                for label in group["labels"]
+            },
+        )
+    else:
+        _register_tmux_context_labels_unlocked(
+            group["labels"], resolved_who,
+            session=session,
+        )
+@
+
+The round trip this machinery exists for: [[stop --all]] over several
+batches, then a bare [[start]], must restore the batch structure ---
+including a window's batch returning to its window file even when the
+[[start]] is typed outside tmux --- and a bare [[stop]] afterwards
+must again mean \enquote{the most recent batch}, not
+\enquote{everything}.
+
+<<test functions>>=
+def test_stop_all_start_restores_batches(
+  temp_tracking_dir,
+):
+  """stop --all then bare start restores separate batches."""
+  runner.invoke(cli, ["start", "a", "b"])
+  runner.invoke(cli, ["start", "c"])
+  runner.invoke(cli, ["stop", "--all"])
+  result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  assert "Resuming" in result.output
+  session = load_active_session()
+  assert (
+    session.active_labels["a"][2]
+    == session.active_labels["b"][2]
+  )
+  assert (
+    session.active_labels["c"][2]
+    != session.active_labels["a"][2]
+  )
+  stop_result = runner.invoke(cli, ["stop"])
+  assert stop_result.exit_code == 0
+  assert "c" in stop_result.output
+  session = load_active_session()
+  assert "a" in session.active_labels
+  assert "c" not in session.active_labels
+
+def test_stop_annotates_resume_groups_with_window(
+  temp_tracking_dir,
+):
+  """A stop stamps each resume group with its owning window."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop", "--all"])
+  assert result.exit_code == 0
+  groups = {
+    tuple(g["labels"]): g
+    for g in load_active_session().last_stopped
+  }
+  assert groups[("windowed",)]["window"] == window_id
+  assert (
+    groups[("windowed",)]["server_key"]
+    == TEST_SERVER_KEY
+  )
+  assert groups[("global",)]["window"] is None
+
+def test_stop_all_start_reattaches_window_batches(
+  temp_tracking_dir,
+):
+  """Resume returns a window's batch to its window file."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["stop", "--all"])
+    assert read_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+    ) == []
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) == {
+    "windowed": session.active_labels["windowed"][2],
+  }
+  assert (
+    session.active_labels["global"][2]
+    != session.active_labels["windowed"][2]
+  )
+
+def test_resume_degrades_when_window_gone(
+  temp_tracking_dir,
+):
+  """A resumed group whose window file vanished goes global."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+    runner.invoke(cli, ["stop", "--all"])
+  delete_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert "windowed" in session.active_labels
+  assert read_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) is None
+@
+
+The window auto-suspend transition resumes a window the same way a
+bare [[start]] resumes a stop: it must not flatten.  Suspending a
+window stops its labels but leaves them (and their batch ids) in the
+window file; restarting them in one call would merge the window's
+batches into one, which is why, historically, a bare [[stop]] after
+switching windows stopped \emph{all} the window's labels instead of
+the latest batch.  Here the file's per-label batch ids are the
+grouping key: labels sharing an old id restart together (one new batch
+per group; ids without a record---legacy files---form one group), and
+the file is refreshed with the new ids afterwards, under the same
+locks, so the next suspend groups correctly again.  The refresh reads
+the ids off the updated session rather than the start calls: a label
+that was already running elsewhere keeps its current batch, and the
+file should say so.
+
+<<session management>>=
+def restart_window_batches(
+    *,
+    who: str = None,
+    window_id: str,
+    tmux_server_key: str,
+    label_batches: dict,
+    start_time: datetime.datetime = None,
+):
+    """Restart a window's labels, one batch per file group."""
+    if start_time is None:
+        start_time = datetime.datetime.now()
+    resolved_who = (
+        who if who is not None
+        else default_username
+    )
+    groups = {}
+    for label, batch_id in label_batches.items():
+        groups.setdefault(batch_id, []).append(label)
+
+    def update(session, history_entries):
+        for group_labels in groups.values():
+            session.start_labels(
+                group_labels, start_time,
+            )
+        return session, history_entries
+
+    def refresh_window_file(session, history_entries):
+        update_window_label_batches(
+            window_id, resolved_who, tmux_server_key,
+            {
+                label: session.active_labels[label][2]
+                for label in label_batches
+                if label in session.active_labels
+            },
+        )
+
+    mutate_worker_tracking_state(
+        update, who,
+        post_update=refresh_window_file,
+    )
+@
+
+Suspend and restart round-trip through the window file: two batches
+suspended by a switch away must come back as two batches on the switch
+back, so that a bare [[stop]] in the window still means the latest
+batch.
+
+<<test functions>>=
+def test_restart_window_batches_preserves_groups(
+  temp_tracking_dir,
+):
+  """Restarting a window's labels keeps their batch grouping."""
+  window_id = "@42"
+  add_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+    ["a", "b"], batches={"a": 7, "b": 7},
+  )
+  add_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+    ["c"], batches={"c": 9},
+  )
+  restart_window_batches(
+    window_id=window_id,
+    tmux_server_key=TEST_SERVER_KEY,
+    label_batches=read_window_label_batches(
+      window_id, default_username, TEST_SERVER_KEY,
+    ),
+  )
+  session = load_active_session()
+  assert (
+    session.active_labels["a"][2]
+    == session.active_labels["b"][2]
+  )
+  assert (
+    session.active_labels["c"][2]
+    != session.active_labels["a"][2]
+  )
+  assert read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) == {
+    "a": session.active_labels["a"][2],
+    "b": session.active_labels["b"][2],
+    "c": session.active_labels["c"][2],
+  }
 @
 
 Now we combine all state management functions:
@@ -3297,11 +3812,13 @@ such as resume and launch validation.  The actual state mutation happens
 session = load_active_session(who)
 
 # If no labels provided, try to resume last stopped labels
+resume_batches = False
 if not labels:
     if command_args is not None:
         labels = []
     elif session.last_stopped:
-        labels = session.last_stopped
+        labels = session.last_stopped_labels()
+        resume_batches = True
         typer.echo(
             f"Resuming: {', '.join(sorted(labels))}"
         )
@@ -3509,15 +4026,30 @@ string as the batch description.  We attach it to every newly started label in
 that batch so the grouped entry keeps the description regardless of which label
 is encountered first during shutdown.
 
+A plain bare [[start]] takes the batch-preserving resume path instead,
+so a [[stop --all]] followed by [[start]] restores the stopped batches
+rather than merging them into one.  Launch modes keep the flat path: a
+new window or command legitimately claims the resumed labels as one
+fresh batch of its own.  So does [[--replace]], whose discard-and-
+restart semantics for still-active labels only exist on the flat path.
+
 <<start tracking and report results>>=
-started, already_tracking, discarded = start_tracking_labels(
-    launch_owned_labels,
-    start_time=start_time,
-    who=who,
-    replace=replace,
-    description=command_text,
-    update_tmux_context=not (pane or window),
-)
+if resume_batches and not launch_requested and not replace:
+    started, already_tracking, discarded = (
+        resume_stopped_batches(
+            who=who,
+            start_time=start_time,
+        )
+    )
+else:
+    started, already_tracking, discarded = start_tracking_labels(
+        launch_owned_labels,
+        start_time=start_time,
+        who=who,
+        replace=replace,
+        description=command_text,
+        update_tmux_context=not (pane or window),
+    )
 
 if discarded:
     typer.echo(
@@ -7322,6 +7854,20 @@ if needs_window_sync:
     )
 
 if published_window_labels:
+    def backfill_window_batches():
+        session = load_active_session(focus_who)
+        update_window_label_batches(
+            window_id,
+            focus_who,
+            tmux_server_key,
+            {
+                label: session.active_labels[label][2]
+                for label in focus_labels
+                if label in session.active_labels
+            },
+        )
+
+    with_tmux_context_lock(backfill_window_batches)
     install_tmux_window_cleanup_hook(
         pane_id,
         window_id,
@@ -7330,6 +7876,14 @@ if published_window_labels:
         focus_labels,
     )
 @
+
+The batch-id backfill runs last on purpose.  The labels file is
+published early (batchless) so the hook subprocesses see the window as
+tracked immediately, but the ids are only final once the auto-suspend
+transition has run: a label inherited from the source window is stopped
+and restarted there, which moves it to a fresh batch.  Reading the
+session after the dust settles records the ids that will actually be
+live in this window.
 
 Note which steps hang off which condition.  Publishing the labels and
 installing the cleanup hook that eventually removes them are two halves
@@ -7636,9 +8190,18 @@ That lets [[mutate_worker_tracking_state]] call them from its [[post_update]]
 hook without deadlocking on a second attempt to take the same lock, while the
 public wrappers still provide the lock for ordinary callers.
 
+Registration is also where batch ids enter the window file.  The
+[[post_update]] hooks run with the freshly mutated session at hand, so
+they pass it along and we look each label's batch id up in
+[[active_labels]].  Only the window side records ids---pane files are
+never consulted for batch scoping, so they stay as plain label lists.
+When no session is supplied (the public wrapper's callers predate the
+session mutation), labels register batchless and are backfilled later.
+
 <<helper functions>>=
 def _register_tmux_context_labels_unlocked(
     labels: list[str], who: str,
+    session=None,
 ) -> None:
     """Add labels to the current tmux context.
 
@@ -7660,9 +8223,16 @@ def _register_tmux_context_labels_unlocked(
         who, tmux_server_key,
     )
     if window_id:
+        batches = None
+        if session is not None:
+            batches = {
+                label: session.active_labels[label][2]
+                for label in labels
+                if label in session.active_labels
+            }
         add_window_labels(
             window_id, who, tmux_server_key,
-            list(labels),
+            list(labels), batches=batches,
         )
 
 
@@ -7829,17 +8399,37 @@ Unlike pane state, window state may receive overlapping contributions.
 Two panes in the same tracked window can both contribute [[work]], and a
 single pane exit must not delete [[work]] globally while the other pane
 still owns it.  We therefore persist per-label reference counts on disk.
-The public read helper still returns the visible ordered union of labels,
-and it accepts the older flat-list format for compatibility by treating
-each listed label as count~1.
+
+Besides the count, each label also records the id of the batch it
+belongs to in the active session.  The batch id is what lets a bare
+[[stop]] or hashless [[edit]] inside a tracked window target only that
+window's batches (\cref{track:window-batch-scope}): the window file acts
+as a candidate filter over the session's batches, never as a source of
+truth.  Recording the \emph{id} rather than relying on label names is
+what makes stale files harmless---when a batch is stopped its id never
+recurs ([[next_batch_id]] only grows), so a leftover entry simply
+matches nothing, whereas a recycled label \emph{name} would falsely
+claim a brand-new global batch for the window.
+
+The on-disk value for a label has gone through three generations: a
+flat list (each label count~1, no batch), a label-to-count dict (no
+batch), and now a label-to-entry dict where each entry carries
+[[count]] and [[batch]] ([[None]] when unknown).  These files live in
+the tmux runtime state directory and vanish on reboot, so migration is
+read-side only: one canonical reader accepts all three generations and
+the writers only ever emit the newest.
 
 <<helper functions>>=
-def read_window_label_counts(
+def read_window_label_entries(
     window_id: str,
     who: str,
     tmux_server_key: str,
-) -> dict[str, int] | None:
-    """Read tracked window label counts, or ``None`` if absent."""
+) -> dict[str, dict] | None:
+    """Read tracked window label entries, or ``None`` if absent.
+
+    Each entry maps a label to
+    ``{"count": int, "batch": int | None}``.
+    """
     path = window_labels_path(
         window_id, who, tmux_server_key,
     )
@@ -7849,20 +8439,82 @@ def read_window_label_counts(
         return None
 
     if isinstance(data, list):
-        counts = {}
-        for label in data:
-            if label not in counts:
-                counts[label] = 1
-        return counts
+        return {
+            label: {"count": 1, "batch": None}
+            for label in dict.fromkeys(data)
+        }
 
     if isinstance(data, dict):
-        counts = {}
-        for label, count in data.items():
-            if isinstance(count, int) and count > 0:
-                counts[label] = count
-        return counts
+        entries = {}
+        for label, value in data.items():
+            <<normalize one window label entry>>
+        return entries
 
     return None
+@
+
+Within a dict-format file the two dict generations may in principle mix
+(they never do in practice, but accepting both per value costs
+nothing).  Any malformed value is dropped rather than propagated.
+
+<<normalize one window label entry>>=
+if isinstance(value, int):
+    if value > 0:
+        entries[label] = {
+            "count": value, "batch": None,
+        }
+elif isinstance(value, dict):
+    count = value.get("count")
+    if isinstance(count, int) and count > 0:
+        batch = value.get("batch")
+        entries[label] = {
+            "count": count,
+            "batch": (
+                batch
+                if isinstance(batch, int)
+                else None
+            ),
+        }
+@
+
+The count and batch views are simple projections of the entries.  The
+count view keeps its historical name and shape because tests and the
+removal logic think in reference counts; the batch view is what the
+window-scoped selection consumes.
+
+<<helper functions>>=
+def read_window_label_counts(
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
+) -> dict[str, int] | None:
+    """Read tracked window label counts, or ``None`` if absent."""
+    entries = read_window_label_entries(
+        window_id, who, tmux_server_key,
+    )
+    if entries is None:
+        return None
+    return {
+        label: entry["count"]
+        for label, entry in entries.items()
+    }
+
+
+def read_window_label_batches(
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
+) -> dict[str, int | None] | None:
+    """Read tracked window batch ids, or ``None`` if absent."""
+    entries = read_window_label_entries(
+        window_id, who, tmux_server_key,
+    )
+    if entries is None:
+        return None
+    return {
+        label: entry["batch"]
+        for label, entry in entries.items()
+    }
 
 <<helper functions>>=
 def read_window_labels(
@@ -7880,21 +8532,26 @@ def read_window_labels(
 @
 
 Writing again uses an atomic temporary file in the same directory.
+[[write_window_labels]] keeps its plain-list signature because its
+callers (window launch, test seeding) run before any session mutation
+and so cannot know batch ids yet; the ids are backfilled once the
+session has allocated them (see [[update_window_label_batches]]
+below).
 
 <<helper functions>>=
-def write_window_label_counts(
+def write_window_label_entries(
     window_id: str,
     who: str,
     tmux_server_key: str,
-    label_counts: dict[str, int],
+    entries: dict[str, dict],
 ) -> None:
-    """Atomically write a tracked window's label counts."""
+    """Atomically write a tracked window's label entries."""
     path = window_labels_path(
         window_id, who, tmux_server_key,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(label_counts))
+    tmp.write_text(json.dumps(entries))
     tmp.rename(path)
 
 
@@ -7905,19 +8562,25 @@ def write_window_labels(
     labels: list[str],
 ) -> None:
     """Atomically write a tracked window's labels."""
-    write_window_label_counts(
+    write_window_label_entries(
         window_id,
         who,
         tmux_server_key,
         {
-            label: 1 for label in dict.fromkeys(labels)
+            label: {"count": 1, "batch": None}
+            for label in dict.fromkeys(labels)
         },
     )
 @
 
 As with panes, we merge new labels while preserving the visible order.
 Repeated contributions increment the label's reference count instead of
-duplicating it in the visible list.
+duplicating it in the visible list.  When the caller knows batch ids
+(registration runs inside the session mutation, where the session is at
+hand), it passes them in [[batches]] and they overwrite whatever the
+file recorded before: a label being (re)started or relabeled has just
+been placed in a batch, so the session's current assignment is the
+truth and any older id is stale by definition.
 
 <<helper functions>>=
 def add_window_labels(
@@ -7925,16 +8588,49 @@ def add_window_labels(
     who: str,
     tmux_server_key: str,
     labels: list[str],
+    batches: dict[str, int] | None = None,
 ) -> None:
     """Add labels to a tracked window's active set."""
-    existing = read_window_label_counts(
+    existing = read_window_label_entries(
         window_id, who, tmux_server_key,
     ) or {}
     for lbl in labels:
         if lbl not in existing:
-            existing[lbl] = 0
-        existing[lbl] += 1
-    write_window_label_counts(
+            existing[lbl] = {"count": 0, "batch": None}
+        existing[lbl]["count"] += 1
+        if batches and lbl in batches:
+            existing[lbl]["batch"] = batches[lbl]
+    write_window_label_entries(
+        window_id, who, tmux_server_key, existing,
+    )
+@
+
+Some call sites write the window file \emph{before} the session
+mutation that allocates batch ids: the window launch publishes the file
+immediately so the tmux hook subprocesses see it, and [[adopt]] merges
+its labels under the tmux-context lock before starting them.  Those
+sites backfill the ids afterwards.  The backfill touches only labels
+the file already lists and leaves counts alone---it corrects the batch
+view without disturbing the reference-count bookkeeping, and a file
+that disappeared in between (window closed) is silently left absent.
+
+<<helper functions>>=
+def update_window_label_batches(
+    window_id: str,
+    who: str,
+    tmux_server_key: str,
+    batches: dict[str, int],
+) -> None:
+    """Backfill batch ids for a window's existing labels."""
+    existing = read_window_label_entries(
+        window_id, who, tmux_server_key,
+    )
+    if existing is None:
+        return
+    for lbl, batch_id in batches.items():
+        if lbl in existing:
+            existing[lbl]["batch"] = batch_id
+    write_window_label_entries(
         window_id, who, tmux_server_key, existing,
     )
 @
@@ -7959,20 +8655,20 @@ def remove_window_labels(
     labels: list[str],
 ) -> None:
     """Remove labels from a tracked window's active set."""
-    existing = read_window_label_counts(
+    existing = read_window_label_entries(
         window_id, who, tmux_server_key,
     )
     if existing is None:
         return
     for label in dict.fromkeys(labels):
-        count = existing.get(label)
-        if count is None:
+        entry = existing.get(label)
+        if entry is None:
             continue
-        if count <= 1:
+        if entry["count"] <= 1:
             del existing[label]
         else:
-            existing[label] = count - 1
-    write_window_label_counts(
+            entry["count"] -= 1
+    write_window_label_entries(
         window_id, who, tmux_server_key, existing,
     )
 @
@@ -7996,6 +8692,352 @@ def delete_window_labels(
         ).unlink()
     except OSError:
         pass
+@
+
+\subsubsection{Window-Scoped Batch Targeting}
+\label{track:window-batch-scope}
+
+A tracked window is a promise of isolation: work started elsewhere ---
+another terminal, a script, a different window --- must not become what
+a bare [[stop]] or hashless [[edit]] \emph{in this window} acts on.
+Without that promise, every bare command races against concurrent
+tracking: whichever batch started last wins the \enquote{most recent}
+crown, wherever it came from.  The batch ids recorded in the window
+file (\cref{track:window-auto-suspend}) close the race: they name the
+batches that belong to this window, and the selection in
+[[most_recent_batch_labels]] restricts itself to them.
+
+The distinction between \emph{no} tracked window and an \emph{empty}
+one carries through to the scope.  [[None]] means the command runs
+outside any tracked window, so selection stays global---plain shells
+keep today's behavior.  An empty set means the window is tracked but
+nothing is tracking in it (the user stopped everything and is taking a
+break); a bare [[stop]] then finds nothing rather than reaching out
+and grabbing a global batch, which is exactly the isolation the window
+promised.
+
+Legacy entries without a batch id resolve by name through the
+session's [[active_labels]]---if the label is still active somewhere,
+its current batch stands in for the unrecorded one.  This is the safe
+direction for the fallback: a recycled name at worst \emph{includes} a
+batch in the window's scope, and only until the id-carrying rewrite on
+the next registration.
+
+The helper reads the window file, so it requires the tmux-context lock;
+its callers are the [[update]] closures run by
+[[mutate_worker_tracking_state]], which holds that lock throughout.
+
+<<helper functions>>=
+def current_window_batch_scope(
+    session,
+    who: str,
+) -> set[int] | None:
+    """Return the tracked window's batch-id scope, or ``None``.
+
+    ``None`` means no tracked window is current (selection stays
+    global); an empty set means the window is tracked but has no
+    batches.  Requires the tmux-context lock to already be held.
+    """
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return None
+    window_id = get_current_tracked_window_id(
+        who, tmux_server_key,
+    )
+    if not window_id:
+        return None
+    batches = read_window_label_batches(
+        window_id, who, tmux_server_key,
+    ) or {}
+    scope = set()
+    for label, batch_id in batches.items():
+        if batch_id is not None:
+            scope.add(batch_id)
+        elif label in session.active_labels:
+            scope.add(session.active_labels[label][2])
+    return scope
+@
+
+The inverse question---\enquote{which window does this batch belong
+to?}---arises when a stop snapshots the resume set: the answer lets a
+later bare [[start]] re-attach each resumed batch to its window.  The
+lookup keys on batch ids, not label names, because two tracked windows
+may legitimately declare the same label (that is why the files hold
+reference counts); the batch id is unique across the session.  It must
+run \emph{before} the stop's [[post_update]] drains the current
+window's file, which is exactly the order
+[[mutate_worker_tracking_state]] gives its [[update]] callback.
+Outside tmux there is nothing to consult and the groups stay
+window-less, degrading resume to today's current-context behavior.
+
+<<helper functions>>=
+def annotate_last_stopped_windows(
+    session,
+    who: str,
+) -> None:
+    """Stamp last_stopped groups with their owning windows.
+
+    Requires the tmux-context lock to already be held.
+    """
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return
+    batch_windows = {}
+    pattern = (
+        "window_labels"
+        f"_{sanitize_tmux_id(tmux_server_key)}"
+        f"_window_*_{sanitize_who(who)}.json"
+    )
+    for path in get_tmux_state_dir().glob(pattern):
+        match = _STATE_FILE_ID_RE.search(path.name)
+        if not match:
+            continue
+        window_id = f"@{match.group(2)}"
+        batches = read_window_label_batches(
+            window_id, who, tmux_server_key,
+        ) or {}
+        for batch_id in batches.values():
+            if batch_id is not None:
+                batch_windows[batch_id] = window_id
+    for group in session.last_stopped:
+        window_id = batch_windows.get(group.get("batch"))
+        if window_id is not None:
+            group["window"] = window_id
+            group["server_key"] = tmux_server_key
+@
+
+The three scope shapes---untracked, tracked-but-empty, and populated
+(with a legacy batchless entry resolved by name)---are each worth a
+check:
+
+<<test functions>>=
+def test_current_window_batch_scope(temp_tracking_dir):
+  """Scope is None untracked, empty on break, ids otherwise."""
+  window_id = "@42"
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["a"], t0)
+  session.start_labels(["b"], t0)
+  a_id = session.active_labels["a"][2]
+  b_id = session.active_labels["b"][2]
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, {}, clear=True):
+    assert current_window_batch_scope(
+      session, default_username,
+    ) is None
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    assert current_window_batch_scope(
+      session, default_username,
+    ) is None
+    write_window_labels(
+      window_id, default_username, TEST_SERVER_KEY, [],
+    )
+    assert current_window_batch_scope(
+      session, default_username,
+    ) == set()
+    add_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+      ["a"], batches={"a": a_id},
+    )
+    add_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+      ["b"],
+    )
+    assert current_window_batch_scope(
+      session, default_username,
+    ) == {a_id, b_id}
+@
+
+End to end, the promise reads: a batch started in a plain shell after
+the window's batch must not be what a bare [[stop]] or hashless
+[[edit]] in the window acts on---and during a break the bare commands
+find nothing rather than reaching for the global batch.  An explicit
+[[--containing]], by contrast, crosses the window boundary on purpose.
+
+<<test functions>>=
+def test_bare_stop_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """A bare stop in a tracked window skips newer global batches."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop"])
+  assert result.exit_code == 0
+  assert "windowed" in result.output
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+  assert "windowed" not in session.active_labels
+
+def test_bare_stop_in_empty_tracked_window_errors(
+  temp_tracking_dir,
+):
+  """During a break, bare stop refuses to grab a global batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop"])
+  assert result.exit_code == 1
+  assert "in this window" in result.output
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+
+def test_hashless_edit_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """A hashless edit in a tracked window targets its batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["edit", "-a", "extra"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert (
+    session.active_labels["extra"][2]
+    == session.active_labels["windowed"][2]
+  )
+  assert (
+    session.active_labels["global"][2]
+    != session.active_labels["windowed"][2]
+  )
+
+def test_hashless_edit_in_empty_tracked_window_errors(
+  temp_tracking_dir,
+):
+  """Editing during a break names the window in its error."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["edit", "-a", "extra"],
+    )
+  assert result.exit_code == 1
+  assert "in this window" in result.output
+
+def test_containing_crosses_window_scope(
+  temp_tracking_dir,
+):
+  """--containing reaches a global batch from inside a window."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+    result = runner.invoke(
+      cli,
+      ["edit", "--containing", "global",
+       "-a", "extra"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert (
+    session.active_labels["extra"][2]
+    == session.active_labels["global"][2]
+  )
+
+def test_bare_switch_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """switch in a tracked window suspends only its batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["switch", "meeting"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+  assert "meeting" in session.active_labels
+  assert "windowed" not in session.active_labels
 @
 
 \subsubsection{Window Transition Execution}
@@ -8503,6 +9545,13 @@ session has already disappeared.  Treating that observation failure as a
 real switch to an untracked window would spuriously stop the source
 labels, so we bail out before mutating tracking state.
 
+The target side reads the window's per-label \emph{batch ids}, not
+just its labels, and resumes through [[restart_window_batches]] so the
+window's batch structure survives the suspend/resume cycle.  The
+source side needs no such care: stopping an explicit label list
+already records one history entry per batch, and the source window's
+file keeps its ids as the grouping key for the next switch back.
+
 <<detached window switch command>>=
 @cli.command(
     name="_window-switch-detached", hidden=True
@@ -8535,7 +9584,7 @@ def window_switch_detached(
                 who,
                 tmux_server_key,
             )
-        target_labels = read_window_labels(
+        target_batches = read_window_label_batches(
             selected_window_id,
             who,
             tmux_server_key,
@@ -8549,7 +9598,7 @@ def window_switch_detached(
         return (
             prev_window_id,
             source_labels,
-            target_labels,
+            target_batches,
         )
 
     result = with_tmux_context_lock(read_and_update)
@@ -8558,7 +9607,7 @@ def window_switch_detached(
     (
         prev_window_id,
         source_labels,
-        target_labels,
+        target_batches,
     ) = result
     transition_time = datetime.datetime.now()
     if source_labels:
@@ -8569,12 +9618,13 @@ def window_switch_detached(
             quiet_if_missing=True,
             update_tmux_context=False,
         )
-    if target_labels:
-        start_tracking_labels(
+    if target_batches:
+        restart_window_batches(
             who=who,
-            labels=target_labels,
+            window_id=selected_window_id,
+            tmux_server_key=tmux_server_key,
+            label_batches=target_batches,
             start_time=transition_time,
-            update_tmux_context=False,
         )
     emit_window_event_debug(
         who,
@@ -8589,7 +9639,7 @@ def window_switch_detached(
             prev_window_id,
             source_labels,
             selected_window_id,
-            target_labels,
+            list(target_batches or {}),
         ),
     )
 @
@@ -10286,6 +11336,31 @@ started, already_tracking, _ = start_tracking_labels(
     who=who,
     update_tmux_context=False,
 )
+<<backfill adopted window batch ids>>
+@
+
+Adoption publishes the labels file before the session transition (so
+the hooks see the window as tracked from the first moment), which means
+the file cannot know batch ids yet.  Freshly started labels got a new
+batch just now; already-running ones keep the batch they were in, which
+is precisely the case adoption exists for.  Reading the session
+afterwards covers both.
+
+<<backfill adopted window batch ids>>=
+def backfill_adopted_batches():
+    session = load_active_session(who)
+    update_window_label_batches(
+        window_id,
+        who,
+        tmux_server_key,
+        {
+            label: session.active_labels[label][2]
+            for label in labels
+            if label in session.active_labels
+        },
+    )
+
+with_tmux_context_lock(backfill_adopted_batches)
 @
 
 Publication and cleanup are two halves of one act: the adopting
@@ -10386,6 +11461,24 @@ def test_adopt_merges_into_tracked_window(temp_tracking_dir):
   assert read_window_labels(
     "@7", "me", TEST_SERVER_KEY,
   ) == ["old", "new"]
+
+def test_adopt_records_batch_ids(temp_tracking_dir):
+  """Adopt backfills batch ids for fresh and running labels."""
+  runner.invoke(cli, ["start", "already", "--who", "me"])
+  result, _, _ = invoke_adopt(
+    ["already", "fresh", "--who", "me",
+     "--no-auto-suspend"],
+  )
+  assert result.exit_code == 0
+  session = load_active_session("me")
+  batches = read_window_label_batches(
+    "@7", "me", TEST_SERVER_KEY,
+  )
+  assert batches == {
+    lbl: session.active_labels[lbl][2]
+    for lbl in ["already", "fresh"]
+  }
+  assert batches["already"] != batches["fresh"]
 
 def test_adopt_reports_already_active_labels(temp_tracking_dir):
   """Labels already running are reported, not restarted."""
@@ -10744,6 +11837,100 @@ def test_remove_window_labels_empty_then_re_add(
   assert read_window_labels(
     window_id, who, TEST_SERVER_KEY,
   ) == ["a"]
+@
+
+The batch ids ride along with the counts: registration records them,
+removal of a shared contribution must not lose them, and both older
+file generations read back as batchless entries rather than errors.
+The backfill helper only corrects labels the file already lists.
+
+<<test functions>>=
+def test_window_label_batches_recorded_and_read(
+  temp_tracking_dir,
+):
+  """add_window_labels records batch ids for the batch view."""
+  window_id, who = "@42", "me"
+  add_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["a", "b"],
+    batches={"a": 3, "b": 3},
+  )
+  add_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["c"],
+    batches={"c": 4},
+  )
+  assert read_window_label_batches(
+    window_id, who, TEST_SERVER_KEY,
+  ) == {"a": 3, "b": 3, "c": 4}
+
+def test_window_label_batches_survive_shared_remove(
+  temp_tracking_dir,
+):
+  """Decrementing a shared label keeps its batch id."""
+  window_id, who = "@42", "me"
+  add_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["shared"],
+    batches={"shared": 7},
+  )
+  add_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["shared"],
+  )
+  remove_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["shared"],
+  )
+  assert read_window_label_batches(
+    window_id, who, TEST_SERVER_KEY,
+  ) == {"shared": 7}
+
+def test_window_label_file_accepts_legacy_formats(
+  temp_tracking_dir,
+):
+  """Flat-list and count-dict files read as batchless entries."""
+  who = "me"
+  list_path = window_labels_path(
+    "@1", who, TEST_SERVER_KEY,
+  )
+  list_path.parent.mkdir(parents=True, exist_ok=True)
+  list_path.write_text('["a", "a", "b"]')
+  assert read_window_label_counts(
+    "@1", who, TEST_SERVER_KEY,
+  ) == {"a": 1, "b": 1}
+  assert read_window_label_batches(
+    "@1", who, TEST_SERVER_KEY,
+  ) == {"a": None, "b": None}
+  window_labels_path(
+    "@2", who, TEST_SERVER_KEY,
+  ).write_text('{"a": 2, "b": 1}')
+  assert read_window_label_counts(
+    "@2", who, TEST_SERVER_KEY,
+  ) == {"a": 2, "b": 1}
+  assert read_window_label_batches(
+    "@2", who, TEST_SERVER_KEY,
+  ) == {"a": None, "b": None}
+
+def test_update_window_label_batches_backfills(
+  temp_tracking_dir,
+):
+  """Backfill sets ids for listed labels, ignores the rest."""
+  window_id, who = "@42", "me"
+  write_window_labels(
+    window_id, who, TEST_SERVER_KEY, ["a", "b"],
+  )
+  update_window_label_batches(
+    window_id, who, TEST_SERVER_KEY,
+    {"a": 5, "ghost": 6},
+  )
+  assert read_window_label_batches(
+    window_id, who, TEST_SERVER_KEY,
+  ) == {"a": 5, "b": None}
+  assert read_window_label_counts(
+    window_id, who, TEST_SERVER_KEY,
+  ) == {"a": 1, "b": 1}
+  update_window_label_batches(
+    "@99", who, TEST_SERVER_KEY, {"a": 5},
+  )
+  assert read_window_labels(
+    "@99", who, TEST_SERVER_KEY,
+  ) is None
 
 def test_install_tmux_window_sync_hooks_register_session_hooks():
     """Window sync installs only the authoritative session hook."""
@@ -10940,7 +12127,7 @@ def test_window_switch_detached_executes_tracked_to_tracked(
     ), patch(
         "nytid.cli.track.stop_tracking_labels",
     ) as mock_stop, patch(
-        "nytid.cli.track.start_tracking_labels",
+        "nytid.cli.track.restart_window_batches",
     ) as mock_start, patch(
         "nytid.cli.track.emit_window_event_debug",
     ) as mock_debug:
@@ -10961,9 +12148,10 @@ def test_window_switch_detached_executes_tracked_to_tracked(
     )
     mock_start.assert_called_once_with(
         who=who,
-        labels=["admin"],
+        window_id="@2",
+        tmux_server_key=TEST_SERVER_KEY,
+        label_batches={"admin": None},
         start_time=mock_stop.call_args.kwargs["end_time"],
-        update_tmux_context=False,
     )
     assert read_last_selected_window(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -11041,7 +12229,7 @@ def test_window_switch_detached_executes_untracked_to_tracked(
     ), patch(
         "nytid.cli.track.stop_tracking_labels",
     ) as mock_stop, patch(
-        "nytid.cli.track.start_tracking_labels",
+        "nytid.cli.track.restart_window_batches",
     ) as mock_start, patch(
         "nytid.cli.track.emit_window_event_debug",
     ) as mock_debug:
@@ -11068,6 +12256,74 @@ def test_window_switch_detached_executes_untracked_to_tracked(
             "@1", None, "@2", ["admin"],
         ),
     )
+
+
+def test_window_switch_round_trip_preserves_batches(
+    temp_tracking_dir,
+):
+    """Switching away and back keeps the window's batches."""
+    who = "me"
+    window_id = "@1"
+    write_window_labels(
+        window_id, who, TEST_SERVER_KEY, [],
+    )
+    env = {
+        "TMUX_PANE": "%99",
+        "TMUX": "/tmp/tmux.sock,123,0",
+    }
+    with patch.dict(os.environ, env), patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value=window_id,
+    ):
+        runner.invoke(
+            cli, ["start", "a", "b", "--who", who],
+        )
+        runner.invoke(cli, ["start", "c", "--who", who])
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, window_id,
+    )
+
+    def switch_to(target):
+        with patch(
+            "nytid.cli.track.get_tmux_selected_window_id",
+            return_value=target,
+        ), patch(
+            "nytid.cli.track.emit_window_event_debug",
+        ):
+            return runner.invoke(cli, [
+                "_window-switch-detached",
+                "--server-key", TEST_SERVER_KEY,
+                "--session-id", TEST_SESSION_ID,
+                "--who", who,
+            ])
+
+    assert switch_to("@2").exit_code == 0
+    assert load_active_session(
+        who,
+    ).get_active_labels() == []
+
+    assert switch_to(window_id).exit_code == 0
+    session = load_active_session(who)
+    assert (
+        session.active_labels["a"][2]
+        == session.active_labels["b"][2]
+    )
+    assert (
+        session.active_labels["c"][2]
+        != session.active_labels["a"][2]
+    )
+
+    with patch.dict(os.environ, env), patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value=window_id,
+    ):
+        stop_result = runner.invoke(
+            cli, ["stop", "--who", who],
+        )
+    assert stop_result.exit_code == 0
+    session = load_active_session(who)
+    assert "a" in session.active_labels
+    assert "c" not in session.active_labels
 
 
 def test_window_event_debug_disabled_by_default(
@@ -13450,6 +14706,7 @@ content, silently unhooking the pane from tracking:
 if outcome["added"]:
     _register_tmux_context_labels_unlocked(
         outcome["added"], resolved_who,
+        session=session,
     )
 if outcome["removed"]:
     _unregister_tmux_context_labels_unlocked(
@@ -13459,9 +14716,16 @@ if outcome["removed"]:
 
 The two selectors from \cref{sec:track-edit-active} meet here:
 [[--containing]] resolves through [[batch_labels_containing]], the
-default through [[most_recent_batch_labels]].  Batch members share
-their start time and batch id by the [[start_labels]] invariant, so
-reading them off the first member is enough:
+default through [[most_recent_batch_labels]] --- restricted, inside a
+tracked window, to that window's batches
+(\cref{track:window-batch-scope}), the same restriction a bare
+[[stop]] applies, so the invariant that [[edit]] corrects exactly what
+a following [[stop]] would end survives the scoping.  [[--containing]]
+deliberately ignores the window scope: it is an explicit selector, and
+its callers (scripted correction from outside any window) exist
+precisely because implicit selection cannot be trusted there.  Batch
+members share their start time and batch id by the [[start_labels]]
+invariant, so reading them off the first member is enough:
 
 <<resolve the target batch>>=
 if containing is not None:
@@ -13471,8 +14735,18 @@ if containing is not None:
             f"Label '{containing}' is not currently tracking"
         )
 else:
-    batch = session.most_recent_batch_labels()
+    scope = current_window_batch_scope(
+        session, resolved_who,
+    )
+    batch = session.most_recent_batch_labels(
+        among=scope,
+    )
     if not batch:
+        if scope is not None:
+            raise ValueError(
+                "No active tracking session "
+                "in this window"
+            )
         raise ValueError("No active tracking session")
 start_time, _, batch_id = session.active_labels[batch[0]]
 @
@@ -13949,7 +15223,7 @@ def test_edit_discard_leaves_unrelated_state(temp_tracking_dir):
   session = load_active_session()
   assert session.get_active_labels() == ["B"]
   assert session.switch_other == ["A"]
-  assert session.last_stopped == ["A"]
+  assert session.last_stopped_labels() == ["A"]
 
 def test_edit_discard_unregisters_pane_labels(temp_tracking_dir):
   """A discarded batch leaves the pane context file."""
@@ -15327,11 +16601,16 @@ from nytid.cli.track import (
     window_labels_path,
     read_window_labels,
     read_window_label_counts,
+    read_window_label_batches,
     write_window_labels,
     add_window_labels,
+    update_window_label_batches,
     remove_window_labels,
     delete_window_labels,
+    current_window_batch_scope,
     suspend_tracking_labels,
+    restart_window_batches,
+    resume_stopped_batches,
     resume_tracking_labels,
     summarize_window_transition,
     with_tmux_context_lock,
@@ -16321,6 +17600,41 @@ def test_stop_all_keeps_window_tracked_and_resume_reassociates(
   ) == ["X"]
 @
 
+Registration is where batch ids reach the window file, and it must work
+from the empty tracked marker too: starting labels during a break in a
+drained-but-tracked window records both the labels and their batch,
+which is what makes the later window-scoped [[stop]] find them.
+
+<<test functions>>=
+def test_start_in_tracked_window_records_batch_ids(
+  temp_tracking_dir,
+):
+  """Starting in a tracked (even empty) window records batch ids."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["start", "A", "B"])
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  batches = read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  )
+  assert batches == {
+    lbl: session.active_labels[lbl][2]
+    for lbl in ["A", "B"]
+  }
+  assert batches["A"] == batches["B"]
+@
+
 The [[--timeout]] option only applies to direct subprocesses, not
 tmux panes.
 
@@ -16572,6 +17886,52 @@ def test_run_tmux_command_publishes_window_labels_unsuspended(
   assert "stop" not in events
   assert "sync-hooks" not in events
   assert "cleanup-hook" in events
+@
+
+The published file starts batchless (the launch cannot know ids that
+the transition may still change) and gains its ids from the backfill.
+The session was mutated by the [[start]] command before the launch, so
+the backfill finds the labels' batches there.
+
+<<test functions>>=
+def test_run_tmux_command_backfills_window_batch_ids(
+  temp_tracking_dir,
+):
+  """A window launch backfills the published file's batch ids."""
+  runner.invoke(cli, ["start", "work"])
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      window=True,
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      focus_window=True,
+      auto_suspend=False,
+    )
+
+  session = load_active_session(default_username)
+  assert read_window_label_batches(
+    "@7", default_username, TEST_SERVER_KEY,
+  ) == {"work": session.active_labels["work"][2]}
 
 
 def test_make_tmux_completion_guard_without_status_file():
@@ -16679,13 +18039,15 @@ The tracked-window launch path holds the tmux-context lock only across
 the narrow hook-observability phase: [[new-window]], label publication,
 and the [[last_selected_window]] write.  After releasing the lock it
 executes the source stop, target start, and one debug emission inline,
-then installs the session sync hook and cleanup hook.
+then briefly retakes the lock to backfill the published file's batch
+ids (they are only final after the transition) before installing the
+session sync hook and cleanup hook.
 
 <<test functions>>=
 def test_run_tmux_command_locks_window_launch_setup(
     temp_tracking_dir,
 ):
-    """Lock covers only the hook-observability phase."""
+    """Locks cover state publication and batch backfill only."""
     events = []
 
     def fake_with_tmux_context_lock(callback):
@@ -16785,6 +18147,8 @@ def test_run_tmux_command_locks_window_launch_setup(
         "start",
         "debug",
         "sync-hooks",
+        "lock-enter",
+        "lock-exit",
         "cleanup-hook",
         "ready",
     ]
