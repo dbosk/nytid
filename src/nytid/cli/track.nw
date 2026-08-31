@@ -1686,7 +1686,8 @@ class ActiveSession:
         end_time: datetime.datetime = None,
         count: int = None,
         stop_batch: bool = True,
-        who: str = None
+        who: str = None,
+        among: set[int] = None,
     ) -> list[TrackingEntry]:
         """
         Stop tracking for specified labels and return completed entries.
@@ -1697,23 +1698,33 @@ class ActiveSession:
             count: Number of most recently started labels to stop. If None, uses batch logic.
             stop_batch: If True (default), stopping without arguments stops the most recent batch.
             who: Worker identity (default $USER).
+            among: Batch ids the batch selection may pick from;
+                None leaves the selection unrestricted.
 
         Returns:
             List of TrackingEntry objects for the stopped labels
 
         Raises:
             ValueError: if `end_time` is not after the start time of
-                every label that would be stopped
+                every label that would be stopped, or if `among`
+                excludes every batch while labels are active
         """
         if who is None:
             who = default_username
         if end_time is None:
             end_time = datetime.datetime.now()
-        
+
         # Determine which labels to stop
         if labels is None and count is None:
             if stop_batch and self.label_order:
-                labels = self.most_recent_batch_labels()
+                labels = self.most_recent_batch_labels(
+                    among=among,
+                )
+                if not labels:
+                    raise ValueError(
+                        "No labels are tracking "
+                        "in this window"
+                    )
             else:
                 # Stop most recently started label only
                 if not self.label_order:
@@ -3054,6 +3065,18 @@ matters when a caller has filtered a candidate list down to nothing;
 the empty list means \enquote{I chose these specific labels and there
 are zero}, not \enquote{please stop the batch}.
 
+Only the batch-stop path is window-scoped
+(\cref{track:window-batch-scope}).  Naming labels or passing
+[[--all]] is an explicit request that should mean the same thing in
+every shell; it is the \emph{implicit} \enquote{what I am doing now}
+that must not be stolen by tracking started elsewhere.  The scope is
+computed inside the [[update]] closure because that is where both
+requirements meet: the tmux-context lock is held (so the window file
+cannot change under us) and the freshly loaded session is at hand (to
+resolve legacy batchless entries).  Note that a bare [[switch]] closes
+its current context through this very function, so the scoping covers
+it without further wiring.
+
 The todo wrapper needs one more operation: stop a specific label and,
 optionally, a few companion labels, but only if they are currently
 active and not protected by some higher-level policy.  Rather than let
@@ -3118,6 +3141,9 @@ def stop_tracking_labels(
                 end_time=end_time,
                 stop_batch=True,
                 who=who,
+                among=current_window_batch_scope(
+                    session, resolved_who,
+                ),
             )
 
         updated_entries = list(history_entries)
@@ -8312,6 +8338,192 @@ def test_current_window_batch_scope(temp_tracking_dir):
     assert current_window_batch_scope(
       session, default_username,
     ) == {a_id, b_id}
+@
+
+End to end, the promise reads: a batch started in a plain shell after
+the window's batch must not be what a bare [[stop]] or hashless
+[[edit]] in the window acts on---and during a break the bare commands
+find nothing rather than reaching for the global batch.  An explicit
+[[--containing]], by contrast, crosses the window boundary on purpose.
+
+<<test functions>>=
+def test_bare_stop_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """A bare stop in a tracked window skips newer global batches."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop"])
+  assert result.exit_code == 0
+  assert "windowed" in result.output
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+  assert "windowed" not in session.active_labels
+
+def test_bare_stop_in_empty_tracked_window_errors(
+  temp_tracking_dir,
+):
+  """During a break, bare stop refuses to grab a global batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop"])
+  assert result.exit_code == 1
+  assert "in this window" in result.output
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+
+def test_hashless_edit_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """A hashless edit in a tracked window targets its batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["edit", "-a", "extra"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert (
+    session.active_labels["extra"][2]
+    == session.active_labels["windowed"][2]
+  )
+  assert (
+    session.active_labels["global"][2]
+    != session.active_labels["windowed"][2]
+  )
+
+def test_hashless_edit_in_empty_tracked_window_errors(
+  temp_tracking_dir,
+):
+  """Editing during a break names the window in its error."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["edit", "-a", "extra"],
+    )
+  assert result.exit_code == 1
+  assert "in this window" in result.output
+
+def test_containing_crosses_window_scope(
+  temp_tracking_dir,
+):
+  """--containing reaches a global batch from inside a window."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+    result = runner.invoke(
+      cli,
+      ["edit", "--containing", "global",
+       "-a", "extra"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert (
+    session.active_labels["extra"][2]
+    == session.active_labels["global"][2]
+  )
+
+def test_bare_switch_scoped_to_tracked_window(
+  temp_tracking_dir,
+):
+  """switch in a tracked window suspends only its batch."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(
+      cli, ["switch", "meeting"],
+    )
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  assert "global" in session.active_labels
+  assert "meeting" in session.active_labels
+  assert "windowed" not in session.active_labels
 @
 
 \subsubsection{Window Transition Execution}
@@ -13913,9 +14125,16 @@ if outcome["removed"]:
 
 The two selectors from \cref{sec:track-edit-active} meet here:
 [[--containing]] resolves through [[batch_labels_containing]], the
-default through [[most_recent_batch_labels]].  Batch members share
-their start time and batch id by the [[start_labels]] invariant, so
-reading them off the first member is enough:
+default through [[most_recent_batch_labels]] --- restricted, inside a
+tracked window, to that window's batches
+(\cref{track:window-batch-scope}), the same restriction a bare
+[[stop]] applies, so the invariant that [[edit]] corrects exactly what
+a following [[stop]] would end survives the scoping.  [[--containing]]
+deliberately ignores the window scope: it is an explicit selector, and
+its callers (scripted correction from outside any window) exist
+precisely because implicit selection cannot be trusted there.  Batch
+members share their start time and batch id by the [[start_labels]]
+invariant, so reading them off the first member is enough:
 
 <<resolve the target batch>>=
 if containing is not None:
@@ -13925,8 +14144,18 @@ if containing is not None:
             f"Label '{containing}' is not currently tracking"
         )
 else:
-    batch = session.most_recent_batch_labels()
+    scope = current_window_batch_scope(
+        session, resolved_who,
+    )
+    batch = session.most_recent_batch_labels(
+        among=scope,
+    )
     if not batch:
+        if scope is not None:
+            raise ValueError(
+                "No active tracking session "
+                "in this window"
+            )
         raise ValueError("No active tracking session")
 start_time, _, batch_id = session.active_labels[batch[0]]
 @
