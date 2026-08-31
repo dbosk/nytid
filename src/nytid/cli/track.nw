@@ -1636,8 +1636,10 @@ class ActiveSession:
         self.batches: dict[int, list[str]] = {}
         # Next batch ID to use
         self.next_batch_id: int = 1
-        # Remember last stopped labels for resume functionality
-        self.last_stopped: list[str] = []
+        # Remember last stopped batches for resume: each group is
+        # {"labels": [...], "batch": id, "window": id or None,
+        #  "server_key": key or None}
+        self.last_stopped: list[dict] = []
         # The other side of the toggle for switch.
         # A forward switch saves stopped labels here; a bare
         # switch toggles between current and this saved set.
@@ -1791,6 +1793,16 @@ entry.  Two labels started together cover the same wall-clock interval,
 so emitting them separately would double-count that time in every
 downstream total.
 
+The resume set records the same grouping.  A flat label list here
+would destroy structure the history preserves: [[stop --all]] across
+three batches followed by a bare [[start]] used to merge everything
+into one new batch, so the next bare [[stop]] no longer meant what it
+did before the break.  Each group also keeps its old batch id---ids
+never recur, so this is a safe correlation key for the window
+annotation in [[stop_tracking_labels]]---and two [[None]] slots for
+that annotation to fill in.  Group order follows [[label_order]], so
+recreating the groups in list order restores their relative recency.
+
 <<active session class>>=
         groups = {}
         stopped = []
@@ -1809,7 +1821,16 @@ downstream total.
                 groups[key][1].append(label)
 
         if stopped:
-            self.last_stopped = stopped
+            self.last_stopped = [
+                {
+                    "labels": list(grp_labels),
+                    "batch": key[1],
+                    "window": None,
+                    "server_key": None,
+                }
+                for key, (st, grp_labels, notes)
+                in groups.items()
+            ]
 
         entries = []
         for key, (st, grp_labels, notes) in (
@@ -1824,6 +1845,21 @@ downstream total.
         return entries
 @
 
+Most consumers of the resume set only care about the names---the
+resume announcement, tests, the resume path's fallback.  Rather than
+have each of them re-derive the flattening (and drift on ordering), we
+expose it once:
+
+<<active session class>>=
+    def last_stopped_labels(self) -> list[str]:
+        """Return the last stopped labels as a flat list."""
+        return [
+            label
+            for group in self.last_stopped
+            for label in group["labels"]
+        ]
+@
+
 Let's verify that a stop naming an unknown label leaves the resume set
 alone---first at the class level, then end-to-end through the CLI, where
 the failing exit code and the surviving resume set must coexist:
@@ -1834,10 +1870,10 @@ def test_failed_stop_keeps_last_stopped(temp_tracking_dir):
   session = ActiveSession()
   session.start_labels(["A", "B"], datetime.datetime.now())
   session.stop_labels()
-  assert set(session.last_stopped) == {"A", "B"}
+  assert set(session.last_stopped_labels()) == {"A", "B"}
 
   assert session.stop_labels(["TYPO"]) == []
-  assert set(session.last_stopped) == {"A", "B"}
+  assert set(session.last_stopped_labels()) == {"A", "B"}
 
 def test_failed_stop_does_not_break_resume(temp_tracking_dir):
   """A mistyped stop must not make bare start resume a phantom label."""
@@ -1847,12 +1883,50 @@ def test_failed_stop_does_not_break_resume(temp_tracking_dir):
   result = runner.invoke(cli, ["stop", "TYPO"])
   assert result.exit_code == 1
 
-  assert set(load_active_session().last_stopped) == {"A", "B"}
+  assert set(
+    load_active_session().last_stopped_labels()
+  ) == {"A", "B"}
 
   result = runner.invoke(cli, ["start"])
   assert result.exit_code == 0
   assert "TYPO" not in result.stdout
   assert set(load_active_session().get_active_labels()) == {"A", "B"}
+@
+
+The resume set's grouping and its migration from the old flat form are
+worth checking at the class level:
+
+<<test functions>>=
+def test_stop_all_groups_resume_set_by_batch(
+  temp_tracking_dir,
+):
+  """Stopping everything records one resume group per batch."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["a", "b"], t0)
+  session.start_labels(["c"], t0)
+  session.stop_labels(count=len(session.label_order))
+  assert [
+    g["labels"] for g in session.last_stopped
+  ] == [["a", "b"], ["c"]]
+  assert all(
+    g["window"] is None for g in session.last_stopped
+  )
+  assert session.last_stopped_labels() == ["a", "b", "c"]
+
+def test_from_dict_migrates_flat_last_stopped():
+  """A flat last_stopped list loads as one window-less group."""
+  session = ActiveSession()
+  session.start_labels(["x"], datetime.datetime.now())
+  data = session.to_dict()
+  data["last_stopped"] = ["a", "b"]
+  restored = ActiveSession.from_dict(data)
+  assert restored.last_stopped == [{
+    "labels": ["a", "b"], "batch": None,
+    "window": None, "server_key": None,
+  }]
+  data["last_stopped"] = []
+  assert ActiveSession.from_dict(data).last_stopped == []
 @
 
 \subsubsection{Selecting the Target Batch}
@@ -2319,12 +2393,16 @@ def test_edit_batch_leaves_unrelated_state():
   session = ActiveSession()
   session.start_labels(["A"], datetime.datetime.now())
   session.switch_other = ["saved"]
-  session.last_stopped = ["earlier"]
+  earlier = [{
+    "labels": ["earlier"], "batch": None,
+    "window": None, "server_key": None,
+  }]
+  session.last_stopped = list(earlier)
 
   session.edit_batch(1, ["B"])
 
   assert session.switch_other == ["saved"]
-  assert session.last_stopped == ["earlier"]
+  assert session.last_stopped == earlier
 @
 
 <<active session class>>=
@@ -2443,7 +2521,18 @@ def test_edit_batch_leaves_unrelated_state():
             if 'next_batch_id' in data:
                 session.next_batch_id = data['next_batch_id']
             if 'last_stopped' in data:
-                session.last_stopped = data['last_stopped']
+                stored = data['last_stopped']
+                if stored and isinstance(stored[0], str):
+                    # Old format: flat label list —
+                    # migrate to one window-less group.
+                    session.last_stopped = [{
+                        "labels": list(stored),
+                        "batch": None,
+                        "window": None,
+                        "server_key": None,
+                    }]
+                else:
+                    session.last_stopped = stored
             if 'switch_other' in data:
                 # New format: single saved set (toggle semantics)
                 session.switch_other = data['switch_other']
@@ -3146,6 +3235,10 @@ def stop_tracking_labels(
                 ),
             )
 
+        if completed_entries:
+            annotate_last_stopped_windows(
+                session, resolved_who,
+            )
         updated_entries = list(history_entries)
         updated_entries.extend(completed_entries)
         stopped_labels[:] = [
@@ -3211,6 +3304,10 @@ def stop_tracking_labels_if_active(
             who=who,
         )
         active_labels.extend(to_stop)
+        if completed_entries:
+            annotate_last_stopped_windows(
+                session, resolved_who,
+            )
         updated_entries = list(history_entries)
         updated_entries.extend(completed_entries)
         stopped_labels[:] = [
@@ -3248,6 +3345,256 @@ def update_switch_other_labels(
         return session, history_entries
 
     mutate_worker_tracking_state(update, who)
+@
+
+A bare [[start]] resumes the last stopped labels, and the resume set
+remembers its batch grouping (\cref{track:window-batch-scope}).
+Passing the flat label list to [[start_tracking_labels]] would merge
+every group into one fresh batch---precisely the structure loss the
+grouped resume set exists to prevent.  This function instead restarts
+one batch per group, inside a single
+[[mutate_worker_tracking_state]] call so the whole resume is atomic,
+and in list order, which restores the groups' relative recency (new
+batch ids grow monotonically).  It returns the same
+[[(started, already_tracking, discarded)]] triple as
+[[start_tracking_labels]] so the [[start]] command's reporting code
+serves both paths.
+
+<<session management>>=
+def resume_stopped_batches(
+    *,
+    who: str = None,
+    start_time: datetime.datetime = None,
+):
+    """Restart the last stopped batches, one batch per group."""
+    if start_time is None:
+        start_time = datetime.datetime.now()
+    resolved_who = (
+        who if who is not None
+        else default_username
+    )
+    started_labels = []
+    already_tracking = []
+    resumed_groups = []
+
+    def update(session, history_entries):
+        <<restart each stopped group as its own batch>>
+        return session, history_entries
+
+    def sync_tmux_context(session, history_entries):
+        <<register resumed groups into their windows>>
+
+    mutate_worker_tracking_state(
+        update, who,
+        post_update=sync_tmux_context,
+    )
+    return started_labels, already_tracking, []
+@
+
+A group's labels may have been restarted individually since the stop;
+[[start_labels]] skips active labels, and a group whose every label is
+already running contributes no new batch.  The freshly started labels
+share one batch id by the [[start_labels]] invariant, so reading it
+off the first suffices.
+
+<<restart each stopped group as its own batch>>=
+for group in list(session.last_stopped):
+    labels = list(group["labels"])
+    started = session.start_labels(labels, start_time)
+    if not started:
+        already_tracking.extend(labels)
+        continue
+    started_labels.extend(started)
+    already_tracking.extend(
+        label for label in labels
+        if label not in started
+    )
+    resumed_groups.append({
+        "labels": started,
+        "batch": session.active_labels[started[0]][2],
+        "window": group.get("window"),
+        "server_key": group.get("server_key"),
+    })
+@
+
+Re-registration is what makes the round trip complete: a window-tagged
+group returns to \emph{its} window's file, with its new batch id, even
+when the [[start]] was typed somewhere else.  The existence check is
+the \enquote{window still exists} test, and it deliberately accepts
+the empty tracked marker---stopping everything in a window keeps the
+file precisely so that this resume re-attaches the labels instead of
+degrading them to globals.  A group whose window is gone (file
+deleted, other server, never tagged) falls back to today's behavior:
+register into whatever pane/window context the command runs in.
+Window-tagged groups skip the current pane file on purpose---they
+belong to their window, not to the pane the user happened to type in.
+
+<<register resumed groups into their windows>>=
+for group in resumed_groups:
+    window_id = group["window"]
+    server_key = group["server_key"]
+    if (
+        window_id
+        and server_key
+        and read_window_labels(
+            window_id, resolved_who, server_key,
+        ) is not None
+    ):
+        add_window_labels(
+            window_id, resolved_who, server_key,
+            group["labels"],
+            batches={
+                label: group["batch"]
+                for label in group["labels"]
+            },
+        )
+    else:
+        _register_tmux_context_labels_unlocked(
+            group["labels"], resolved_who,
+            session=session,
+        )
+@
+
+The round trip this machinery exists for: [[stop --all]] over several
+batches, then a bare [[start]], must restore the batch structure ---
+including a window's batch returning to its window file even when the
+[[start]] is typed outside tmux --- and a bare [[stop]] afterwards
+must again mean \enquote{the most recent batch}, not
+\enquote{everything}.
+
+<<test functions>>=
+def test_stop_all_start_restores_batches(
+  temp_tracking_dir,
+):
+  """stop --all then bare start restores separate batches."""
+  runner.invoke(cli, ["start", "a", "b"])
+  runner.invoke(cli, ["start", "c"])
+  runner.invoke(cli, ["stop", "--all"])
+  result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  assert "Resuming" in result.output
+  session = load_active_session()
+  assert (
+    session.active_labels["a"][2]
+    == session.active_labels["b"][2]
+  )
+  assert (
+    session.active_labels["c"][2]
+    != session.active_labels["a"][2]
+  )
+  stop_result = runner.invoke(cli, ["stop"])
+  assert stop_result.exit_code == 0
+  assert "c" in stop_result.output
+  session = load_active_session()
+  assert "a" in session.active_labels
+  assert "c" not in session.active_labels
+
+def test_stop_annotates_resume_groups_with_window(
+  temp_tracking_dir,
+):
+  """A stop stamps each resume group with its owning window."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["stop", "--all"])
+  assert result.exit_code == 0
+  groups = {
+    tuple(g["labels"]): g
+    for g in load_active_session().last_stopped
+  }
+  assert groups[("windowed",)]["window"] == window_id
+  assert (
+    groups[("windowed",)]["server_key"]
+    == TEST_SERVER_KEY
+  )
+  assert groups[("global",)]["window"] is None
+
+def test_stop_all_start_reattaches_window_batches(
+  temp_tracking_dir,
+):
+  """Resume returns a window's batch to its window file."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+  with patch.dict(os.environ, {}, clear=True):
+    runner.invoke(cli, ["start", "global"])
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["stop", "--all"])
+    assert read_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+    ) == []
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) == {
+    "windowed": session.active_labels["windowed"][2],
+  }
+  assert (
+    session.active_labels["global"][2]
+    != session.active_labels["windowed"][2]
+  )
+
+def test_resume_degrades_when_window_gone(
+  temp_tracking_dir,
+):
+  """A resumed group whose window file vanished goes global."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    runner.invoke(cli, ["start", "windowed"])
+    runner.invoke(cli, ["stop", "--all"])
+  delete_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+  )
+  with patch.dict(os.environ, {}, clear=True):
+    result = runner.invoke(cli, ["start"])
+  assert result.exit_code == 0
+  session = load_active_session()
+  assert "windowed" in session.active_labels
+  assert read_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) is None
 @
 
 Now we combine all state management functions:
@@ -3363,11 +3710,13 @@ such as resume and launch validation.  The actual state mutation happens
 session = load_active_session(who)
 
 # If no labels provided, try to resume last stopped labels
+resume_batches = False
 if not labels:
     if command_args is not None:
         labels = []
     elif session.last_stopped:
-        labels = session.last_stopped
+        labels = session.last_stopped_labels()
+        resume_batches = True
         typer.echo(
             f"Resuming: {', '.join(sorted(labels))}"
         )
@@ -3575,15 +3924,30 @@ string as the batch description.  We attach it to every newly started label in
 that batch so the grouped entry keeps the description regardless of which label
 is encountered first during shutdown.
 
+A plain bare [[start]] takes the batch-preserving resume path instead,
+so a [[stop --all]] followed by [[start]] restores the stopped batches
+rather than merging them into one.  Launch modes keep the flat path: a
+new window or command legitimately claims the resumed labels as one
+fresh batch of its own.  So does [[--replace]], whose discard-and-
+restart semantics for still-active labels only exist on the flat path.
+
 <<start tracking and report results>>=
-started, already_tracking, discarded = start_tracking_labels(
-    launch_owned_labels,
-    start_time=start_time,
-    who=who,
-    replace=replace,
-    description=command_text,
-    update_tmux_context=not (pane or window),
-)
+if resume_batches and not launch_requested and not replace:
+    started, already_tracking, discarded = (
+        resume_stopped_batches(
+            who=who,
+            start_time=start_time,
+        )
+    )
+else:
+    started, already_tracking, discarded = start_tracking_labels(
+        launch_owned_labels,
+        start_time=start_time,
+        who=who,
+        replace=replace,
+        description=command_text,
+        update_tmux_context=not (pane or window),
+    )
 
 if discarded:
     typer.echo(
@@ -8290,6 +8654,54 @@ def current_window_batch_scope(
         elif label in session.active_labels:
             scope.add(session.active_labels[label][2])
     return scope
+@
+
+The inverse question---\enquote{which window does this batch belong
+to?}---arises when a stop snapshots the resume set: the answer lets a
+later bare [[start]] re-attach each resumed batch to its window.  The
+lookup keys on batch ids, not label names, because two tracked windows
+may legitimately declare the same label (that is why the files hold
+reference counts); the batch id is unique across the session.  It must
+run \emph{before} the stop's [[post_update]] drains the current
+window's file, which is exactly the order
+[[mutate_worker_tracking_state]] gives its [[update]] callback.
+Outside tmux there is nothing to consult and the groups stay
+window-less, degrading resume to today's current-context behavior.
+
+<<helper functions>>=
+def annotate_last_stopped_windows(
+    session,
+    who: str,
+) -> None:
+    """Stamp last_stopped groups with their owning windows.
+
+    Requires the tmux-context lock to already be held.
+    """
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return
+    batch_windows = {}
+    pattern = (
+        "window_labels"
+        f"_{sanitize_tmux_id(tmux_server_key)}"
+        f"_window_*_{sanitize_who(who)}.json"
+    )
+    for path in get_tmux_state_dir().glob(pattern):
+        match = _STATE_FILE_ID_RE.search(path.name)
+        if not match:
+            continue
+        window_id = f"@{match.group(2)}"
+        batches = read_window_label_batches(
+            window_id, who, tmux_server_key,
+        ) or {}
+        for batch_id in batches.values():
+            if batch_id is not None:
+                batch_windows[batch_id] = window_id
+    for group in session.last_stopped:
+        window_id = batch_windows.get(group.get("batch"))
+        if window_id is not None:
+            group["window"] = window_id
+            group["server_key"] = tmux_server_key
 @
 
 The three scope shapes---untracked, tracked-but-empty, and populated
@@ -14632,7 +15044,7 @@ def test_edit_discard_leaves_unrelated_state(temp_tracking_dir):
   session = load_active_session()
   assert session.get_active_labels() == ["B"]
   assert session.switch_other == ["A"]
-  assert session.last_stopped == ["A"]
+  assert session.last_stopped_labels() == ["A"]
 
 def test_edit_discard_unregisters_pane_labels(temp_tracking_dir):
   """A discarded batch leaves the pane context file."""
