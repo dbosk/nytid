@@ -79,7 +79,7 @@ import typer
 import typerconf as config
 from nytid.cli.utils.defaults import default
 from nytid.cli.utils.labels import apply_label_edits
-from nytid.cli.utils.output import print_rows
+from nytid.cli.utils.output import print_markdown, print_rows
 from typing import Annotated
 from dataclasses import dataclass, field
 from enum import Enum
@@ -6736,11 +6736,60 @@ Because [[note]] and [[done]] follow the same convention, [[view]] now
 uses the shared [[resolve_todo_id()]] helper rather than reimplementing
  the stack lookup inline.
 
+\paragraph{Two readers, two renderings}
+
+[[view]] has the same two audiences as the listings in
+\cref{cli.utils.output}, and here the gap between them is widest.
+Notes and descriptions are Markdown, so a person at a terminal is
+best served by rendering them---and by a title that stands out, a
+metadata block that lines up and a sub-item table---while an agent
+running [[nytid todo view]] to plan its work wants the notes exactly
+as written, ready to quote or extend with [[note]].
+We therefore keep two renderers: a rich one for terminals and the
+original plain one for everything else, chosen by [[isatty()]] as
+[[ls]] does.
+The plain renderer is deliberately the old output, byte for byte, so
+that the switch changes nothing for pipes.
+
+The rich renderer is also where [[rich]] gets imported, and only there:
+\cref{sec:cli-import-cost} explains why the import must stay out of
+module scope, and keeping it out of the plain branch too means an agent
+calling [[view]] in a loop never pays for a library whose output it
+does not want.
+
+[[--format]] overrides the detection in either direction.
+Forcing [[rich]] serves the user who pipes into [[less -R]] to read a
+long note; forcing [[plain]] serves the one who wants to copy the
+Markdown source out of a terminal.
+Unlike [[ls]] there is no configuration key for it: the automatic
+choice is right for both audiences, so the override is an occasional
+tool rather than a preference.
+
+<<constants>>=
+class ViewFormat(str, Enum):
+    """Output formats for ``todo view``."""
+    auto = "auto"
+    rich = "rich"
+    plain = "plain"
+@
+
 <<argument and option definitions>>=
 todo_id_arg = typer.Argument(
     help="Todo ID (default: current active todo)",
     autocompletion=complete_todo_ids)
+view_format_opt = typer.Option(
+    "--format", "-f",
+    help="Output format: auto (rich on a terminal, "
+         "plain otherwise), rich, plain")
 @
+
+Both renderers show the same things, so the command first gathers
+what there is to show---the metadata fields, the notes or GitHub
+content, the visible sub-items---and only then renders it.
+Sharing the gathered data rather than sharing chunks between the two
+renderers is what keeps them from drifting apart: a field added to
+[[<<collect metadata fields>>]] appears in both outputs, and neither
+renderer can show something the other lacks.
 
 <<view command>>=
 @cli.command()
@@ -6749,12 +6798,17 @@ def view(
                        todo_id_arg] = None,
     include_done: Annotated[bool,
                             done_opt] = False,
+    output_format: Annotated[ViewFormat,
+                             view_format_opt] = ViewFormat.auto,
 ):
     """View a todo item with full details.
 
     If no ID given, shows the current active task.
     Done sub-items are
     hidden by default; pass --done to include them.
+    Notes are rendered as Markdown on a terminal and printed as
+    written when piped; --format rich or --format plain forces
+    either.
     """
     _, todos = load_todos()
 
@@ -6773,49 +6827,55 @@ def view(
         )
         raise typer.Exit(1)
 
-    <<display todo details>>
-    <<display todo children>>
+    <<decide whether to render richly>>
+    <<collect metadata fields>>
+    <<fetch GitHub content>>
+    <<collect visible sub-items>>
+    if use_rich:
+        <<render view with rich>>
+    else:
+        <<render view as plain text>>
 @
 
-<<display todo details>>=
-typer.echo(
-    f"#{item.id} {item.title} [{item.status}]"
-)
-parts = []
-if item.priority is not None:
-    parts.append(f"Priority: {item.priority:.1f}")
+<<decide whether to render richly>>=
+if output_format == ViewFormat.auto:
+    use_rich = sys.stdout.isatty()
 else:
-    parts.append("Priority: unset")
+    use_rich = output_format == ViewFormat.rich
+@
+
+The metadata is an ordered list of label--value pairs.
+Priority is the one field that is always present---an unranked item
+says so explicitly, because a missing priority is the usual reason an
+item sorts unexpectedly and the user should not have to infer it from
+an absent line.
+
+<<collect metadata fields>>=
+fields = []
+if item.priority is not None:
+    fields.append(("Priority", f"{item.priority:.1f}"))
+else:
+    fields.append(("Priority", "unset"))
 if item.deadline:
-    parts.append(f"Deadline: {item.deadline}")
+    fields.append(("Deadline", str(item.deadline)))
 if item.estimated:
-    parts.append(f"Est: {item.estimated:.1f}h")
-if parts:
-    typer.echo("  " + "  ".join(parts))
-meta_parts = []
+    fields.append(("Est", f"{item.estimated:.1f}h"))
 if item.labels:
-    meta_parts.append(
-        f"Labels: {', '.join(item.labels)}"
-    )
+    fields.append(("Labels", ", ".join(item.labels)))
 if item.who:
-    meta_parts.append(f"Worker: {item.who}")
-if meta_parts:
-    typer.echo("  " + "  ".join(meta_parts))
+    fields.append(("Worker", item.who))
 if item.wd:
-    typer.echo(f"  WD: {item.wd}")
+    fields.append(("WD", item.wd))
 if item.worktree:
-    typer.echo(f"  Worktree: {item.worktree}")
+    fields.append(("Worktree", item.worktree))
 if item.command:
-    typer.echo(f"  Command: {item.command}")
+    fields.append(("Command", item.command))
 if item.github:
     gh = item.github
-    typer.echo(
-        f"  GitHub: {gh['repo']}"
-        f"#{gh['number']} ({gh.get('type', 'issue')})"
-    )
-if item.description:
-    typer.echo(f"  Description: {item.description}")
-<<display notes>>
+    fields.append((
+        "GitHub",
+        f"{gh['repo']}#{gh['number']} ({gh.get('type', 'issue')})",
+    ))
 @
 
 For GitHub-linked items, we fetch the issue body and comments
@@ -6824,50 +6884,37 @@ For local-only items, we display the stored [[notes]] field. This
 design means GitHub is the source of truth for notes on linked
 items---we never cache them locally, avoiding stale data.
 
-<<display notes>>=
+The fetch normalises each comment into an (author, date, body) triple
+so that neither renderer has to know the shape of the [[gh]] JSON.
+A failed fetch is reported on stderr right here rather than by the
+renderers: stderr is a separate stream, so the position only matters
+on a terminal, and there a warning that the notes are missing reads
+better above the todo than buried below its metadata.
+
+<<fetch GitHub content>>=
+gh_body = None
+gh_comments = []
 if item.github:
     try:
         gh = item.github
-        repo = gh["repo"]
-        number = gh["number"]
-        item_type = gh.get("type", "issue")
-        if item_type == "pr":
-            data = gh_fetch_pr(repo, number)
+        if gh.get("type", "issue") == "pr":
+            data = gh_fetch_pr(gh["repo"], gh["number"])
         else:
-            data = gh_fetch_issue(repo, number)
-        if data.get("body"):
-            typer.echo("")
-            typer.echo("Description:")
-            for line in data["body"].splitlines():
-                typer.echo(f"  {line}")
-        comments = data.get("comments", [])
-        if comments:
-            typer.echo("")
-            typer.echo("Comments:")
-            for comment in comments:
-                author = comment.get(
-                    "author", {}
-                ).get("login", "unknown")
-                created = comment.get(
-                    "createdAt", ""
-                )[:10]
-                typer.echo(
-                    f"  [{author} {created}]"
-                )
-                body = comment.get("body", "")
-                for line in body.splitlines():
-                    typer.echo(f"    {line}")
-                typer.echo("")
+            data = gh_fetch_issue(gh["repo"], gh["number"])
+        gh_body = data.get("body")
+        gh_comments = [
+            (
+                comment.get("author", {}).get("login", "unknown"),
+                comment.get("createdAt", "")[:10],
+                comment.get("body", ""),
+            )
+            for comment in data.get("comments", [])
+        ]
     except Exception as e:
         typer.echo(
             f"  (Could not fetch GitHub data: {e})",
             err=True,
         )
-elif item.notes:
-    typer.echo("")
-    typer.echo("Notes:")
-    for line in item.notes.splitlines():
-        typer.echo(f"  {line}")
 @
 
 Children and grandchildren use the same display ordering as [[ls]]:
@@ -6878,66 +6925,241 @@ tasks that have not been numerically ranked yet.
 Done sub-items are hidden by default for the same reason as in
 [[ls]]---a long list of completed children clutters the view of
 what remains to be done.  Passing [[--done]] includes them.  When
-items are hidden we print a short hint so the user knows there is
-more to see; without the hint a parent could appear childless even
-though it has completed sub-items.
+items are hidden we count them so the renderers can print a short
+hint; without it a parent could appear childless even though it has
+completed sub-items.
 
-<<display todo children>>=
-all_children = get_children(todos, item.id)
-children = sort_todos_for_display(all_children)
+The result is a flat list of (depth, item) rows, children at depth
+zero and grandchildren at depth one, in the order they are to appear.
+Flattening here means each renderer is a single loop with an
+indentation rule, instead of two nested loops that would each have to
+repeat the done-filtering.
+A hidden child takes its grandchildren with it uncounted, exactly as
+the nested loops did: they belong to a branch the user chose not to
+see.
+
+<<collect visible sub-items>>=
+rows = []
 hidden_done = 0
-if not include_done:
-    hidden_done += sum(
-        1 for c in children
-        if c.status == "done"
-    )
-    children = [
-        c for c in children
-        if c.status != "done"
-    ]
-if children:
+for child in sort_todos_for_display(get_children(todos, item.id)):
+    if child.status == "done" and not include_done:
+        hidden_done += 1
+        continue
+    rows.append((0, child))
+    for gc in sort_todos_for_display(get_children(todos, child.id)):
+        if gc.status == "done" and not include_done:
+            hidden_done += 1
+            continue
+        rows.append((1, gc))
+@
+
+Sub-items show their status as a short word rather than the stored
+value, so that the eye-catching one---[[active]]---is the item being
+worked on.
+The rich renderer additionally colours the word; both tables are
+defined next to each other so a new status is added to both at once.
+
+<<constants>>=
+VIEW_STATUS_MARKS = {
+    "done": "done",
+    "in-progress": "active",
+    "pending": "pending",
+}
+VIEW_STATUS_STYLES = {
+    "done": "green",
+    "in-progress": "yellow",
+    "pending": "dim",
+}
+@
+
+\paragraph{The plain renderer}
+
+This is the output [[view]] has always produced, and its layout is kept
+rather than tidied: the first two groups of metadata share a line each
+(priority, deadline and estimate; then labels and worker) and the
+remaining fields get a line of their own.
+[[VIEW_INLINE_FIELD_GROUPS]] records that grouping so the renderer can
+reproduce it from the shared field list.
+Notes go through [[print_markdown]] with the terminal form switched
+off, which prints them as written under the same two-space indent as
+before.
+
+<<constants>>=
+VIEW_INLINE_FIELD_GROUPS = (
+    ("Priority", "Deadline", "Est"),
+    ("Labels", "Worker"),
+)
+@
+
+<<render view as plain text>>=
+typer.echo(f"#{item.id} {item.title} [{item.status}]")
+for group in VIEW_INLINE_FIELD_GROUPS:
+    line = [f"{k}: {v}" for k, v in fields if k in group]
+    if line:
+        typer.echo("  " + "  ".join(line))
+grouped = {k for group in VIEW_INLINE_FIELD_GROUPS for k in group}
+for label, value in fields:
+    if label not in grouped:
+        typer.echo(f"  {label}: {value}")
+if item.description:
+    typer.echo(f"  Description: {item.description}")
+<<print notes as plain text>>
+<<print sub-items as plain text>>
+@
+
+<<print notes as plain text>>=
+if item.github:
+    if gh_body:
+        typer.echo("")
+        typer.echo("Description:")
+        print_markdown(gh_body, indent=2, terminal=False)
+    if gh_comments:
+        typer.echo("")
+        typer.echo("Comments:")
+        for author, created, body in gh_comments:
+            typer.echo(f"  [{author} {created}]")
+            print_markdown(body, indent=4, terminal=False)
+            typer.echo("")
+elif item.notes:
+    typer.echo("")
+    typer.echo("Notes:")
+    print_markdown(item.notes, indent=2, terminal=False)
+@
+
+Only children, not grandchildren, get the first line of their notes as
+a preview: at two levels down the extra line would read as a fourth
+level of nesting.
+
+<<print sub-items as plain text>>=
+if rows:
     typer.echo("")
     typer.echo("Sub-items:")
-    for child in children:
-        status_mark = {
-            "done": "done",
-            "in-progress": "active",
-            "pending": "pending",
-        }.get(child.status, child.status)
-        typer.echo(
-            f"  #{child.id} [{status_mark}] "
-            f"{child.title}"
-        )
-        if child.notes:
-            first_line = child.notes.splitlines()[0]
-            typer.echo(f"    {first_line}")
-        grandchildren = sort_todos_for_display(
-            get_children(todos, child.id)
-        )
-        if not include_done:
-            hidden_done += sum(
-                1 for gc in grandchildren
-                if gc.status == "done"
-            )
-            grandchildren = [
-                gc for gc in grandchildren
-                if gc.status != "done"
-            ]
-        for gc in grandchildren:
-            gc_mark = {
-                "done": "done",
-                "in-progress": "active",
-                "pending": "pending",
-            }.get(gc.status, gc.status)
-            typer.echo(
-                f"    #{gc.id} [{gc_mark}] "
-                f"{gc.title}"
-            )
+    for depth, child in rows:
+        indent = "  " * (depth + 1)
+        mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+        typer.echo(f"{indent}#{child.id} [{mark}] {child.title}")
+        if depth == 0 and child.notes:
+            typer.echo(f"{indent}  {child.notes.splitlines()[0]}")
 if hidden_done:
     typer.echo(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)"
     )
+@
+
+\paragraph{The rich renderer}
+
+Every string that reaches rich here is wrapped in [[Text]] first.
+Rich parses bare strings as console markup, in which anything in
+square brackets---the bracketed status we print, or a title such as
+\enquote{Fix [parser] crash}---is a style tag that silently disappears
+from the output.
+[[Text]] takes the string literally, which is the only safe treatment
+for user-written titles and for the bracketed status we print.
+
+<<render view with rich>>=
+from rich import box
+from rich.console import Console
+from rich.padding import Padding
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+console.print(Text.assemble(
+    (f"#{item.id} ", "cyan"),
+    (item.title, "bold"),
+    " ",
+    (f"[{item.status}]",
+     VIEW_STATUS_STYLES.get(item.status, "")),
+))
+<<print metadata as a grid>>
+<<print description and notes richly>>
+<<print sub-items as a table>>
+@
+
+A two-column grid lines the values up under each other, which the
+plain layout's shared lines cannot; the labels are dimmed so the values
+carry the line.
+
+<<print metadata as a grid>>=
+grid = Table.grid(padding=(0, 2))
+grid.add_column(style="dim")
+grid.add_column()
+for label, value in fields:
+    grid.add_row(label, Text(value))
+console.print(Padding(grid, (0, 0, 0, 2)))
+@
+
+The description and the notes are Markdown, so they go through
+[[print_markdown]] with the terminal form forced on---forced, because
+the decision was already taken by [[--format]] and must not be retaken
+from [[isatty()]] inside the helper.
+Each block gets a bold title in place of the plain renderer's
+[[Label:]] line, and each GitHub comment a header with a bold author
+and dimmed date.
+
+<<print description and notes richly>>=
+if item.description:
+    console.print()
+    console.print(Text("Description", style="bold"))
+    print_markdown(item.description, indent=2, terminal=True)
+if item.github:
+    if gh_body:
+        console.print()
+        console.print(Text("Description", style="bold"))
+        print_markdown(gh_body, indent=2, terminal=True)
+    if gh_comments:
+        console.print()
+        console.print(Text("Comments", style="bold"))
+        for author, created, body in gh_comments:
+            console.print(Padding(
+                Text.assemble((author, "bold"), " ", (created, "dim")),
+                (0, 0, 0, 2),
+            ))
+            print_markdown(body, indent=4, terminal=True)
+            console.print()
+elif item.notes:
+    console.print()
+    console.print(Text("Notes", style="bold"))
+    print_markdown(item.notes, indent=2, terminal=True)
+@
+
+The sub-item table uses the same [[Table]] arguments as [[ls]]
+(\cref{sec:todo-code-outline}), so the two commands look like parts of
+one interface.
+Depth becomes indentation of the title, the way [[ls]] indents its
+tree, and the note preview gets a folding column so a long first line
+wraps instead of being cut off.
+
+<<print sub-items as a table>>=
+if rows:
+    console.print()
+    console.print(Text("Sub-items", style="bold"))
+    table = Table(show_header=True, header_style="bold",
+                  box=box.SIMPLE, show_edge=False,
+                  pad_edge=False)
+    table.add_column("ID", justify="right", style="cyan")
+    table.add_column("Status")
+    table.add_column("Title")
+    table.add_column("Note", overflow="fold")
+    for depth, child in rows:
+        mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+        note = ""
+        if depth == 0 and child.notes:
+            note = child.notes.splitlines()[0]
+        table.add_row(
+            str(child.id),
+            Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
+            Text("  " * depth + child.title),
+            Text(note),
+        )
+    console.print(Padding(table, (0, 0, 0, 2)))
+if hidden_done:
+    console.print(Text(
+        f"  ({hidden_done} done sub-items hidden,"
+        f" use --done to show)",
+        style="dim",
+    ))
 @
 
 \subsection{Testing the [[view]] Command}
@@ -6967,6 +7189,123 @@ def test_view_command(temp_todo_dir):
     assert "claude" in result.stdout
     assert "Some notes" in result.stdout
     assert "Child task" in result.stdout
+@
+
+Under [[CliRunner]] stdout is not a terminal, so the test above
+exercises the plain renderer; [[--format rich]] is how we reach the
+other one.
+Rich then writes to the runner's captured stream without colour, so
+the assertions can be about content.
+Two environment variables would perturb that: [[COLUMNS]] sets the
+width rich wraps to, which otherwise depends on the terminal the test
+suite runs in, and [[FORCE_COLOR]], if set in the developer's shell,
+would make rich emit escape codes into the captured text.
+The rendered form must show the heading without its marker and the
+list item with a bullet---the two visible differences from the source.
+
+<<integration tests>>=
+def test_view_format_rich_renders_markdown(temp_todo_dir, monkeypatch):
+    """--format rich renders notes as Markdown even when piped."""
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            description="Short *summary*",
+            notes="# Heading\n\n- bullet\n",
+            wd="/tmp/project",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            parent_id=1, priority=1.0,
+            created="2026-02-20T10:00:00",
+            notes="Child note\nsecond line",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "--format", "rich"])
+    assert result.exit_code == 0
+    assert "Parent task" in result.stdout
+    assert "/tmp/project" in result.stdout
+    assert "summary" in result.stdout
+    assert "# Heading" not in result.stdout
+    assert "Heading" in result.stdout
+    assert "• bullet" in result.stdout
+    assert "Child task" in result.stdout
+    assert "Child note" in result.stdout
+    assert "second line" not in result.stdout
+@
+
+The other direction must hold too: forcing [[plain]] keeps the
+Markdown source, marker and all, whatever the stream is.
+
+<<integration tests>>=
+def test_view_format_plain_keeps_markdown_source(temp_todo_dir):
+    """--format plain prints notes as written."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            notes="# Heading\n\n- bullet\n",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "--format", "plain"])
+    assert result.exit_code == 0
+    assert "  # Heading" in result.stdout
+    assert "  - bullet" in result.stdout
+    assert "•" not in result.stdout
+@
+
+The sub-item table has to preserve what the plain list guarantees:
+display order, a grandchild directly under its parent, done items
+hidden with a hint.
+
+<<integration tests>>=
+def test_view_rich_children_keep_order_and_hint(
+    temp_todo_dir, monkeypatch,
+):
+    """The rich sub-item table orders and hides like the plain list."""
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    save_todos(6, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Ranked child", parent_id=1,
+            priority=1.0, created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Unranked child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=4, title="Done child", parent_id=1,
+            status="done", created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=5, title="Grandchild", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "--format", "rich"])
+    assert result.exit_code == 0
+    out = result.stdout
+    assert out.index("Ranked child") < out.index("Grandchild")
+    assert out.index("Grandchild") < out.index("Unranked child")
+    assert "Done child" not in out
+    assert "1 done sub-items hidden" in out
+
+    result = runner.invoke(
+        cli, ["view", "1", "--format", "rich", "--done"]
+    )
+    assert result.exit_code == 0
+    assert "Done child" in result.stdout
+    assert "hidden" not in result.stdout
 @
 
 The same default must stay local to the current tmux pane or window.
