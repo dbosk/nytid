@@ -1859,24 +1859,39 @@ files may predate batch records, so when the batch id is unknown we
 degrade to that single label rather than failing---the same fallback
 [[stop_labels]] has always used for such files.
 
+The optional [[among]] restriction exists for window-scoped targeting
+(\cref{track:window-batch-scope}): a caller may pass the set of batch
+ids that qualify, and the walk simply skips more recent labels whose
+batch is outside the set.  The restriction is a \emph{filter}, not an
+alternative source of truth---membership and recency still come from
+the session itself, so a stale id in the candidate set (its batch long
+since stopped) matches no active label and costs nothing.  With
+[[among=None]] the first iteration inspects the last label in
+[[label_order]] and the behavior is exactly the unrestricted one.
+
 <<active session class>>=
-    def most_recent_batch_labels(self) -> list[str]:
+    def most_recent_batch_labels(
+        self,
+        among: set[int] | None = None,
+    ) -> list[str]:
         """Return the most recent batch's still-active labels.
 
         The most recent batch is the one containing the most
-        recently started label.  Labels come back in batch order;
-        the list is empty when nothing is being tracked.
+        recently started label; with `among`, only batches whose
+        id is in that set qualify.  Labels come back in batch
+        order; the list is empty when no batch qualifies.
         """
-        if not self.label_order:
-            return []
-        most_recent = self.label_order[-1]
-        _, _, batch_id = self.active_labels[most_recent]
-        if batch_id in self.batches:
-            return [
-                l for l in self.batches[batch_id]
-                if l in self.active_labels
-            ]
-        return [most_recent]
+        for label in reversed(self.label_order):
+            _, _, batch_id = self.active_labels[label]
+            if among is not None and batch_id not in among:
+                continue
+            if batch_id in self.batches:
+                return [
+                    l for l in self.batches[batch_id]
+                    if l in self.active_labels
+                ]
+            return [label]
+        return []
 
 @
 
@@ -1900,6 +1915,30 @@ def test_most_recent_batch_labels_without_batch_record():
   session.start_labels(["A", "B"], datetime.datetime.now())
   session.batches.clear()
   assert session.most_recent_batch_labels() == ["B"]
+@
+
+The restriction must skip past newer non-candidates, distinguish an
+empty candidate set (nothing qualifies) from no restriction at all,
+and shrug off ids that match nothing:
+
+<<test functions>>=
+def test_most_recent_batch_labels_among():
+  """among skips newer batches outside the candidate set."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["scoped"], t0)
+  scoped_id = session.active_labels["scoped"][2]
+  session.start_labels(["global"], t0)
+  assert session.most_recent_batch_labels() == ["global"]
+  assert session.most_recent_batch_labels(
+    among={scoped_id},
+  ) == ["scoped"]
+  assert session.most_recent_batch_labels(
+    among=set(),
+  ) == []
+  assert session.most_recent_batch_labels(
+    among={scoped_id + 999},
+  ) == []
 @
 
 Recency is the right default, but a caller that already knows
@@ -8161,6 +8200,118 @@ def delete_window_labels(
         ).unlink()
     except OSError:
         pass
+@
+
+\subsubsection{Window-Scoped Batch Targeting}
+\label{track:window-batch-scope}
+
+A tracked window is a promise of isolation: work started elsewhere ---
+another terminal, a script, a different window --- must not become what
+a bare [[stop]] or hashless [[edit]] \emph{in this window} acts on.
+Without that promise, every bare command races against concurrent
+tracking: whichever batch started last wins the \enquote{most recent}
+crown, wherever it came from.  The batch ids recorded in the window
+file (\cref{track:window-auto-suspend}) close the race: they name the
+batches that belong to this window, and the selection in
+[[most_recent_batch_labels]] restricts itself to them.
+
+The distinction between \emph{no} tracked window and an \emph{empty}
+one carries through to the scope.  [[None]] means the command runs
+outside any tracked window, so selection stays global---plain shells
+keep today's behavior.  An empty set means the window is tracked but
+nothing is tracking in it (the user stopped everything and is taking a
+break); a bare [[stop]] then finds nothing rather than reaching out
+and grabbing a global batch, which is exactly the isolation the window
+promised.
+
+Legacy entries without a batch id resolve by name through the
+session's [[active_labels]]---if the label is still active somewhere,
+its current batch stands in for the unrecorded one.  This is the safe
+direction for the fallback: a recycled name at worst \emph{includes} a
+batch in the window's scope, and only until the id-carrying rewrite on
+the next registration.
+
+The helper reads the window file, so it requires the tmux-context lock;
+its callers are the [[update]] closures run by
+[[mutate_worker_tracking_state]], which holds that lock throughout.
+
+<<helper functions>>=
+def current_window_batch_scope(
+    session,
+    who: str,
+) -> set[int] | None:
+    """Return the tracked window's batch-id scope, or ``None``.
+
+    ``None`` means no tracked window is current (selection stays
+    global); an empty set means the window is tracked but has no
+    batches.  Requires the tmux-context lock to already be held.
+    """
+    tmux_server_key = get_current_tmux_server_key()
+    if tmux_server_key is None:
+        return None
+    window_id = get_current_tracked_window_id(
+        who, tmux_server_key,
+    )
+    if not window_id:
+        return None
+    batches = read_window_label_batches(
+        window_id, who, tmux_server_key,
+    ) or {}
+    scope = set()
+    for label, batch_id in batches.items():
+        if batch_id is not None:
+            scope.add(batch_id)
+        elif label in session.active_labels:
+            scope.add(session.active_labels[label][2])
+    return scope
+@
+
+The three scope shapes---untracked, tracked-but-empty, and populated
+(with a legacy batchless entry resolved by name)---are each worth a
+check:
+
+<<test functions>>=
+def test_current_window_batch_scope(temp_tracking_dir):
+  """Scope is None untracked, empty on break, ids otherwise."""
+  window_id = "@42"
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["a"], t0)
+  session.start_labels(["b"], t0)
+  a_id = session.active_labels["a"][2]
+  b_id = session.active_labels["b"][2]
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, {}, clear=True):
+    assert current_window_batch_scope(
+      session, default_username,
+    ) is None
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    assert current_window_batch_scope(
+      session, default_username,
+    ) is None
+    write_window_labels(
+      window_id, default_username, TEST_SERVER_KEY, [],
+    )
+    assert current_window_batch_scope(
+      session, default_username,
+    ) == set()
+    add_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+      ["a"], batches={"a": a_id},
+    )
+    add_window_labels(
+      window_id, default_username, TEST_SERVER_KEY,
+      ["b"],
+    )
+    assert current_window_batch_scope(
+      session, default_username,
+    ) == {a_id, b_id}
 @
 
 \subsubsection{Window Transition Execution}
@@ -15636,6 +15787,7 @@ from nytid.cli.track import (
     update_window_label_batches,
     remove_window_labels,
     delete_window_labels,
+    current_window_batch_scope,
     suspend_tracking_labels,
     resume_tracking_labels,
     summarize_window_transition,
