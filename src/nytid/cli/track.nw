@@ -1844,7 +1844,7 @@ def test_failed_stop_does_not_break_resume(temp_tracking_dir):
   assert set(load_active_session().get_active_labels()) == {"A", "B"}
 @
 
-\subsubsection{Selecting the Most Recent Batch}
+\subsubsection{Selecting the Target Batch}
 
 A bare [[stop]] ends \enquote{what I am doing now}, and a hashless
 [[edit]] (added later in this document) corrects it.  Both need the
@@ -1900,6 +1900,58 @@ def test_most_recent_batch_labels_without_batch_record():
   session.start_labels(["A", "B"], datetime.datetime.now())
   session.batches.clear()
   assert session.most_recent_batch_labels() == ["B"]
+@
+
+Recency is the right default, but a caller that already knows
+\emph{which label} it wants to fix should not have to hope that label's
+batch is still the newest one---any tracking started later, perhaps
+from another terminal, silently steals the default target.  Batch
+membership was not queryable from outside, which is the gap issue~\#472
+reports.  Since a label is active in at most one batch (the
+[[active_labels]] dictionary enforces this globally), asking for
+\enquote{the batch containing this label} has an unambiguous answer,
+with the same missing-record fallback as above:
+
+<<active session class>>=
+    def batch_labels_containing(self, label: str) -> list[str]:
+        """Return the still-active labels of `label`'s batch.
+
+        Labels come back in batch order; the list is empty when
+        `label` is not being tracked.
+        """
+        if label not in self.active_labels:
+            return []
+        _, _, batch_id = self.active_labels[label]
+        if batch_id in self.batches:
+            return [
+                l for l in self.batches[batch_id]
+                if l in self.active_labels
+            ]
+        return [label]
+
+@
+
+Let's verify that the lookup finds the older batch---the case recency
+cannot serve---and degrades like its sibling:
+
+<<test functions>>=
+def test_batch_labels_containing():
+  """The batch is found by any member label, at any recency."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["old", "friend"], t0)
+  session.start_labels(["new"], t0)
+
+  assert session.batch_labels_containing("old") == ["old", "friend"]
+  assert session.batch_labels_containing("new") == ["new"]
+  assert session.batch_labels_containing("ghost") == []
+
+def test_batch_labels_containing_without_batch_record():
+  """Missing batch records degrade to the named label alone."""
+  session = ActiveSession()
+  session.start_labels(["A", "B"], datetime.datetime.now())
+  session.batches.clear()
+  assert session.batch_labels_containing("A") == ["A"]
 @
 
 \subsubsection{Discarding an Active Session}
@@ -2016,9 +2068,14 @@ invariant is enforced here.
 Removed labels do \emph{not} touch [[last_stopped]]: they were
 corrected away, not stopped, and a later bare [[start]] should resume
 what the user last \emph{stopped}, not a label they disowned as a
-typo.  Added labels append to [[label_order]], which keeps the edited
-batch the most recent one---so a bare [[stop]] right after the
-correction still ends the session that was just fixed.
+typo.  Added labels take the batch's \emph{existing} position in
+[[label_order]] rather than appending to the end.  The invariant is
+that an edit never changes which batch is most recent: correcting the
+newest batch leaves it newest (so a bare [[stop]] right after still
+ends the session that was just fixed), and correcting an \emph{older}
+batch---possible via [[--containing]], perhaps from a background
+script---must not make it jump the queue and silently retarget the
+user's next bare [[stop]].
 
 <<active session class>>=
     def edit_batch(
@@ -2080,13 +2137,18 @@ effective_start = (
     start_time if start_time is not None
     else self.active_labels[old[0]][0]
 )
+order_snapshot = list(self.label_order)
+last_old_member = max(old, key=order_snapshot.index)
 @
+
+The order snapshot and the batch's rearmost member are captured while
+the old labels are still present---the anchor for the rebuild below
+would be unrecoverable once a full replacement has dropped them.
 
 <<drop corrected-away labels>>=
 removed = [l for l in old if l not in deduped]
 for label in removed:
     del self.active_labels[label]
-    self.label_order.remove(label)
 @
 
 Kept labels are rewritten even when nothing about them changes: batch
@@ -2105,6 +2167,12 @@ for label in kept:
     )
 @
 
+Rebuilding [[label_order]] wholesale is simpler than in-place index
+arithmetic: removed labels drop out, and added labels slot in right
+after the batch's rearmost member's original position---whether that
+member itself survived or was replaced---so the batch's recency
+position is preserved exactly:
+
 <<attach added labels to the batch>>=
 added = [l for l in deduped if l not in old]
 for label in added:
@@ -2113,7 +2181,13 @@ for label in added:
         notes if notes is not None else "",
         batch_id,
     )
-    self.label_order.append(label)
+new_order = []
+for existing in order_snapshot:
+    if existing not in removed:
+        new_order.append(existing)
+    if existing == last_old_member:
+        new_order.extend(added)
+self.label_order = new_order
 @
 
 Let's verify the surgery: swapping a sibling must leave the kept
@@ -2177,6 +2251,18 @@ def test_edit_batch_rejects_cross_batch_label():
   with pytest.raises(ValueError, match="already being tracked"):
     session.edit_batch(2, ["B", "A"])
   assert session.active_labels["A"][2] == 1
+
+def test_edit_batch_keeps_recency_position():
+  """Editing an older batch does not make it most recent."""
+  session = ActiveSession()
+  t0 = datetime.datetime.now()
+  session.start_labels(["A"], t0)
+  session.start_labels(["B"], t0)
+
+  session.edit_batch(1, ["A", "C"])
+
+  assert session.label_order == ["A", "C", "B"]
+  assert session.most_recent_batch_labels() == ["B"]
 
 def test_edit_batch_leaves_unrelated_state():
   """`switch_other` and `last_stopped` survive a relabeling."""
