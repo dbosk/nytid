@@ -2991,6 +2991,7 @@ def start_tracking_labels(
         if update_tmux_context and started_labels:
             _register_tmux_context_labels_unlocked(
                 started_labels, resolved_who,
+                session=session,
             )
 
     _, _, started, already_tracking, discarded = (
@@ -7322,6 +7323,20 @@ if needs_window_sync:
     )
 
 if published_window_labels:
+    def backfill_window_batches():
+        session = load_active_session(focus_who)
+        update_window_label_batches(
+            window_id,
+            focus_who,
+            tmux_server_key,
+            {
+                label: session.active_labels[label][2]
+                for label in focus_labels
+                if label in session.active_labels
+            },
+        )
+
+    with_tmux_context_lock(backfill_window_batches)
     install_tmux_window_cleanup_hook(
         pane_id,
         window_id,
@@ -7330,6 +7345,14 @@ if published_window_labels:
         focus_labels,
     )
 @
+
+The batch-id backfill runs last on purpose.  The labels file is
+published early (batchless) so the hook subprocesses see the window as
+tracked immediately, but the ids are only final once the auto-suspend
+transition has run: a label inherited from the source window is stopped
+and restarted there, which moves it to a fresh batch.  Reading the
+session after the dust settles records the ids that will actually be
+live in this window.
 
 Note which steps hang off which condition.  Publishing the labels and
 installing the cleanup hook that eventually removes them are two halves
@@ -7636,9 +7659,18 @@ That lets [[mutate_worker_tracking_state]] call them from its [[post_update]]
 hook without deadlocking on a second attempt to take the same lock, while the
 public wrappers still provide the lock for ordinary callers.
 
+Registration is also where batch ids enter the window file.  The
+[[post_update]] hooks run with the freshly mutated session at hand, so
+they pass it along and we look each label's batch id up in
+[[active_labels]].  Only the window side records ids---pane files are
+never consulted for batch scoping, so they stay as plain label lists.
+When no session is supplied (the public wrapper's callers predate the
+session mutation), labels register batchless and are backfilled later.
+
 <<helper functions>>=
 def _register_tmux_context_labels_unlocked(
     labels: list[str], who: str,
+    session=None,
 ) -> None:
     """Add labels to the current tmux context.
 
@@ -7660,9 +7692,16 @@ def _register_tmux_context_labels_unlocked(
         who, tmux_server_key,
     )
     if window_id:
+        batches = None
+        if session is not None:
+            batches = {
+                label: session.active_labels[label][2]
+                for label in labels
+                if label in session.active_labels
+            }
         add_window_labels(
             window_id, who, tmux_server_key,
-            list(labels),
+            list(labels), batches=batches,
         )
 
 
@@ -10412,6 +10451,31 @@ started, already_tracking, _ = start_tracking_labels(
     who=who,
     update_tmux_context=False,
 )
+<<backfill adopted window batch ids>>
+@
+
+Adoption publishes the labels file before the session transition (so
+the hooks see the window as tracked from the first moment), which means
+the file cannot know batch ids yet.  Freshly started labels got a new
+batch just now; already-running ones keep the batch they were in, which
+is precisely the case adoption exists for.  Reading the session
+afterwards covers both.
+
+<<backfill adopted window batch ids>>=
+def backfill_adopted_batches():
+    session = load_active_session(who)
+    update_window_label_batches(
+        window_id,
+        who,
+        tmux_server_key,
+        {
+            label: session.active_labels[label][2]
+            for label in labels
+            if label in session.active_labels
+        },
+    )
+
+with_tmux_context_lock(backfill_adopted_batches)
 @
 
 Publication and cleanup are two halves of one act: the adopting
@@ -10512,6 +10576,24 @@ def test_adopt_merges_into_tracked_window(temp_tracking_dir):
   assert read_window_labels(
     "@7", "me", TEST_SERVER_KEY,
   ) == ["old", "new"]
+
+def test_adopt_records_batch_ids(temp_tracking_dir):
+  """Adopt backfills batch ids for fresh and running labels."""
+  runner.invoke(cli, ["start", "already", "--who", "me"])
+  result, _, _ = invoke_adopt(
+    ["already", "fresh", "--who", "me",
+     "--no-auto-suspend"],
+  )
+  assert result.exit_code == 0
+  session = load_active_session("me")
+  batches = read_window_label_batches(
+    "@7", "me", TEST_SERVER_KEY,
+  )
+  assert batches == {
+    lbl: session.active_labels[lbl][2]
+    for lbl in ["already", "fresh"]
+  }
+  assert batches["already"] != batches["fresh"]
 
 def test_adopt_reports_already_active_labels(temp_tracking_dir):
   """Labels already running are reported, not restarted."""
@@ -13670,6 +13752,7 @@ content, silently unhooking the pane from tracking:
 if outcome["added"]:
     _register_tmux_context_labels_unlocked(
         outcome["added"], resolved_who,
+        session=session,
     )
 if outcome["removed"]:
     _unregister_tmux_context_labels_unlocked(
@@ -16543,6 +16626,41 @@ def test_stop_all_keeps_window_tracked_and_resume_reassociates(
   ) == ["X"]
 @
 
+Registration is where batch ids reach the window file, and it must work
+from the empty tracked marker too: starting labels during a break in a
+drained-but-tracked window records both the labels and their batch,
+which is what makes the later window-scoped [[stop]] find them.
+
+<<test functions>>=
+def test_start_in_tracked_window_records_batch_ids(
+  temp_tracking_dir,
+):
+  """Starting in a tracked (even empty) window records batch ids."""
+  window_id = "@42"
+  write_window_labels(
+    window_id, default_username, TEST_SERVER_KEY, [],
+  )
+  env = {
+    "TMUX_PANE": "%99",
+    "TMUX": "/tmp/tmux.sock,123,0",
+  }
+  with patch.dict(os.environ, env), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value=window_id,
+  ):
+    result = runner.invoke(cli, ["start", "A", "B"])
+  assert result.exit_code == 0
+  session = load_active_session(default_username)
+  batches = read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  )
+  assert batches == {
+    lbl: session.active_labels[lbl][2]
+    for lbl in ["A", "B"]
+  }
+  assert batches["A"] == batches["B"]
+@
+
 The [[--timeout]] option only applies to direct subprocesses, not
 tmux panes.
 
@@ -16794,6 +16912,52 @@ def test_run_tmux_command_publishes_window_labels_unsuspended(
   assert "stop" not in events
   assert "sync-hooks" not in events
   assert "cleanup-hook" in events
+@
+
+The published file starts batchless (the launch cannot know ids that
+the transition may still change) and gains its ids from the backfill.
+The session was mutated by the [[start]] command before the launch, so
+the backfill finds the labels' batches there.
+
+<<test functions>>=
+def test_run_tmux_command_backfills_window_batch_ids(
+  temp_tracking_dir,
+):
+  """A window launch backfills the published file's batch ids."""
+  runner.invoke(cli, ["start", "work"])
+
+  def fake_subprocess_run(args, **kwargs):
+    class Result:
+      stdout = "%42 @7 $9\n"
+    return Result()
+
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_subprocess_run,
+  ), patch(
+    "nytid.cli.track.install_tmux_exit_hooks",
+  ), patch(
+    "nytid.cli.track.compute_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.install_tmux_window_cleanup_hook",
+  ):
+    run_tmux_command(
+      ["/bin/sh"],
+      cwd="/tmp",
+      env={"TMUX": "/tmp/tmux.sock,1,0"},
+      window=True,
+      block=False,
+      focus_labels=["work"],
+      focus_who=default_username,
+      focus_window=True,
+      auto_suspend=False,
+    )
+
+  session = load_active_session(default_username)
+  assert read_window_label_batches(
+    "@7", default_username, TEST_SERVER_KEY,
+  ) == {"work": session.active_labels["work"][2]}
 
 
 def test_make_tmux_completion_guard_without_status_file():
@@ -16901,13 +17065,15 @@ The tracked-window launch path holds the tmux-context lock only across
 the narrow hook-observability phase: [[new-window]], label publication,
 and the [[last_selected_window]] write.  After releasing the lock it
 executes the source stop, target start, and one debug emission inline,
-then installs the session sync hook and cleanup hook.
+then briefly retakes the lock to backfill the published file's batch
+ids (they are only final after the transition) before installing the
+session sync hook and cleanup hook.
 
 <<test functions>>=
 def test_run_tmux_command_locks_window_launch_setup(
     temp_tracking_dir,
 ):
-    """Lock covers only the hook-observability phase."""
+    """Locks cover state publication and batch backfill only."""
     events = []
 
     def fake_with_tmux_context_lock(callback):
@@ -17007,6 +17173,8 @@ def test_run_tmux_command_locks_window_launch_setup(
         "start",
         "debug",
         "sync-hooks",
+        "lock-enter",
+        "lock-exit",
         "cleanup-hook",
         "ready",
     ]
