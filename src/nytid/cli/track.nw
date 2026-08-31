@@ -3597,6 +3597,108 @@ def test_resume_degrades_when_window_gone(
   ) is None
 @
 
+The window auto-suspend transition resumes a window the same way a
+bare [[start]] resumes a stop: it must not flatten.  Suspending a
+window stops its labels but leaves them (and their batch ids) in the
+window file; restarting them in one call would merge the window's
+batches into one, which is why, historically, a bare [[stop]] after
+switching windows stopped \emph{all} the window's labels instead of
+the latest batch.  Here the file's per-label batch ids are the
+grouping key: labels sharing an old id restart together (one new batch
+per group; ids without a record---legacy files---form one group), and
+the file is refreshed with the new ids afterwards, under the same
+locks, so the next suspend groups correctly again.  The refresh reads
+the ids off the updated session rather than the start calls: a label
+that was already running elsewhere keeps its current batch, and the
+file should say so.
+
+<<session management>>=
+def restart_window_batches(
+    *,
+    who: str = None,
+    window_id: str,
+    tmux_server_key: str,
+    label_batches: dict,
+    start_time: datetime.datetime = None,
+):
+    """Restart a window's labels, one batch per file group."""
+    if start_time is None:
+        start_time = datetime.datetime.now()
+    resolved_who = (
+        who if who is not None
+        else default_username
+    )
+    groups = {}
+    for label, batch_id in label_batches.items():
+        groups.setdefault(batch_id, []).append(label)
+
+    def update(session, history_entries):
+        for group_labels in groups.values():
+            session.start_labels(
+                group_labels, start_time,
+            )
+        return session, history_entries
+
+    def refresh_window_file(session, history_entries):
+        update_window_label_batches(
+            window_id, resolved_who, tmux_server_key,
+            {
+                label: session.active_labels[label][2]
+                for label in label_batches
+                if label in session.active_labels
+            },
+        )
+
+    mutate_worker_tracking_state(
+        update, who,
+        post_update=refresh_window_file,
+    )
+@
+
+Suspend and restart round-trip through the window file: two batches
+suspended by a switch away must come back as two batches on the switch
+back, so that a bare [[stop]] in the window still means the latest
+batch.
+
+<<test functions>>=
+def test_restart_window_batches_preserves_groups(
+  temp_tracking_dir,
+):
+  """Restarting a window's labels keeps their batch grouping."""
+  window_id = "@42"
+  add_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+    ["a", "b"], batches={"a": 7, "b": 7},
+  )
+  add_window_labels(
+    window_id, default_username, TEST_SERVER_KEY,
+    ["c"], batches={"c": 9},
+  )
+  restart_window_batches(
+    window_id=window_id,
+    tmux_server_key=TEST_SERVER_KEY,
+    label_batches=read_window_label_batches(
+      window_id, default_username, TEST_SERVER_KEY,
+    ),
+  )
+  session = load_active_session()
+  assert (
+    session.active_labels["a"][2]
+    == session.active_labels["b"][2]
+  )
+  assert (
+    session.active_labels["c"][2]
+    != session.active_labels["a"][2]
+  )
+  assert read_window_label_batches(
+    window_id, default_username, TEST_SERVER_KEY,
+  ) == {
+    "a": session.active_labels["a"][2],
+    "b": session.active_labels["b"][2],
+    "c": session.active_labels["c"][2],
+  }
+@
+
 Now we combine all state management functions:
 
 <<tracking state management>>=
@@ -9443,6 +9545,13 @@ session has already disappeared.  Treating that observation failure as a
 real switch to an untracked window would spuriously stop the source
 labels, so we bail out before mutating tracking state.
 
+The target side reads the window's per-label \emph{batch ids}, not
+just its labels, and resumes through [[restart_window_batches]] so the
+window's batch structure survives the suspend/resume cycle.  The
+source side needs no such care: stopping an explicit label list
+already records one history entry per batch, and the source window's
+file keeps its ids as the grouping key for the next switch back.
+
 <<detached window switch command>>=
 @cli.command(
     name="_window-switch-detached", hidden=True
@@ -9475,7 +9584,7 @@ def window_switch_detached(
                 who,
                 tmux_server_key,
             )
-        target_labels = read_window_labels(
+        target_batches = read_window_label_batches(
             selected_window_id,
             who,
             tmux_server_key,
@@ -9489,7 +9598,7 @@ def window_switch_detached(
         return (
             prev_window_id,
             source_labels,
-            target_labels,
+            target_batches,
         )
 
     result = with_tmux_context_lock(read_and_update)
@@ -9498,7 +9607,7 @@ def window_switch_detached(
     (
         prev_window_id,
         source_labels,
-        target_labels,
+        target_batches,
     ) = result
     transition_time = datetime.datetime.now()
     if source_labels:
@@ -9509,12 +9618,13 @@ def window_switch_detached(
             quiet_if_missing=True,
             update_tmux_context=False,
         )
-    if target_labels:
-        start_tracking_labels(
+    if target_batches:
+        restart_window_batches(
             who=who,
-            labels=target_labels,
+            window_id=selected_window_id,
+            tmux_server_key=tmux_server_key,
+            label_batches=target_batches,
             start_time=transition_time,
-            update_tmux_context=False,
         )
     emit_window_event_debug(
         who,
@@ -9529,7 +9639,7 @@ def window_switch_detached(
             prev_window_id,
             source_labels,
             selected_window_id,
-            target_labels,
+            list(target_batches or {}),
         ),
     )
 @
@@ -12017,7 +12127,7 @@ def test_window_switch_detached_executes_tracked_to_tracked(
     ), patch(
         "nytid.cli.track.stop_tracking_labels",
     ) as mock_stop, patch(
-        "nytid.cli.track.start_tracking_labels",
+        "nytid.cli.track.restart_window_batches",
     ) as mock_start, patch(
         "nytid.cli.track.emit_window_event_debug",
     ) as mock_debug:
@@ -12038,9 +12148,10 @@ def test_window_switch_detached_executes_tracked_to_tracked(
     )
     mock_start.assert_called_once_with(
         who=who,
-        labels=["admin"],
+        window_id="@2",
+        tmux_server_key=TEST_SERVER_KEY,
+        label_batches={"admin": None},
         start_time=mock_stop.call_args.kwargs["end_time"],
-        update_tmux_context=False,
     )
     assert read_last_selected_window(
         who, TEST_SERVER_KEY, TEST_SESSION_ID,
@@ -12118,7 +12229,7 @@ def test_window_switch_detached_executes_untracked_to_tracked(
     ), patch(
         "nytid.cli.track.stop_tracking_labels",
     ) as mock_stop, patch(
-        "nytid.cli.track.start_tracking_labels",
+        "nytid.cli.track.restart_window_batches",
     ) as mock_start, patch(
         "nytid.cli.track.emit_window_event_debug",
     ) as mock_debug:
@@ -12145,6 +12256,74 @@ def test_window_switch_detached_executes_untracked_to_tracked(
             "@1", None, "@2", ["admin"],
         ),
     )
+
+
+def test_window_switch_round_trip_preserves_batches(
+    temp_tracking_dir,
+):
+    """Switching away and back keeps the window's batches."""
+    who = "me"
+    window_id = "@1"
+    write_window_labels(
+        window_id, who, TEST_SERVER_KEY, [],
+    )
+    env = {
+        "TMUX_PANE": "%99",
+        "TMUX": "/tmp/tmux.sock,123,0",
+    }
+    with patch.dict(os.environ, env), patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value=window_id,
+    ):
+        runner.invoke(
+            cli, ["start", "a", "b", "--who", who],
+        )
+        runner.invoke(cli, ["start", "c", "--who", who])
+    write_last_selected_window(
+        who, TEST_SERVER_KEY, TEST_SESSION_ID, window_id,
+    )
+
+    def switch_to(target):
+        with patch(
+            "nytid.cli.track.get_tmux_selected_window_id",
+            return_value=target,
+        ), patch(
+            "nytid.cli.track.emit_window_event_debug",
+        ):
+            return runner.invoke(cli, [
+                "_window-switch-detached",
+                "--server-key", TEST_SERVER_KEY,
+                "--session-id", TEST_SESSION_ID,
+                "--who", who,
+            ])
+
+    assert switch_to("@2").exit_code == 0
+    assert load_active_session(
+        who,
+    ).get_active_labels() == []
+
+    assert switch_to(window_id).exit_code == 0
+    session = load_active_session(who)
+    assert (
+        session.active_labels["a"][2]
+        == session.active_labels["b"][2]
+    )
+    assert (
+        session.active_labels["c"][2]
+        != session.active_labels["a"][2]
+    )
+
+    with patch.dict(os.environ, env), patch(
+        "nytid.cli.track.get_tmux_window_id_for_pane",
+        return_value=window_id,
+    ):
+        stop_result = runner.invoke(
+            cli, ["stop", "--who", who],
+        )
+    assert stop_result.exit_code == 0
+    session = load_active_session(who)
+    assert "a" in session.active_labels
+    assert "c" not in session.active_labels
 
 
 def test_window_event_debug_disabled_by_default(
@@ -16430,6 +16609,8 @@ from nytid.cli.track import (
     delete_window_labels,
     current_window_batch_scope,
     suspend_tracking_labels,
+    restart_window_batches,
+    resume_stopped_batches,
     resume_tracking_labels,
     summarize_window_transition,
     with_tmux_context_lock,
