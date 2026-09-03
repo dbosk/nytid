@@ -139,6 +139,7 @@ tools and workflows that teachers use for time management and reporting.
 The main module structure follows nytid's standard patterns:
 
 <<[[track.py]]>>=
+import calendar
 import click
 import datetime
 from enum import Enum
@@ -161,7 +162,10 @@ import typerconf as config
 from nytid.cli.utils.defaults import default
 from nytid.cli.utils.labels import apply_label_edits
 from nytid.cli.utils.output import Column, print_rows
-from typing import Annotated
+from nytid.cli.utils.workweek import (
+    DAY_NAMES, count_work_days, get_work_days, is_work_day,
+)
+from typing import Annotated, NamedTuple
 import time
 
 from nytid import storage
@@ -1258,41 +1262,254 @@ def make_stats_dates(
         now.date() - datetime.timedelta(days=offset)
         for offset in range(days)
     ]
+@
 
-def filter_entries_for_stats_window(
-    entries: "list[TrackingEntry]",
-    days: int,
+\subsubsection{Calendar Periods}
+\label{sec:track-calendar-periods}
+
+The daily views above answer for one date at a time.  The period
+reports of \cref{sec:track-stats} ask the same question over a week, a
+month or a year, and then compare the answer with what the work week
+(\cref{cli.utils.workweek}) says it should have been.  Four zoom
+levels, one question: the only thing that varies is where the period
+boundaries fall.  So the granularity becomes a value and there is one
+implementation.  A [[str]]-backed [[Enum]] is the module's usual
+spelling for such a closed choice, cf.\ [[ExportFormat]].
+
+<<constants>>=
+class StatsPeriod(str, Enum):
+    daily = "daily"
+    weekly = "weekly"
+    monthly = "monthly"
+    yearly = "yearly"
+@
+
+A period is the calendar unit containing a date, named by its
+inclusive end points.  Weeks are \textsc{iso} weeks, Monday to
+Sunday: that is the week a printed calendar shows, and it is what makes
+\enquote{this week} a Monday-anchored question rather than a rolling
+seven days.  Months and years are the calendar ones;
+[[calendar.monthrange]] knows how long February is in a given year, so
+no date library is needed.
+
+<<helper functions>>=
+def period_bounds(
+    granularity: StatsPeriod,
+    date: datetime.date,
+) -> tuple[datetime.date, datetime.date]:
+    """Return the inclusive (start, end) of the period holding `date`."""
+    if granularity == StatsPeriod.weekly:
+        start = date - datetime.timedelta(days=date.weekday())
+        return start, start + datetime.timedelta(days=6)
+    if granularity == StatsPeriod.monthly:
+        last = calendar.monthrange(date.year, date.month)[1]
+        return date.replace(day=1), date.replace(day=last)
+    if granularity == StatsPeriod.yearly:
+        return (
+            date.replace(month=1, day=1),
+            date.replace(month=12, day=31),
+        )
+    return date, date
+@
+
+Let's verify the bounds in a leap February, so that the month case is
+checked where a fixed month length would go wrong.  15 February 2024
+is a Thursday, whose week starts on Monday the 12th.
+
+<<test functions>>=
+def test_period_bounds():
+  """Each granularity names the calendar unit around a date."""
+  day = datetime.date(2024, 2, 15)
+  assert period_bounds(StatsPeriod.daily, day) == (day, day)
+  assert period_bounds(StatsPeriod.weekly, day) == (
+    datetime.date(2024, 2, 12), datetime.date(2024, 2, 18)
+  )
+  assert period_bounds(StatsPeriod.monthly, day) == (
+    datetime.date(2024, 2, 1), datetime.date(2024, 2, 29)
+  )
+  assert period_bounds(StatsPeriod.yearly, day) == (
+    datetime.date(2024, 1, 1), datetime.date(2024, 12, 31)
+  )
+@
+
+The label names the period the way a reader would: an \textsc{iso}
+date, an \textsc{iso} week such as [[2026-W36]], a month such as
+[[2026-09]], or a year.  The week label is computed from the period's
+Monday, not from whichever date the report was asked about, and that
+is what makes it right at year boundaries.  1 January 2027 is a Friday
+in week 53 of 2026; asking its Monday, 28 December 2026, for its
+\textsc{iso} year and week gives exactly [[2026-W53]].  A weekly
+label's year can therefore differ from the calendar year of the dates
+it covers.  That is a property of \textsc{iso} weeks, not a bug.
+
+<<helper functions>>=
+def period_label(
+    granularity: StatsPeriod,
+    start: datetime.date,
+) -> str:
+    """Name the period that starts on `start`."""
+    if granularity == StatsPeriod.weekly:
+        iso_year, iso_week, _ = start.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+    if granularity == StatsPeriod.monthly:
+        return f"{start.year}-{start.month:02d}"
+    if granularity == StatsPeriod.yearly:
+        return str(start.year)
+    return start.isoformat()
+@
+
+<<test functions>>=
+def test_period_label_at_year_boundaries():
+  """Weeks are labelled by their Monday's ISO year and week."""
+  monday, _ = period_bounds(
+    StatsPeriod.weekly, datetime.date(2027, 1, 1)
+  )
+  assert monday == datetime.date(2026, 12, 28)
+  assert period_label(StatsPeriod.weekly, monday) == "2026-W53"
+
+  monday, _ = period_bounds(
+    StatsPeriod.weekly, datetime.date(2026, 1, 1)
+  )
+  assert period_label(StatsPeriod.weekly, monday) == "2026-W01"
+
+  assert period_label(
+    StatsPeriod.monthly, datetime.date(2026, 9, 1)
+  ) == "2026-09"
+  assert period_label(
+    StatsPeriod.yearly, datetime.date(2026, 1, 1)
+  ) == "2026"
+  assert period_label(
+    StatsPeriod.daily, datetime.date(2026, 9, 3)
+  ) == "2026-09-03"
+@
+
+A report covers the most recent [[count]] periods, newest first, and
+the newest is the one containing today even though it is not over
+yet: a Wednesday report that hid the current week would be answering
+last week's question.  The three values travel together as a named
+tuple so that a caller can say [[period.label]] instead of remembering
+a position.
+
+<<helper functions>>=
+class Period(NamedTuple):
+    """A calendar period: inclusive end points and a display label."""
+
+    start: datetime.date
+    end: datetime.date
+    label: str
+@
+
+Walking backwards needs no month arithmetic.  The day before a
+period's start lies in the previous period whatever the
+granularity---the day before 1 January is 31 December of the year
+before---so [[period_bounds]] of that day \emph{is} the previous
+period.  Like [[make_stats_dates]], the function takes [[now]] so that
+tests can pin the calendar and a command can capture the clock once and
+hand the same instant to every helper.
+
+<<helper functions>>=
+def make_period_ranges(
+    granularity: StatsPeriod,
+    count: int,
     now: datetime.datetime | None = None,
-) -> "list[TrackingEntry]":
-    """Return entries clipped to the stats calendar window.
+) -> list[Period]:
+    """Return the `count` most recent periods, newest first.
 
-    The stats command reports whole calendar days, not a rolling
-    ``24 * days`` hour window. An overnight entry that starts before
-    midnight but continues into today must therefore remain visible,
-    while late work from yesterday should not leak into today's
-    summary just because it happened within the last 24 hours.
+    The first period is the one containing today.
     """
     if now is None:
         now = datetime.datetime.now()
 
-    start_date = now.date() - datetime.timedelta(days=days - 1)
+    periods = []
+    start, end = period_bounds(granularity, now.date())
+    for _ in range(count):
+        periods.append(
+            Period(start, end, period_label(granularity, start))
+        )
+        start, end = period_bounds(
+            granularity, start - datetime.timedelta(days=1)
+        )
+    return periods
+@
+
+Let's verify the walk at the awkward places: across the year boundary
+for weeks (4 January 2027 is a Monday), across February for months,
+and across a month boundary for days.  Whatever the granularity,
+consecutive periods must abut exactly.
+
+<<test functions>>=
+def test_make_period_ranges_walks_backwards():
+  """Periods come newest first and abut exactly."""
+  now = datetime.datetime(2027, 1, 4, 9, 0)
+  weeks = make_period_ranges(StatsPeriod.weekly, 2, now=now)
+  assert [p.label for p in weeks] == ["2027-W01", "2026-W53"]
+  assert weeks[0].start == datetime.date(2027, 1, 4)
+  assert weeks[1] == Period(
+    datetime.date(2026, 12, 28), datetime.date(2027, 1, 3), "2026-W53"
+  )
+
+  months = make_period_ranges(
+    StatsPeriod.monthly, 3, now=datetime.datetime(2026, 3, 15)
+  )
+  assert [p.label for p in months] == ["2026-03", "2026-02", "2026-01"]
+  assert months[1].end == datetime.date(2026, 2, 28)
+
+  years = make_period_ranges(
+    StatsPeriod.yearly, 2, now=datetime.datetime(2026, 9, 3)
+  )
+  assert [p.label for p in years] == ["2026", "2025"]
+
+  days = make_period_ranges(
+    StatsPeriod.daily, 3, now=datetime.datetime(2026, 3, 1)
+  )
+  assert [p.label for p in days] == [
+    "2026-03-01", "2026-02-28", "2026-02-27"
+  ]
+
+  for granularity in StatsPeriod:
+    periods = make_period_ranges(granularity, 3, now=now)
+    for newer, older in zip(periods, periods[1:]):
+      assert older.end + datetime.timedelta(days=1) == newer.start
+@
+
+A report's window is the union of its periods, and the entries must
+be cut to it before anything is summed.  The cut is calendar-based,
+not a rolling number of hours.  Rolling would mean that a report for
+\enquote{today} shows the last 24 hours, which can exclude
+early-morning work from today while including late-evening work from
+yesterday.  Cutting at midnight instead keeps the part of an overnight
+session that belongs to the window and drops the part that does not,
+so the totals agree with the dates the report names.
+
+<<helper functions>>=
+def clip_entries_to_dates(
+    entries: "list[TrackingEntry]",
+    start_date: datetime.date,
+    end_date: datetime.date,
+) -> "list[TrackingEntry]":
+    """Return entries clipped to the inclusive calendar date range.
+
+    Entries entirely outside the range are dropped; an entry that
+    crosses a boundary of the range is cut at midnight so that only
+    the part inside remains.
+    """
     window_start = datetime.datetime.combine(
         start_date,
         datetime.time.min,
     )
     window_end = datetime.datetime.combine(
-        now.date() + datetime.timedelta(days=1),
+        end_date + datetime.timedelta(days=1),
         datetime.time.min,
     )
 
-    filtered = []
+    clipped = []
     for entry in entries:
         if entry.end_time <= window_start:
             continue
         if entry.start_time >= window_end:
             continue
 
-        filtered.append(
+        clipped.append(
             TrackingEntry(
                 start_time=max(entry.start_time, window_start),
                 end_time=min(entry.end_time, window_end),
@@ -1302,7 +1519,142 @@ def filter_entries_for_stats_window(
             )
         )
 
-    return filtered
+    return clipped
+@
+
+<<test functions>>=
+def test_clip_entries_to_dates_uses_calendar_days():
+    """Clipping uses calendar dates, not rolling 24-hour cutoffs."""
+    entries = [
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 23, 30, 0),
+            datetime.datetime(2026, 3, 12, 1, 0, 0),
+            ["overnight"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 8, 0, 0),
+            datetime.datetime(2026, 3, 11, 9, 0, 0),
+            ["yesterday"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 12, 10, 0, 0),
+            datetime.datetime(2026, 3, 12, 11, 0, 0),
+            ["today"],
+        ),
+    ]
+
+    today = datetime.date(2026, 3, 12)
+    clipped = clip_entries_to_dates(entries, today, today)
+
+    assert len(clipped) == 2
+    assert clipped[0].labels == ["overnight"]
+    assert clipped[0].start_time == datetime.datetime(2026, 3, 12, 0, 0, 0)
+    assert clipped[0].end_time == datetime.datetime(2026, 3, 12, 1, 0, 0)
+    assert clipped[1].labels == ["today"]
+@
+
+Bucketing works on the daily totals, not on the entries.  The pipeline
+is: clip to the window, split and merge per day with
+[[compute_daily_wall_clock]], then add each day's total into the
+period that contains it.  Every step is exact.  Splitting at midnight
+puts an overnight session's hours on the two dates they belong to;
+merging per day means two labels tracked side by side count once; and
+the per-day totals can simply be added, because after the split no
+interval crosses midnight, so two different days cannot overlap.
+Bucketing entries directly would have to redo the merge per period
+and would still get the overnight case wrong.
+
+<<helper functions>>=
+def totals_per_period(
+    daily_totals: dict[datetime.date, datetime.timedelta],
+    granularity: StatsPeriod,
+) -> dict[datetime.date, datetime.timedelta]:
+    """Sum per-date totals into periods, keyed by period start."""
+    totals = {}
+    for date, duration in daily_totals.items():
+        start, _ = period_bounds(granularity, date)
+        totals[start] = (
+            totals.get(start, datetime.timedelta()) + duration
+        )
+    return totals
+@
+
+Let's verify the two properties the pipeline is built for: an
+overnight session from Sunday 6 September 2026 into the Monday lands
+in two different weeks, and two labels tracked over the same hour
+count as one hour.
+
+<<test functions>>=
+def test_totals_per_period_sums_split_days():
+  """An overnight entry is split between the weeks it spans."""
+  entries = [
+    TrackingEntry(
+      datetime.datetime(2026, 9, 6, 23, 30),
+      datetime.datetime(2026, 9, 7, 1, 0),
+      ["overnight"],
+    ),
+  ]
+  totals = totals_per_period(
+    compute_daily_wall_clock(entries), StatsPeriod.weekly
+  )
+  assert totals == {
+    datetime.date(2026, 8, 31): datetime.timedelta(minutes=30),
+    datetime.date(2026, 9, 7): datetime.timedelta(hours=1),
+  }
+
+def test_totals_per_period_merges_overlapping_labels():
+  """Concurrent labels do not inflate a period's total."""
+  start = datetime.datetime(2026, 9, 7, 9, 0)
+  end = datetime.datetime(2026, 9, 7, 10, 0)
+  entries = [
+    TrackingEntry(start, end, ["DD1310"]),
+    TrackingEntry(start, end, ["grading"]),
+  ]
+  totals = totals_per_period(
+    compute_daily_wall_clock(entries), StatsPeriod.monthly
+  )
+  assert totals == {
+    datetime.date(2026, 9, 1): datetime.timedelta(hours=1)
+  }
+@
+
+The expectation is the work week's answer to \enquote{how much should
+have been tracked}: one daily limit per work day in the range.  The
+caller clips the range to today, so the current week expects the work
+days that have happened rather than all five.  A Wednesday report
+would otherwise show a two-day deficit that no amount of work could
+have closed.  Weekends are simply not work days, so any time tracked on
+one is a deviation in the other direction, which is the point.
+
+<<helper functions>>=
+def expected_time(
+    start_date: datetime.date,
+    end_date: datetime.date,
+    daily_limit: float,
+    work_days: list[str] | None = None,
+) -> datetime.timedelta:
+    """Return `daily_limit` hours per work day in the inclusive range."""
+    work_day_count = count_work_days(start_date, end_date, work_days)
+    return datetime.timedelta(hours=work_day_count * daily_limit)
+@
+
+<<test functions>>=
+def test_expected_time_counts_only_workdays():
+  """Only work days contribute to the expectation."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  monday = datetime.date(2026, 9, 7)
+  wednesday = datetime.date(2026, 9, 9)
+  saturday = datetime.date(2026, 9, 12)
+  sunday = datetime.date(2026, 9, 13)
+  assert expected_time(monday, sunday, 8.0, weekdays) == (
+    datetime.timedelta(hours=40)
+  )
+  assert expected_time(monday, wednesday, 8.0, weekdays) == (
+    datetime.timedelta(hours=24)
+  )
+  assert expected_time(saturday, sunday, 8.0, weekdays) == (
+    datetime.timedelta()
+  )
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -13640,8 +13992,8 @@ The stats command adds one extra step on top of this shared helper.
 [[ls]] and [[export]] interpret [[--days]] as a rolling age limit, but
 [[stats]] presents named calendar dates.  It therefore narrows the
 already-filtered entries to the requested date range with
-[[filter_entries_for_stats_window()]] so the summary and the daily table
-agree even around midnight.
+[[clip_entries_to_dates()]] (\cref{sec:track-calendar-periods}) so the
+summary and the daily table agree even around midnight.
 
 <<helper functions>>=
 def filter_entries(
@@ -13721,39 +14073,6 @@ def test_filter_entries(temp_tracking_dir):
         who="alice", labels=["DD1310"]
     )
     assert len(result) == 1
-
-def test_filter_entries_for_stats_window_uses_calendar_days():
-    """Stats windows use calendar dates, not rolling 24-hour cutoffs."""
-    now = datetime.datetime(2026, 3, 12, 7, 0, 0)
-    entries = [
-        TrackingEntry(
-            datetime.datetime(2026, 3, 11, 23, 30, 0),
-            datetime.datetime(2026, 3, 12, 1, 0, 0),
-            ["overnight"],
-        ),
-        TrackingEntry(
-            datetime.datetime(2026, 3, 11, 8, 0, 0),
-            datetime.datetime(2026, 3, 11, 9, 0, 0),
-            ["yesterday"],
-        ),
-        TrackingEntry(
-            datetime.datetime(2026, 3, 12, 10, 0, 0),
-            datetime.datetime(2026, 3, 12, 11, 0, 0),
-            ["today"],
-        ),
-    ]
-
-    filtered = filter_entries_for_stats_window(
-        entries,
-        days=1,
-        now=now,
-    )
-
-    assert len(filtered) == 2
-    assert filtered[0].labels == ["overnight"]
-    assert filtered[0].start_time == datetime.datetime(2026, 3, 12, 0, 0, 0)
-    assert filtered[0].end_time == datetime.datetime(2026, 3, 12, 1, 0, 0)
-    assert filtered[1].labels == ["today"]
 
 def test_merge_duplicate_tracking_entries_warns(caplog):
     """Exact duplicate history rows are collapsed with a warning."""
@@ -15996,7 +16315,7 @@ would mean
 \enquote{the last 24 hours,} which can exclude early-morning work from
 today while including late-evening work from yesterday.  We therefore
 load by worker and labels first, then apply
-[[filter_entries_for_stats_window()]] with a single captured
+[[clip_entries_to_dates()]] with a single captured
 [[stats_now]] timestamp so the filter and the rendered date headers agree:
 
 <<load and filter entries for stats>>=
@@ -16009,10 +16328,10 @@ if recent_entries is None:
     typer.echo("No tracking data available")
     return
 
-recent_entries = filter_entries_for_stats_window(
+recent_entries = clip_entries_to_dates(
     recent_entries,
-    days=days,
-    now=stats_now,
+    stats_now.date() - datetime.timedelta(days=days - 1),
+    stats_now.date(),
 )
 
 if labels:
@@ -16630,7 +16949,10 @@ from nytid.cli.track import (
     load_tracking_data, load_active_session,
     mutate_worker_tracking_state,
     format_duration, format_signed_duration,
-    filter_entries, filter_entries_for_stats_window,
+    filter_entries, clip_entries_to_dates,
+    StatsPeriod, Period, period_bounds, period_label,
+    make_period_ranges, totals_per_period, expected_time,
+    compute_daily_wall_clock,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
     parse_offset, parse_at_time,
