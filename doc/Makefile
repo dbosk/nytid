@@ -20,6 +20,7 @@ nytid.pdf: ../src/nytid/cli/utils/defaults.tex
 nytid.pdf: ../src/nytid/cli/utils/rooms.tex
 nytid.pdf: ../src/nytid/cli/utils/labels.tex
 nytid.pdf: ../src/nytid/cli/utils/output.tex
+nytid.pdf: ../src/nytid/cli/utils/workweek.tex
 
 nytid.pdf: ../src/nytid/storage/init.tex
 nytid.pdf: ../src/nytid/storage/afs.tex
