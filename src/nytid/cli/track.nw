@@ -154,11 +154,13 @@ import shlex
 import shutil
 import signal
 import socket
+import statistics
 import sys
 import subprocess
 import tempfile
 import typer
 import typerconf as config
+from dataclasses import dataclass
 from nytid.cli.utils.defaults import default
 from nytid.cli.utils.labels import apply_label_edits
 from nytid.cli.utils.output import Column, print_rows
@@ -1655,6 +1657,294 @@ def test_expected_time_counts_only_workdays():
   assert expected_time(saturday, sunday, 8.0, weekdays) == (
     datetime.timedelta()
   )
+@
+
+\subsubsection{The Work Summary}
+\label{sec:track-work-summary}
+
+A table of periods says how much; the summary says how.  The
+questions it answers are the ones a teacher asks about a term in
+hindsight: did the hours add up, on which days were they done, how
+long did the long days get, when does a working day usually start and
+end, and where did the time go.  The answers are computed here, apart
+from any printing, so that each can be tested from a handful of fixed
+entries and so that the reports of \cref{sec:track-stats} only have to
+decide what to say about them.
+
+<<helper functions>>=
+@dataclass
+class WorkSummary:
+    """Aggregate statistics over a window of tracked time.
+
+    `longest_day` is a `(date, duration)` pair, `median_start` and
+    `median_end` are times of day, and `top_label_sets` lists
+    `(labels, duration)` pairs, largest first; all are `None` or
+    empty when nothing was tracked.
+    """
+
+    total: datetime.timedelta
+    expected: datetime.timedelta
+    workdays: int
+    days_worked: int
+    off_days_worked: int
+    off_days_total: datetime.timedelta
+    longest_day: tuple[datetime.date, datetime.timedelta] | None
+    longest_streak: int
+    median_start: datetime.time | None
+    median_end: datetime.time | None
+    top_label_sets: list[tuple[tuple[str, ...], datetime.timedelta]]
+
+    @property
+    def diff(self) -> datetime.timedelta:
+        """Tracked minus expected time."""
+        return self.total - self.expected
+
+    @property
+    def per_workday(self) -> datetime.timedelta | None:
+        """Tracked time per work day, or `None` without work days."""
+        if not self.workdays:
+            return None
+        return self.total / self.workdays
+@
+
+The computation starts from the same per-day totals the period tables
+use, so the two can never disagree about the total.  [[end_date]] is
+the window's end already clipped to today by the caller, for the same
+reason as in [[expected_time]]: the work days still to come are not
+yet owed.
+
+<<helper functions>>=
+def compute_work_summary(
+    entries: "list[TrackingEntry]",
+    start_date: datetime.date,
+    end_date: datetime.date,
+    daily_limit: float,
+    work_days: list[str] | None = None,
+) -> WorkSummary:
+    """Summarise entries already clipped to `start_date`..`end_date`."""
+    if work_days is None:
+        work_days = get_work_days()
+    daily_totals = compute_daily_wall_clock(entries)
+    worked = sorted(
+        date for date, duration in daily_totals.items()
+        if duration > datetime.timedelta()
+    )
+    <<sum tracked time on work days and off days>>
+    <<find the longest day and streak>>
+    <<find the typical start and end of a day>>
+    <<rank the label sets>>
+    return WorkSummary(
+        total=total,
+        expected=expected_time(
+            start_date, end_date, daily_limit, work_days
+        ),
+        workdays=count_work_days(start_date, end_date, work_days),
+        days_worked=days_worked,
+        off_days_worked=len(off_days),
+        off_days_total=off_days_total,
+        longest_day=longest_day,
+        longest_streak=longest_streak,
+        median_start=median_start,
+        median_end=median_end,
+        top_label_sets=top_label_sets,
+    )
+@
+
+Work on a day the mask says is free is the deviation that a total
+hides best: a week of 40 hours can be five even days or four short
+ones and a Sunday.  So the days with time are split by the mask, and
+the off days are counted and summed separately.
+
+<<sum tracked time on work days and off days>>=
+total = sum(daily_totals.values(), datetime.timedelta())
+days_worked = sum(1 for date in worked if is_work_day(date, work_days))
+off_days = [
+    date for date in worked if not is_work_day(date, work_days)
+]
+off_days_total = sum(
+    (daily_totals[date] for date in off_days), datetime.timedelta()
+)
+@
+
+The longest day is the peak; the longest streak of consecutive days
+with any tracked time is the other extreme, days without a break.
+Both come from the sorted dates with time, so a day off in the middle
+of a week ends a streak even if the week's total is unremarkable.
+
+<<find the longest day and streak>>=
+longest_day = None
+if worked:
+    longest_day = max(daily_totals.items(), key=lambda item: item[1])
+
+longest_streak = 0
+streak = 0
+previous = None
+for date in worked:
+    if (
+        previous is not None
+        and date - previous == datetime.timedelta(days=1)
+    ):
+        streak += 1
+    else:
+        streak = 1
+    longest_streak = max(longest_streak, streak)
+    previous = date
+@
+
+A day's boundaries are the first start and the last end among the
+entries that \emph{began} on that date, not among the midnight-split
+intervals.  A session that runs past midnight belongs to the evening
+it started in; splitting it would make the next day appear to start
+at [[00:00]], which is a lie about when anyone sat down.  The end is
+therefore measured from the start date's midnight and may exceed a
+day, and is folded back to a time of day only for display, so that
+such a session ends at [[01:12]] rather than at a 25th hour.
+
+The medians, not the extremes, are what a \enquote{typical day}
+means.  One 03:00 debugging session should not redefine when work
+starts, and the median is indifferent to how extreme the outlier is.
+
+<<find the typical start and end of a day>>=
+first_starts = {}
+last_ends = {}
+for entry in entries:
+    date = entry.start_time.date()
+    midnight = datetime.datetime.combine(date, datetime.time.min)
+    start = (entry.start_time - midnight).total_seconds()
+    end = (entry.end_time - midnight).total_seconds()
+    first_starts[date] = min(first_starts.get(date, start), start)
+    last_ends[date] = max(last_ends.get(date, end), end)
+
+median_start = median_end = None
+if first_starts:
+    median_start = time_of_day(
+        statistics.median(first_starts.values())
+    )
+    median_end = time_of_day(statistics.median(last_ends.values()))
+@
+
+Folding a number of seconds back to a time of day is one line, but a
+line with a modulo in it, so it gets a name.  Adding to
+[[datetime.min]] lets [[datetime]] do the wrapping.
+
+<<helper functions>>=
+def time_of_day(seconds: float) -> datetime.time:
+    """Fold seconds since some midnight to a time of day."""
+    moment = datetime.datetime.min + datetime.timedelta(seconds=seconds)
+    return moment.time().replace(microsecond=0)
+@
+
+The label sets are ranked the same way [[today]] groups them: by the
+exact set, so that the tags stay peers and repeated bursts on the same
+combination collapse into one line.  Summing the per-date label-set
+totals across dates is exact for the reason given in
+\cref{sec:track-calendar-periods}.  Three sets are enough to say where
+the time went; a long tail would only repeat the table.
+
+<<constants>>=
+TOP_LABEL_SETS = 3
+<<rank the label sets>>=
+label_set_totals = {}
+for label_totals in compute_daily_label_set_totals(entries).values():
+    for labels_key, duration in label_totals.items():
+        label_set_totals[labels_key] = (
+            label_set_totals.get(labels_key, datetime.timedelta())
+            + duration
+        )
+top_label_sets = sorted(
+    label_set_totals.items(),
+    key=lambda item: (-item[1].total_seconds(), item[0]),
+)[:TOP_LABEL_SETS]
+@
+
+Let's verify every field from one fixed week, Monday 7 to Sunday 13
+September 2026, with work on Monday to Wednesday and a Saturday:
+
+<<test functions>>=
+def summary_week_entries():
+  """Three weekdays and a Saturday of fixed entries."""
+  def entry(day, start, end, *labels):
+    return TrackingEntry(
+      datetime.datetime(2026, 9, day, *start),
+      datetime.datetime(2026, 9, day, *end),
+      list(labels),
+    )
+  return [
+    entry(7, (9, 0), (17, 0), "nytid"),
+    entry(8, (8, 0), (18, 30), "nytid"),
+    entry(9, (9, 30), (16, 0), "DD1310"),
+    entry(12, (10, 0), (12, 0), "email"),
+  ]
+
+def test_compute_work_summary_over_a_week():
+  """All fields agree with the fixed week."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  summary = compute_work_summary(
+    summary_week_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    weekdays,
+  )
+  assert summary.total == datetime.timedelta(hours=27)
+  assert summary.expected == datetime.timedelta(hours=40)
+  assert summary.diff == datetime.timedelta(hours=-13)
+  assert summary.workdays == 5
+  assert summary.per_workday == datetime.timedelta(hours=5, minutes=24)
+  assert summary.days_worked == 3
+  assert summary.off_days_worked == 1
+  assert summary.off_days_total == datetime.timedelta(hours=2)
+  assert summary.longest_day == (
+    datetime.date(2026, 9, 8), datetime.timedelta(hours=10, minutes=30)
+  )
+  assert summary.longest_streak == 3
+  assert summary.median_start == datetime.time(9, 15)
+  assert summary.median_end == datetime.time(16, 30)
+  assert summary.top_label_sets == [
+    (("nytid",), datetime.timedelta(hours=18, minutes=30)),
+    (("DD1310",), datetime.timedelta(hours=6, minutes=30)),
+    (("email",), datetime.timedelta(hours=2)),
+  ]
+@
+
+An overnight session belongs to the evening it started in, and a
+window with nothing in it must produce an empty summary rather than a
+division by zero:
+
+<<test functions>>=
+def test_compute_work_summary_keeps_overnight_sessions_whole():
+  """The day boundaries come from where a session began."""
+  entries = [
+    TrackingEntry(
+      datetime.datetime(2026, 9, 7, 23, 0),
+      datetime.datetime(2026, 9, 8, 1, 0),
+      ["late"],
+    ),
+  ]
+  summary = compute_work_summary(
+    entries,
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 8),
+    8.0,
+    ["mon", "tue"],
+  )
+  assert summary.median_start == datetime.time(23, 0)
+  assert summary.median_end == datetime.time(1, 0)
+  assert summary.longest_streak == 2
+
+def test_compute_work_summary_of_nothing():
+  """An empty window yields an empty summary."""
+  summary = compute_work_summary(
+    [], datetime.date(2026, 9, 12), datetime.date(2026, 9, 13), 8.0,
+    ["mon"],
+  )
+  assert summary.total == datetime.timedelta()
+  assert summary.workdays == 0
+  assert summary.per_workday is None
+  assert summary.longest_day is None
+  assert summary.longest_streak == 0
+  assert summary.median_start is None
+  assert summary.top_label_sets == []
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -16952,7 +17242,8 @@ from nytid.cli.track import (
     filter_entries, clip_entries_to_dates,
     StatsPeriod, Period, period_bounds, period_label,
     make_period_ranges, totals_per_period, expected_time,
-    compute_daily_wall_clock,
+    compute_daily_wall_clock, compute_work_summary, WorkSummary,
+    time_of_day,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
     parse_offset, parse_at_time,
