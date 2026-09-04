@@ -1,0 +1,231 @@
+\chapter{The shape of a working week, the \texttt{cli.utils.workweek}
+module}%
+\label{cli.utils.workweek}
+
+Three commands need to know when the user is \emph{supposed} to be
+working.  [[nytid todo]] slots pending tasks into work hours,
+[[nytid schedule show]] computes the free slots of each work day, and
+[[nytid track stats]] compares the time actually tracked with the hours
+a work week is expected to contain.  All three must agree on what a
+work day is: a user who removes Friday from the mask should see that
+Friday disappear from the schedule \emph{and} stop being counted as a
+day on which eight hours were due.
+
+The settings originally lived in the [[todo]] module, and [[schedule]]
+imported them from there.  [[track]] cannot do the same, because
+[[todo]] imports from [[track]] at module level (it derives times for
+started todos from the tracking history), so an import in the other
+direction is a cycle.  A neutral home under [[cli.utils]] resolves
+this: the settings depend on nothing but the [[default]] helper
+(\cref{cli.utils.defaults}), and every command imports them from here.
+
+The configuration keys keep their historical [[todo.]] prefix.  They
+are settings users have already written into their configuration
+files, and renaming a key would silently reset every configured work
+week to the built-in default.  The prefix therefore records where the
+settings came from, not which command owns them.
+
+\section{Module structure}
+
+<<[[workweek.py]]>>=
+"""The user's work week, shared by the todo, schedule and track commands.
+
+Work hours and work days are read from the personal config through
+`default`; the keys keep their historical `todo.` prefix. See the
+`cli.utils.workweek` chapter in the manual for the design rationale.
+"""
+import datetime
+
+from nytid.cli.utils.defaults import default
+
+<<configuration keys and defaults>>
+<<work-window accessors>>
+<<work-day predicates>>
+@
+
+\section{The work window}
+
+A work day is described by three values: when it starts, when it ends,
+and which days of the week count.  Start and end are kept as
+[[HH:MM]] strings rather than parsed here, because the two consumers
+parse them differently---[[schedule]] combines them with a date into
+[[datetime]] objects, while [[todo]] only ever displays them---and a
+string round-trips through the configuration file unchanged.
+
+<<configuration keys and defaults>>=
+WORK_START_CONFIG = "todo.work_start"
+WORK_END_CONFIG = "todo.work_end"
+WORK_DAYS_CONFIG = "todo.work_days"
+
+DEFAULT_WORK_START = "08:00"
+DEFAULT_WORK_END = "17:00"
+DEFAULT_WORK_DAYS = "mon,tue,wed,thu,fri"
+@
+
+The accessors are functions rather than module-level constants so that
+the configuration is consulted when a command runs, not when the module
+is imported.  Tests rely on this: they can patch [[default]] and observe
+the effect without reloading the module.
+
+<<work-window accessors>>=
+def get_work_start() -> str:
+    """Get configured work day start time as `HH:MM`."""
+    return default(WORK_START_CONFIG, DEFAULT_WORK_START, str)
+
+
+def get_work_end() -> str:
+    """Get configured work day end time as `HH:MM`."""
+    return default(WORK_END_CONFIG, DEFAULT_WORK_END, str)
+@
+
+The day mask accepts two spellings.  Written by hand, the natural form
+is the comma-separated string above; written by a tool, or by a user
+who prefers structure, it is a JSON list of names.  Normalising both to
+one lower-case list means that no consumer needs to know which form the
+file used, and that [[Mon]] and [[mon]] name the same day.
+
+<<work-window accessors>>=
+def get_work_days() -> list[str]:
+    """Get configured work days as a list of lower-case day names.
+
+    Handles both string (`"mon,tue,wed"`) and list
+    (`["mon", "tue", "wed"]`) config formats.
+    """
+    days_val = default(WORK_DAYS_CONFIG, DEFAULT_WORK_DAYS)
+    if isinstance(days_val, list):
+        days_val = ",".join(str(d) for d in days_val)
+    return [d.strip().lower() for d in days_val.split(",")]
+@
+
+Let's verify that both spellings normalise to the same list.  We patch
+[[default]] rather than writing a configuration file, since the only
+thing under test is the normalisation.
+
+<<test functions>>=
+def test_get_work_days_accepts_string_and_list(monkeypatch):
+  monkeypatch.setattr(
+    "nytid.cli.utils.workweek.default",
+    lambda key, fallback, cast=None: "Mon, tue,WED",
+  )
+  assert get_work_days() == ["mon", "tue", "wed"]
+
+  monkeypatch.setattr(
+    "nytid.cli.utils.workweek.default",
+    lambda key, fallback, cast=None: ["mon", "Tue"],
+  )
+  assert get_work_days() == ["mon", "tue"]
+@
+
+\section{Naming the days}
+
+The mask names days the way people do, [[mon]] through [[sun]], while
+Python numbers them the way [[date.weekday()]] does, Monday as zero.
+One list, indexed by that number, is the whole translation.
+
+<<configuration keys and defaults>>=
+DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+@
+
+The predicate takes the mask as an optional argument.  This is not a
+convenience: [[schedule]] reads the work window once per invocation
+and its tests control the mask by patching that single read, so a
+predicate that consulted the configuration on its own would silently
+escape the tests' control.  A caller with no mask of its own, such as
+[[track]], omits the argument and gets the configured one.
+
+<<work-day predicates>>=
+def is_work_day(date, work_days=None) -> bool:
+    """Return whether `date` falls on a configured work day.
+
+    `work_days` is a list of lower-case day names as returned by
+    `get_work_days()`; it is read from the configuration when omitted.
+    """
+    if work_days is None:
+        work_days = get_work_days()
+    return DAY_NAMES[date.weekday()] in work_days
+@
+
+Counting the work days in a date range is what turns a mask into an
+expectation: so many work days times so many hours per day.  Both ends
+are inclusive, because the ranges this is used for are calendar
+periods---a week from Monday to Sunday, a month from the first to the
+last---and those are naturally named by their end points.  An inverted
+range counts nothing rather than raising, so that a caller clipping a
+period to \enquote{today} need not special-case a period that has not
+started.
+
+<<work-day predicates>>=
+def count_work_days(start_date, end_date, work_days=None) -> int:
+    """Count the work days from `start_date` to `end_date`, inclusive.
+
+    Returns 0 when `end_date` precedes `start_date`.
+    """
+    if work_days is None:
+        work_days = get_work_days()
+    count = 0
+    date = start_date
+    while date <= end_date:
+        if is_work_day(date, work_days):
+            count += 1
+        date += datetime.timedelta(days=1)
+    return count
+@
+
+Let's verify the predicates against a known week: 2026-09-07 is a
+Monday.  The explicit mask must win over the configuration, and the
+inclusive count over a full week must be exactly the five weekdays.
+
+<<test functions>>=
+def test_is_work_day_uses_the_explicit_mask():
+  monday = datetime.date(2026, 9, 7)
+  saturday = datetime.date(2026, 9, 12)
+  assert is_work_day(monday, ["mon"])
+  assert not is_work_day(saturday, ["mon"])
+  assert is_work_day(saturday, ["sat"])
+
+
+def test_is_work_day_falls_back_to_the_configuration(monkeypatch):
+  monkeypatch.setattr(
+    "nytid.cli.utils.workweek.get_work_days",
+    lambda: ["sat"],
+  )
+  assert is_work_day(datetime.date(2026, 9, 12))
+  assert not is_work_day(datetime.date(2026, 9, 7))
+
+
+def test_count_work_days_is_inclusive():
+  monday = datetime.date(2026, 9, 7)
+  sunday = datetime.date(2026, 9, 13)
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  assert count_work_days(monday, sunday, weekdays) == 5
+  assert count_work_days(monday, monday, weekdays) == 1
+  saturday = datetime.date(2026, 9, 12)
+  assert count_work_days(saturday, saturday, weekdays) == 0
+
+
+def test_count_work_days_of_inverted_range_is_zero():
+  later = datetime.date(2026, 9, 13)
+  earlier = datetime.date(2026, 9, 7)
+  assert count_work_days(later, earlier, ["mon"]) == 0
+@
+
+\section{Tests}
+
+The tests are tangled into [[tests/test_cliutilsworkweek.py]].  The
+helpers are pure apart from the configuration read, which every test
+either bypasses with an explicit mask or patches out.
+
+<<test [[cliutilsworkweek.py]]>>=
+import datetime
+import sys
+sys.path.insert(0, "../src")
+
+from nytid.cli.utils.workweek import (
+  DAY_NAMES,
+  count_work_days,
+  get_work_days,
+  is_work_day,
+)
+
+<<test functions>>
+@

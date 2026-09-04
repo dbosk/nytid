@@ -63,7 +63,8 @@ statistics, export to JSON/CSV/ICS, and edit past entries.
 nytid track start DD1310 grading
 nytid track start email --run mutt
 nytid track stop
-nytid track stats
+nytid track today
+nytid track stats weekly
 ```
 
 ### `todo` — task management with agent support

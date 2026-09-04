@@ -5,6 +5,7 @@ MODULES+=	defaults.py defaults.tex
 MODULES+=	rooms.py rooms.tex
 MODULES+=	labels.py labels.tex
 MODULES+=	output.py output.tex
+MODULES+=	workweek.py workweek.tex
 
 .PHONY: all
 all: ${MODULES}

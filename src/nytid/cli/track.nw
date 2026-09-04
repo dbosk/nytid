@@ -139,6 +139,7 @@ tools and workflows that teachers use for time management and reporting.
 The main module structure follows nytid's standard patterns:
 
 <<[[track.py]]>>=
+import calendar
 import click
 import datetime
 from enum import Enum
@@ -153,15 +154,20 @@ import shlex
 import shutil
 import signal
 import socket
+import statistics
 import sys
 import subprocess
 import tempfile
 import typer
 import typerconf as config
+from dataclasses import dataclass
 from nytid.cli.utils.defaults import default
 from nytid.cli.utils.labels import apply_label_edits
 from nytid.cli.utils.output import Column, print_rows
-from typing import Annotated
+from nytid.cli.utils.workweek import (
+    DAY_NAMES, count_work_days, get_work_days, is_work_day,
+)
+from typing import Annotated, NamedTuple
 import time
 
 from nytid import storage
@@ -198,8 +204,10 @@ cli = typer.Typer(
                     " grading.\n"
                     "  nytid track stop -a                    # stop all"
                     " active tracking\n"
-                    "  nytid track stats DD1310               # view time"
-                    " summary"
+                    "  nytid track today DD1310               # today's"
+                    " time\n"
+                    "  nytid track stats weekly               # tracked vs"
+                    " expected"
                   ))
 
 <<helper functions>>
@@ -223,10 +231,10 @@ The track system supports the following configuration options:
 \begin{description}
 \item[[[track.data_dir]]] Directory where tracking data is stored.
   Defaults to \texttt{\~{}/.nytid/tracking} if not configured.
-\item[[[track.weekly_limit]]] Default weekly hour limit for warnings
-  in statistics. Defaults to 40.0 hours if not configured.
-\item[[[track.daily_limit]]] Default daily hour limit for warnings
-  in statistics. Defaults to 8.0 hours if not configured.
+\item[[[track.daily_limit]]] Hours expected per work day, which
+  [[today]] and [[stats]] compare the tracked time with.  Defaults to
+  8.0 hours if not configured.  Which days are work days is the
+  shared [[todo.work_days]] setting (\cref{cli.utils.workweek}).
 \item[[[track.auto-suspend.default]]] Whether to automatically
   suspend tracking when a tmux pane loses focus and resume when it
   regains focus.  Defaults to \enquote{true}.  Can be overridden
@@ -248,10 +256,7 @@ To customize the track system, use the standard nytid config commands:
 # Set custom data directory
 nytid config track.data_dir -s /path/to/custom/tracking/data
 
-# Set weekly hour limit for work-life balance warnings  
-nytid config track.weekly_limit -s 35.0
-
-# Set daily hour limit warnings
+# Set the hours expected per work day
 nytid config track.daily_limit -s 7.5
 
 # Disable auto-suspend for an automated worker
@@ -262,7 +267,6 @@ nytid config track.debug -s true
 
 # View current track configuration
 nytid config track.data_dir
-nytid config track.weekly_limit  
 nytid config track.daily_limit
 nytid config track.debug
 \end{minted}
@@ -770,21 +774,12 @@ def get_current_session_lock_file(
     return session_file.with_suffix(".lock")
 @
 
-The weekly limit helper only needs one key, so we keep that key next to
-the helper that reads it.
-
-<<constants>>=
-DEFAULT_WEEKLY_LIMIT_CONFIG = "track.weekly_limit"
-@
-
-<<configuration management>>=
-def get_default_weekly_limit() -> float:
-    """Get the default weekly hour limit from config"""
-    return default(DEFAULT_WEEKLY_LIMIT_CONFIG,
-                   DEFAULT_WEEKLY_LIMIT_HOURS, float)
-@
-
-Likewise, the daily-limit key belongs with the daily-limit helper.
+The daily-limit helper only needs one key, so we keep that key next to
+the helper that reads it.  The value is both the expectation the
+reports of \cref{sec:track-today,sec:track-stats} compare a work day
+with and, historically, the limit above which a day was flagged; the
+two coincide, since a day is over its limit exactly when it exceeds
+what was expected of it.
 
 <<constants>>=
 DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
@@ -792,7 +787,7 @@ DEFAULT_DAILY_LIMIT_CONFIG = "track.daily_limit"
 
 <<configuration management>>=
 def get_default_daily_limit() -> float:
-    """Get the default daily hour limit from config"""
+    """Get the hours expected per work day from config"""
     return default(DEFAULT_DAILY_LIMIT_CONFIG,
                    DEFAULT_DAILY_LIMIT_HOURS, float)
 @
@@ -883,8 +878,7 @@ human-readable.
 # Label display separators
 LABEL_SEPARATOR = " > "
 
-# Default time limits for work-life balance warnings
-DEFAULT_WEEKLY_LIMIT_HOURS = 40.0  # Standard full-time work week
+# Hours expected per work day
 DEFAULT_DAILY_LIMIT_HOURS = 8.0    # Standard work day
 @
 
@@ -902,25 +896,47 @@ negative durations---the commands that build entries reject inverted
 intervals---but a formatter that cannot lie is what makes such a bug
 visible instead of silent.
 
+Seconds are optional.  A single session is measured to the second, and
+[[status]] and [[ls]] show it that way.  The period reports of
+\cref{sec:track-stats} are sums over days or weeks, where
+[[148h 20m 0s]] says nothing that [[148h 20m]] does not, and an
+expected [[8h 0m 0s]] reads as a measurement rather than the target it
+is.  The switch lives on this one formatter instead of in a second
+function so that the two spellings cannot drift apart in the one place
+where drifting would matter: the treatment of the sign.  A magnitude
+that rounds to no whole minute is unsigned, since [[-0m]] would claim a
+direction the number cannot show.
+
 <<helper functions>>=
-def format_duration(duration: datetime.timedelta) -> str:
+def format_duration(
+    duration: datetime.timedelta,
+    seconds: bool = True,
+) -> str:
     """Format a duration in a human-readable way.
 
     Negative durations keep a leading minus sign so an
     inverted interval can never be displayed as a
-    positive one.
+    positive one.  With `seconds=False` the seconds are
+    dropped: `1h 30m`, `30m`, `0m`.
     """
     total_seconds = int(duration.total_seconds())
     sign = "-" if total_seconds < 0 else ""
     hours, remainder = divmod(abs(total_seconds), 3600)
-    minutes, seconds = divmod(remainder, 60)
+    minutes, secs = divmod(remainder, 60)
 
+    if not seconds:
+        if hours > 0:
+            return f"{sign}{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{sign}{minutes}m"
+        else:
+            return "0m"
     if hours > 0:
-        return f"{sign}{hours}h {minutes}m {seconds}s"
+        return f"{sign}{hours}h {minutes}m {secs}s"
     elif minutes > 0:
-        return f"{sign}{minutes}m {seconds}s"
+        return f"{sign}{minutes}m {secs}s"
     else:
-        return f"{sign}{seconds}s"
+        return f"{sign}{secs}s"
 
 def get_labels_display(labels: list[str]) -> str:
     """Get a display string for labels (as comma-separated tags)"""
@@ -933,6 +949,62 @@ def test_format_duration_is_sign_aware():
   assert format_duration(datetime.timedelta(minutes=30)) == "30m 0s"
   assert format_duration(datetime.timedelta(minutes=-30)) == "-30m 0s"
   assert format_duration(datetime.timedelta(minutes=-90)) == "-1h 30m 0s"
+
+def test_format_duration_without_seconds():
+  """The minute-resolution form drops seconds but never the sign."""
+  assert format_duration(
+    datetime.timedelta(hours=148, minutes=20, seconds=5),
+    seconds=False,
+  ) == "148h 20m"
+  assert format_duration(
+    datetime.timedelta(hours=8), seconds=False
+  ) == "8h 0m"
+  assert format_duration(
+    datetime.timedelta(minutes=-30), seconds=False
+  ) == "-30m"
+  assert format_duration(
+    datetime.timedelta(seconds=-30), seconds=False
+  ) == "0m"
+@
+
+A deviation is read in both directions: [[1h 30m]] beside an expected
+[[8h 0m]] does not say whether the day ran over or under.
+[[format_duration]] already refuses to hide a minus; this wrapper makes
+the plus equally explicit.  Zero stays unsigned, for the same reason
+[[-0m]] is never produced: a sign asserts a direction, and zero has
+none.
+
+<<helper functions>>=
+def format_signed_duration(
+    duration: datetime.timedelta,
+    seconds: bool = True,
+) -> str:
+    """Format a deviation with an explicit `+` or `-` sign.
+
+    Zero is unsigned; `seconds` is passed on to `format_duration`.
+    """
+    text = format_duration(duration, seconds=seconds)
+    if text.startswith("-") or text in ("0s", "0m"):
+        return text
+    return "+" + text
+@
+
+<<test functions>>=
+def test_format_signed_duration():
+  """Deviations carry a sign in both directions, except zero."""
+  assert format_signed_duration(
+    datetime.timedelta(minutes=90), seconds=False
+  ) == "+1h 30m"
+  assert format_signed_duration(
+    datetime.timedelta(hours=-2), seconds=False
+  ) == "-2h 0m"
+  assert format_signed_duration(
+    datetime.timedelta(), seconds=False
+  ) == "0m"
+  assert format_signed_duration(
+    datetime.timedelta(seconds=45)
+  ) == "+45s"
+  assert format_signed_duration(datetime.timedelta()) == "0s"
   assert format_duration(datetime.timedelta(seconds=-5)) == "-5s"
   assert format_duration(datetime.timedelta()) == "0s"
 @
@@ -1099,8 +1171,9 @@ There are two useful views of the split data:
   still merging overlaps within that label set.
 \end{description}
 
-We also generate the requested date range explicitly so that days off
-remain visible as [[0s]] rather than disappearing from the report.
+The reports generate their date ranges explicitly
+(\cref{sec:track-calendar-periods}) so that days off remain visible as
+[[0s]] rather than disappearing.
 
 <<helper functions>>=
 def compute_daily_wall_clock(
@@ -1167,54 +1240,254 @@ def compute_daily_label_set_totals(
         }
 
     return daily_totals
+@
 
-def make_stats_dates(
-    days: int,
+\subsubsection{Calendar Periods}
+\label{sec:track-calendar-periods}
+
+The daily views above answer for one date at a time.  The period
+reports of \cref{sec:track-stats} ask the same question over a week, a
+month or a year, and then compare the answer with what the work week
+(\cref{cli.utils.workweek}) says it should have been.  Four zoom
+levels, one question: the only thing that varies is where the period
+boundaries fall.  So the granularity becomes a value and there is one
+implementation.  A [[str]]-backed [[Enum]] is the module's usual
+spelling for such a closed choice, cf.\ [[ExportFormat]].
+
+<<constants>>=
+class StatsPeriod(str, Enum):
+    daily = "daily"
+    weekly = "weekly"
+    monthly = "monthly"
+    yearly = "yearly"
+@
+
+A period is the calendar unit containing a date, named by its
+inclusive end points.  Weeks are \textsc{iso} weeks, Monday to
+Sunday: that is the week a printed calendar shows, and it is what makes
+\enquote{this week} a Monday-anchored question rather than a rolling
+seven days.  Months and years are the calendar ones;
+[[calendar.monthrange]] knows how long February is in a given year, so
+no date library is needed.
+
+<<helper functions>>=
+def period_bounds(
+    granularity: StatsPeriod,
+    date: datetime.date,
+) -> tuple[datetime.date, datetime.date]:
+    """Return the inclusive (start, end) of the period holding `date`."""
+    if granularity == StatsPeriod.weekly:
+        start = date - datetime.timedelta(days=date.weekday())
+        return start, start + datetime.timedelta(days=6)
+    if granularity == StatsPeriod.monthly:
+        last = calendar.monthrange(date.year, date.month)[1]
+        return date.replace(day=1), date.replace(day=last)
+    if granularity == StatsPeriod.yearly:
+        return (
+            date.replace(month=1, day=1),
+            date.replace(month=12, day=31),
+        )
+    return date, date
+@
+
+Let's verify the bounds in a leap February, so that the month case is
+checked where a fixed month length would go wrong.  15 February 2024
+is a Thursday, whose week starts on Monday the 12th.
+
+<<test functions>>=
+def test_period_bounds():
+  """Each granularity names the calendar unit around a date."""
+  day = datetime.date(2024, 2, 15)
+  assert period_bounds(StatsPeriod.daily, day) == (day, day)
+  assert period_bounds(StatsPeriod.weekly, day) == (
+    datetime.date(2024, 2, 12), datetime.date(2024, 2, 18)
+  )
+  assert period_bounds(StatsPeriod.monthly, day) == (
+    datetime.date(2024, 2, 1), datetime.date(2024, 2, 29)
+  )
+  assert period_bounds(StatsPeriod.yearly, day) == (
+    datetime.date(2024, 1, 1), datetime.date(2024, 12, 31)
+  )
+@
+
+The label names the period the way a reader would: an \textsc{iso}
+date, an \textsc{iso} week such as [[2026-W36]], a month such as
+[[2026-09]], or a year.  The week label is computed from the period's
+Monday, not from whichever date the report was asked about, and that
+is what makes it right at year boundaries.  1 January 2027 is a Friday
+in week 53 of 2026; asking its Monday, 28 December 2026, for its
+\textsc{iso} year and week gives exactly [[2026-W53]].  A weekly
+label's year can therefore differ from the calendar year of the dates
+it covers.  That is a property of \textsc{iso} weeks, not a bug.
+
+<<helper functions>>=
+def period_label(
+    granularity: StatsPeriod,
+    start: datetime.date,
+) -> str:
+    """Name the period that starts on `start`."""
+    if granularity == StatsPeriod.weekly:
+        iso_year, iso_week, _ = start.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+    if granularity == StatsPeriod.monthly:
+        return f"{start.year}-{start.month:02d}"
+    if granularity == StatsPeriod.yearly:
+        return str(start.year)
+    return start.isoformat()
+@
+
+<<test functions>>=
+def test_period_label_at_year_boundaries():
+  """Weeks are labelled by their Monday's ISO year and week."""
+  monday, _ = period_bounds(
+    StatsPeriod.weekly, datetime.date(2027, 1, 1)
+  )
+  assert monday == datetime.date(2026, 12, 28)
+  assert period_label(StatsPeriod.weekly, monday) == "2026-W53"
+
+  monday, _ = period_bounds(
+    StatsPeriod.weekly, datetime.date(2026, 1, 1)
+  )
+  assert period_label(StatsPeriod.weekly, monday) == "2026-W01"
+
+  assert period_label(
+    StatsPeriod.monthly, datetime.date(2026, 9, 1)
+  ) == "2026-09"
+  assert period_label(
+    StatsPeriod.yearly, datetime.date(2026, 1, 1)
+  ) == "2026"
+  assert period_label(
+    StatsPeriod.daily, datetime.date(2026, 9, 3)
+  ) == "2026-09-03"
+@
+
+A report covers the most recent [[count]] periods, newest first, and
+the newest is the one containing today even though it is not over
+yet: a Wednesday report that hid the current week would be answering
+last week's question.  The three values travel together as a named
+tuple so that a caller can say [[period.label]] instead of remembering
+a position.
+
+<<helper functions>>=
+class Period(NamedTuple):
+    """A calendar period: inclusive end points and a display label."""
+
+    start: datetime.date
+    end: datetime.date
+    label: str
+@
+
+Walking backwards needs no month arithmetic.  The day before a
+period's start lies in the previous period whatever the
+granularity---the day before 1 January is 31 December of the year
+before---so [[period_bounds]] of that day \emph{is} the previous
+period.  The function takes [[now]] so that tests can pin the
+calendar and a command can capture the clock once and hand the same
+instant to every helper.
+
+<<helper functions>>=
+def make_period_ranges(
+    granularity: StatsPeriod,
+    count: int,
     now: datetime.datetime | None = None,
-) -> list[datetime.date]:
-    """Return the reporting dates, newest first."""
-    if now is None:
-        now = datetime.datetime.now()
+) -> list[Period]:
+    """Return the `count` most recent periods, newest first.
 
-    return [
-        now.date() - datetime.timedelta(days=offset)
-        for offset in range(days)
-    ]
-
-def filter_entries_for_stats_window(
-    entries: "list[TrackingEntry]",
-    days: int,
-    now: datetime.datetime | None = None,
-) -> "list[TrackingEntry]":
-    """Return entries clipped to the stats calendar window.
-
-    The stats command reports whole calendar days, not a rolling
-    ``24 * days`` hour window. An overnight entry that starts before
-    midnight but continues into today must therefore remain visible,
-    while late work from yesterday should not leak into today's
-    summary just because it happened within the last 24 hours.
+    The first period is the one containing today.
     """
     if now is None:
         now = datetime.datetime.now()
 
-    start_date = now.date() - datetime.timedelta(days=days - 1)
+    periods = []
+    start, end = period_bounds(granularity, now.date())
+    for _ in range(count):
+        periods.append(
+            Period(start, end, period_label(granularity, start))
+        )
+        start, end = period_bounds(
+            granularity, start - datetime.timedelta(days=1)
+        )
+    return periods
+@
+
+Let's verify the walk at the awkward places: across the year boundary
+for weeks (4 January 2027 is a Monday), across February for months,
+and across a month boundary for days.  Whatever the granularity,
+consecutive periods must abut exactly.
+
+<<test functions>>=
+def test_make_period_ranges_walks_backwards():
+  """Periods come newest first and abut exactly."""
+  now = datetime.datetime(2027, 1, 4, 9, 0)
+  weeks = make_period_ranges(StatsPeriod.weekly, 2, now=now)
+  assert [p.label for p in weeks] == ["2027-W01", "2026-W53"]
+  assert weeks[0].start == datetime.date(2027, 1, 4)
+  assert weeks[1] == Period(
+    datetime.date(2026, 12, 28), datetime.date(2027, 1, 3), "2026-W53"
+  )
+
+  months = make_period_ranges(
+    StatsPeriod.monthly, 3, now=datetime.datetime(2026, 3, 15)
+  )
+  assert [p.label for p in months] == ["2026-03", "2026-02", "2026-01"]
+  assert months[1].end == datetime.date(2026, 2, 28)
+
+  years = make_period_ranges(
+    StatsPeriod.yearly, 2, now=datetime.datetime(2026, 9, 3)
+  )
+  assert [p.label for p in years] == ["2026", "2025"]
+
+  days = make_period_ranges(
+    StatsPeriod.daily, 3, now=datetime.datetime(2026, 3, 1)
+  )
+  assert [p.label for p in days] == [
+    "2026-03-01", "2026-02-28", "2026-02-27"
+  ]
+
+  for granularity in StatsPeriod:
+    periods = make_period_ranges(granularity, 3, now=now)
+    for newer, older in zip(periods, periods[1:]):
+      assert older.end + datetime.timedelta(days=1) == newer.start
+@
+
+A report's window is the union of its periods, and the entries must
+be cut to it before anything is summed.  The cut is calendar-based,
+not a rolling number of hours.  Rolling would mean that a report for
+\enquote{today} shows the last 24 hours, which can exclude
+early-morning work from today while including late-evening work from
+yesterday.  Cutting at midnight instead keeps the part of an overnight
+session that belongs to the window and drops the part that does not,
+so the totals agree with the dates the report names.
+
+<<helper functions>>=
+def clip_entries_to_dates(
+    entries: "list[TrackingEntry]",
+    start_date: datetime.date,
+    end_date: datetime.date,
+) -> "list[TrackingEntry]":
+    """Return entries clipped to the inclusive calendar date range.
+
+    Entries entirely outside the range are dropped; an entry that
+    crosses a boundary of the range is cut at midnight so that only
+    the part inside remains.
+    """
     window_start = datetime.datetime.combine(
         start_date,
         datetime.time.min,
     )
     window_end = datetime.datetime.combine(
-        now.date() + datetime.timedelta(days=1),
+        end_date + datetime.timedelta(days=1),
         datetime.time.min,
     )
 
-    filtered = []
+    clipped = []
     for entry in entries:
         if entry.end_time <= window_start:
             continue
         if entry.start_time >= window_end:
             continue
 
-        filtered.append(
+        clipped.append(
             TrackingEntry(
                 start_time=max(entry.start_time, window_start),
                 end_time=min(entry.end_time, window_end),
@@ -1224,7 +1497,435 @@ def filter_entries_for_stats_window(
             )
         )
 
-    return filtered
+    return clipped
+@
+
+<<test functions>>=
+def test_clip_entries_to_dates_uses_calendar_days():
+    """Clipping uses calendar dates, not rolling 24-hour cutoffs."""
+    entries = [
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 23, 30, 0),
+            datetime.datetime(2026, 3, 12, 1, 0, 0),
+            ["overnight"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 11, 8, 0, 0),
+            datetime.datetime(2026, 3, 11, 9, 0, 0),
+            ["yesterday"],
+        ),
+        TrackingEntry(
+            datetime.datetime(2026, 3, 12, 10, 0, 0),
+            datetime.datetime(2026, 3, 12, 11, 0, 0),
+            ["today"],
+        ),
+    ]
+
+    today = datetime.date(2026, 3, 12)
+    clipped = clip_entries_to_dates(entries, today, today)
+
+    assert len(clipped) == 2
+    assert clipped[0].labels == ["overnight"]
+    assert clipped[0].start_time == datetime.datetime(2026, 3, 12, 0, 0, 0)
+    assert clipped[0].end_time == datetime.datetime(2026, 3, 12, 1, 0, 0)
+    assert clipped[1].labels == ["today"]
+@
+
+Bucketing works on the daily totals, not on the entries.  The pipeline
+is: clip to the window, split and merge per day with
+[[compute_daily_wall_clock]], then add each day's total into the
+period that contains it.  Every step is exact.  Splitting at midnight
+puts an overnight session's hours on the two dates they belong to;
+merging per day means two labels tracked side by side count once; and
+the per-day totals can simply be added, because after the split no
+interval crosses midnight, so two different days cannot overlap.
+Bucketing entries directly would have to redo the merge per period
+and would still get the overnight case wrong.
+
+<<helper functions>>=
+def totals_per_period(
+    daily_totals: dict[datetime.date, datetime.timedelta],
+    granularity: StatsPeriod,
+) -> dict[datetime.date, datetime.timedelta]:
+    """Sum per-date totals into periods, keyed by period start."""
+    totals = {}
+    for date, duration in daily_totals.items():
+        start, _ = period_bounds(granularity, date)
+        totals[start] = (
+            totals.get(start, datetime.timedelta()) + duration
+        )
+    return totals
+@
+
+Let's verify the two properties the pipeline is built for: an
+overnight session from Sunday 6 September 2026 into the Monday lands
+in two different weeks, and two labels tracked over the same hour
+count as one hour.
+
+<<test functions>>=
+def test_totals_per_period_sums_split_days():
+  """An overnight entry is split between the weeks it spans."""
+  entries = [
+    TrackingEntry(
+      datetime.datetime(2026, 9, 6, 23, 30),
+      datetime.datetime(2026, 9, 7, 1, 0),
+      ["overnight"],
+    ),
+  ]
+  totals = totals_per_period(
+    compute_daily_wall_clock(entries), StatsPeriod.weekly
+  )
+  assert totals == {
+    datetime.date(2026, 8, 31): datetime.timedelta(minutes=30),
+    datetime.date(2026, 9, 7): datetime.timedelta(hours=1),
+  }
+
+def test_totals_per_period_merges_overlapping_labels():
+  """Concurrent labels do not inflate a period's total."""
+  start = datetime.datetime(2026, 9, 7, 9, 0)
+  end = datetime.datetime(2026, 9, 7, 10, 0)
+  entries = [
+    TrackingEntry(start, end, ["DD1310"]),
+    TrackingEntry(start, end, ["grading"]),
+  ]
+  totals = totals_per_period(
+    compute_daily_wall_clock(entries), StatsPeriod.monthly
+  )
+  assert totals == {
+    datetime.date(2026, 9, 1): datetime.timedelta(hours=1)
+  }
+@
+
+The expectation is the work week's answer to \enquote{how much should
+have been tracked}: one daily limit per work day in the range.  The
+caller clips the range to today, so the current week expects the work
+days that have happened rather than all five.  A Wednesday report
+would otherwise show a two-day deficit that no amount of work could
+have closed.  Weekends are simply not work days, so any time tracked on
+one is a deviation in the other direction, which is the point.
+
+<<helper functions>>=
+def expected_time(
+    start_date: datetime.date,
+    end_date: datetime.date,
+    daily_limit: float,
+    work_days: list[str] | None = None,
+) -> datetime.timedelta:
+    """Return `daily_limit` hours per work day in the inclusive range."""
+    work_day_count = count_work_days(start_date, end_date, work_days)
+    return datetime.timedelta(hours=work_day_count * daily_limit)
+@
+
+<<test functions>>=
+def test_expected_time_counts_only_workdays():
+  """Only work days contribute to the expectation."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  monday = datetime.date(2026, 9, 7)
+  wednesday = datetime.date(2026, 9, 9)
+  saturday = datetime.date(2026, 9, 12)
+  sunday = datetime.date(2026, 9, 13)
+  assert expected_time(monday, sunday, 8.0, weekdays) == (
+    datetime.timedelta(hours=40)
+  )
+  assert expected_time(monday, wednesday, 8.0, weekdays) == (
+    datetime.timedelta(hours=24)
+  )
+  assert expected_time(saturday, sunday, 8.0, weekdays) == (
+    datetime.timedelta()
+  )
+@
+
+\subsubsection{The Work Summary}
+\label{sec:track-work-summary}
+
+A table of periods says how much; the summary says how.  The
+questions it answers are the ones a teacher asks about a term in
+hindsight: did the hours add up, on which days were they done, how
+long did the long days get, when does a working day usually start and
+end, and where did the time go.  The answers are computed here, apart
+from any printing, so that each can be tested from a handful of fixed
+entries and so that the reports of \cref{sec:track-stats} only have to
+decide what to say about them.
+
+<<helper functions>>=
+@dataclass
+class WorkSummary:
+    """Aggregate statistics over a window of tracked time.
+
+    `longest_day` is a `(date, duration)` pair, `median_start` and
+    `median_end` are times of day, and `top_label_sets` lists
+    `(labels, duration)` pairs, largest first; all are `None` or
+    empty when nothing was tracked.  `start_date` and `end_date`
+    are the inclusive window the summary covers.
+    """
+
+    start_date: datetime.date
+    end_date: datetime.date
+    total: datetime.timedelta
+    expected: datetime.timedelta
+    workdays: int
+    days_worked: int
+    off_days_worked: int
+    off_days_total: datetime.timedelta
+    longest_day: tuple[datetime.date, datetime.timedelta] | None
+    longest_streak: int
+    median_start: datetime.time | None
+    median_end: datetime.time | None
+    top_label_sets: list[tuple[tuple[str, ...], datetime.timedelta]]
+
+    @property
+    def diff(self) -> datetime.timedelta:
+        """Tracked minus expected time."""
+        return self.total - self.expected
+
+    @property
+    def per_workday(self) -> datetime.timedelta | None:
+        """Tracked time per work day, or `None` without work days."""
+        if not self.workdays:
+            return None
+        return self.total / self.workdays
+@
+
+The computation starts from the same per-day totals the period tables
+use, so the two can never disagree about the total.  [[end_date]] is
+the window's end already clipped to today by the caller, for the same
+reason as in [[expected_time]]: the work days still to come are not
+yet owed.
+
+<<helper functions>>=
+def compute_work_summary(
+    entries: "list[TrackingEntry]",
+    start_date: datetime.date,
+    end_date: datetime.date,
+    daily_limit: float,
+    work_days: list[str] | None = None,
+) -> WorkSummary:
+    """Summarise entries already clipped to `start_date`..`end_date`."""
+    if work_days is None:
+        work_days = get_work_days()
+    daily_totals = compute_daily_wall_clock(entries)
+    worked = sorted(
+        date for date, duration in daily_totals.items()
+        if duration > datetime.timedelta()
+    )
+    <<sum tracked time on work days and off days>>
+    <<find the longest day and streak>>
+    <<find the typical start and end of a day>>
+    <<rank the label sets>>
+    return WorkSummary(
+        start_date=start_date,
+        end_date=end_date,
+        total=total,
+        expected=expected_time(
+            start_date, end_date, daily_limit, work_days
+        ),
+        workdays=count_work_days(start_date, end_date, work_days),
+        days_worked=days_worked,
+        off_days_worked=len(off_days),
+        off_days_total=off_days_total,
+        longest_day=longest_day,
+        longest_streak=longest_streak,
+        median_start=median_start,
+        median_end=median_end,
+        top_label_sets=top_label_sets,
+    )
+@
+
+Work on a day the mask says is free is the deviation that a total
+hides best: a week of 40 hours can be five even days or four short
+ones and a Sunday.  So the days with time are split by the mask, and
+the off days are counted and summed separately.
+
+<<sum tracked time on work days and off days>>=
+total = sum(daily_totals.values(), datetime.timedelta())
+days_worked = sum(1 for date in worked if is_work_day(date, work_days))
+off_days = [
+    date for date in worked if not is_work_day(date, work_days)
+]
+off_days_total = sum(
+    (daily_totals[date] for date in off_days), datetime.timedelta()
+)
+@
+
+The longest day is the peak; the longest streak of consecutive days
+with any tracked time is the other extreme, days without a break.
+Both come from the sorted dates with time, so a day off in the middle
+of a week ends a streak even if the week's total is unremarkable.
+
+<<find the longest day and streak>>=
+longest_day = None
+if worked:
+    longest_day = max(daily_totals.items(), key=lambda item: item[1])
+
+longest_streak = 0
+streak = 0
+previous = None
+for date in worked:
+    if (
+        previous is not None
+        and date - previous == datetime.timedelta(days=1)
+    ):
+        streak += 1
+    else:
+        streak = 1
+    longest_streak = max(longest_streak, streak)
+    previous = date
+@
+
+A day's boundaries are the first start and the last end among the
+entries that \emph{began} on that date, not among the midnight-split
+intervals.  A session that runs past midnight belongs to the evening
+it started in; splitting it would make the next day appear to start
+at [[00:00]], which is a lie about when anyone sat down.  The end is
+therefore measured from the start date's midnight and may exceed a
+day, and is folded back to a time of day only for display, so that
+such a session ends at [[01:12]] rather than at a 25th hour.
+
+The medians, not the extremes, are what a \enquote{typical day}
+means.  One 03:00 debugging session should not redefine when work
+starts, and the median is indifferent to how extreme the outlier is.
+
+<<find the typical start and end of a day>>=
+first_starts = {}
+last_ends = {}
+for entry in entries:
+    date = entry.start_time.date()
+    midnight = datetime.datetime.combine(date, datetime.time.min)
+    start = (entry.start_time - midnight).total_seconds()
+    end = (entry.end_time - midnight).total_seconds()
+    first_starts[date] = min(first_starts.get(date, start), start)
+    last_ends[date] = max(last_ends.get(date, end), end)
+
+median_start = median_end = None
+if first_starts:
+    median_start = time_of_day(
+        statistics.median(first_starts.values())
+    )
+    median_end = time_of_day(statistics.median(last_ends.values()))
+@
+
+Folding a number of seconds back to a time of day is one line, but a
+line with a modulo in it, so it gets a name.  Adding to
+[[datetime.min]] lets [[datetime]] do the wrapping.
+
+<<helper functions>>=
+def time_of_day(seconds: float) -> datetime.time:
+    """Fold seconds since some midnight to a time of day."""
+    moment = datetime.datetime.min + datetime.timedelta(seconds=seconds)
+    return moment.time().replace(microsecond=0)
+@
+
+The label sets are ranked the same way [[today]] groups them: by the
+exact set, so that the tags stay peers and repeated bursts on the same
+combination collapse into one line.  Summing the per-date label-set
+totals across dates is exact for the reason given in
+\cref{sec:track-calendar-periods}.  Three sets are enough to say where
+the time went; a long tail would only repeat the table.
+
+<<constants>>=
+TOP_LABEL_SETS = 3
+<<rank the label sets>>=
+label_set_totals = {}
+for label_totals in compute_daily_label_set_totals(entries).values():
+    for labels_key, duration in label_totals.items():
+        label_set_totals[labels_key] = (
+            label_set_totals.get(labels_key, datetime.timedelta())
+            + duration
+        )
+top_label_sets = sorted(
+    label_set_totals.items(),
+    key=lambda item: (-item[1].total_seconds(), item[0]),
+)[:TOP_LABEL_SETS]
+@
+
+Let's verify every field from one fixed week, Monday 7 to Sunday 13
+September 2026, with work on Monday to Wednesday and a Saturday:
+
+<<test functions>>=
+def summary_week_entries():
+  """Three weekdays and a Saturday of fixed entries."""
+  def entry(day, start, end, *labels):
+    return TrackingEntry(
+      datetime.datetime(2026, 9, day, *start),
+      datetime.datetime(2026, 9, day, *end),
+      list(labels),
+    )
+  return [
+    entry(7, (9, 0), (17, 0), "nytid"),
+    entry(8, (8, 0), (18, 30), "nytid"),
+    entry(9, (9, 30), (16, 0), "DD1310"),
+    entry(12, (10, 0), (12, 0), "email"),
+  ]
+
+def test_compute_work_summary_over_a_week():
+  """All fields agree with the fixed week."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  summary = compute_work_summary(
+    summary_week_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    weekdays,
+  )
+  assert summary.total == datetime.timedelta(hours=27)
+  assert summary.expected == datetime.timedelta(hours=40)
+  assert summary.diff == datetime.timedelta(hours=-13)
+  assert summary.workdays == 5
+  assert summary.per_workday == datetime.timedelta(hours=5, minutes=24)
+  assert summary.days_worked == 3
+  assert summary.off_days_worked == 1
+  assert summary.off_days_total == datetime.timedelta(hours=2)
+  assert summary.longest_day == (
+    datetime.date(2026, 9, 8), datetime.timedelta(hours=10, minutes=30)
+  )
+  assert summary.longest_streak == 3
+  assert summary.median_start == datetime.time(9, 15)
+  assert summary.median_end == datetime.time(16, 30)
+  assert summary.top_label_sets == [
+    (("nytid",), datetime.timedelta(hours=18, minutes=30)),
+    (("DD1310",), datetime.timedelta(hours=6, minutes=30)),
+    (("email",), datetime.timedelta(hours=2)),
+  ]
+@
+
+An overnight session belongs to the evening it started in, and a
+window with nothing in it must produce an empty summary rather than a
+division by zero:
+
+<<test functions>>=
+def test_compute_work_summary_keeps_overnight_sessions_whole():
+  """The day boundaries come from where a session began."""
+  entries = [
+    TrackingEntry(
+      datetime.datetime(2026, 9, 7, 23, 0),
+      datetime.datetime(2026, 9, 8, 1, 0),
+      ["late"],
+    ),
+  ]
+  summary = compute_work_summary(
+    entries,
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 8),
+    8.0,
+    ["mon", "tue"],
+  )
+  assert summary.median_start == datetime.time(23, 0)
+  assert summary.median_end == datetime.time(1, 0)
+  assert summary.longest_streak == 2
+
+def test_compute_work_summary_of_nothing():
+  """An empty window yields an empty summary."""
+  summary = compute_work_summary(
+    [], datetime.date(2026, 9, 12), datetime.date(2026, 9, 13), 8.0,
+    ["mon"],
+  )
+  assert summary.total == datetime.timedelta()
+  assert summary.workdays == 0
+  assert summary.per_workday is None
+  assert summary.longest_day is None
+  assert summary.longest_streak == 0
+  assert summary.median_start is None
+  assert summary.top_label_sets == []
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -13548,8 +14249,8 @@ elif offset is not None:
 
 \subsection{Shared Entry Filtering}
 
-Three analysis commands ([[ls]], [[stats]], [[export]]) share the same
-load-then-filter pattern.  When the filtering logic was inlined in each
+The analysis commands ([[ls]], [[today]], [[stats]], [[export]]) share
+the same load-then-filter pattern.  When the filtering logic was inlined in each
 command, adding a new filter dimension (such as the [[--who]] flag)
 required updating every command in lock-step --- a maintenance hazard
 that invited subtle inconsistencies.  Extracting the pipeline into a
@@ -13558,12 +14259,12 @@ commands benefit.  Each command still owns its error messages and
 early-return logic, keeping presentation concerns separate from
 filtering policy.
 
-The stats command adds one extra step on top of this shared helper.
-[[ls]] and [[export]] interpret [[--days]] as a rolling age limit, but
-[[stats]] presents named calendar dates.  It therefore narrows the
-already-filtered entries to the requested date range with
-[[filter_entries_for_stats_window()]] so the summary and the daily table
-agree even around midnight.
+The reports add one extra step on top of this shared helper.  [[ls]]
+and [[export]] interpret [[--days]] as a rolling age limit, but
+[[today]] and [[stats]] present named calendar dates.  They therefore
+narrow the already-filtered entries to the requested date range with
+[[clip_entries_to_dates()]] (\cref{sec:track-calendar-periods}) so the
+summary and the table agree even around midnight.
 
 <<helper functions>>=
 def filter_entries(
@@ -13643,39 +14344,6 @@ def test_filter_entries(temp_tracking_dir):
         who="alice", labels=["DD1310"]
     )
     assert len(result) == 1
-
-def test_filter_entries_for_stats_window_uses_calendar_days():
-    """Stats windows use calendar dates, not rolling 24-hour cutoffs."""
-    now = datetime.datetime(2026, 3, 12, 7, 0, 0)
-    entries = [
-        TrackingEntry(
-            datetime.datetime(2026, 3, 11, 23, 30, 0),
-            datetime.datetime(2026, 3, 12, 1, 0, 0),
-            ["overnight"],
-        ),
-        TrackingEntry(
-            datetime.datetime(2026, 3, 11, 8, 0, 0),
-            datetime.datetime(2026, 3, 11, 9, 0, 0),
-            ["yesterday"],
-        ),
-        TrackingEntry(
-            datetime.datetime(2026, 3, 12, 10, 0, 0),
-            datetime.datetime(2026, 3, 12, 11, 0, 0),
-            ["today"],
-        ),
-    ]
-
-    filtered = filter_entries_for_stats_window(
-        entries,
-        days=1,
-        now=now,
-    )
-
-    assert len(filtered) == 2
-    assert filtered[0].labels == ["overnight"]
-    assert filtered[0].start_time == datetime.datetime(2026, 3, 12, 0, 0, 0)
-    assert filtered[0].end_time == datetime.datetime(2026, 3, 12, 1, 0, 0)
-    assert filtered[1].labels == ["today"]
 
 def test_merge_duplicate_tracking_entries_warns(caplog):
     """Exact duplicate history rows are collapsed with a warning."""
@@ -15775,319 +16443,226 @@ def test_ls_empty(temp_tracking_dir):
     assert "No tracking data" in result.output
 @
 
-\subsection{Stats Command}
+\subsection{Today Command}
+\label{sec:track-today}
 
-The stats command answers a question teachers ask constantly:
-\enquote{How much time did I actually spend on this?}  The default view
-answers the most immediate version of that question:
-\enquote{what did today look like?}  A one-day default makes [[stats]] a
-quick daily review, while [[-n]]/[[--days]] expands the window when the
-user wants a longer retrospective.
+The [[today]] command answers the most immediate version of the
+question teachers ask constantly---\enquote{how much time did I
+actually spend on this?}---for the one day where the answer can still
+change what happens next: \enquote{what does today look like, and am I
+ahead or behind?}  It names one calendar date, today, and nothing
+else.  Longer horizons are the business of the period reports in
+\cref{sec:track-stats}; a window to configure here would only make
+this a worse spelling of [[stats daily]].
 
-The default output is aggregated, but not flattened into individual
-labels.  Teachers often work in repeated bursts on the same combination
-of tags, such as [[nytid]], [[devel]], and [[work]].  Listing each
-session separately is noisy, but listing each label individually falsely
-suggests a hierarchy.  Grouping by the exact label set keeps the tags
-equal while still collapsing repeated work into one line per day.
+The output is aggregated, but not flattened into individual labels.
+Teachers often work in repeated bursts on the same combination of
+tags, such as [[nytid]], [[devel]], and [[work]].  Listing each
+session separately is noisy, but listing each label individually
+falsely suggests a hierarchy.  Grouping by the exact label set keeps
+the tags equal while still collapsing repeated work into one line.
 
-Warnings remain part of the optional summary view.  Their threshold is
-prorated: if the window is 3 days and the weekly limit is 40 hours, we
-warn after \(40 \cdot 3/7 \approx 17\) hours rather than a fixed 40. This
-keeps the warning meaningful for both short and long windows.
-
-The window length and summary toggle are the two defaults worth
-configuring per user; the weekly/daily limits are already config-backed
-elsewhere.
-<<constants>>=
-TRACK_STATS_DAYS_CONFIG = "track.stats.days"
-TRACK_STATS_SUMMARY_CONFIG = "track.stats.summary"
-
-DEFAULT_TRACK_STATS_DAYS = default(TRACK_STATS_DAYS_CONFIG, 1, int)
-DEFAULT_TRACK_STATS_SUMMARY = default(TRACK_STATS_SUMMARY_CONFIG,
-                                      False, bool)
-@
+The day is compared with what the work week
+(\cref{cli.utils.workweek}) expects of it: the daily limit on a work
+day, nothing on a day off.  This replaces the prorated weekly warning
+the old summary printed, which had to explain that a three-day window
+warned after \(40 \cdot 3/7\) hours.  A single day needs no
+proration; the hours are owed or they are not, and an hour tracked on
+a Saturday shows as a deviation just as an hour short on a Monday
+does.  The expectation and the deviation sit in the table rather than
+in a line printed around it, because \cref{cli.utils.output} promises
+that a piped listing is rows and nothing else.
 
 <<argument and option definitions>>=
-stats_labels_arg = typer.Argument(
-    help="Filter statistics by specific labels "
+today_labels_arg = typer.Argument(
+    help="Filter today's statistics by specific labels "
          "(shows all if not specified)",
     autocompletion=complete_historical_labels)
-stats_days_opt = typer.Option(
-    "--days", "-n",
-    help="Number of days to include in stats. "
-         "[config: track.stats.days]")
-weekly_limit_opt = typer.Option(
-    "--weekly-limit",
-    help="Weekly hour limit for warnings "
-         "(uses config default if not specified). "
-         "[config: track.weekly_limit]")
 daily_limit_opt = typer.Option(
     "--daily-limit",
-    help="Daily hour limit for warnings "
+    help="Hours expected per work day "
          "(uses config default if not specified). "
          "[config: track.daily_limit]")
-summary_opt = typer.Option(
-    "--summary",
-    help="Include an overall summary "
-         "for the whole window. "
-         "[config: track.stats.summary]")
 @
 
-<<stats command>>=
+<<today command>>=
 @cli.command()
-def stats(
+def today(
     labels: Annotated[list[str],
-                      stats_labels_arg] = None,
-    days: Annotated[int,
-                    stats_days_opt] = DEFAULT_TRACK_STATS_DAYS,
-    weekly_limit: Annotated[float | None,
-                            weekly_limit_opt] = None,
+                      today_labels_arg] = None,
     daily_limit: Annotated[float | None,
                            daily_limit_opt] = None,
     who: Annotated[str | None,
                    who_filter_opt] = None,
-    summary: Annotated[bool,
-                       summary_opt] = DEFAULT_TRACK_STATS_SUMMARY,
 ):
     """
-    Show aggregated statistics for recent tracking history.
+    Show today's tracked time against the day's expectation.
 
-    Use this to see how much time went to a course, compare the last few days,
-    or check whether the workload exceeds configured daily or weekly limits.
+    Label sets are grouped, largest first, under the day's total, the
+    hours expected of it and the difference between the two.
 
     \b
     Examples:
-      nytid track stats
-      nytid track stats DD1310 lecture
-      nytid track stats -n 7 --summary
-      nytid track stats --who Dan-Claude
+      nytid track today
+      nytid track today DD1310 lecture
+      nytid track today --who Dan-Claude
     """
-    <<reject a window shorter than a day>>
-    <<resolve stats limits>>
-    <<load and filter entries for stats>>
-    <<display stats summary when requested>>
-    <<display grouped daily breakdown>>
+    <<resolve today's expectation>>
+    <<load and clip today's entries>>
+    <<build today's table rows>>
+    <<print today's listing>>
 @
 
-A report needs at least one calendar day to describe.  Zero days yields
-no dates, hence no rows, and the two output paths then fail in different
-ways: the summary divides the total by the window length, and the
-plain-text table takes the [[max]] over an empty sequence of rows.
-Neither failure is caught anywhere, so the user gets a traceback.
+The [[--daily-limit]] flag is optional because users should be able to
+configure the expectation once and forget about it; without either,
+the module falls back to the built-in eight hours.  The work-day mask
+is read once here and handed down to every helper, the way
+[[schedule]] does it, so that a test controls the calendar by patching
+one name in this module rather than the configuration.
 
-Rejecting the input is better than clamping it because the value can
-come from [[track.stats.days]] as easily as from [[-n]].  A clamp would
-leave a nonsensical configuration in place and quietly report something
-the user did not ask for, every time; an error names the setting that
-needs fixing.
-
-<<reject a window shorter than a day>>=
-if days < 1:
-    typer.echo(
-        f"Error: --days must be at least 1, got {days} "
-        f"(check {TRACK_STATS_DAYS_CONFIG} in your config)",
-        err=True,
-    )
-    raise typer.Exit(1)
-@
-
-The [[--weekly-limit]] and [[--daily-limit]] flags are optional because
-users should be able to configure sensible defaults once and forget about
-them. When neither flag nor configuration is present the module falls
-back to the built-in constants:
-
-<<resolve stats limits>>=
-if weekly_limit is None:
-    weekly_limit = get_default_weekly_limit()
+<<resolve today's expectation>>=
 if daily_limit is None:
     daily_limit = get_default_daily_limit()
+work_days = get_work_days()
 @
 
-With the shared helper handling the mechanical filtering, this chunk
-focuses on the stats-specific concerns: constructing [[label_filter_msg]]
-for headers, generating the full requested date range, and
-distinguishing \enquote{no data at all} ([[None]]) from
-\enquote{data exists but nothing matched the filter}.  We no longer
-return early on an empty result, because an empty day still belongs in a
-daily report as [[0s]].
+The shared helper handles the mechanical filtering by worker and
+labels, and distinguishes \enquote{no data at all} ([[None]]) from
+\enquote{data exists but nothing matched}.  An empty match is not an
+early return, because an empty day is exactly what this command must
+report.
 
-The extra wrinkle is that the stats report names calendar dates, so its
-window must also be calendar-based.  Using [[filter_entries(days=1)]]
-would mean 
-\enquote{the last 24 hours,} which can exclude early-morning work from
-today while including late-evening work from yesterday.  We therefore
-load by worker and labels first, then apply
-[[filter_entries_for_stats_window()]] with a single captured
-[[stats_now]] timestamp so the filter and the rendered date headers agree:
+Clipping to the calendar date rather than the last 24 hours is the
+argument of \cref{sec:track-calendar-periods}.  We capture one
+timestamp so that the clip and the printed date agree even if
+midnight passes between the two.
 
-<<load and filter entries for stats>>=
-stats_now = datetime.datetime.now()
-recent_entries = filter_entries(
-    who=who, labels=labels
-)
+<<load and clip today's entries>>=
+now = datetime.datetime.now()
+today_date = now.date()
+entries = filter_entries(who=who, labels=labels)
 
-if recent_entries is None:
+if entries is None:
     typer.echo("No tracking data available")
     return
 
-recent_entries = filter_entries_for_stats_window(
-    recent_entries,
-    days=days,
-    now=stats_now,
+entries = clip_entries_to_dates(entries, today_date, today_date)
+daily_totals = compute_daily_wall_clock(entries)
+daily_label_set_totals = compute_daily_label_set_totals(entries)
+@
+
+The report is read comparatively: down the last column to compare
+label sets, across the first row to connect the day with its total.
+That is a table, and since \cref{cli.utils.output} the project has
+exactly one piece of code that knows how to print one, so all this
+command has left to do is produce rows and name its columns.
+
+The first row carries the day---date, total, expectation and
+difference---together with the largest label set; the other label
+sets follow on continuation rows whose leading fields are empty.
+Building the rows before printing them is what stops the two
+audiences from receiving two different reports: the continuation
+layout is decided here, not inside a renderer, so a pipe sees the
+same grouping a terminal does.
+
+A day without matching entries still gets a row.  [[print_rows]]
+prints nothing for no rows, which is the honest answer for most
+listings but would hide the loudest thing this command can say: eight
+hours owed and none tracked.
+
+The rows come from a function rather than being built here, because
+[[stats daily --breakdown]] (\cref{sec:track-stats}) prints the same
+layout for several days in a row.  One function is what keeps the two
+commands from disagreeing about what a day looks like.
+
+<<build today's table rows>>=
+rows = day_breakdown_rows(
+    today_date, daily_totals, daily_label_set_totals,
+    daily_limit, work_days,
 )
+<<helper functions>>=
+def day_breakdown_rows(
+    date: datetime.date,
+    daily_totals: dict[datetime.date, datetime.timedelta],
+    daily_label_set_totals: dict,
+    daily_limit: float,
+    work_days: list[str],
+) -> list[tuple[str, ...]]:
+    """Return one day's rows: its fields, then its label sets.
 
-if labels:
-    label_filter_msg = (
-        f" for labels: {', '.join(labels)}"
-    )
-else:
-    label_filter_msg = ""
-
-stats_dates = make_stats_dates(days, now=stats_now)
-daily_totals = compute_daily_wall_clock(recent_entries)
-daily_label_set_totals = compute_daily_label_set_totals(
-    recent_entries
-)
-@
-
-The optional summary keeps the old big-picture view for users who want a
-single total for the whole window before the daily details:
-
-<<display stats summary when requested>>=
-total_time = merge_intervals(recent_entries)
-total_hours = total_time.total_seconds() / 3600
-
-if summary:
-    typer.echo(
-        f"Statistics for the last {days} days"
-        f"{label_filter_msg}:"
-    )
-    typer.echo(
-        f"Total time: {format_duration(total_time)}"
-        f" ({total_hours:.1f} hours)"
-    )
-    typer.echo(
-        f"Average per day: {total_hours/days:.1f} hours"
-    )
-
-    if total_hours > (weekly_limit * days / 7):
-        typer.echo(
-            f"⚠️  Warning: Exceeding weekly limit of"
-            f" {weekly_limit} hours per week",
-            err=True,
-        )
-    typer.echo()
-@
-
-The default report iterates across the full requested date range, newest
-first, so days without activity still appear.  Within each day we sort
-label sets by duration descending and render the tags with commas to
-emphasise that they are peers rather than a hierarchy.
-
-Presentation matters here because stats is read comparatively: users
-scan down a column to compare durations and across a row to connect a
-day with its label sets.  That is a table, and since
-\cref{cli.utils.output} the project has exactly one piece of code that
-knows how to print one, so all this command has left to do is produce
-rows and name its columns.
-
-Building the rows before printing them is what stops the two audiences
-from receiving two different reports.  The continuation rows below are
-a layout decision, and because it is taken here rather than inside a
-renderer, a pipe sees the same grouping a terminal does.
-
-<<display grouped daily breakdown>>=
-<<build stats table rows>>
-<<print the stats listing>>
-@
-
-<<build stats table rows>>=
-rows = []
-for date in stats_dates:
+    The first row carries the date, total, expectation and
+    difference together with the largest label set; further label
+    sets follow on rows whose first four fields are empty.  A day
+    without label sets is one `(off)` row.
+    """
     label_totals = daily_label_set_totals.get(date, {})
     duration = daily_totals.get(date, datetime.timedelta())
-    hours = duration.total_seconds() / 3600
-    total_text = format_duration(duration)
-    if hours > daily_limit:
-        total_text += " !"
+    expected = expected_time(date, date, daily_limit, work_days)
+    day_fields = (
+        date.isoformat(),
+        format_duration(duration),
+        format_duration(expected, seconds=False),
+        format_signed_duration(duration - expected, seconds=False),
+    )
+    continuation = ("", "", "", "")
 
-    if not label_totals:
-        rows.append((str(date), total_text, "(off)", "0s"))
-        continue
-
-    first_row = True
-
+    rows = []
     for labels_key, labels_duration in sorted(
         label_totals.items(),
         key=lambda item: (-item[1].total_seconds(), item[0]),
     ):
+        head = day_fields if not rows else continuation
         rows.append(
-            (
-                str(date) if first_row else "",
-                total_text if first_row else "",
-                ", ".join(labels_key),
-                format_duration(labels_duration),
-            )
+            head
+            + (", ".join(labels_key), format_duration(labels_duration))
         )
-        first_row = False
+    if not rows:
+        rows.append(day_fields + ("(off)", "0s"))
+    return rows
 @
 
-The column specifications are the ones the hand-written Rich table used,
-so the report a terminal user reads is unchanged.  Only [[Labels]]
-folds, because it is the only cell whose width the data controls: a
-day's label set can be arbitrarily long, while dates and formatted
-durations are as wide as their formatter makes them and no wider.
+Only [[Labels]] folds, because it is the only cell whose width the
+data controls: a label set can be arbitrarily long, while dates and
+formatted durations are as wide as their formatter makes them and no
+wider.  The columns are a constant for the same reason the rows are a
+function: the breakdown of [[stats daily]] prints under them too.
 
-<<print the stats listing>>=
-print_rows(
-    [
-        Column("Date", style="cyan", no_wrap=True),
-        Column("Total", justify="right", no_wrap=True),
-        Column("Labels", fold=True),
-        Column("Time", justify="right", no_wrap=True),
-    ],
-    rows,
-)
+<<constants>>=
+DAY_BREAKDOWN_COLUMNS = [
+    Column("Date", style="cyan", no_wrap=True),
+    Column("Total", justify="right", no_wrap=True),
+    Column("Expected", justify="right", no_wrap=True),
+    Column("Diff", justify="right", no_wrap=True),
+    Column("Labels", fold=True),
+    Column("Time", justify="right", no_wrap=True),
+]
+<<print today's listing>>=
+print_rows(DAY_BREAKDOWN_COLUMNS, rows)
 @
 
-The piped form is where this command pays for the uniformity.  It used
-to be an \textsc{ascii} table computed right here: a header line, a rule
-of dashes under it, then every cell padded to the widest value in its
-column with the trailing padding stripped off again.  It is now four
-tab-separated fields per row and nothing else at all.
-
-The padding is the part that looked helpful and was not.  It made the
-byte offset of each field depend on the widest row in the report, so
-[[cut -c]] could be made to work for one day's data and would then fail
-on the next, while [[cut -f]] never worked at all --- there was no
-delimiter to count.  The header line and the rule were worse than
-useless: two rows that every consumer has to recognise and drop, and
-the rule in particular parses as a perfectly well-formed data row whose
-date happens to be a string of dashes.  With them goes the
-column-measuring pass and the subtlety this document used to have to
-explain about it, namely that the header had to be measured as one more
-row so that [[max]] would not be handed an empty sequence.  On an empty
-report [[print_rows]] now returns before anything can be measured, and
-prints nothing --- which is its third rule (\cref{cli.utils.output}) and
-the honest answer to a report with no days in it.
-
-Continuation rows survive unharmed, because they were always empty
-leading fields rather than short rows.  A day with three label sets is
-one row carrying the date and the day's total plus two carrying [[""]]
-in those two positions, and that is exactly what lets [[cut -f3,4]]
-read all three label lines without having to work out where each day
-begins.  The argument in \cref{sec:track-piped-listings} for why
-changing these bytes is safe covers this command as well: the same
+The piped form is six tab-separated fields per row and nothing else.
+It used to be an \textsc{ascii} table computed in the command, with a
+header, a rule of dashes, and cells padded to the widest value in the
+column---which made the byte offset of every field depend on the
+data, so [[cut -c]] worked for one day and failed the next, and
+[[cut -f]] never worked at all.  Continuation rows are what let
+[[cut -f5,6]] read every label line without working out where a day
+begins: they are rows with empty leading fields, not short rows.  The
+argument in \cref{sec:track-piped-listings} for why changing these
+bytes is safe covers this command as well: the same
 [[nytid.hourly.sh]] that never invokes [[track ls]] never invokes
-[[track stats]] either.
+[[track today]] or [[track stats]] either.
 
-Let us pin the new bytes, taking a day with two label sets so that a
-continuation row is part of what is pinned:
+Let us pin the bytes, taking a day with two label sets so that a
+continuation row is part of what is pinned.  Every day is a work day
+in these tests, so that they pass on a Saturday too.
 
 <<test functions>>=
-def test_stats_pipes_headerless_tsv(temp_tracking_dir):
-  """Piped stats are bare TSV rows, continuations included."""
+def test_today_pipes_headerless_tsv(temp_tracking_dir, monkeypatch):
+  """Piped output is bare TSV rows, continuations included."""
+  monkeypatch.setattr(
+    "nytid.cli.track.get_work_days", lambda: DAY_NAMES
+  )
   today = datetime.datetime.now().date().isoformat()
   runner.invoke(cli, [
     "add", "DD1310",
@@ -16100,58 +16675,968 @@ def test_stats_pipes_headerless_tsv(temp_tracking_dir):
     "--at", f"{today} 11:00"
   ])
 
-  result = runner.invoke(cli, ["stats"])
+  result = runner.invoke(cli, ["today"])
 
   assert result.exit_code == 0
   assert result.stdout == (
-    f"{today}\t1h 30m 0s\tDD1310\t1h 0m 0s\n"
-    "\t\tDD1321\t30m 0s\n"
+    f"{today}\t1h 30m 0s\t8h 0m\t-6h 30m\tDD1310\t1h 0m 0s\n"
+    "\t\t\t\tDD1321\t30m 0s\n"
   )
 @
 
-Let's verify that a degenerate window is refused rather than crashing,
-whichever way it arrives and whichever output path would have rendered
-it:
+An empty work day is owed in full, and a day off expects nothing, so
+any time tracked on it is a positive deviation:
 
 <<test functions>>=
-def test_stats_rejects_window_shorter_than_a_day(temp_tracking_dir):
-  """A zero or negative window is an error, not a traceback."""
+def test_today_shows_an_empty_work_day_as_owed(
+    temp_tracking_dir, monkeypatch
+):
+  """An empty work day is a row, not silence."""
+  monkeypatch.setattr(
+    "nytid.cli.track.get_work_days", lambda: DAY_NAMES
+  )
+  today = datetime.datetime.now().date()
+  yesterday = today - datetime.timedelta(days=1)
+  runner.invoke(cli, [
+    "add", "work", "--duration", "1",
+    "--at", f"{yesterday.isoformat()} 10:00"
+  ])
+
+  result = runner.invoke(cli, ["today"])
+
+  assert result.exit_code == 0
+  assert result.stdout == (
+    f"{today.isoformat()}\t0s\t8h 0m\t-8h 0m\t(off)\t0s\n"
+  )
+
+def test_today_expects_nothing_on_a_day_off(
+    temp_tracking_dir, monkeypatch
+):
+  """Time tracked on a day off is all deviation."""
+  monkeypatch.setattr("nytid.cli.track.get_work_days", lambda: [])
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "work", "--duration", "1", "--at", f"{today} 10:00"
+  ])
+
+  result = runner.invoke(cli, ["today"])
+
+  assert result.exit_code == 0
+  assert f"{today}\t1h 0m 0s\t0m\t+1h 0m\twork\t1h 0m 0s\n" == (
+    result.stdout
+  )
+@
+
+\subsection{The \texttt{stats} Command Group}
+\label{sec:track-stats}
+
+[[today]] answers for one day.  The [[stats]] group answers the
+question the user actually asks over a term: \enquote{we are supposed
+to work eight hours a weekday and nothing at weekends---how far off
+are we?}  It has four subcommands, [[daily]], [[weekly]], [[monthly]]
+and [[yearly]], and each prints one row per period, newest first, with
+the time tracked, the time the work week expected, and the difference.
+A summary of how the work was done follows the table.
+
+The four are one report at four zoom levels.  The period helpers of
+\cref{sec:track-calendar-periods} already made the granularity a
+value, so the subcommands are four twelve-line wrappers around one
+function, and the only thing a reader has to compare between them is
+the default number of periods.
+
+A bare [[nytid track stats]] prints the group's help.  Typer's default
+for a group without a command is a usage error, and this is the most
+typed command in the module; an error there would be a trap set for
+every user who remembers the old name.
+
+<<stats group>>=
+stats = typer.Typer(
+    name="stats",
+    no_args_is_help=True,
+    help=(
+        "Tracked time per period, compared with the work week.\n\n"
+        "One row per day, week, month or year, newest first, with "
+        "the hours expected of it and the difference. With labels, "
+        "the labels' share of all tracked time instead. A summary "
+        "of how the work was done follows on a terminal.\n\n"
+        "Use \"nytid track today\" for today's label sets.\n\n"
+        "Examples:\n\n\b"
+        "  nytid track stats daily -n 14\n"
+        "  nytid track stats weekly DD1310\n"
+        "  nytid track stats monthly -n 12 --no-summary | cut -f1,4\n"
+    ))
+cli.add_typer(stats)
+@
+
+\subsubsection{Options}
+
+The summary is what makes the report interesting, so it should not
+have to be asked for; but \cref{cli.utils.output} promises that a
+piped listing is rows and nothing else, and [[cut -f4]] on a report
+with a paragraph after it is exactly the breakage that promise
+exists to prevent.  The flag is therefore three-valued.  Unset means
+\emph{auto}: the summary is printed when standard output is a
+terminal and omitted when it is a pipe.  [[--summary]] and
+[[--no-summary]] force it either way, and the configuration key can
+do the same permanently.  [[default]] returns the fallback untouched,
+so an unset key yields [[None]] and thereby auto.
+
+<<constants>>=
+TRACK_STATS_SUMMARY_CONFIG = "track.stats.summary"
+DEFAULT_TRACK_STATS_SUMMARY = default(
+    TRACK_STATS_SUMMARY_CONFIG, None, bool
+)
+@
+
+The number of periods has a default per granularity, chosen so that
+the default report fits on a screen and answers a natural question:
+the past week by day, the past month by week, the past half year by
+month, and the past few years.  These are plain constants rather than
+configuration keys; [[-n]] is short enough to type.
+
+<<constants>>=
+DEFAULT_STATS_DAILY_COUNT = 7
+DEFAULT_STATS_WEEKLY_COUNT = 4
+DEFAULT_STATS_MONTHLY_COUNT = 6
+DEFAULT_STATS_YEARLY_COUNT = 3
+@
+
+<<argument and option definitions>>=
+stats_labels_arg = typer.Argument(
+    help="Filter the statistics by specific labels "
+         "(shows the labels' share of all tracked time)",
+    autocompletion=complete_historical_labels)
+stats_count_opt = typer.Option(
+    "--count", "-n",
+    help="Number of periods to include, newest first, "
+         "counting the current one")
+summary_opt = typer.Option(
+    "--summary/--no-summary",
+    help="Print the work summary after the table "
+         "(by default only on a terminal). "
+         "[config: track.stats.summary]")
+breakdown_opt = typer.Option(
+    "--breakdown", "-b",
+    help="List each day's label sets under the day, "
+         "as track today does")
+@
+
+\subsubsection{The Subcommands}
+
+Each subcommand names its granularity and its default count and
+hands everything else to [[run_period_stats]].  The options after
+[[count]] are the same four for all of them, so they are one chunk.
+
+<<period report options>>=
+daily_limit: Annotated[float | None,
+                       daily_limit_opt] = None,
+who: Annotated[str | None,
+               who_filter_opt] = None,
+summary: Annotated[bool | None,
+                   summary_opt] = DEFAULT_TRACK_STATS_SUMMARY,
+@
+
+The daily report alone takes [[--breakdown]], because the breakdown
+is a per-day layout: it is the view [[today]] gives, repeated for
+each day in the window, which is what the old [[stats -n 7]] used to
+show.  A week broken down by day would be a different report.
+
+<<stats period commands>>=
+@stats.command(name="daily")
+def stats_daily(
+    labels: Annotated[list[str],
+                      stats_labels_arg] = None,
+    count: Annotated[int,
+                     stats_count_opt] = DEFAULT_STATS_DAILY_COUNT,
+    breakdown: Annotated[bool,
+                         breakdown_opt] = False,
+    <<period report options>>
+):
+    """
+    Show tracked time per day against the hours expected.
+
+    \b
+    Examples:
+      nytid track stats daily
+      nytid track stats daily -n 14 DD1310
+      nytid track stats daily --breakdown
+    """
+    run_period_stats(
+        StatsPeriod.daily, count, labels, who, daily_limit, summary,
+        breakdown=breakdown,
+    )
+
+@stats.command(name="weekly")
+def stats_weekly(
+    labels: Annotated[list[str],
+                      stats_labels_arg] = None,
+    count: Annotated[int,
+                     stats_count_opt] = DEFAULT_STATS_WEEKLY_COUNT,
+    <<period report options>>
+):
+    """
+    Show tracked time per ISO week against the hours expected.
+
+    \b
+    Examples:
+      nytid track stats weekly
+      nytid track stats weekly -n 12 --who Dan-Claude
+    """
+    run_period_stats(
+        StatsPeriod.weekly, count, labels, who, daily_limit, summary
+    )
+
+@stats.command(name="monthly")
+def stats_monthly(
+    labels: Annotated[list[str],
+                      stats_labels_arg] = None,
+    count: Annotated[int,
+                     stats_count_opt] = DEFAULT_STATS_MONTHLY_COUNT,
+    <<period report options>>
+):
+    """
+    Show tracked time per month against the hours expected.
+
+    \b
+    Examples:
+      nytid track stats monthly
+      nytid track stats monthly -n 12 DD1310 lecture
+    """
+    run_period_stats(
+        StatsPeriod.monthly, count, labels, who, daily_limit, summary
+    )
+
+@stats.command(name="yearly")
+def stats_yearly(
+    labels: Annotated[list[str],
+                      stats_labels_arg] = None,
+    count: Annotated[int,
+                     stats_count_opt] = DEFAULT_STATS_YEARLY_COUNT,
+    <<period report options>>
+):
+    """
+    Show tracked time per year against the hours expected.
+
+    \b
+    Examples:
+      nytid track stats yearly
+      nytid track stats yearly -n 5 --summary
+    """
+    run_period_stats(
+        StatsPeriod.yearly, count, labels, who, daily_limit, summary
+    )
+@
+
+\subsubsection{The Period Report}
+
+The report is a function rather than a shared chunk because it is
+reached from four code paths, and a function makes its inputs
+explicit where a chunk would leave them to whichever command happened
+to define the right variables (\cref{sec:track-code-outline}).
+
+<<period report>>=
+def run_period_stats(
+    granularity: StatsPeriod,
+    count: int,
+    labels: list[str] | None,
+    who: str | None,
+    daily_limit: float | None,
+    summary: bool | None,
+    breakdown: bool = False,
+):
+    """Print the period report shared by the stats subcommands.
+
+    `breakdown` lists each day's label sets and is only meaningful
+    for daily periods.
+    """
+    <<reject a count below one period>>
+    <<resolve the period report's settings>>
+    <<load and clip entries for the period report>>
+    <<compute the per-period totals>>
+    <<build the period table rows>>
+    <<print the period listing>>
+    <<print the work summary>>
+@
+
+A report needs at least one period to describe.  Rejecting the input
+is better than clamping it, because a clamp quietly reports something
+the user did not ask for; the message names the flag, since there is
+no configuration key that could have supplied the value.
+
+<<reject a count below one period>>=
+if count < 1:
+    typer.echo(
+        f"Error: -n must be at least 1, got {count}",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+The settings are resolved the same way [[today]] resolves them, with
+the summary's auto value decided here, once, from the stream the
+rows will go to.
+
+<<resolve the period report's settings>>=
+if daily_limit is None:
+    daily_limit = get_default_daily_limit()
+if summary is None:
+    summary = sys.stdout.isatty()
+work_days = get_work_days()
+@
+
+The window is the union of the periods, oldest start to newest end,
+and the entries are clipped to it once.  The reporting end is the
+window clipped to today, for the expectation; the newest period is
+never over.
+
+With labels the report shows a share, and a share needs the whole:
+the same window loaded again without the label filter.  This is a
+second read of one JSON file, which is the honest cost of the
+column.  Filtering the unfiltered list in memory instead would save
+the read but tie the two loads together in a way that a later change
+to [[filter_entries]] could silently break, and the read is cheap.
+
+<<load and clip entries for the period report>>=
+now = datetime.datetime.now()
+today_date = now.date()
+periods = make_period_ranges(granularity, count, now=now)
+if not periods:
+    return
+window_start = periods[-1].start
+window_end = periods[0].end
+reporting_end = min(window_end, today_date)
+
+entries = filter_entries(who=who, labels=labels)
+if entries is None:
+    typer.echo("No tracking data available")
+    return
+entries = clip_entries_to_dates(entries, window_start, window_end)
+
+all_entries = None
+if labels:
+    all_entries = clip_entries_to_dates(
+        filter_entries(who=who), window_start, window_end
+    )
+@
+
+The totals follow the pipeline of \cref{sec:track-calendar-periods}.
+The weekly, monthly and yearly rows also say on how many of the
+period's work days anything was tracked, which needs the same
+bucketing applied to a count of dates rather than a sum of durations.
+
+<<compute the per-period totals>>=
+daily_totals = compute_daily_wall_clock(entries)
+daily_label_set_totals = compute_daily_label_set_totals(entries)
+period_totals = totals_per_period(daily_totals, granularity)
+worked_per_period = worked_days_per_period(
+    daily_totals, granularity, work_days
+)
+all_totals = None
+if all_entries is not None:
+    all_totals = totals_per_period(
+        compute_daily_wall_clock(all_entries), granularity
+    )
+@
+
+<<helper functions>>=
+def worked_days_per_period(
+    daily_totals: dict[datetime.date, datetime.timedelta],
+    granularity: StatsPeriod,
+    work_days: list[str],
+) -> dict[datetime.date, int]:
+    """Count work days with tracked time per period start."""
+    counts = {}
+    for date, duration in daily_totals.items():
+        if duration <= datetime.timedelta():
+            continue
+        if not is_work_day(date, work_days):
+            continue
+        start, _ = period_bounds(granularity, date)
+        counts[start] = counts.get(start, 0) + 1
+    return counts
+@
+
+<<test functions>>=
+def test_worked_days_per_period_counts_work_days_only():
+  """Only work days with time are counted, per period."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  daily_totals = {
+    datetime.date(2026, 9, 7): datetime.timedelta(hours=8),
+    datetime.date(2026, 9, 8): datetime.timedelta(),
+    datetime.date(2026, 9, 12): datetime.timedelta(hours=2),
+    datetime.date(2026, 9, 14): datetime.timedelta(hours=1),
+  }
+  assert worked_days_per_period(
+    daily_totals, StatsPeriod.weekly, weekdays
+  ) == {
+    datetime.date(2026, 9, 7): 1,
+    datetime.date(2026, 9, 14): 1,
+  }
+@
+
+Three shapes of row.  The breakdown borrows [[today]]'s rows for
+each day.  Otherwise the shape is decided by whether labels were
+given: without labels a period is compared with its expectation; with
+labels the expectation is meaningless---nobody owes eight hours a day
+to one course---so the comparison is with everything tracked in the
+period instead.  The daily rows leave out the work-day count and the
+average, which for a single day would only restate the other columns.
+
+<<build the period table rows>>=
+rows = []
+for period in periods:
+    tracked = period_totals.get(period.start, datetime.timedelta())
+    if breakdown:
+        rows += day_breakdown_rows(
+            period.start, daily_totals, daily_label_set_totals,
+            daily_limit, work_days,
+        )
+    elif labels:
+        <<append a share row for [[period]]>>
+    else:
+        <<append an expectation row for [[period]]>>
+@
+
+The expectation of a period stops at today, so the current week is
+compared with the work days that have passed.  The average is per
+work day in that same clipped range, so a full week and a week in
+progress are comparable.  A period without work days---a weekend
+seen daily, say---has no average, and a dash is more honest than a
+zero.
+
+<<append an expectation row for [[period]]>>=
+period_end = min(period.end, today_date)
+expected = expected_time(
+    period.start, period_end, daily_limit, work_days
+)
+row = (
+    period.label,
+    format_duration(tracked, seconds=False),
+    format_duration(expected, seconds=False),
+    format_signed_duration(tracked - expected, seconds=False),
+)
+if granularity != StatsPeriod.daily:
+    workdays = count_work_days(period.start, period_end, work_days)
+    worked = worked_per_period.get(period.start, 0)
+    average = "-"
+    if workdays:
+        average = format_duration(tracked / workdays, seconds=False)
+    row += (f"{worked}/{workdays}", average)
+rows.append(row)
+@
+
+<<append a share row for [[period]]>>=
+all_tracked = all_totals.get(period.start, datetime.timedelta())
+share = "-"
+if all_tracked:
+    share = f"{round(100 * tracked / all_tracked)}%"
+rows.append((
+    period.label,
+    format_duration(tracked, seconds=False),
+    format_duration(all_tracked, seconds=False),
+    share,
+))
+@
+
+The header is [[Period]] whatever the granularity, so that one
+implementation keeps one vocabulary and a reader of the piped form
+can count on column four meaning the same thing in every report.
+
+<<print the period listing>>=
+if breakdown:
+    columns = DAY_BREAKDOWN_COLUMNS
+elif labels:
+    columns = [
+        Column("Period", style="cyan", no_wrap=True),
+        Column("Tracked", justify="right", no_wrap=True),
+        Column("All", justify="right", no_wrap=True),
+        Column("Share", justify="right", no_wrap=True),
+    ]
+else:
+    columns = [
+        Column("Period", style="cyan", no_wrap=True),
+        Column("Tracked", justify="right", no_wrap=True),
+        Column("Expected", justify="right", no_wrap=True),
+        Column("Diff", justify="right", no_wrap=True),
+    ]
+    if granularity != StatsPeriod.daily:
+        columns += [
+            Column("Days", justify="right", no_wrap=True),
+            Column("Avg", justify="right", no_wrap=True),
+        ]
+print_rows(columns, rows)
+@
+
+The summary covers the whole window at once, computed by
+\cref{sec:track-work-summary} from the same clipped entries, and is
+separated from the table by a blank line.
+
+<<print the work summary>>=
+if not summary:
+    return
+work_summary = compute_work_summary(
+    entries, window_start, reporting_end, daily_limit, work_days
+)
+all_total = None
+if all_totals is not None:
+    all_total = sum(all_totals.values(), datetime.timedelta())
+typer.echo()
+for line in work_summary_lines(
+    work_summary, periods, labels, all_total
+):
+    typer.echo(line)
+@
+
+\subsubsection{Rendering the Summary}
+
+The summary is six lines at most, each dropped when it has nothing to
+say: a window with no work has no longest day, and a report without a
+day off with work should not announce that there were none.  The
+lines are plain \textsc{ascii} so that they survive every terminal
+and every log file.
+
+<<helper functions>>=
+def work_summary_lines(
+    summary: WorkSummary,
+    periods: list[Period],
+    labels: list[str] | None = None,
+    all_total: datetime.timedelta | None = None,
+) -> list[str]:
+    """Render a `WorkSummary` as the lines the period reports print.
+
+    With `labels`, the headline compares the labels' time with
+    `all_total`, the time tracked on everything in the window.
+    """
+    lines = []
+    <<the headline>>
+    <<the work days line>>
+    <<the days off line>>
+    <<the extremes line>>
+    <<the typical day line>>
+    <<the top label sets line>>
+    return lines
+@
+
+The headline names the window by its periods and its length in days,
+then gives the one number the report exists for: tracked against
+expected, or, with labels, tracked against everything.
+
+<<the headline>>=
+span = periods[0].label
+if len(periods) > 1:
+    span = f"{periods[-1].label} to {periods[0].label}"
+days = (summary.end_date - summary.start_date).days + 1
+tracked = format_duration(summary.total, seconds=False)
+if labels:
+    share = "-"
+    if all_total:
+        share = f"{round(100 * summary.total / all_total)}%"
+    lines.append(
+        f"{span}, {count_noun(days, 'day')}, {', '.join(labels)}: "
+        f"tracked {tracked} of "
+        f"{format_duration(all_total, seconds=False)} in total "
+        f"({share})"
+    )
+else:
+    lines.append(
+        f"{span}, {count_noun(days, 'day')}: tracked {tracked} of "
+        f"{format_duration(summary.expected, seconds=False)} "
+        f"expected "
+        f"({format_signed_duration(summary.diff, seconds=False)})"
+    )
+@
+
+<<the work days line>>=
+line = (
+    f"worked {summary.days_worked} of "
+    f"{count_noun(summary.workdays, 'work day')}"
+)
+if labels:
+    line = (
+        f"worked on these labels {summary.days_worked} of "
+        f"{count_noun(summary.workdays, 'work day')}"
+    )
+if summary.per_workday is not None:
+    line += (
+        f", {format_duration(summary.per_workday, seconds=False)}"
+        " per work day"
+    )
+lines.append(line)
+@
+
+<<the days off line>>=
+if summary.off_days_worked:
+    lines.append(
+        f"{count_noun(summary.off_days_worked, 'day')} off with "
+        f"work, {format_duration(summary.off_days_total, seconds=False)}"
+        " in total"
+    )
+@
+
+<<the extremes line>>=
+if summary.longest_day is not None:
+    date, duration = summary.longest_day
+    lines.append(
+        f"longest day {date.isoformat()}, "
+        f"{format_duration(duration, seconds=False)}; "
+        f"longest streak "
+        f"{count_noun(summary.longest_streak, 'day')}"
+    )
+@
+
+<<the typical day line>>=
+if summary.median_start is not None:
+    lines.append(
+        f"typical day {summary.median_start:%H:%M} to "
+        f"{summary.median_end:%H:%M}"
+    )
+@
+
+<<the top label sets line>>=
+if summary.top_label_sets and summary.total:
+    parts = [
+        f"{', '.join(labels_key)} "
+        f"{round(100 * duration / summary.total)}%"
+        for labels_key, duration in summary.top_label_sets
+    ]
+    lines.append("top label sets: " + "; ".join(parts))
+@
+
+English plurals are the one formatting rule the lines share.
+
+<<helper functions>>=
+def count_noun(count: int, noun: str) -> str:
+    """Return `count` with `noun`, pluralised unless `count` is 1."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+@
+
+Let's verify the rendering against the fixed week of
+\cref{sec:track-work-summary}, without and with a label filter, and
+that an empty window renders only the lines that apply:
+
+<<test functions>>=
+def summary_week_periods():
+  return [Period(
+    datetime.date(2026, 9, 7), datetime.date(2026, 9, 13), "2026-W37"
+  )]
+
+def test_work_summary_lines_for_a_week():
+  """Every line of the summary, in order."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  summary = compute_work_summary(
+    summary_week_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    weekdays,
+  )
+  assert work_summary_lines(summary, summary_week_periods()) == [
+    "2026-W37, 7 days: tracked 27h 0m of 40h 0m expected (-13h 0m)",
+    "worked 3 of 5 work days, 5h 24m per work day",
+    "1 day off with work, 2h 0m in total",
+    "longest day 2026-09-08, 10h 30m; longest streak 3 days",
+    "typical day 09:15 to 16:30",
+    "top label sets: nytid 69%; DD1310 24%; email 7%",
+  ]
+
+def test_work_summary_lines_with_labels():
+  """With labels the headline is a share of everything tracked."""
+  weekdays = ["mon", "tue", "wed", "thu", "fri"]
+  summary = compute_work_summary(
+    summary_week_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    weekdays,
+  )
+  lines = work_summary_lines(
+    summary, summary_week_periods(), ["nytid", "DD1310"],
+    datetime.timedelta(hours=54),
+  )
+  assert lines[0] == (
+    "2026-W37, 7 days, nytid, DD1310: "
+    "tracked 27h 0m of 54h 0m in total (50%)"
+  )
+  assert lines[1] == (
+    "worked on these labels 3 of 5 work days, 5h 24m per work day"
+  )
+
+def test_work_summary_lines_of_nothing():
+  """An empty window keeps only the lines that apply."""
+  summary = compute_work_summary(
+    [], datetime.date(2026, 9, 12), datetime.date(2026, 9, 13), 8.0,
+    ["mon"],
+  )
+  periods = [
+    Period(datetime.date(2026, 9, 13), datetime.date(2026, 9, 13),
+           "2026-09-13"),
+    Period(datetime.date(2026, 9, 12), datetime.date(2026, 9, 12),
+           "2026-09-12"),
+  ]
+  assert work_summary_lines(summary, periods) == [
+    "2026-09-12 to 2026-09-13, 2 days: tracked 0m of 0m expected (0m)",
+    "worked 0 of 0 work days",
+  ]
+@
+
+\subsubsection{Testing the Period Report}
+
+The group must answer to its bare name with help rather than an
+error, and list its four subcommands:
+
+<<test functions>>=
+def test_stats_group_lists_subcommands(temp_tracking_dir):
+  """A bare stats prints help naming the four subcommands."""
+  for args in (["stats"], ["stats", "--help"]):
+    result = runner.invoke(cli, args)
+    for name in ("daily", "weekly", "monthly", "yearly"):
+      assert name in result.output
+    assert "Missing command" not in result.output
+@
+
+The calendar is pinned by patching [[make_period_ranges]], the idiom
+the module uses instead of faking the clock, and the dates are in a
+past February so that the expectation is not clipped to today.  Every
+day is a work day unless the test says otherwise.
+
+<<test functions>>=
+def february_days():
+  """Wednesday 14 back to Monday 12 February 2024, newest first."""
+  return [
+    Period(datetime.date(2024, 2, day), datetime.date(2024, 2, day),
+           f"2024-02-{day}")
+    for day in (14, 13, 12)
+  ]
+
+def test_stats_daily_shows_empty_periods_as_zero(
+    temp_tracking_dir, monkeypatch
+):
+  """Every requested period is a row, worked or not."""
+  monkeypatch.setattr(
+    "nytid.cli.track.get_work_days", lambda: DAY_NAMES
+  )
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", "2024-02-13 10:00"
+  ])
+
+  with patch(
+    "nytid.cli.track.make_period_ranges",
+    return_value=february_days(),
+  ):
+    result = runner.invoke(cli, ["stats", "daily", "--no-summary"])
+
+  assert result.exit_code == 0
+  assert result.stdout == (
+    "2024-02-14\t0m\t8h 0m\t-8h 0m\n"
+    "2024-02-13\t1h 0m\t8h 0m\t-7h 0m\n"
+    "2024-02-12\t0m\t8h 0m\t-8h 0m\n"
+  )
+
+def test_stats_weekly_rows_count_work_days(
+    temp_tracking_dir, monkeypatch
+):
+  """Weekly rows add the work days worked and the average."""
+  monkeypatch.setattr(
+    "nytid.cli.track.get_work_days",
+    lambda: ["mon", "tue", "wed", "thu", "fri"],
+  )
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "8", "--at", "2024-02-12 09:00"
+  ])
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "2", "--at", "2024-02-13 09:00"
+  ])
+  week = [Period(
+    datetime.date(2024, 2, 12), datetime.date(2024, 2, 18), "2024-W07"
+  )]
+
+  with patch(
+    "nytid.cli.track.make_period_ranges", return_value=week
+  ):
+    result = runner.invoke(cli, ["stats", "weekly", "--no-summary"])
+
+  assert result.exit_code == 0
+  assert result.stdout == (
+    "2024-W07\t10h 0m\t40h 0m\t-30h 0m\t2/5\t2h 0m\n"
+  )
+
+def test_stats_labels_show_share_of_all_tracked(
+    temp_tracking_dir, monkeypatch
+):
+  """With labels the columns are the labels' share of everything."""
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", "2024-02-13 10:00"
+  ])
+  runner.invoke(cli, [
+    "add", "DD1321", "--duration", "3", "--at", "2024-02-13 12:00"
+  ])
+
+  with patch(
+    "nytid.cli.track.make_period_ranges",
+    return_value=february_days()[1:2],
+  ):
+    result = runner.invoke(
+      cli, ["stats", "daily", "DD1310", "--no-summary"]
+    )
+
+  assert result.exit_code == 0
+  assert result.stdout == "2024-02-13\t1h 0m\t4h 0m\t25%\n"
+@
+
+The breakdown must print exactly what [[today]] would print for each
+day, days without work included:
+
+<<test functions>>=
+def test_stats_daily_breakdown_lists_label_sets(
+    temp_tracking_dir, monkeypatch
+):
+  """--breakdown repeats today's layout for every day."""
+  monkeypatch.setattr(
+    "nytid.cli.track.get_work_days", lambda: DAY_NAMES
+  )
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", "2024-02-13 10:00"
+  ])
+  runner.invoke(cli, [
+    "add", "DD1321", "--duration", "3", "--at", "2024-02-13 12:00"
+  ])
+
+  with patch(
+    "nytid.cli.track.make_period_ranges",
+    return_value=february_days(),
+  ):
+    result = runner.invoke(
+      cli, ["stats", "daily", "-b", "--no-summary"]
+    )
+
+  assert result.exit_code == 0
+  assert result.stdout == (
+    "2024-02-14\t0s\t8h 0m\t-8h 0m\t(off)\t0s\n"
+    "2024-02-13\t4h 0m 0s\t8h 0m\t-4h 0m\tDD1321\t3h 0m 0s\n"
+    "\t\t\t\tDD1310\t1h 0m 0s\n"
+    "2024-02-12\t0s\t8h 0m\t-8h 0m\t(off)\t0s\n"
+  )
+@
+
+The current period must appear at every granularity, labelled as the
+helpers label it, so the test asks them rather than hard-coding a
+week that would be wrong next week:
+
+<<test functions>>=
+def test_stats_shows_the_current_period_at_each_granularity(
+    temp_tracking_dir
+):
+  """One entry today appears in the newest period of every report."""
+  now = datetime.datetime.now()
+  today = now.date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", f"{today} 10:00"
+  ])
+
+  for granularity in StatsPeriod:
+    result = runner.invoke(
+      cli, ["stats", granularity.value, "-n", "1", "--no-summary"]
+    )
+    assert result.exit_code == 0
+    fields = result.stdout.rstrip("\n").split("\t")
+    expected_label = make_period_ranges(granularity, 1, now=now)[0].label
+    assert fields[0] == expected_label
+    assert fields[1] == "1h 0m"
+@
+
+The summary is auto by default, which under the test runner means
+off, since its standard output is not a terminal; the flags force it
+either way:
+
+<<test functions>>=
+def test_stats_summary_is_silent_in_a_pipe(temp_tracking_dir):
+  """Without a terminal the default output is rows only."""
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", f"{today} 10:00"
+  ])
+
+  result = runner.invoke(cli, ["stats", "daily"])
+
+  assert result.exit_code == 0
+  assert result.stdout.count("\n") == DEFAULT_STATS_DAILY_COUNT
+  assert all("\t" in line for line in result.stdout.splitlines())
+
+def test_stats_summary_flag_prints_the_block(temp_tracking_dir):
+  """--summary appends the summary after a blank line."""
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", f"{today} 10:00"
+  ])
+
+  result = runner.invoke(cli, ["stats", "daily", "--summary"])
+
+  assert result.exit_code == 0
+  assert "\n\n" in result.stdout
+  assert "tracked 1h 0m of" in result.stdout
+  assert "work day" in result.stdout
+  assert "top label sets: DD1310 100%" in result.stdout
+@
+
+The degenerate inputs: no data at all, a count below one, and a
+window naming no periods:
+
+<<test functions>>=
+def test_stats_no_data(temp_tracking_dir):
+  """Without any history the report says so."""
+  result = runner.invoke(cli, ["stats", "weekly"])
+  assert result.exit_code == 0
+  assert "No tracking data available" in result.stdout
+
+def test_stats_rejects_count_below_one(temp_tracking_dir):
+  """A zero or negative count is an error, not a traceback."""
   runner.invoke(cli, ["add", "work", "--duration", "1"])
 
   for args in (
-    ["stats", "-n", "0"],
-    ["stats", "-n", "0", "--summary"],
-    ["stats", "-n", "-3"],
+    ["stats", "daily", "-n", "0"],
+    ["stats", "monthly", "-n", "-3", "--summary"],
   ):
     result = runner.invoke(cli, args)
     assert result.exit_code == 1
     assert result.exception is None or isinstance(
       result.exception, SystemExit
     )
-    assert "--days must be at least 1" in result.output
-    assert TRACK_STATS_DAYS_CONFIG in result.output
-@
+    assert "-n must be at least 1" in result.output
 
-The other degenerate case is a window that is well-formed but names no
-dates.  [[--days]] can no longer produce one, but it is still what the
-row builder sees whenever [[make_stats_dates]] returns empty, so we
-substitute that function directly.  The old table answered with a
-header and a rule drawn over nothing; the answer now is silence, so the
-test that used to assert the headers asserts their absence instead:
-
-<<test functions>>=
 def test_stats_prints_nothing_for_an_empty_window(temp_tracking_dir):
-  """A report naming no dates prints nothing at all."""
+  """A report naming no periods prints nothing at all."""
   runner.invoke(cli, ["add", "work", "--duration", "1"])
 
   with patch(
-    "nytid.cli.track.make_stats_dates",
+    "nytid.cli.track.make_period_ranges",
     return_value=[],
   ):
-    result = runner.invoke(cli, ["stats"])
+    result = runner.invoke(cli, ["stats", "daily", "--summary"])
 
   assert result.exit_code == 0
   assert result.stdout == ""
+@
+
+Worker filters apply before anything is bucketed:
+
+<<test functions>>=
+def test_stats_with_who_filter(temp_tracking_dir):
+  """--who narrows the report to one worker."""
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", f"{today} 09:00"
+  ])
+  runner.invoke(cli, [
+    "add", "coding", "--duration", "1.5", "--who", "Dan-Claude",
+    "--at", f"{today} 11:00"
+  ])
+
+  result = runner.invoke(cli, [
+    "stats", "daily", "-n", "1", "--who", "Dan-Claude", "--no-summary"
+  ])
+
+  assert result.exit_code == 0
+  assert result.stdout.split("\t")[1] == "1h 30m"
 @
 
 \subsection{Export Command}
@@ -16435,7 +17920,10 @@ and data export:
 
 <<analysis commands>>=
 <<ls command>>
-<<stats command>>
+<<today command>>
+<<stats group>>
+<<period report>>
+<<stats period commands>>
 <<export command>>
 <<ics export function>>
 <<json export function>>
@@ -16546,13 +18034,17 @@ from nytid.cli.track import (
     cli, TrackingEntry, ActiveSession,
     TRACKING_DIR_CONFIG,
     TRACKING_HASH_PREFIX_MIN_LENGTH,
-    TRACK_STATS_DAYS_CONFIG,
     AUTO_SUSPEND_CONFIG,
     TRACK_DEBUG_CONFIG,
     load_tracking_data, load_active_session,
     mutate_worker_tracking_state,
-    format_duration,
-    filter_entries, filter_entries_for_stats_window,
+    format_duration, format_signed_duration,
+    filter_entries, clip_entries_to_dates,
+    StatsPeriod, Period, period_bounds, period_label,
+    make_period_ranges, totals_per_period, expected_time,
+    compute_daily_wall_clock, compute_work_summary, WorkSummary,
+    time_of_day, DAY_NAMES, work_summary_lines,
+    worked_days_per_period, DEFAULT_STATS_DAILY_COUNT,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
     parse_offset, parse_at_time,
@@ -16659,14 +18151,14 @@ TEST_SESSION_ID = "$1"
 @
 
 <<integration tests>>=
-def test_stats_no_data(temp_tracking_dir):
-    """Test stats command with no data"""
-    result = runner.invoke(cli, ["stats"])
+def test_today_no_data(temp_tracking_dir):
+    """Test today command with no data"""
+    result = runner.invoke(cli, ["today"])
     assert result.exit_code == 0
     assert "No tracking data available" in result.stdout
 
-def test_stats_with_data(temp_tracking_dir):
-    """Default stats show today's grouped label sets."""
+def test_today_with_data(temp_tracking_dir):
+    """Today shows today's grouped label sets."""
     today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
@@ -16674,14 +18166,13 @@ def test_stats_with_data(temp_tracking_dir):
         "--at", f"{today} 10:00"
     ])
 
-    result = runner.invoke(cli, ["stats"])
+    result = runner.invoke(cli, ["today"])
     assert result.exit_code == 0
     assert today in result.stdout
     assert "DD1310, grading" in result.stdout
     assert "1h 0m 0s" in result.stdout
-    assert "Statistics for the last" not in result.stdout
 
-def test_stats_groups_matching_label_sets(temp_tracking_dir):
+def test_today_groups_matching_label_sets(temp_tracking_dir):
     """Repeated sessions with the same labels collapse together."""
     today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
@@ -16695,48 +18186,14 @@ def test_stats_groups_matching_label_sets(temp_tracking_dir):
         "--at", f"{today} 11:00"
     ])
 
-    result = runner.invoke(cli, ["stats"])
+    result = runner.invoke(cli, ["today"])
     assert result.exit_code == 0
     assert "devel, nytid, work" in result.stdout
     assert result.stdout.count("devel, nytid, work") == 1
     assert "1h 15m 0s" in result.stdout
 
-def test_stats_show_empty_days_as_zero(temp_tracking_dir):
-    """Requested windows include off-days as explicit zeros."""
-    today = datetime.datetime.now().date().isoformat()
-    runner.invoke(cli, [
-        "add", "DD1310", "grading",
-        "--duration", "1",
-        "--at", f"{today} 10:00"
-    ])
-
-    result = runner.invoke(cli, ["stats", "-n", "2"])
-    assert result.exit_code == 0
-    yesterday = (
-        datetime.datetime.now().date()
-        - datetime.timedelta(days=1)
-    ).isoformat()
-    assert today in result.stdout
-    assert yesterday in result.stdout
-    assert "(off)" in result.stdout
-    assert "0s" in result.stdout
-
-def test_stats_summary_flag_shows_aggregate_totals(temp_tracking_dir):
-    """--summary restores the overall window totals."""
-    today = datetime.datetime.now().date().isoformat()
-    runner.invoke(cli, [
-        "add", "DD1310", "grading",
-        "--duration", "1",
-        "--at", f"{today} 10:00"
-    ])
-
-    result = runner.invoke(cli, ["stats", "--summary"])
-    assert result.exit_code == 0
-    assert "Statistics for the last 1 days:" in result.stdout
-    assert "Total time: 1h 0m 0s (1.0 hours)" in result.stdout
-
-def test_stats_summary_uses_calendar_day_window(temp_tracking_dir):
-    """Today's stats include only today's calendar day."""
+def test_today_uses_calendar_day_window(temp_tracking_dir):
+    """Today includes only today's calendar day."""
     today = datetime.datetime.now().date()
     yesterday = today - datetime.timedelta(days=1)
     runner.invoke(cli, [
@@ -16750,30 +18207,17 @@ def test_stats_summary_uses_calendar_day_window(temp_tracking_dir):
         "--at", f"{today.isoformat()} 10:00"
     ])
 
-    result = runner.invoke(cli, ["stats", "--summary"])
+    result = runner.invoke(cli, ["today"])
 
     assert result.exit_code == 0
     assert today.isoformat() in result.stdout
     assert yesterday.isoformat() not in result.stdout
-    assert "Total time: 2h 0m 0s (2.0 hours)" in result.stdout
+    assert "\t2h 0m 0s\t" in result.stdout
     assert "overnight" in result.stdout
-    assert result.stdout.count("1h 0m 0s") >= 2
+    assert result.stdout.count("1h 0m 0s") == 2
 
-def test_stats_days_short_option(temp_tracking_dir):
-    """-n is a shorthand for --days on stats."""
-    today = datetime.datetime.now().date().isoformat()
-    runner.invoke(cli, [
-        "add", "DD1310", "grading",
-        "--duration", "1",
-        "--at", f"{today} 10:00"
-    ])
-
-    result = runner.invoke(cli, ["stats", "-n", "3", "--summary"])
-    assert result.exit_code == 0
-    assert "Statistics for the last 3 days:" in result.stdout
-
-def test_stats_filtered_by_labels(temp_tracking_dir):
-    """Label filters retain grouped daily output."""
+def test_today_filtered_by_labels(temp_tracking_dir):
+    """Label filters retain grouped output."""
     today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "DD1310", "grading",
@@ -16791,8 +18235,8 @@ def test_stats_filtered_by_labels(temp_tracking_dir):
         "--at", f"{today} 14:00"
     ])
 
-    # Get stats for DD1310 only
-    result = runner.invoke(cli, ["stats", "DD1310"])
+    # Get today's time for DD1310 only
+    result = runner.invoke(cli, ["today", "DD1310"])
     assert result.exit_code == 0
     assert "DD1310, grading" in result.stdout
     assert "DD1310, lecture" in result.stdout
@@ -16800,25 +18244,18 @@ def test_stats_filtered_by_labels(temp_tracking_dir):
     assert "45m 0s" in result.stdout
     assert "DD1321, lecture" not in result.stdout
 
-    # Get stats for lecture only
-    result = runner.invoke(cli, ["stats", "lecture"])
+    # Get today's time for lecture only
+    result = runner.invoke(cli, ["today", "lecture"])
     assert result.exit_code == 0
     assert "DD1321, lecture" in result.stdout
     assert "DD1310, lecture" in result.stdout
     assert "1h 30m 0s" in result.stdout
     assert "45m 0s" in result.stdout
 
-    # Get stats for multiple labels
-    result = runner.invoke(
-        cli, ["stats", "DD1310", "DD1321", "--summary"]
-    )
-    assert result.exit_code == 0
-    assert "for labels: DD1310, DD1321" in result.stdout
-
-def test_stats_filtered_days_without_matches_show_zero(
+def test_today_filtered_day_without_matches_shows_off(
     temp_tracking_dir,
 ):
-    """Filtered windows still show empty days explicitly."""
+    """A filter that matches nothing still yields the day's row."""
     today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
         "add", "nytid", "work",
@@ -16826,9 +18263,9 @@ def test_stats_filtered_days_without_matches_show_zero(
         "--at", f"{today} 10:00"
     ])
 
-    result = runner.invoke(cli, ["stats", "grading", "-n", "2"])
+    result = runner.invoke(cli, ["today", "grading"])
     assert result.exit_code == 0
-    assert result.stdout.count("(off)") == 2
+    assert result.stdout.count("(off)") == 1
 
 def test_all_tracking_module_functions(temp_tracking_dir):
     """Comprehensive test of all tracking module functions"""
@@ -16893,11 +18330,11 @@ def test_all_tracking_module_functions(temp_tracking_dir):
     result = runner.invoke(cli, ["export", "--format", "csv"])
     assert result.exit_code == 0
     
-    # Test stats with various options
-    result = runner.invoke(cli, ["stats", "--days", "1"])
+    # Test today with and without a label filter
+    result = runner.invoke(cli, ["today"])
     assert result.exit_code == 0
-    
-    result = runner.invoke(cli, ["stats", "manual_label"])
+
+    result = runner.invoke(cli, ["today", "manual_label"])
     assert result.exit_code == 0
 
 def test_export_json(temp_tracking_dir):
@@ -18254,7 +19691,7 @@ def test_status_shows_all_workers(temp_tracking_dir):
     assert "DD1310" in result.stdout
     assert "coding" in result.stdout
 
-def test_stats_with_who_filter(temp_tracking_dir):
+def test_today_with_who_filter(temp_tracking_dir):
     """Worker filters apply before daily grouping."""
     today = datetime.datetime.now().date().isoformat()
     runner.invoke(cli, [
@@ -18267,18 +19704,18 @@ def test_stats_with_who_filter(temp_tracking_dir):
         "--at", f"{today} 11:00"
     ])
 
-    # Stats for Dan-Claude only
+    # Today's time for Dan-Claude only
     result = runner.invoke(cli, [
-        "stats", "--who", "Dan-Claude"
+        "today", "--who", "Dan-Claude"
     ])
     assert result.exit_code == 0
     assert "coding" in result.stdout
     assert "1h 30m 0s" in result.stdout
     assert "DD1310" not in result.stdout
 
-    # Stats for default worker only
+    # Today's time for the default worker only
     result = runner.invoke(
-        cli, ["stats", "--who", default_username]
+        cli, ["today", "--who", default_username]
     )
     assert result.exit_code == 0
     assert "DD1310" in result.stdout
