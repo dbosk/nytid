@@ -907,6 +907,13 @@ where drifting would matter: the treatment of the sign.  A magnitude
 that rounds to no whole minute is unsigned, since [[-0m]] would claim a
 direction the number cannot show.
 
+Discarding the seconds rounds rather than truncates.  Truncation is
+biased: every value it changes it makes smaller, so a column of them
+understates each entry by up to a minute and the shortfall accumulates
+down the column instead of cancelling out.  Rounding is unbiased, and
+it costs nothing here because the seconds are being thrown away either
+way.
+
 <<helper functions>>=
 def format_duration(
     duration: datetime.timedelta,
@@ -921,16 +928,19 @@ def format_duration(
     """
     total_seconds = int(duration.total_seconds())
     sign = "-" if total_seconds < 0 else ""
-    hours, remainder = divmod(abs(total_seconds), 3600)
-    minutes, secs = divmod(remainder, 60)
+    magnitude = abs(total_seconds)
 
     if not seconds:
+        hours, minutes = divmod(round(magnitude / 60), 60)
         if hours > 0:
             return f"{sign}{hours}h {minutes}m"
         elif minutes > 0:
             return f"{sign}{minutes}m"
         else:
             return "0m"
+
+    hours, remainder = divmod(magnitude, 3600)
+    minutes, secs = divmod(remainder, 60)
     if hours > 0:
         return f"{sign}{hours}h {minutes}m {secs}s"
     elif minutes > 0:
@@ -988,6 +998,88 @@ def format_signed_duration(
         return text
     return "+" + text
 @
+
+Truncation is what made the old summary fail to add up: [[27h 2m]]
+tracked and [[12h 57m]] behind make [[39h 59m]], not the [[40h 0m]]
+expected on the same line.  Rounding repairs that case, but only by
+luck of the arithmetic.  Rounding three numbers separately preserves
+their identity exactly when the expectation already falls on a whole
+minute, because the difference then inherits the fractional part of
+the tracked value and rounds along with it.  Set [[track.daily_limit]]
+to something like [[7.51]] and it no longer does: with [[27h 0m 36s]]
+tracked against [[7h 30m 30s]] the printed difference lands a minute
+away from the printed operands.
+
+Prose could hide such a slip---nobody subtracts across a
+sentence---but a column invites the subtraction, and a report whose own
+arithmetic does not hold is one the reader stops trusting.  So the
+three cells are formatted as a unit: we round the two measured
+quantities first and take the difference of the \emph{rounded} values,
+which is exactly the calculation the printed digits invite.  The
+guarantee then holds for any expectation, not only the whole-hour ones.
+
+<<helper functions>>=
+def round_to_minute(
+    duration: datetime.timedelta,
+) -> datetime.timedelta:
+    """Return `duration` rounded to the nearest whole minute."""
+    return datetime.timedelta(
+        minutes=round(duration.total_seconds() / 60)
+    )
+
+def format_comparison(
+    tracked: datetime.timedelta,
+    expected: datetime.timedelta,
+) -> tuple[str, str, str]:
+    """Format tracked, expected and their difference as a unit.
+
+    The three cells are at minute resolution and reconcile exactly:
+    the difference is taken between the rounded values, so subtracting
+    the printed numbers gives the printed difference.
+    """
+    tracked = round_to_minute(tracked)
+    expected = round_to_minute(expected)
+    return (
+        format_duration(tracked, seconds=False),
+        format_duration(expected, seconds=False),
+        format_signed_duration(tracked - expected, seconds=False),
+    )
+@
+
+<<test functions>>=
+def displayed_minutes(text):
+  """Read a rendered duration back as a signed number of minutes."""
+  sign = -1 if text.startswith("-") else 1
+  return sign * sum(
+    int(part[:-1]) * (60 if part.endswith("h") else 1)
+    for part in text.lstrip("+-").split()
+  )
+
+def test_format_comparison_cells_reconcile():
+  """The printed difference is the difference of the printed cells."""
+  cases = [
+    (datetime.timedelta(hours=27, minutes=2, seconds=40),
+     datetime.timedelta(hours=40)),
+    (datetime.timedelta(hours=27, seconds=36),
+     datetime.timedelta(hours=7, minutes=30, seconds=30)),
+    (datetime.timedelta(), datetime.timedelta(hours=8)),
+  ]
+  for tracked, expected in cases:
+    cells = format_comparison(tracked, expected)
+    assert (
+      displayed_minutes(cells[0]) - displayed_minutes(cells[1])
+      == displayed_minutes(cells[2])
+    ), cells
+
+def test_format_comparison_rounds_the_tracked_time():
+  """Cells are at minute resolution, rounded rather than truncated."""
+  assert format_comparison(
+    datetime.timedelta(hours=27, minutes=2, seconds=40),
+    datetime.timedelta(hours=40),
+  ) == ("27h 3m", "40h 0m", "-12h 57m")
+  assert format_comparison(
+    datetime.timedelta(hours=8), datetime.timedelta(hours=8)
+  ) == ("8h 0m", "8h 0m", "0m")
 
 <<test functions>>=
 def test_format_signed_duration():
@@ -17109,12 +17201,7 @@ period_end = min(period.end, today_date)
 expected = expected_time(
     period.start, period_end, daily_limit, work_days
 )
-row = (
-    period.label,
-    format_duration(tracked, seconds=False),
-    format_duration(expected, seconds=False),
-    format_signed_duration(tracked - expected, seconds=False),
-)
+row = (period.label,) + format_comparison(tracked, expected)
 if granularity != StatsPeriod.daily:
     workdays = count_work_days(period.start, period_end, work_days)
     worked = worked_per_period.get(period.start, 0)
@@ -18039,6 +18126,7 @@ from nytid.cli.track import (
     load_tracking_data, load_active_session,
     mutate_worker_tracking_state,
     format_duration, format_signed_duration,
+    format_comparison, round_to_minute,
     filter_entries, clip_entries_to_dates,
     StatsPeriod, Period, period_bounds, period_label,
     make_period_ranges, totals_per_period, expected_time,
