@@ -907,6 +907,13 @@ where drifting would matter: the treatment of the sign.  A magnitude
 that rounds to no whole minute is unsigned, since [[-0m]] would claim a
 direction the number cannot show.
 
+Discarding the seconds rounds rather than truncates.  Truncation is
+biased: every value it changes it makes smaller, so a column of them
+understates each entry by up to a minute and the shortfall accumulates
+down the column instead of cancelling out.  Rounding is unbiased, and
+it costs nothing here because the seconds are being thrown away either
+way.
+
 <<helper functions>>=
 def format_duration(
     duration: datetime.timedelta,
@@ -921,16 +928,19 @@ def format_duration(
     """
     total_seconds = int(duration.total_seconds())
     sign = "-" if total_seconds < 0 else ""
-    hours, remainder = divmod(abs(total_seconds), 3600)
-    minutes, secs = divmod(remainder, 60)
+    magnitude = abs(total_seconds)
 
     if not seconds:
+        hours, minutes = divmod(round(magnitude / 60), 60)
         if hours > 0:
             return f"{sign}{hours}h {minutes}m"
         elif minutes > 0:
             return f"{sign}{minutes}m"
         else:
             return "0m"
+
+    hours, remainder = divmod(magnitude, 3600)
+    minutes, secs = divmod(remainder, 60)
     if hours > 0:
         return f"{sign}{hours}h {minutes}m {secs}s"
     elif minutes > 0:
@@ -988,6 +998,88 @@ def format_signed_duration(
         return text
     return "+" + text
 @
+
+Truncation is what made the old summary fail to add up: [[27h 2m]]
+tracked and [[12h 57m]] behind make [[39h 59m]], not the [[40h 0m]]
+expected on the same line.  Rounding repairs that case, but only by
+luck of the arithmetic.  Rounding three numbers separately preserves
+their identity exactly when the expectation already falls on a whole
+minute, because the difference then inherits the fractional part of
+the tracked value and rounds along with it.  Set [[track.daily_limit]]
+to something like [[7.51]] and it no longer does: with [[27h 0m 36s]]
+tracked against [[7h 30m 30s]] the printed difference lands a minute
+away from the printed operands.
+
+Prose could hide such a slip---nobody subtracts across a
+sentence---but a column invites the subtraction, and a report whose own
+arithmetic does not hold is one the reader stops trusting.  So the
+three cells are formatted as a unit: we round the two measured
+quantities first and take the difference of the \emph{rounded} values,
+which is exactly the calculation the printed digits invite.  The
+guarantee then holds for any expectation, not only the whole-hour ones.
+
+<<helper functions>>=
+def round_to_minute(
+    duration: datetime.timedelta,
+) -> datetime.timedelta:
+    """Return `duration` rounded to the nearest whole minute."""
+    return datetime.timedelta(
+        minutes=round(duration.total_seconds() / 60)
+    )
+
+def format_comparison(
+    tracked: datetime.timedelta,
+    expected: datetime.timedelta,
+) -> tuple[str, str, str]:
+    """Format tracked, expected and their difference as a unit.
+
+    The three cells are at minute resolution and reconcile exactly:
+    the difference is taken between the rounded values, so subtracting
+    the printed numbers gives the printed difference.
+    """
+    tracked = round_to_minute(tracked)
+    expected = round_to_minute(expected)
+    return (
+        format_duration(tracked, seconds=False),
+        format_duration(expected, seconds=False),
+        format_signed_duration(tracked - expected, seconds=False),
+    )
+@
+
+<<test functions>>=
+def displayed_minutes(text):
+  """Read a rendered duration back as a signed number of minutes."""
+  sign = -1 if text.startswith("-") else 1
+  return sign * sum(
+    int(part[:-1]) * (60 if part.endswith("h") else 1)
+    for part in text.lstrip("+-").split()
+  )
+
+def test_format_comparison_cells_reconcile():
+  """The printed difference is the difference of the printed cells."""
+  cases = [
+    (datetime.timedelta(hours=27, minutes=2, seconds=40),
+     datetime.timedelta(hours=40)),
+    (datetime.timedelta(hours=27, seconds=36),
+     datetime.timedelta(hours=7, minutes=30, seconds=30)),
+    (datetime.timedelta(), datetime.timedelta(hours=8)),
+  ]
+  for tracked, expected in cases:
+    cells = format_comparison(tracked, expected)
+    assert (
+      displayed_minutes(cells[0]) - displayed_minutes(cells[1])
+      == displayed_minutes(cells[2])
+    ), cells
+
+def test_format_comparison_rounds_the_tracked_time():
+  """Cells are at minute resolution, rounded rather than truncated."""
+  assert format_comparison(
+    datetime.timedelta(hours=27, minutes=2, seconds=40),
+    datetime.timedelta(hours=40),
+  ) == ("27h 3m", "40h 0m", "-12h 57m")
+  assert format_comparison(
+    datetime.timedelta(hours=8), datetime.timedelta(hours=8)
+  ) == ("8h 0m", "8h 0m", "0m")
 
 <<test functions>>=
 def test_format_signed_duration():
@@ -1653,16 +1745,21 @@ class WorkSummary:
     """Aggregate statistics over a window of tracked time.
 
     `longest_day` is a `(date, duration)` pair, `median_start` and
-    `median_end` are times of day, and `top_label_sets` lists
-    `(labels, duration)` pairs, largest first; all are `None` or
+    `median_end` are times of day, and `top_labels` lists
+    `(labels, duration)` pairs, largest first, each either an exact
+    label set or one label totalled across its combinations; all are
+    `None` or
     empty when nothing was tracked.  `start_date` and `end_date`
-    are the inclusive window the summary covers.
+    are the inclusive window the summary covers, and `expected` is
+    what the work week asked of that window as a whole, against
+    `expected_per_workday` for one work day of it.
     """
 
     start_date: datetime.date
     end_date: datetime.date
     total: datetime.timedelta
     expected: datetime.timedelta
+    expected_per_workday: datetime.timedelta
     workdays: int
     days_worked: int
     off_days_worked: int
@@ -1671,7 +1768,7 @@ class WorkSummary:
     longest_streak: int
     median_start: datetime.time | None
     median_end: datetime.time | None
-    top_label_sets: list[tuple[tuple[str, ...], datetime.timedelta]]
+    top_labels: list[tuple[tuple[str, ...], datetime.timedelta]]
 
     @property
     def diff(self) -> datetime.timedelta:
@@ -1719,6 +1816,7 @@ def compute_work_summary(
         expected=expected_time(
             start_date, end_date, daily_limit, work_days
         ),
+        expected_per_workday=datetime.timedelta(hours=daily_limit),
         workdays=count_work_days(start_date, end_date, work_days),
         days_worked=days_worked,
         off_days_worked=len(off_days),
@@ -1727,7 +1825,7 @@ def compute_work_summary(
         longest_streak=longest_streak,
         median_start=median_start,
         median_end=median_end,
-        top_label_sets=top_label_sets,
+        top_labels=top_labels,
     )
 @
 
@@ -1815,27 +1913,61 @@ def time_of_day(seconds: float) -> datetime.time:
     return moment.time().replace(microsecond=0)
 @
 
-The label sets are ranked the same way [[today]] groups them: by the
+Label sets are accumulated the same way [[today]] groups them: by the
 exact set, so that the tags stay peers and repeated bursts on the same
 combination collapse into one line.  Summing the per-date label-set
 totals across dates is exact for the reason given in
-\cref{sec:track-calendar-periods}.  Three sets are enough to say where
-the time went; a long tail would only repeat the table.
+\cref{sec:track-calendar-periods}.
 
-<<constants>>=
-TOP_LABEL_SETS = 3
 <<rank the label sets>>=
-label_set_totals = {}
+set_totals = {}
 for label_totals in compute_daily_label_set_totals(entries).values():
     for labels_key, duration in label_totals.items():
-        label_set_totals[labels_key] = (
-            label_set_totals.get(labels_key, datetime.timedelta())
+        set_totals[labels_key] = (
+            set_totals.get(labels_key, datetime.timedelta())
             + duration
         )
-top_label_sets = sorted(
-    label_set_totals.items(),
+<<total each label across its combinations>>
+top_labels = sorted(
+    rows.items(),
     key=lambda item: (-item[1].total_seconds(), item[0]),
-)[:TOP_LABEL_SETS]
+)
+@
+
+Ranking those sets alone answers a narrower question than the one
+asked.  A label tracked in several combinations has its time divided
+among them, so a term spent almost entirely on [[prgi26]]---but always
+beside a second tag---is represented by a handful of small pair
+totals, each of which an unpaired [[email]] can outrank.  The block
+then reports the term as mostly email, which is true of no reading of
+the data.
+
+So each label is also totalled across every set it appears in.  Two
+rules keep exactly one row per name.  A label occurring in a single
+set gets no row of its own, because that set already holds all of its
+time and a second row would restate it under another name.  A label
+occurring in several does get one, and then its solo set---if it has
+one---is left out of the per-set pass, because the total already
+contains that time and two rows called [[prgi26]] holding different
+durations is precisely the confusion this is meant to avoid.
+
+<<total each label across its combinations>>=
+sets_by_label = {}
+for labels_key in set_totals:
+    for label in labels_key:
+        sets_by_label.setdefault(label, []).append(labels_key)
+
+rows = {
+    labels_key: duration
+    for labels_key, duration in set_totals.items()
+    if len(labels_key) > 1
+    or len(sets_by_label[labels_key[0]]) == 1
+}
+for label, keys in sets_by_label.items():
+    if len(keys) > 1:
+        rows[(label,)] = sum(
+            (set_totals[key] for key in keys), datetime.timedelta()
+        )
 @
 
 Let's verify every field from one fixed week, Monday 7 to Sunday 13
@@ -1881,7 +2013,7 @@ def test_compute_work_summary_over_a_week():
   assert summary.longest_streak == 3
   assert summary.median_start == datetime.time(9, 15)
   assert summary.median_end == datetime.time(16, 30)
-  assert summary.top_label_sets == [
+  assert summary.top_labels == [
     (("nytid",), datetime.timedelta(hours=18, minutes=30)),
     (("DD1310",), datetime.timedelta(hours=6, minutes=30)),
     (("email",), datetime.timedelta(hours=2)),
@@ -1925,7 +2057,97 @@ def test_compute_work_summary_of_nothing():
   assert summary.longest_day is None
   assert summary.longest_streak == 0
   assert summary.median_start is None
-  assert summary.top_label_sets == []
+  assert summary.top_labels == []
+@
+
+Each label of that week occurs in exactly one set, so no label earns a
+total of its own and no name is listed twice.  A label spread across
+combinations is the case the ranking exists for.  In the week below
+[[prgi26]] takes 28 of 36 tracked hours but never more than six under
+any one combination, while [[email]] takes eight in a single
+combination of its own.  Ranked by set alone, every [[email]] hour
+outranks every [[prgi26]] combination and the week reads as mostly
+email; totalled per label, [[prgi26]] leads by more than three to one,
+which is what the week was.  Its four solo hours belong inside that
+total rather than in a row of their own.
+
+<<test functions>>=
+def paired_label_entries():
+  """A week of 36 hours: 28 on prgi26, mostly paired, and 8 on email."""
+  def entry(day, start, hours, *labels):
+    begin = datetime.datetime(2026, 9, day, start)
+    return TrackingEntry(
+      begin, begin + datetime.timedelta(hours=hours), list(labels)
+    )
+  return [
+    entry(7, 9, 6, "prgi26", "prep"),
+    entry(8, 9, 6, "prgi26", "grading"),
+    entry(9, 9, 6, "prgi26", "lecture"),
+    entry(10, 9, 6, "prgi26", "exam"),
+    entry(11, 9, 4, "prgi26"),
+    entry(11, 13, 8, "email"),
+  ]
+
+def test_top_labels_totals_a_label_across_its_combinations():
+  """A label in several sets leads with the sum of all of them."""
+  summary = compute_work_summary(
+    paired_label_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    ["mon", "tue", "wed", "thu", "fri"],
+  )
+  hours = lambda n: datetime.timedelta(hours=n)
+  assert summary.total == hours(36)
+
+  assert summary.top_labels == [
+    (("prgi26",), hours(28)),
+    (("email",), hours(8)),
+    (("exam", "prgi26"), hours(6)),
+    (("grading", "prgi26"), hours(6)),
+    (("lecture", "prgi26"), hours(6)),
+    (("prep", "prgi26"), hours(6)),
+  ]
+
+  names = [key for key, _ in summary.top_labels]
+  assert names.count(("prgi26",)) == 1
+  assert ("prep",) not in names
+  assert all(
+    duration < hours(8)
+    for key, duration in summary.top_labels if len(key) > 1
+  )
+@
+
+The cap belongs to the layout rather than to the computation, so the
+ranking above is complete however few rows are printed:
+
+<<test functions>>=
+def test_work_summary_sections_cap_the_label_rows():
+  """top_labels slices the label section and can empty it."""
+  summary = compute_work_summary(
+    paired_label_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    ["mon", "tue", "wed", "thu", "fri"],
+  )
+  periods = summary_week_periods()
+
+  _, sections = work_summary_sections(
+    summary, periods, top_labels=2
+  )
+  assert sections[-1].rows == [
+    ("prgi26", "28h 0m", "78% of tracked"),
+    ("email", "8h 0m", "22%"),
+  ]
+
+  _, sections = work_summary_sections(
+    summary, periods, top_labels=0
+  )
+  assert all(
+    "prgi26" not in row[0]
+    for section in sections for row in section.rows
+  )
 @
 
 \subsubsection{Shell Completion Helpers}
@@ -16794,6 +17016,30 @@ the past week by day, the past month by week, the past half year by
 month, and the past few years.  These are plain constants rather than
 configuration keys; [[-n]] is short enough to type.
 
+How many label rows to print is the one thing about the block worth
+setting once and forgetting.  Five is enough to see a term's shape
+without turning the summary into a second table; a user tracking many
+combinations at once will want more, and one tracking two labels will
+never reach the limit either way.
+
+<<constants>>=
+TRACK_STATS_TOP_LABELS_CONFIG = "track.stats.top_labels"
+DEFAULT_TRACK_STATS_TOP_LABELS = default(
+    TRACK_STATS_TOP_LABELS_CONFIG, 5, int
+)
+@
+
+<<argument and option definitions>>=
+top_labels_opt = typer.Option(
+    "--top-labels",
+    help="Number of label rows in the summary. "
+         "[config: track.stats.top_labels]")
+@
+
+The flag is not called [[--labels]].  The subcommands already take
+[[labels]] as a positional argument, and a reader meeting both in one
+help text would have to work out which of them filters the report.
+
 <<constants>>=
 DEFAULT_STATS_DAILY_COUNT = 7
 DEFAULT_STATS_WEEKLY_COUNT = 4
@@ -16834,6 +17080,10 @@ who: Annotated[str | None,
                who_filter_opt] = None,
 summary: Annotated[bool | None,
                    summary_opt] = DEFAULT_TRACK_STATS_SUMMARY,
+top_labels: Annotated[int,
+                      top_labels_opt] = (
+    DEFAULT_TRACK_STATS_TOP_LABELS
+),
 @
 
 The daily report alone takes [[--breakdown]], because the breakdown
@@ -16863,7 +17113,7 @@ def stats_daily(
     """
     run_period_stats(
         StatsPeriod.daily, count, labels, who, daily_limit, summary,
-        breakdown=breakdown,
+        top_labels, breakdown=breakdown,
     )
 
 @stats.command(name="weekly")
@@ -16883,7 +17133,8 @@ def stats_weekly(
       nytid track stats weekly -n 12 --who Dan-Claude
     """
     run_period_stats(
-        StatsPeriod.weekly, count, labels, who, daily_limit, summary
+        StatsPeriod.weekly, count, labels, who, daily_limit, summary,
+        top_labels
     )
 
 @stats.command(name="monthly")
@@ -16903,7 +17154,8 @@ def stats_monthly(
       nytid track stats monthly -n 12 DD1310 lecture
     """
     run_period_stats(
-        StatsPeriod.monthly, count, labels, who, daily_limit, summary
+        StatsPeriod.monthly, count, labels, who, daily_limit, summary,
+        top_labels
     )
 
 @stats.command(name="yearly")
@@ -16923,7 +17175,8 @@ def stats_yearly(
       nytid track stats yearly -n 5 --summary
     """
     run_period_stats(
-        StatsPeriod.yearly, count, labels, who, daily_limit, summary
+        StatsPeriod.yearly, count, labels, who, daily_limit, summary,
+        top_labels
     )
 @
 
@@ -16942,12 +17195,13 @@ def run_period_stats(
     who: str | None,
     daily_limit: float | None,
     summary: bool | None,
+    top_labels: int = DEFAULT_TRACK_STATS_TOP_LABELS,
     breakdown: bool = False,
 ):
     """Print the period report shared by the stats subcommands.
 
-    `breakdown` lists each day's label sets and is only meaningful
-    for daily periods.
+    `top_labels` caps the summary's label rows.  `breakdown` lists
+    each day's label sets and is only meaningful for daily periods.
     """
     <<reject a count below one period>>
     <<resolve the period report's settings>>
@@ -17109,12 +17363,7 @@ period_end = min(period.end, today_date)
 expected = expected_time(
     period.start, period_end, daily_limit, work_days
 )
-row = (
-    period.label,
-    format_duration(tracked, seconds=False),
-    format_duration(expected, seconds=False),
-    format_signed_duration(tracked - expected, seconds=False),
-)
+row = (period.label,) + format_comparison(tracked, expected)
 if granularity != StatsPeriod.daily:
     workdays = count_work_days(period.start, period_end, work_days)
     worked = worked_per_period.get(period.start, 0)
@@ -17168,8 +17417,7 @@ print_rows(columns, rows)
 @
 
 The summary covers the whole window at once, computed by
-\cref{sec:track-work-summary} from the same clipped entries, and is
-separated from the table by a blank line.
+\cref{sec:track-work-summary} from the same clipped entries.
 
 <<print the work summary>>=
 if not summary:
@@ -17180,129 +17428,282 @@ work_summary = compute_work_summary(
 all_total = None
 if all_totals is not None:
     all_total = sum(all_totals.values(), datetime.timedelta())
-typer.echo()
-for line in work_summary_lines(
-    work_summary, periods, labels, all_total
-):
-    typer.echo(line)
+print_work_summary(
+    *work_summary_sections(
+        work_summary, periods, labels, all_total, top_labels
+    )
+)
 @
 
-\subsubsection{Rendering the Summary}
+\subsubsection{Laying the Summary Out}
+\label{sec:track-summary-layout}
 
-The summary is six lines at most, each dropped when it has nothing to
-say: a window with no work has no longest day, and a report without a
-day off with work should not announce that there were none.  The
-lines are plain \textsc{ascii} so that they survive every terminal
-and every log file.
+The summary used to be six sentences, one per fact:
+
+\begin{quote}
+\ttfamily
+worked 5 of 5 work days, 5h 24m per work day \\
+1 day off with work, 6m in total \\
+longest day 2026-09-03, 6h 42m; longest streak 6 days
+\end{quote}
+
+Every number in it sits mid-sentence, at a column the previous
+sentence decided.  Reading two of them means finding both and holding
+the first while parsing the second, which is precisely the work a
+column of figures does for the eye instead.  So the summary becomes
+what it always was underneath---small tables---and the questions it
+answers separate into three:
+
+\begin{description}
+\item[Measures that have an expectation.] Time tracked, time per work
+  day, work days worked.  Each has a value, a target and a distance
+  from it, so each is a row under [[Tracked]], [[Expected]] and
+  [[Diff]].  Those are the period table's own column headings, and
+  reusing them says that the summary is that table's bottom line
+  rather than a different report.
+\item[Facts with no expectation.] The longest day, the streak, the
+  days off that were worked anyway, when a day typically starts and
+  ends.  Nothing is owed here, so a [[Diff]] column would be empty;
+  they get their own block of quantity and context.
+\item[Where the time went.] The label sets, largest first.
+\end{description}
+
+Laying out is separated from deciding what to say, the way
+[[todo view]] separates them (\cref{cli.todo}): one pass gathers, a
+second renders.  The gathering is then a pure function whose result a
+test can assert on directly, and the rendering has no arithmetic left
+in it to get wrong.
+
+A section is a run of rows, optionally under a header.  It carries its
+own column justifications, because the two shapes differ: the measures
+are three numbers to be compared down the column, while the facts and
+the label sets are a quantity with text beside it.  It also names the
+column, if any, whose sign is worth colouring.
 
 <<helper functions>>=
-def work_summary_lines(
+class SummarySection(NamedTuple):
+    """One block of the work summary: rows, optionally headed.
+
+    `justify` gives each column's alignment as `rich` spells it, and
+    `emphasis` is the index of the column whose sign should be
+    coloured, or `None` when no column carries a deviation.
+    """
+
+    header: tuple[str, ...] | None
+    rows: list[tuple[str, ...]]
+    justify: tuple[str, ...]
+    emphasis: int | None = None
+@
+
+\paragraph{Deciding what to say}
+
+<<helper functions>>=
+def work_summary_sections(
     summary: WorkSummary,
     periods: list[Period],
     labels: list[str] | None = None,
     all_total: datetime.timedelta | None = None,
-) -> list[str]:
-    """Render a `WorkSummary` as the lines the period reports print.
+    top_labels: int = DEFAULT_TRACK_STATS_TOP_LABELS,
+) -> tuple[str, list[SummarySection]]:
+    """Lay a `WorkSummary` out as a title and a list of sections.
 
-    With `labels`, the headline compares the labels' time with
-    `all_total`, the time tracked on everything in the window.
+    With `labels`, the measures are compared with `all_total`, the
+    time tracked on everything in the window, instead of with the
+    work week, which owes nothing to any one label.  `top_labels`
+    caps how many label rows the last section holds.
     """
-    lines = []
-    <<the headline>>
-    <<the work days line>>
-    <<the days off line>>
-    <<the extremes line>>
-    <<the typical day line>>
-    <<the top label sets line>>
-    return lines
+    <<the summary title>>
+    sections = []
+    <<the measures section>>
+    <<the facts section>>
+    <<the label sets section>>
+    return title, [
+        section for section in sections if section.rows
+    ]
 @
 
-The headline names the window by its periods and its length in days,
-then gives the one number the report exists for: tracked against
-expected, or, with labels, tracked against everything.
+The title names the window twice over, by its periods and by its
+length in days, because the two answer different questions: which
+weeks these are, and how much time they add up to.
 
-<<the headline>>=
+<<the summary title>>=
 span = periods[0].label
 if len(periods) > 1:
     span = f"{periods[-1].label} to {periods[0].label}"
-days = (summary.end_date - summary.start_date).days + 1
-tracked = format_duration(summary.total, seconds=False)
+title = f"{span}, {count_noun(days_in_window(summary), 'day')}"
 if labels:
-    share = "-"
-    if all_total:
-        share = f"{round(100 * summary.total / all_total)}%"
-    lines.append(
-        f"{span}, {count_noun(days, 'day')}, {', '.join(labels)}: "
-        f"tracked {tracked} of "
-        f"{format_duration(all_total, seconds=False)} in total "
-        f"({share})"
-    )
+    title += f", {', '.join(labels)}"
+@
+
+<<helper functions>>=
+def days_in_window(summary: WorkSummary) -> int:
+    """Return the number of calendar days a summary covers."""
+    return (summary.end_date - summary.start_date).days + 1
+@
+
+Every cell of the measures table goes through
+[[format_comparison]], so the three columns reconcile by subtraction
+in each row.  The work-day row counts days rather than measuring
+time, which is why it is spelled out here instead: the shape is the
+same, the unit is not.
+
+The per-work-day row is dropped when the window contains no work
+days, since dividing by none of them has no answer, and a dash in a
+column of durations reads as a value rather than as an absence.
+
+<<the measures section>>=
+if labels:
+    <<the measures against everything tracked>>
 else:
-    lines.append(
-        f"{span}, {count_noun(days, 'day')}: tracked {tracked} of "
-        f"{format_duration(summary.expected, seconds=False)} "
-        f"expected "
-        f"({format_signed_duration(summary.diff, seconds=False)})"
-    )
+    header = ("", "Tracked", "Expected", "Diff")
+    emphasis = 3
+    rows = [("Total",) + format_comparison(
+        summary.total, summary.expected
+    )]
+    if summary.per_workday is not None:
+        rows.append(("Per work day",) + format_comparison(
+            summary.per_workday, summary.expected_per_workday
+        ))
+    shortfall = summary.days_worked - summary.workdays
+    rows.append((
+        "Work days",
+        str(summary.days_worked),
+        str(summary.workdays),
+        f"{shortfall:+d}" if shortfall else "0",
+    ))
+sections.append(SummarySection(
+    header, rows, ("left", "right", "right", "right"), emphasis
+))
 @
 
-<<the work days line>>=
-line = (
-    f"worked {summary.days_worked} of "
-    f"{count_noun(summary.workdays, 'work day')}"
-)
-if labels:
-    line = (
-        f"worked on these labels {summary.days_worked} of "
-        f"{count_noun(summary.workdays, 'work day')}"
-    )
+Under a label filter there is nothing to be behind on---no one owes
+eight hours a day to a single course---so the comparison is with
+everything tracked in the same window, under the [[All]] and [[Share]]
+headings the period table uses for exactly that case.  The share is
+printed on the total only: the per-work-day figures are that same
+ratio scaled by the same divisor, so repeating it would be noise.
+Nothing is a deviation here, so no column is emphasised.
+
+<<the measures against everything tracked>>=
+header = ("", "Tracked", "All", "Share")
+emphasis = None
+share = "-"
+if all_total:
+    share = f"{round(100 * summary.total / all_total)}%"
+rows = [(
+    "Total",
+    format_minutes(summary.total),
+    format_minutes(all_total or datetime.timedelta()),
+    share,
+)]
 if summary.per_workday is not None:
-    line += (
-        f", {format_duration(summary.per_workday, seconds=False)}"
-        " per work day"
-    )
-lines.append(line)
+    rows.append((
+        "Per work day",
+        format_minutes(summary.per_workday),
+        format_minutes(
+            (all_total or datetime.timedelta()) / summary.workdays
+        ),
+        "",
+    ))
+rows.append((
+    "Work days",
+    str(summary.days_worked),
+    str(summary.workdays),
+    "",
+))
 @
 
-<<the days off line>>=
-if summary.off_days_worked:
-    lines.append(
-        f"{count_noun(summary.off_days_worked, 'day')} off with "
-        f"work, {format_duration(summary.off_days_total, seconds=False)}"
-        " in total"
-    )
+Minute resolution is what the tables are read at, and asking for it
+twice over---round, then format without seconds---is easy to get half
+right.  Naming the pair keeps the two halves together.
+
+<<helper functions>>=
+def format_minutes(duration: datetime.timedelta) -> str:
+    """Format `duration` at minute resolution, rounded."""
+    return format_duration(round_to_minute(duration), seconds=False)
 @
 
-<<the extremes line>>=
+Each fact is dropped when the window has nothing to say about it: an
+empty window has no longest day, and a week worked entirely on work
+days should not announce that no day off was touched.  What survives
+is a quantity and the context that makes it mean something---how long
+and on which day, how many and how much.
+
+The typical day splits across those two columns rather than sitting
+whole in one, so that its start time lines up under the other
+quantities instead of pushing the column to its own width.
+
+<<the facts section>>=
+facts = []
 if summary.longest_day is not None:
     date, duration = summary.longest_day
-    lines.append(
-        f"longest day {date.isoformat()}, "
-        f"{format_duration(duration, seconds=False)}; "
-        f"longest streak "
-        f"{count_noun(summary.longest_streak, 'day')}"
-    )
-@
-
-<<the typical day line>>=
+    facts.append((
+        "Longest day", format_minutes(duration), date.isoformat()
+    ))
+if summary.longest_streak:
+    facts.append((
+        "Streak", count_noun(summary.longest_streak, "day"), ""
+    ))
+if summary.off_days_worked:
+    facts.append((
+        "Days off",
+        str(summary.off_days_worked),
+        f"{format_minutes(summary.off_days_total)} with work",
+    ))
 if summary.median_start is not None:
-    lines.append(
-        f"typical day {summary.median_start:%H:%M} to "
-        f"{summary.median_end:%H:%M}"
-    )
+    facts.append((
+        "Typical day",
+        f"{summary.median_start:%H:%M}",
+        f"to {summary.median_end:%H:%M}",
+    ))
+sections.append(
+    SummarySection(None, facts, ("left", "right", "left"))
+)
 @
 
-<<the top label sets line>>=
-if summary.top_label_sets and summary.total:
-    parts = [
-        f"{', '.join(labels_key)} "
-        f"{round(100 * duration / summary.total)}%"
-        for labels_key, duration in summary.top_label_sets
-    ]
-    lines.append("top label sets: " + "; ".join(parts))
+The label sets lead with their durations, and this is the one place
+where the shape of the report is load-bearing rather than cosmetic.
+The percentages are shares of the window's merged total, and two label
+sets tracked at once each claim the same hour, so they can add up to
+well past a hundred: a real week of the author's read
+
+\begin{quote}
+\ttfamily
+top label sets: work 93\%; claude 55\%; prep, prgi26 34\%
+\end{quote}
+
+which is $182\%$ of a week.  Every one of those numbers is correct as
+an answer to \enquote{how much of my tracked time carried this label},
+and the semicolons were what made them wrong, by promising a partition
+they were never computing.  A column of durations promises nothing of
+the kind, so the percentages can stay beside them as the context they
+always were, with the denominator named once at the top.
+
+The per-label totals overlap harder still, and on purpose: a label
+totalled across its combinations covers every hour the combinations
+beneath it cover.  That is the whole point of the row---it is there to
+say that the term went to [[prgi26]] whatever else was tagged
+alongside---and it is only legible because the column is durations
+rather than slices.
+
+<<the label sets section>>=
+label_rows = []
+if summary.total:
+    for index, (labels_key, duration) in enumerate(
+        summary.top_labels[:max(top_labels, 0)]
+    ):
+        share = f"{round(100 * duration / summary.total)}%"
+        if index == 0:
+            share += " of tracked"
+        label_rows.append((
+            ", ".join(labels_key), format_minutes(duration), share
+        ))
+sections.append(
+    SummarySection(None, label_rows, ("left", "right", "left"))
+)
 @
 
-English plurals are the one formatting rule the lines share.
+English plurals are the one formatting rule the sections share.
 
 <<helper functions>>=
 def count_noun(count: int, noun: str) -> str:
@@ -17310,59 +17711,101 @@ def count_noun(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 @
 
-Let's verify the rendering against the fixed week of
-\cref{sec:track-work-summary}, without and with a label filter, and
-that an empty window renders only the lines that apply:
+Let us verify the sections against the fixed week of
+\cref{sec:track-work-summary}: Monday 7 to Sunday 13 September 2026,
+worked on the Monday, Tuesday and Wednesday and again on the Saturday.
 
 <<test functions>>=
+def summary_week():
+  """The fixed week's summary, with Monday to Friday as work days."""
+  return compute_work_summary(
+    summary_week_entries(),
+    datetime.date(2026, 9, 7),
+    datetime.date(2026, 9, 13),
+    8.0,
+    ["mon", "tue", "wed", "thu", "fri"],
+  )
+
 def summary_week_periods():
   return [Period(
     datetime.date(2026, 9, 7), datetime.date(2026, 9, 13), "2026-W37"
   )]
 
-def test_work_summary_lines_for_a_week():
-  """Every line of the summary, in order."""
-  weekdays = ["mon", "tue", "wed", "thu", "fri"]
-  summary = compute_work_summary(
-    summary_week_entries(),
-    datetime.date(2026, 9, 7),
-    datetime.date(2026, 9, 13),
-    8.0,
-    weekdays,
+def test_work_summary_sections_for_a_week():
+  """The three sections, row by row."""
+  title, sections = work_summary_sections(
+    summary_week(), summary_week_periods()
   )
-  assert work_summary_lines(summary, summary_week_periods()) == [
-    "2026-W37, 7 days: tracked 27h 0m of 40h 0m expected (-13h 0m)",
-    "worked 3 of 5 work days, 5h 24m per work day",
-    "1 day off with work, 2h 0m in total",
-    "longest day 2026-09-08, 10h 30m; longest streak 3 days",
-    "typical day 09:15 to 16:30",
-    "top label sets: nytid 69%; DD1310 24%; email 7%",
-  ]
+  assert title == "2026-W37, 7 days"
 
-def test_work_summary_lines_with_labels():
-  """With labels the headline is a share of everything tracked."""
-  weekdays = ["mon", "tue", "wed", "thu", "fri"]
-  summary = compute_work_summary(
-    summary_week_entries(),
-    datetime.date(2026, 9, 7),
-    datetime.date(2026, 9, 13),
-    8.0,
-    weekdays,
+  measures, facts, label_sets = sections
+  assert measures.header == ("", "Tracked", "Expected", "Diff")
+  assert measures.emphasis == 3
+  assert measures.rows == [
+    ("Total", "27h 0m", "40h 0m", "-13h 0m"),
+    ("Per work day", "5h 24m", "8h 0m", "-2h 36m"),
+    ("Work days", "3", "5", "-2"),
+  ]
+  assert facts.rows == [
+    ("Longest day", "10h 30m", "2026-09-08"),
+    ("Streak", "3 days", ""),
+    ("Days off", "1", "2h 0m with work"),
+    ("Typical day", "09:15", "to 16:30"),
+  ]
+  assert label_sets.rows == [
+    ("nytid", "18h 30m", "69% of tracked"),
+    ("DD1310", "6h 30m", "24%"),
+    ("email", "2h 0m", "7%"),
+  ]
+@
+
+The measures rows must reconcile by subtraction, which is the whole
+reason \cref{sec:track-stats} formats them as a unit:
+
+<<test functions>>=
+def test_work_summary_measures_reconcile():
+  """Every measures row subtracts to its own difference."""
+  _, sections = work_summary_sections(
+    summary_week(), summary_week_periods()
   )
-  lines = work_summary_lines(
-    summary, summary_week_periods(), ["nytid", "DD1310"],
+  for label, tracked, expected, diff in sections[0].rows:
+    if label == "Work days":
+      assert int(tracked) - int(expected) == int(diff)
+    else:
+      assert (
+        displayed_minutes(tracked) - displayed_minutes(expected)
+        == displayed_minutes(diff)
+      ), label
+@
+
+Under a label filter the measures change what they are measured
+against, and nothing is a deviation any more:
+
+<<test functions>>=
+def test_work_summary_sections_with_labels():
+  """Labels are compared with everything tracked, not the work week."""
+  title, sections = work_summary_sections(
+    summary_week(), summary_week_periods(), ["nytid", "DD1310"],
     datetime.timedelta(hours=54),
   )
-  assert lines[0] == (
-    "2026-W37, 7 days, nytid, DD1310: "
-    "tracked 27h 0m of 54h 0m in total (50%)"
-  )
-  assert lines[1] == (
-    "worked on these labels 3 of 5 work days, 5h 24m per work day"
-  )
+  assert title == "2026-W37, 7 days, nytid, DD1310"
 
-def test_work_summary_lines_of_nothing():
-  """An empty window keeps only the lines that apply."""
+  measures = sections[0]
+  assert measures.header == ("", "Tracked", "All", "Share")
+  assert measures.emphasis is None
+  assert measures.rows == [
+    ("Total", "27h 0m", "54h 0m", "50%"),
+    ("Per work day", "5h 24m", "10h 48m", ""),
+    ("Work days", "3", "5", ""),
+  ]
+@
+
+A window with nothing in it keeps only the section it can fill, and
+must not divide by the work days it does not have:
+
+<<test functions>>=
+def test_work_summary_sections_of_nothing():
+  """An empty window yields the measures alone."""
   summary = compute_work_summary(
     [], datetime.date(2026, 9, 12), datetime.date(2026, 9, 13), 8.0,
     ["mon"],
@@ -17373,10 +17816,223 @@ def test_work_summary_lines_of_nothing():
     Period(datetime.date(2026, 9, 12), datetime.date(2026, 9, 12),
            "2026-09-12"),
   ]
-  assert work_summary_lines(summary, periods) == [
-    "2026-09-12 to 2026-09-13, 2 days: tracked 0m of 0m expected (0m)",
-    "worked 0 of 0 work days",
+  title, sections = work_summary_sections(summary, periods)
+
+  assert title == "2026-09-12 to 2026-09-13, 2 days"
+  assert len(sections) == 1
+  assert sections[0].rows == [
+    ("Total", "0m", "0m", "0m"),
+    ("Work days", "0", "0", "0"),
   ]
+@
+
+\subsubsection{Rendering the Summary}
+\label{sec:track-summary-rendering}
+
+One renderer serves both destinations.  [[rich]] reports a stream that
+is not a terminal as such and drops the styling from what it writes,
+while keeping the widths it computed, so a forced [[--summary]] in a
+pipe yields the same layout in plain text---which is what a reader who
+pages the output through [[less]] or keeps it in a log wants, and it
+means there is only one layout to keep correct.  The alternative,
+tab-separated rows, was rejected because the period table above is
+already tab-separated and a consumer would have no way to tell the two
+kinds of row apart.
+
+This is the one place in [[nytid]] where [[rich]] renders into a pipe.
+Listings must not (\cref{cli.utils.output}): their piped form is a
+compatibility contract with [[cut]] and [[awk]].  The summary has no
+such contract---it is prose that happens to be aligned---and it is
+never printed into a pipe unless asked for by name.
+
+[[rich]] pads a cell out to its column, so a row whose last cell is
+short of the widest one in that column ends in spaces---invisible on a
+terminal, but whitespace a reader has to strip before diffing two
+reports or searching one.  Widening the cells is not something a
+caller can opt out of, so we render into a capture, trim each line,
+and write the result out ourselves.  Capturing keeps the escape
+sequences that a terminal console produces, so trimming costs no
+colour.
+
+The blocks are padded with [[expand=False]] as well, which stops
+[[Padding]] filling the whole console width, and the blank line
+between blocks is printed on its own rather than asked for as padding
+above them, since a padded blank line is padded too.
+
+The [[console]] parameter is what makes the rendering testable: a test
+passes one of known width writing to a buffer, as
+[[cli.utils.output]]'s own tests do, and can then assert on the styling
+as well as the text.
+
+<<helper functions>>=
+def print_work_summary(
+    title: str,
+    sections: list[SummarySection],
+    console=None,
+) -> None:
+    """Print the work summary, aligned, under `title`.
+
+    Styling is applied only when the console writes to a terminal;
+    elsewhere the same layout is printed as plain text.  `console`
+    overrides the destination, which tests use to capture output.
+    """
+    from rich.console import Console
+    from rich.padding import Padding
+    from rich.table import Table
+    from rich.text import Text
+
+    if console is None:
+        console = Console()
+
+    with console.capture() as capture:
+        console.print()
+        console.print(
+            Padding(Text(title), (0, 0, 0, 2), expand=False)
+        )
+        for section in sections:
+            console.print()
+            <<print one summary section>>
+    console.file.write(trim_trailing_space(capture.get()))
+@
+
+<<helper functions>>=
+def trim_trailing_space(text: str) -> str:
+    """Return `text` with trailing spaces removed from every line."""
+    return "".join(
+        line.rstrip() + "\n" for line in text.splitlines()
+    )
+@
+
+The label column is dimmed and so is the header, following the
+metadata grid of [[todo view]], so that the eye lands on the figures
+rather than on the words naming them.  Each cell is wrapped in
+[[Text]] for the reason \cref{cli.utils.output} gives: [[rich]] reads
+a bare string as console markup, and a label set called
+[[[draft]]] would otherwise vanish.
+
+<<print one summary section>>=
+grid = Table.grid(padding=(0, 3))
+for index, justify in enumerate(section.justify):
+    grid.add_column(
+        justify=justify, style="dim" if index == 0 else None
+    )
+if section.header:
+    grid.add_row(*(
+        Text(cell, style="dim") for cell in section.header
+    ))
+for row in section.rows:
+    grid.add_row(*(
+        Text(cell, style=(
+            deviation_style(cell)
+            if index == section.emphasis else ""
+        ))
+        for index, cell in enumerate(row)
+    ))
+console.print(Padding(grid, (0, 0, 0, 2), expand=False))
+@
+
+Colour says which way the deviation runs, and only that.  Yellow marks
+time over the expectation, because that is the direction worth
+noticing in a tool whose limits exist to catch overwork; under it is
+dimmed rather than coloured, since being short of the target is
+ordinary and not a fault.  Green is deliberately absent: it would
+praise a full week and, by omission, judge every other one.  Zero
+takes no colour at all---it is the target met, not a deviation in
+either direction.
+
+The style follows from the sign already printed in the cell, so the
+rendering never recomputes a comparison the layout has settled.
+
+<<helper functions>>=
+def deviation_style(cell: str) -> str:
+    """Return the `rich` style for a deviation cell, by its sign."""
+    if cell.startswith("+"):
+        return "yellow"
+    if cell.startswith("-"):
+        return "dim"
+    return ""
+@
+
+Let us verify both destinations.  In a pipe the layout survives and
+the escape sequences do not, and the columns line up under their
+headings:
+
+<<test functions>>=
+def render_summary(title, sections, **console_options):
+  """Return what print_work_summary writes to a console."""
+  buffer = io.StringIO()
+  console = rich.console.Console(
+    file=buffer, width=80, **console_options
+  )
+  print_work_summary(title, sections, console=console)
+  return buffer.getvalue()
+
+def test_print_work_summary_aligns_without_colour_in_a_pipe():
+  """A non-terminal console gets the layout and no escapes."""
+  rendered = render_summary(
+    *work_summary_sections(summary_week(), summary_week_periods())
+  )
+
+  assert "\x1b" not in rendered
+  assert "2026-W37, 7 days" in rendered
+
+  lines = rendered.splitlines()
+  header = next(l for l in lines if "Tracked" in l)
+  total = next(l for l in lines if l.strip().startswith("Total"))
+  assert header.index("Tracked") + len("Tracked") == (
+    total.index("27h 0m") + len("27h 0m")
+  )
+@
+
+On a terminal the deviation carries its direction.  A week under the
+expectation is dimmed; one over it is yellow:
+
+<<test functions>>=
+def test_print_work_summary_colours_the_deviation():
+  """Over the expectation is yellow, under it is dim."""
+  under = render_summary(
+    *work_summary_sections(summary_week(), summary_week_periods()),
+    force_terminal=True,
+  )
+  assert "\x1b[2m" in under
+
+  over = SummarySection(
+    ("", "Tracked", "Expected", "Diff"),
+    [("Total", "48h 0m", "40h 0m", "+8h 0m")],
+    ("left", "right", "right", "right"),
+    3,
+  )
+  rendered = render_summary("2026-W37, 7 days", [over],
+                            force_terminal=True)
+  assert "\x1b[33m" in rendered
+
+def test_stats_top_labels_option_caps_the_block(temp_tracking_dir):
+  """--top-labels reaches the summary from the command line."""
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "2", "--at", f"{today} 09:00"
+  ])
+  runner.invoke(cli, [
+    "add", "email", "--duration", "1", "--at", f"{today} 12:00"
+  ])
+
+  full = runner.invoke(cli, ["stats", "daily", "-n", "1", "--summary"])
+  assert full.exit_code == 0
+  assert "DD1310" in full.stdout
+  assert "email" in full.stdout
+
+  capped = runner.invoke(cli, [
+    "stats", "daily", "-n", "1", "--summary", "--top-labels", "1"
+  ])
+  assert capped.exit_code == 0
+  assert "DD1310" in capped.stdout
+  assert "email" not in capped.stdout
+
+def test_deviation_style_ignores_an_exact_match():
+  """Meeting the expectation is not a deviation in either direction."""
+  assert deviation_style("+8h 0m") == "yellow"
+  assert deviation_style("-8h 0m") == "dim"
+  assert deviation_style("0m") == ""
 @
 
 \subsubsection{Testing the Period Report}
@@ -17563,7 +18219,7 @@ def test_stats_summary_is_silent_in_a_pipe(temp_tracking_dir):
   assert all("\t" in line for line in result.stdout.splitlines())
 
 def test_stats_summary_flag_prints_the_block(temp_tracking_dir):
-  """--summary appends the summary after a blank line."""
+  """--summary appends the aligned summary after a blank line."""
   today = datetime.datetime.now().date().isoformat()
   runner.invoke(cli, [
     "add", "DD1310", "--duration", "1", "--at", f"{today} 10:00"
@@ -17573,9 +18229,28 @@ def test_stats_summary_flag_prints_the_block(temp_tracking_dir):
 
   assert result.exit_code == 0
   assert "\n\n" in result.stdout
-  assert "tracked 1h 0m of" in result.stdout
-  assert "work day" in result.stdout
-  assert "top label sets: DD1310 100%" in result.stdout
+  assert "Tracked" in result.stdout
+  assert "Expected" in result.stdout
+  assert "Total" in result.stdout
+  assert "Work days" in result.stdout
+  assert "DD1310   1h 0m   100% of tracked" in result.stdout
+  assert "\x1b" not in result.stdout
+
+def test_stats_summary_leaves_no_trailing_whitespace(
+    temp_tracking_dir
+):
+  """A piped summary is not padded out to the console width."""
+  today = datetime.datetime.now().date().isoformat()
+  runner.invoke(cli, [
+    "add", "DD1310", "--duration", "1", "--at", f"{today} 10:00"
+  ])
+
+  result = runner.invoke(cli, ["stats", "daily", "--summary"])
+
+  assert result.exit_code == 0
+  assert not any(
+    line != line.rstrip() for line in result.stdout.splitlines()
+  )
 @
 
 The degenerate inputs: no data at all, a count below one, and a
@@ -18013,10 +18688,12 @@ Here we assemble the final test file:
 
 <<test [[clitrack.py]]>>=
 import datetime
+import io
 import json
 import logging
 import os
 import pathlib
+import rich.console
 import shlex
 import shutil
 import socket
@@ -18039,11 +18716,14 @@ from nytid.cli.track import (
     load_tracking_data, load_active_session,
     mutate_worker_tracking_state,
     format_duration, format_signed_duration,
+    format_comparison, round_to_minute,
     filter_entries, clip_entries_to_dates,
     StatsPeriod, Period, period_bounds, period_label,
     make_period_ranges, totals_per_period, expected_time,
     compute_daily_wall_clock, compute_work_summary, WorkSummary,
-    time_of_day, DAY_NAMES, work_summary_lines,
+    time_of_day, DAY_NAMES, SummarySection,
+    DEFAULT_TRACK_STATS_TOP_LABELS, TRACK_STATS_TOP_LABELS_CONFIG,
+    work_summary_sections, print_work_summary, deviation_style,
     worked_days_per_period, DEFAULT_STATS_DAILY_COUNT,
     normalize_tracking_entries,
     merge_duplicate_tracking_entries,
