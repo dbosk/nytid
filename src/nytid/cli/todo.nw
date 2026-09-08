@@ -140,6 +140,7 @@ cli = typer.Typer(
 <<child priority helpers>>
 <<editor infrastructure>>
 <<binary search priority>>
+<<placement helpers>>
 <<autocompletion functions>>
 <<helpers>>
 <<argument and option definitions>>
@@ -804,7 +805,8 @@ def test_normalize_deadline_passes_empty_through():
   assert normalize_deadline("") is None
 @
 
-\section{Effective Priority}
+\section{Effective Priority}%
+\label{todo:effective-priority}
 
 The effective priority determines display and scheduling order for
 ranked items. Without a deadline, it equals the base priority. With a
@@ -1584,7 +1586,8 @@ def test_active_stack_discards_unknown_ids(temp_todo_dir):
     assert load_active_stack() == []
 @
 
-\section{Sub-item Helpers}
+\section{Sub-item Helpers}%
+\label{todo:sub-item-helpers}
 
 Sub-items create a tree structure within the flat todo list. We need
 helpers to navigate this tree: finding children, finding siblings (for
@@ -1632,6 +1635,29 @@ def get_siblings(
         for t in todos
         if t.parent_id == item.parent_id and t.id != item.id
     ]
+@
+
+Going the other way---from an item to the parent whose range bounds
+it---is the lookup every re-ranking path needs before it can place
+anything, because the parent supplies both the interval and the
+question of whether a numeric position is available at all.  We give
+it a name so that the three commands that ask it cannot drift apart on
+what \enquote{no parent} means: a top-level item and an item whose
+parent has been deleted both answer [[None]], and both are placed
+against the top level.
+
+<<sub-item helpers>>=
+def get_parent(
+    todos: list[TodoItem], item: TodoItem
+) -> TodoItem | None:
+    """Get the parent of an item, or `None` at top
+    level."""
+    if item.parent_id is None:
+        return None
+    return next(
+        (t for t in todos if t.id == item.parent_id),
+        None,
+    )
 @
 
 Direct children are the right unit for display and for priority
@@ -1931,7 +1957,8 @@ def test_check_parent_completion():
     assert check_parent_completion(todos, 1)
 @
 
-\subsection{Context-Aware Child Priorities}
+\subsection{Context-Aware Child Priorities}%
+\label{sec:child-priority-helpers}
 
 When children are created via the editor or reconciled during edits,
 they need priorities that place them \emph{between} their parent and
@@ -2012,6 +2039,47 @@ def distribute_priorities_in_range(
     return [high - step * (i + 1) for i in range(count)]
 @
 
+The third helper answers the degenerate case the first two cannot: a
+level with no ranked item in it yet.  There is no neighbour to take a
+midpoint against, so the question becomes where to start.  Starting in
+the \emph{middle} of the parent's range rather than at one end is what
+lets the second and third arrival be placed above or below the first
+without renumbering anything---the same reason
+[[distribute_priorities_in_range]] leaves room at both ends.  At the
+top level there is no range to halve, so we fall back to [[1.0]] and
+let later items grow the scale in either direction.
+
+An unranked parent has no range at all, and no number we could invent
+would mean anything relative to it.  We raise rather than guess,
+because the callers each have their own right answer: [[add]] and
+[[edit]] leave the item unranked, while [[reprioritize]] tells the
+user to rank the parent first.
+
+<<child priority helpers>>=
+def default_priority_without_siblings(
+    parent: TodoItem | None = None,
+    todos: list[TodoItem] | None = None,
+) -> float:
+    """Return the priority for the first ranked item at
+    a level.
+
+    With a ranked `parent` this is the middle of that
+    parent's child range; at the top level it is `1.0`.
+    Raises `ValueError` for an unranked parent.
+    """
+    if parent is None or todos is None:
+        return 1.0
+    if parent.priority is None:
+        raise ValueError(
+            "cannot assign numeric priority under "
+            "an unranked parent"
+        )
+    high, low = compute_child_priority_range(
+        todos, parent
+    )
+    return (high + low) / 2.0
+@
+
 \subsection{Testing Child Priority Helpers}
 
 <<test functions>>=
@@ -2047,6 +2115,31 @@ def test_compute_child_priority_range_no_sibling():
     )
     assert high == 5.0
     assert low == -5.0
+
+
+def test_default_priority_without_siblings():
+    """An empty level starts in the middle of the range."""
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=3.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    assert default_priority_without_siblings(
+        todos[0], todos
+    ) == 4.0
+    assert default_priority_without_siblings() == 1.0
+    with pytest.raises(ValueError):
+        default_priority_without_siblings(
+            TodoItem(
+                id=3, title="Unranked", priority=None
+            ),
+            todos,
+        )
 
 
 def test_distribute_priorities_in_range():
@@ -3548,7 +3641,8 @@ for warning in parsed.warnings:
     typer.echo(f"Warning: {warning}", err=True)
 @
 
-\section{Binary Search Priority}
+\section{Binary Search Priority}%
+\label{todo:binary-search}
 
 When a user adds a new todo, we need to determine where it falls in
 the priority order relative to existing items. Rather than asking the
@@ -3621,17 +3715,9 @@ def binary_search_priority(
         if sibling.priority is not None
     ]
     if not ranked_siblings:
-        if parent is not None and todos is not None:
-            if parent.priority is None:
-                raise ValueError(
-                    "cannot assign numeric priority under "
-                    "an unranked parent"
-                )
-            high, low = compute_child_priority_range(
-                todos, parent
-            )
-            return (high + low) / 2.0
-        return 1.0
+        return default_priority_without_siblings(
+            parent, todos
+        )
 
     sorted_items = sorted(
         ranked_siblings,
@@ -3670,49 +3756,32 @@ def binary_search_priority(
 def assign_priority_at_position(
     sorted_items: list[TodoItem],
     position: int,
+    priority_of=require_effective_priority,
 ) -> float:
     """Compute a priority value at the given insertion
     position in a sorted (descending) list.
 
     The priority is the midpoint between neighbors,
-    or offset by 1.0 at the edges.
+    or offset by 1.0 at the edges.  `priority_of` reads
+    the number to interpolate between; the binary search
+    compares what the user sees, so it keeps the default
+    effective priority, while the non-interactive
+    placement flags pass the stored one.
     """
     if not sorted_items:
         return 1.0
 
     if position == 0:
-        top = require_effective_priority(sorted_items[0])
+        top = priority_of(sorted_items[0])
         return top + 1.0
 
     if position >= len(sorted_items):
-        bottom = require_effective_priority(
-            sorted_items[-1]
-        )
+        bottom = priority_of(sorted_items[-1])
         return bottom - 1.0
 
-    above = require_effective_priority(
-        sorted_items[position - 1]
-    )
-    below = require_effective_priority(
-        sorted_items[position]
-    )
+    above = priority_of(sorted_items[position - 1])
+    below = priority_of(sorted_items[position])
     return (above + below) / 2.0
-
-
-def append_priority_after_siblings(
-    siblings: list[TodoItem],
-) -> float:
-    """Return a base priority below all sibling bases."""
-    ranked_siblings = [
-        item for item in siblings
-        if item.priority is not None
-    ]
-    if not ranked_siblings:
-        return 1.0
-    bottom = min(
-        item.priority for item in ranked_siblings
-    )
-    return bottom - 1.0
 @
 
 After the binary search narrows down the position, we compute the
@@ -3813,6 +3882,464 @@ def test_assign_priority_between():
     ]
     p = assign_priority_at_position(items, 1)
     assert p == 4.0
+@
+
+\section{Placing an Item Without Asking}%
+\label{todo:placement}
+
+The binary search is the right tool when a human is at the keyboard
+and the wrong one for a script.  An agent that creates a module's
+worth of tasks already knows where each one belongs; what it lacks is
+a way to say so, and the workaround---piping a stream of [[y]] or
+[[n]] answers into the prompt---reaches only the two extremes and
+exits on a broken pipe.
+
+Four requests turn out to be the same request.  [[add --top]] and
+[[add --bottom]] place a new item at one end of its sibling list;
+[[reprioritize --above]] and [[--below]] place an existing item next
+to a named neighbour; [[edit --top]] and [[--bottom]] re-rank where
+the item already is; and the re-ranking after [[edit --parent]] does
+it among siblings the item has just joined.  All of them ask
+\enquote{put this item at this position among these siblings}, so they
+share one helper.  Sharing is not merely tidy here: the interesting
+placements are the ones \emph{between} two neighbours, and a caller
+that computes its own midpoint is a caller that will eventually
+disagree with the others about the empty list, the outer edges, or
+which of the two priority numbers to interpolate.
+
+\subsection{Naming a Position}
+
+[[assign_priority_at_position]] already takes an insertion index, so
+each flag only has to name one.  [[--top]] and [[--bottom]] name the
+ends directly.  [[--above]] and [[--below]] name a neighbour instead,
+which is the same thing once the siblings are sorted: the slot just
+above a target is the target's own index, and the slot just below it
+is the next one.
+
+<<constants>>=
+PLACE_TOP = "top"
+PLACE_BOTTOM = "bottom"
+PLACE_ABOVE = "above"
+PLACE_BELOW = "below"
+<<placement helpers>>=
+def sibling_insert_position(
+    ordered: list[TodoItem],
+    placement: str,
+    target: TodoItem | None = None,
+) -> int:
+    """Return the insertion index named by `placement`.
+
+    `ordered` holds ranked siblings, highest stored
+    priority first.  `PLACE_ABOVE` and `PLACE_BELOW`
+    need `target`, a sibling present in `ordered`.
+    """
+    if placement == PLACE_TOP:
+        return 0
+    if placement == PLACE_BOTTOM:
+        return len(ordered)
+    index = next(
+        i
+        for i, sibling in enumerate(ordered)
+        if sibling.id == target.id
+    )
+    if placement == PLACE_ABOVE:
+        return index
+    return index + 1
+@
+
+\subsection{Ordering by Stored Priority}
+
+Placement reads the \emph{stored} priorities, not the effective ones.
+A deadline boost is temporary by design
+(\cref{todo:effective-priority}): interpolating between boosted scores
+and storing the result would let a sibling one day from its deadline
+donate its urgency to the item we are placing, and that borrowed
+urgency would outlive the deadline that justified it.  This is the
+argument the [[--append]] path has always made; what changes is that
+it now covers every non-interactive placement instead of one of them.
+
+<<placement helpers>>=
+def require_stored_priority(item: TodoItem) -> float:
+    """Return the stored base priority of a ranked item."""
+    if item.priority is None:
+        raise ValueError(
+            f"todo #{item.id} has no numeric priority"
+        )
+    return item.priority
+
+
+def sort_siblings_by_stored_priority(
+    siblings: list[TodoItem],
+) -> list[TodoItem]:
+    """Return the ranked siblings, highest stored
+    priority first."""
+    ranked = [
+        sibling
+        for sibling in siblings
+        if sibling.priority is not None
+    ]
+    return sorted(
+        ranked,
+        key=require_stored_priority,
+        reverse=True,
+    )
+@
+
+\subsection{The Shared Placement Helper}
+
+With a position and an ordering, placement is one call.  The empty
+comparison set is the only case needing separate treatment, and it
+gets the rule the interactive path already uses
+(\cref{sec:child-priority-helpers}) rather than a second opinion of
+its own.
+
+<<placement helpers>>=
+def place_among_siblings(
+    siblings: list[TodoItem],
+    placement: str,
+    target: TodoItem | None = None,
+    parent: TodoItem | None = None,
+    todos: list[TodoItem] | None = None,
+) -> float:
+    """Return a stored priority placing an item at
+    `placement` among `siblings`.
+
+    `placement` is one of the `PLACE_*` values;
+    `PLACE_ABOVE` and `PLACE_BELOW` need `target`.
+    `parent` and `todos` supply the fallback range for a
+    level with no ranked sibling yet.
+    """
+    ordered = sort_siblings_by_stored_priority(siblings)
+    if not ordered:
+        return default_priority_without_siblings(
+            parent, todos
+        )
+    return assign_priority_at_position(
+        ordered,
+        sibling_insert_position(
+            ordered, placement, target
+        ),
+        priority_of=require_stored_priority,
+    )
+@
+
+Let's verify that the ends and the interior all read stored numbers,
+and that a placement next to a named neighbour lands strictly between
+that neighbour and the one beyond it:
+
+<<test functions>>=
+def test_place_among_siblings_at_the_ends():
+    """--top and --bottom step past the outermost sibling."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_TOP
+    ) == 6.0
+    assert place_among_siblings(
+        siblings, PLACE_BOTTOM
+    ) == 2.0
+
+
+def test_place_among_siblings_beside_a_target():
+    """--above and --below split the neighbouring gap."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=6.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=4.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=3, title="C", priority=2.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_ABOVE, siblings[1]
+    ) == 5.0
+    assert place_among_siblings(
+        siblings, PLACE_BELOW, siblings[1]
+    ) == 3.0
+
+
+def test_place_among_siblings_beside_an_extreme():
+    """A target at the end behaves like --top or --bottom."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_ABOVE, siblings[0]
+    ) == 6.0
+    assert place_among_siblings(
+        siblings, PLACE_BELOW, siblings[1]
+    ) == 2.0
+
+
+def test_place_among_siblings_ignores_deadline_boost():
+    """Placement interpolates stored, not effective, values."""
+    now = datetime.datetime.now()
+    created = (
+        now - datetime.timedelta(days=29)
+    ).isoformat()
+    siblings = [
+        TodoItem(
+            id=1, title="Stable", priority=5.0,
+            created=created,
+        ),
+        TodoItem(
+            id=2, title="Urgent soon", priority=1.0,
+            created=created,
+            deadline=(
+                now + datetime.timedelta(days=1)
+            ).isoformat(),
+        ),
+    ]
+    assert effective_priority(siblings[1]) > 1.0
+    assert place_among_siblings(
+        siblings, PLACE_BOTTOM
+    ) == 0.0
+
+
+def test_place_among_siblings_without_siblings():
+    """An empty level starts in the parent's range."""
+    parent = TodoItem(
+        id=1, title="Parent", priority=5.0,
+        created="2026-01-01T00:00:00",
+    )
+    assert place_among_siblings(
+        [], PLACE_TOP, parent=parent, todos=[parent]
+    ) == 0.0
+    assert place_among_siblings([], PLACE_BOTTOM) == 1.0
+@
+
+\subsection{Re-ranking an Item That Already Exists}
+
+Two commands re-rank an item already on disk.  [[reprioritize]] does
+it on request; [[edit]] does it after [[--parent]] has moved the item,
+because a number chosen among the old siblings says nothing about the
+new ones.  Both need the same three answers---which parent bounds the
+range, which siblings form the comparison set, and how a placement
+becomes a number---so both ask one function rather than assembling
+their own.
+
+The comparison set is the item's active, ranked siblings for its own
+worker.  Restricting it to one worker is what makes the resulting
+number mean anything at all (\cref{todo:sub-item-helpers}); excluding
+done siblings keeps the ordering about work that is still ahead.
+
+<<placement helpers>>=
+def comparison_siblings(
+    todos: list[TodoItem], item: TodoItem
+) -> list[TodoItem]:
+    """Return the siblings `item` is ranked against.
+
+    These are the active, ranked siblings assigned to the
+    same worker, highest stored priority first.
+    """
+    return sort_siblings_by_stored_priority(
+        get_active_siblings(
+            todos,
+            item,
+            who=item.who or default_username,
+            ranked_only=True,
+        )
+    )
+@
+
+An unranked parent is a boundary rather than an error at this level.
+Children of an unranked parent stay unranked---that is the invariant
+[[add]] enforces when it creates them---so a re-ranking helper that
+raised here would only force every caller to pre-check the same
+condition.  Returning [[None]] instead lets the caller store exactly
+what it was handed: an item that has just moved under an unranked
+parent becomes unranked itself, and the invariant survives the move.
+
+<<placement helpers>>=
+def place_existing_item(
+    todos: list[TodoItem],
+    item: TodoItem,
+    placement: str | None = None,
+    target: TodoItem | None = None,
+) -> float | None:
+    """Return a new stored priority for `item`.
+
+    `placement` is one of the `PLACE_*` values, or `None`
+    to ask the user through the interactive binary
+    search.  Returns `None` when the item's parent is
+    itself unranked, since a ranked child of an unranked
+    parent has no interval to live in.
+    """
+    parent_ctx = get_parent(todos, item)
+    if (
+        parent_ctx is not None
+        and parent_ctx.priority is None
+    ):
+        return None
+    siblings = comparison_siblings(todos, item)
+    if placement is None:
+        return binary_search_priority(
+            siblings,
+            item,
+            parent=parent_ctx,
+            todos=todos,
+        )
+    return place_among_siblings(
+        siblings,
+        placement,
+        target,
+        parent=parent_ctx,
+        todos=todos,
+    )
+@
+
+Let's verify that the comparison set excludes what it should, and that
+an unranked parent short-circuits the whole computation instead of
+reaching the binary search:
+
+<<test functions>>=
+def test_comparison_siblings_excludes_others():
+    """Done, unranked and other workers' items are out."""
+    todos = [
+        TodoItem(id=1, title="Me", priority=5.0,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=2, title="Also me", priority=3.0,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=3, title="Done", priority=4.0,
+                 status="done",
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=4, title="Unranked",
+                 priority=None,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=5, title="Theirs", priority=9.0,
+                 created="2026-01-01T00:00:00",
+                 who="other-worker"),
+    ]
+    assert [
+        s.id for s in comparison_siblings(todos, todos[0])
+    ] == [2]
+
+
+def test_place_existing_item_under_unranked_parent():
+    """An unranked parent leaves the child unranked."""
+    todos = [
+        TodoItem(id=1, title="Unranked parent",
+                 priority=None,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="Child", priority=3.0,
+                 parent_id=1,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_existing_item(
+        todos, todos[1], PLACE_TOP
+    ) is None
+@
+
+\subsection{A Sibling List for the Command Tests}
+
+Three commands place items now, and each of them is easiest to read
+against the same four siblings: the gaps between them are two units
+wide, so every midpoint is a whole number and a test can assert
+[[== 5.0]] instead of explaining the arithmetic first.  The item that
+moves starts at the bottom, which makes every placement a visible
+change.
+
+<<test functions>>=
+@pytest.fixture
+def ranked_siblings(temp_todo_dir):
+  """Four ranked top-level items for one worker."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="First", priority=6.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Second", priority=4.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="Third", priority=2.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=4, title="Mover", priority=0.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  return temp_todo_dir
+
+
+def stored_priority(todo_id):
+  """Read one item's stored priority back from disk."""
+  _, todos = load_todos()
+  return next(
+    t for t in todos if t.id == todo_id
+  ).priority
+@
+
+\subsection{Refusing Contradictory Instructions}
+
+Every command that can place an item offers several ways to say where,
+and no two of them can be honoured at once: [[--prio]] says
+\enquote{this exact number}, [[--top]] and [[--bottom]] say
+\enquote{derive one from the siblings}, and [[--skip-priority]] and
+[[--keep-prio]] say \enquote{do not derive one at all}.  Silently
+letting one win would make a script's mistake invisible for as long as
+the two flags happen to agree, so we refuse the combination instead.
+
+The check is table-driven because the three commands offer different
+subsets of the flags and would otherwise each grow their own ladder of
+pairwise comparisons; a caller lists the flags it accepts, in the order
+it wants them named, and gets the same message shape everywhere.
+
+<<placement helpers>>=
+def reject_conflicting_flags(flags: dict) -> None:
+    """Exit when more than one placement flag is set.
+
+    `flags` maps option spellings to whether the caller
+    used them; the first two that are set are named in
+    the error.
+    """
+    used = [
+        name for name, active in flags.items() if active
+    ]
+    if len(used) > 1:
+        typer.echo(
+            f"Error: {used[0]} and {used[1]} cannot be "
+            "used together",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+Let's verify that one flag passes, that two are rejected in the order
+the caller listed them, and that the rejection is an exit rather than
+an exception the CLI would show as a traceback:
+
+<<test functions>>=
+def test_reject_conflicting_flags_allows_one():
+    """A single placement flag is not a conflict."""
+    reject_conflicting_flags(
+        {"--top": True, "--bottom": False}
+    )
+
+
+def test_reject_conflicting_flags_names_both():
+    """Two flags exit and are named in listing order."""
+    with pytest.raises(typer.Exit):
+        reject_conflicting_flags(
+            {"--top": True, "--bottom": True}
+        )
 @
 
 \section{Shell Autocompletion}
@@ -5455,7 +5982,9 @@ def add(
     """Add a new todo item.
 
     Priority is determined by interactive binary search
-    comparison with existing items at the same level.
+    comparison with existing items at the same level,
+    unless --prio, --top, --bottom or --skip-priority
+    says otherwise.
 
     \b
     Examples:
@@ -5593,23 +6122,109 @@ notes_text = "\n\n".join(note) if note else ""
 
 Most of the time we infer priority interactively by comparing the new
 item with its siblings. Sometimes, however, the caller already knows the
-numeric value or simply wants to add the item after the current lowest-
-priority sibling. The [[--prio]] option handles the former case, while
-[[--append]] keeps the latter non-interactive.
+numeric value, or knows only that the item belongs at one end of the
+list.  The [[--prio]] option handles the first case; [[--top]] and
+[[--bottom]] keep the second non-interactive.
 
-The new [[--skip-priority]] flag covers a third case: capturing a task
+The [[--skip-priority]] flag covers a third case: capturing a task
 without ranking it yet.  That is useful when triaging a backlog or when
 the right comparison set is not available at creation time.  Unranked
 items sort after ranked ones until [[reprioritize]] assigns them a numeric
-position:
+position.
+
+\paragraph{What the number means.}
+A priority is a bare float with no scale attached, which leaves three
+questions a caller cannot answer by experiment without writing to the
+real task list: which direction is urgent, whether values below zero
+are allowed, and why the number that comes back out of [[ls]] is
+larger than the one that went in (\cref{todo:effective-priority}).  One
+paragraph answers all three, and it lives in a constant so that the
+four places a priority surfaces cannot answer them differently.
+
+The paragraph deliberately says nothing about spelling, because
+[[ls -p]] uses it too and has no value to spell.  Options that take a
+value add that sentence themselves: a leading minus makes the argument
+look like another option to the parser, so [[--prio=-10]] is the form
+that works---the one thing a caller cannot discover from the type
+annotation.
+
+<<constants>>=
+PRIORITY_HELP = (
+    "Priority is a float and higher means more urgent; "
+    "any value is allowed, negative ones included. "
+    "Listings show the effective priority: the stored "
+    "number plus a boost that grows as a deadline "
+    "approaches."
+)
+PRIORITY_VALUE_HELP = (
+    PRIORITY_HELP
+    + " Write a negative value as --prio=-10; "
+    "'ls -p' shows the effective one."
+)
+@
+
+Let's verify that the paragraph actually reaches all four places.  The
+help is rendered into a box and wrapped to the terminal width, so the
+assertion compares whitespace-normalised text with the box rules
+stripped; comparing the raw string would only test how wide the
+terminal happened to be.
+
+<<test functions>>=
+def normalized_help(args):
+  """Return one command's help as a single line."""
+  result = runner.invoke(cli, args)
+  assert result.exit_code == 0
+  return " ".join(
+    result.output.replace("│", " ").split()
+  )
+
+
+@pytest.mark.parametrize(
+  "args",
+  [
+    ["add", "--help"],
+    ["edit", "--help"],
+    ["reprioritize", "--help"],
+    ["ls", "--help"],
+  ],
+)
+def test_priority_help_is_shared(args):
+  """Every priority-bearing command explains the scale."""
+  assert (
+    " ".join(PRIORITY_HELP.split())
+    in normalized_help(args)
+  )
+
+
+@pytest.mark.parametrize(
+  "command", ["add", "edit"],
+)
+def test_prio_help_shows_the_negative_spelling(command):
+  """The options taking a value document --prio=-10."""
+  assert "--prio=-10" in normalized_help(
+    [command, "--help"]
+  )
+@
+
+[[--append]] was the original name of [[--bottom]], from a time when
+placing an item last was the only non-interactive choice.  Now that
+[[--top]] exists, a pair of opposites reads better than a verb and its
+missing mirror image, but the old name stays registered on the same
+option: it appears in scripts, in the shell history of everyone who has
+used it, and in this document's own tests, and an alias costs one
+string.
 
 <<argument and option definitions>>=
 prio_opt = typer.Option(
     "--prio",
-    help="Set explicit priority")
-append_opt = typer.Option(
-    "--append",
-    help="Append after lowest-priority sibling")
+    help=PRIORITY_VALUE_HELP)
+top_opt = typer.Option(
+    "--top",
+    help="Place above the highest-priority sibling")
+bottom_opt = typer.Option(
+    "--bottom", "--append",
+    help="Place below the lowest-priority sibling "
+         "(--append is the old name)")
 skip_prio_opt = typer.Option(
     "--skip-priority",
     help="Create without assigning a numeric priority")
@@ -5618,7 +6233,8 @@ skip_prio_opt = typer.Option(
 <<add command options>>=
 explicit_priority: Annotated[float | None,
                              prio_opt] = None,
-append: Annotated[bool, append_opt] = False,
+top: Annotated[bool, top_opt] = False,
+bottom: Annotated[bool, bottom_opt] = False,
 skip_priority: Annotated[bool, skip_prio_opt] = False,
 @
 
@@ -5763,37 +6379,69 @@ else:
     <<add via cli flags>>
 @
 
-Some combinations would give contradictory instructions. In
-particular, [[--prio]] says 
-\enquote{use exactly this numeric value} while
-[[--append]] says 
-\enquote{derive a value by placing the item after its
-siblings}. Rather than silently picking one interpretation, we reject
-the combination and ask the user to choose.  [[--skip-priority]] is also
-exclusive with both numeric modes: either we store a number now, or we
-store no number and leave the item for later ranking:
+Some combinations would give contradictory instructions, and the shared
+validator (\cref{todo:placement}) rejects them all.  The listing order
+decides how a conflict is phrased, so we put the flag that suppresses
+ranking first and the two derived placements last, which reads as a
+progression from \enquote{no number} through \enquote{this number} to
+\enquote{work one out}:
 
 <<validate add options>>=
-if explicit_priority is not None and append:
-    typer.echo(
-        "Error: --prio and --append cannot be used together",
-        err=True,
-    )
-    raise typer.Exit(1)
-if skip_priority and explicit_priority is not None:
-    typer.echo(
-        "Error: --skip-priority and --prio cannot be "
-        "used together",
-        err=True,
-    )
-    raise typer.Exit(1)
-if skip_priority and append:
-    typer.echo(
-        "Error: --skip-priority and --append cannot be "
-        "used together",
-        err=True,
-    )
-    raise typer.Exit(1)
+reject_conflicting_flags({
+    "--skip-priority": skip_priority,
+    "--prio": explicit_priority is not None,
+    "--top": top,
+    "--bottom": bottom,
+})
+@
+
+The three tests further down that spell the flag [[--append]] pin the
+alias itself; this table pins the matrix, using the canonical names so
+that a message read from a terminal can be matched against it word for
+word:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--skip-priority", "--prio", "5"],
+      "--skip-priority and --prio cannot be used together",
+    ),
+    (
+      ["--skip-priority", "--top"],
+      "--skip-priority and --top cannot be used together",
+    ),
+    (
+      ["--skip-priority", "--bottom"],
+      "--skip-priority and --bottom cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--top"],
+      "--prio and --top cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--bottom"],
+      "--prio and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+  ],
+)
+def test_add_rejects_flag_pairs(
+  temp_todo_dir, flags, message,
+):
+  """Every pair of priority flags is refused."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Conflicting", "--top-level", *flags],
+  )
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert todos == []
 @
 
 The CLI-flag path is the original flow: resolve parent, determine the
@@ -5919,10 +6567,10 @@ def test_ls_survives_unparseable_deadline(temp_todo_dir):
 @
 
 Priority selection has three modes. [[--prio]] bypasses all inference.
-[[--append]] keeps the operation non-interactive by placing the item at
-the bottom of the current sibling list. Otherwise we fall back to the
-interactive binary search, which remains the default because it
-preserves the existing 
+[[--top]] and [[--bottom]] keep the operation non-interactive by placing
+the item at one end of the current sibling list. Otherwise we fall back
+to the interactive binary search, which remains the default because it
+preserves the existing
 \enquote{compare against nearby tasks} workflow.  In all three modes
 the sibling set is scoped to the target worker ([[--who]]) so that
 priorities stay meaningful within one person's task list.
@@ -5933,23 +6581,16 @@ numeric placement and stores [[None]] instead.
 An unranked parent is an even stronger constraint.  Until the parent
 itself has a numeric priority there is no child interval to place new
 work into, so every newly added child stays unranked regardless of
-whether the caller asked for [[--prio]], [[--append]], or the default
-interactive comparison.
+whether the caller asked for [[--prio]], [[--top]], [[--bottom]], or
+the default interactive comparison.
 
-The append path works from stored base priorities, not
-[[effective_priority]].  Deadline boost is intentionally temporary; if we
-reused an effective score as a newly stored base priority, an urgent
-sibling could donate its temporary boost to the appended item and change
-the long-term ordering.
-
-The empty-sibling case under a parent is different.  There the child
-range is still completely unused, so 
-placing the first child at the midpoint is not a failure to append.
-Instead it preserves room on both sides for later siblings, mirroring
-the same 
-binary-search insertion strategy we use elsewhere: the first placement
-creates a balanced starting point, and later children can still be added
-above or below it without forcing an early renumbering.
+Both ends go through [[place_among_siblings]]
+(\cref{todo:placement}), which is where the reasoning about stored
+versus effective priorities and about the still-empty level now lives.
+Routing [[--bottom]] through it rather than through a bespoke
+\enquote{one below the minimum} calculation is what guarantees that
+[[--top]] and [[--bottom]] remain exact mirror images of each other as
+that reasoning evolves.
 
 <<resolve priority for new todo>>=
 # Build a candidate item once so sibling lookup and interactive
@@ -5977,24 +6618,71 @@ elif skip_priority:
     priority = None
 elif explicit_priority is not None:
     priority = explicit_priority
-elif append:
-    if siblings:
-        priority = append_priority_after_siblings(
-            siblings
-        )
-    elif parent_ctx is not None:
-        high, low = compute_child_priority_range(
-            todos, parent_ctx
-        )
-        priority = (high + low) / 2.0
-    else:
-        priority = 1.0
+elif top or bottom:
+    priority = place_among_siblings(
+        siblings,
+        PLACE_TOP if top else PLACE_BOTTOM,
+        parent=parent_ctx,
+        todos=todos,
+    )
 else:
     priority = binary_search_priority(
         siblings,
         candidate,
         parent=parent_ctx, todos=todos,
     )
+@
+
+Let's verify that the two ends are mirror images: with siblings at
+[[6.0]] and [[4.0]] and [[2.0]], [[--top]] must land above the first
+and [[--bottom]] below the last, and the old spelling must land in the
+same place as the new one.  The last test covers the spelling a
+negative value needs: a bare [[--prio -10]] is read as another option
+by the parser, so [[--prio=-10]] is the form the help text shows:
+
+<<test functions>>=
+def test_add_top_lands_above_the_highest(ranked_siblings):
+  """--top places the new item above every sibling."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Topped", "--top", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == 7.0
+
+
+def test_add_bottom_lands_below_the_lowest(
+  ranked_siblings,
+):
+  """--bottom places the new item below every sibling."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Bottomed", "--bottom", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == -1.0
+
+
+def test_add_append_matches_bottom(ranked_siblings):
+  """The --append alias still means --bottom."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Appended", "--append", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == -1.0
+
+
+def test_add_negative_prio_with_equals_sign(
+  temp_todo_dir,
+):
+  """--prio=-10 stores a negative priority."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Sunk", "--prio=-10", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(1) == -10.0
 @
 
 When [[--here]] is used, we capture the current working directory and
@@ -6863,7 +7551,8 @@ ls_status_opt = typer.Option(
          "pending, in-progress, done")
 ls_prio_opt = typer.Option(
     "--prio", "-p",
-    help="Show effective priority column")
+    help="Show the effective priority column. "
+         + PRIORITY_HELP)
 ls_output_opt = typer.Option(
     "--output", "-o",
     help="Write CSV output to file")
@@ -8773,6 +9462,10 @@ edit_who_opt = typer.Option(
 edit_parent_opt = typer.Option(
     "--parent", "-p",
     help="New parent ID (0 = make top-level)")
+keep_prio_opt = typer.Option(
+    "--keep-prio",
+    help="Keep the stored priority when moving "
+         "with --parent")
 @
 
 <<edit command>>=
@@ -8809,6 +9502,11 @@ def edit(
                            command_opt] = None,
     parent: Annotated[int | None,
                       edit_parent_opt] = None,
+    explicit_priority: Annotated[float | None,
+                                 prio_opt] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    keep_prio: Annotated[bool, keep_prio_opt] = False,
 ):
     """Edit an existing todo item.
 
@@ -8846,11 +9544,25 @@ def edit(
         <<edit via cli flags>>
 @
 
-Each flag is optional and defaults to [[None]]. We only overwrite a
-field when the user explicitly supplied a value --- [[None]] means
-\enquote{leave this field alone}. This lets you update a single
-attribute (e.g.\ just the deadline) without touching the rest of the
-item:
+Four of the flags say where the item should rank, and the shared
+validator (\cref{todo:placement}) rejects any two of them together.  It
+runs first, before a single field is touched, so a contradictory
+command line cannot half-apply.
+
+<<edit via cli flags>>=
+reject_conflicting_flags({
+    "--keep-prio": keep_prio,
+    "--prio": explicit_priority is not None,
+    "--top": top,
+    "--bottom": bottom,
+})
+@
+
+The remaining flags are optional and default to [[None]]. We only
+overwrite a field when the user explicitly supplied a value ---
+[[None]] means \enquote{leave this field alone}. This lets you update a
+single attribute (e.g.\ just the deadline) without touching the rest of
+the item:
 
 <<edit via cli flags>>=
 if title is not None:
@@ -9136,10 +9848,7 @@ losing its creation timestamp and any notes.
 We use [[0]] as a sentinel for \enquote{promote to top-level}
 because valid IDs always start from [[1]], so [[0]] is unambiguous.
 Passing a positive integer instead reassigns the item under a
-different parent.  Because the item's existing priority was computed
-relative to its old siblings, it may sort oddly after a reparent ---
-the user can run [[reprioritize]] afterwards to restore the intended
-ordering:
+different parent:
 
 <<edit via cli flags>>=
 if parent is not None:
@@ -9157,9 +9866,271 @@ if parent is not None:
             )
             raise typer.Exit(1)
         item.parent_id = parent
+@
+
+A priority is a position in one list, not a property of the item.  The
+number~[[5.0]] means \enquote{above the [[4.5]] next to me}; carried
+into a different set of siblings it means whatever those siblings
+happen to be numbered, which is to say nothing.  Moving an item with
+[[--parent]] therefore invalidates its priority, and leaving the stale
+number behind made every move cost a follow-up [[reprioritize]] the
+user had to remember.  We re-rank as part of the move instead, running
+the same binary search [[add]] runs, so that the default outcome of a
+move is a placed item rather than an arbitrary one.
+
+The placement flags say what to do instead of asking.  [[--keep-prio]]
+keeps the stored number---the old behaviour, and still the right answer
+when the caller has already decided where the item lands, as a script
+moving items it just numbered has.  [[--prio]] sets the number
+outright; [[--top]] and [[--bottom]] derive it from the new siblings.
+All three also work \emph{without} [[--parent]], where they re-rank the
+item among the siblings it already has, which is what makes [[edit]]
+enough for the whole flow of moving and ranking a batch.
+[[--keep-prio]] without [[--parent]] asks for exactly what would happen
+anyway, so it is a no-op rather than an error.
+
+<<edit via cli flags>>=
+rerank = top or bottom or (
+    parent is not None and not keep_prio
+)
+if explicit_priority is not None:
+    item.priority = explicit_priority
+elif rerank:
+    <<place the edited item among its siblings>>
 
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+The move can also land the item under a parent that is itself
+unranked, and [[place_existing_item]] answers [[None]] for that case
+(\cref{todo:placement}).  Storing that [[None]] is what keeps the
+hierarchy consistent---no ranked child under an unranked parent---but
+it silently drops a number the user chose, so we say so when it
+happens.
+
+<<place the edited item among its siblings>>=
+if top:
+    placement = PLACE_TOP
+elif bottom:
+    placement = PLACE_BOTTOM
+else:
+    placement = None
+new_priority = place_existing_item(
+    todos, item, placement
+)
+if (
+    new_priority is None
+    and item.priority is not None
+):
+    typer.echo(
+        f"#{todo_id} is now unranked: parent "
+        f"#{item.parent_id} is unranked too"
+    )
+item.priority = new_priority
+@
+
+Let's verify the four ways of ranking an existing item.  The mover
+starts at the bottom of the shared sibling list
+(\cref{todo:placement}), so each flag has somewhere visible to move it:
+[[--top]] above [[6.0]], [[--bottom]] below the lowest \emph{other}
+sibling at [[2.0]], and [[--prio]] wherever it says, including below
+zero.
+
+<<test functions>>=
+def test_edit_top_reranks_current_siblings(
+  ranked_siblings,
+):
+  """--top re-ranks without a --parent move."""
+  result = runner.invoke(cli, ["edit", "4", "--top"])
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_edit_bottom_reranks_current_siblings(
+  ranked_siblings,
+):
+  """--bottom re-ranks below the other siblings."""
+  result = runner.invoke(cli, ["edit", "4", "--bottom"])
+  assert result.exit_code == 0
+  assert stored_priority(4) == 1.0
+
+
+def test_edit_prio_sets_the_number(ranked_siblings):
+  """--prio stores the value as given, with no search."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--prio", "5"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 5.0
+
+
+def test_edit_negative_prio(ranked_siblings):
+  """--prio=-3 stores a negative priority."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--prio=-3"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == -3.0
+@
+
+A move is where the flags earn their place.  Without one, the item is
+re-ranked among its new siblings by the interactive search; with
+[[--keep-prio]] it arrives carrying the number it had, which is the
+behaviour this command had before; and with [[--top]] or [[--bottom]]
+it arrives at a known end of the new list:
+
+<<test functions>>=
+@pytest.fixture
+def two_parents(temp_todo_dir):
+  """Two ranked parents, one with a ranked child."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="Parent A", priority=10.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Parent B", priority=6.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="B child", priority=8.0,
+      parent_id=2,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=4, title="Mover", priority=1.0,
+      parent_id=1,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  return temp_todo_dir
+
+
+def test_edit_parent_runs_the_search(two_parents):
+  """A move re-ranks interactively by default."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2"], input="y\n",
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" in result.output
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_keep_prio(two_parents):
+  """--keep-prio moves without asking or re-ranking."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--keep-prio"],
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" not in result.output
+  assert stored_priority(4) == 1.0
+
+
+def test_edit_parent_top(two_parents):
+  """--top places the moved item above its new siblings."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--top"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_bottom(two_parents):
+  """--bottom places the moved item below them."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--bottom"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_edit_keep_prio_alone_is_a_no_op(
+  ranked_siblings,
+):
+  """--keep-prio without --parent changes nothing."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--keep-prio"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 0.0
+@
+
+Moving under an unranked parent is the case that has to give up the
+number rather than invent one, and it says so instead of doing it
+quietly:
+
+<<test functions>>=
+def test_edit_parent_unranked_unranks_the_item(
+  temp_todo_dir,
+):
+  """A move under an unranked parent unranks the item."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked parent", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Mover", priority=4.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["edit", "2", "--parent", "1"]
+  )
+
+  assert result.exit_code == 0
+  assert stored_priority(2) is None
+  assert "#2 is now unranked" in result.output
+@
+
+The pairs are refused the same way [[add]] refuses its own:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--keep-prio", "--prio", "5"],
+      "--keep-prio and --prio cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--top"],
+      "--keep-prio and --top cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--bottom"],
+      "--keep-prio and --bottom cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--top"],
+      "--prio and --top cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--bottom"],
+      "--prio and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+  ],
+)
+def test_edit_rejects_flag_pairs(
+  ranked_siblings, flags, message,
+):
+  """Every pair of priority flags is refused."""
+  result = runner.invoke(cli, ["edit", "4", *flags])
+  assert result.exit_code == 1
+  assert message in result.output
+  assert stored_priority(4) == 0.0
 @
 
 \subsubsection{Editing via the Editor}
@@ -9756,9 +10727,12 @@ def test_child_who_override():
 Reparenting addresses the common accident of creating a todo as a
 child of an active item when a top-level item was intended.  We
 verify both directions: promoting a child to the top level and
-moving it under a different parent.  We also confirm that supplying
-an invalid parent ID is rejected with a non-zero exit code rather
-than silently storing a dangling reference.
+moving it under a different parent.  Both re-rank as part of the
+move, which the first test meets as a binary-search question and the
+second as a silent placement in the new parent's still-empty child
+range.  We also confirm that supplying an invalid parent ID is
+rejected with a non-zero exit code rather than silently storing a
+dangling reference.
 
 <<test functions>>=
 def test_edit_reparent_toplevel(temp_todo_dir):
@@ -9777,11 +10751,15 @@ def test_edit_reparent_toplevel(temp_todo_dir):
 
     result = runner.invoke(
         cli, ["edit", "2", "--parent", "0"],
+        input="y\n",
     )
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
     assert child.parent_id is None
+    # The move re-ranks: answering "yes" puts the child
+    # above its new sibling instead of keeping 0.5.
+    assert child.priority == 1.0
 
 def test_edit_reparent_to_other(temp_todo_dir):
     """--parent N moves a child under a new parent."""
@@ -9808,6 +10786,9 @@ def test_edit_reparent_to_other(temp_todo_dir):
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 3)
     assert child.parent_id == 2
+    # First child of B: the middle of B's child range,
+    # asked for without a single question.
+    assert child.priority == -5.0
 
 def test_edit_reparent_invalid(temp_todo_dir):
     """--parent with a non-existent ID is an error."""
@@ -9887,11 +10868,40 @@ non-done items and ask the same binary-search questions for each.  We do
 parents before children so that a child can use its newly ranked parent
 as the upper bound of its own insertion range.
 
+Four flags answer the questions in advance.  [[--top]] and [[--bottom]]
+name the ends of the sibling list; [[--above]] and [[--below]] name a
+neighbour to sit next to, which is how a script expresses an ordering
+it already knows without having to know the numbers behind it.  All
+four go through the shared placement helper
+(\cref{todo:placement}), so they agree with [[add]] about what
+\enquote{the top} means.
+
+The command's own help text carries the shared priority paragraph,
+which the docstring cannot: a docstring is a literal, and the constant
+exists precisely so the wording has one home.  Typer prefers the
+[[help]] argument when both are present, so the docstring stays as the
+short summary a reader of [[help(reprioritize)]] wants.
+
+<<constants>>=
+REPRIORITIZE_HELP = (
+    "Set a todo item's priority.\n\n"
+    "With no placement flag this reruns the interactive "
+    "binary search. With no ID it reprioritizes every "
+    "unranked, non-done item for the current worker.\n\n"
+    + PRIORITY_HELP
+    + "\n\nAlias: reprio"
+)
+@
+
 <<reprioritize command>>=
-@cli.command()
+@cli.command(help=REPRIORITIZE_HELP)
 def reprioritize(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    above: Annotated[int | None, above_opt] = None,
+    below: Annotated[int | None, below_opt] = None,
 ):
     """Rerun binary search priority for a todo item.
 
@@ -9902,6 +10912,7 @@ def reprioritize(
     Alias: reprio
     """
     next_id, todos = load_todos()
+    <<validate reprioritize placement>>
     if todo_id is None:
         targets = [
             t for t in todos
@@ -9921,13 +10932,7 @@ def reprioritize(
             key=lambda item: todo_depth(todos, item)
         )
         for item in targets:
-            parent_ctx = next(
-                (
-                    t for t in todos
-                    if t.id == item.parent_id
-                ),
-                None,
-            )
+            parent_ctx = get_parent(todos, item)
             if (
                 parent_ctx is not None
                 and parent_ctx.priority is None
@@ -9966,10 +10971,7 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
-    parent_ctx = next(
-        (t for t in todos if t.id == item.parent_id),
-        None,
-    )
+    parent_ctx = get_parent(todos, item)
     if (
         parent_ctx is not None
         and parent_ctx.priority is None
@@ -9982,16 +10984,9 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
-    siblings = get_active_siblings(
-        todos, item,
-        who=item.who or default_username,
-        ranked_only=True,
-    )
-    new_priority = binary_search_priority(
-        siblings,
-        item,
-        parent=parent_ctx,
-        todos=todos,
+    <<resolve the reprioritize placement>>
+    new_priority = place_existing_item(
+        todos, item, placement, target
     )
     old_priority = item.priority
     item.priority = new_priority
@@ -10004,6 +10999,346 @@ def reprioritize(
     )
 @
 
+
+The two options that name a neighbour take an ID, and completing that
+ID from the existing todos is what makes them usable by hand as well as
+from a script.
+
+<<argument and option definitions>>=
+above_opt = typer.Option(
+    "--above",
+    help="Place just above sibling ID",
+    autocompletion=complete_todo_ids)
+below_opt = typer.Option(
+    "--below",
+    help="Place just below sibling ID",
+    autocompletion=complete_todo_ids)
+@
+
+The flags are mutually exclusive, and all four need to know which item
+they are placing.  Without an ID the command means \enquote{rank
+everything that is unranked}, and a single placement cannot describe
+what should happen to a whole batch: applying [[--top]] to each item in
+turn would leave them stacked in visiting order, which is not what the
+flag says.  We refuse rather than invent an interpretation.
+
+<<validate reprioritize placement>>=
+reject_conflicting_flags({
+    "--top": top,
+    "--bottom": bottom,
+    "--above": above is not None,
+    "--below": below is not None,
+})
+places = (
+    top or bottom
+    or above is not None
+    or below is not None
+)
+if todo_id is None and places:
+    typer.echo(
+        "Error: --top, --bottom, --above and --below "
+        "need a todo ID",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Turning the flags into a placement is a small dispatch; the work is in
+validating what [[--above]] and [[--below]] point at.
+
+<<resolve the reprioritize placement>>=
+placement = None
+target = None
+if top:
+    placement = PLACE_TOP
+elif bottom:
+    placement = PLACE_BOTTOM
+elif above is not None or below is not None:
+    if above is not None:
+        placement = PLACE_ABOVE
+        target_id = above
+    else:
+        placement = PLACE_BELOW
+        target_id = below
+    <<resolve the placement target>>
+@
+
+A target has to be an item this one can actually be ranked against,
+and each way of failing that has its own remedy, so each gets its own
+message rather than one generic refusal.  An item is not its own
+neighbour; an item under a different parent is in a different ordering
+entirely; and an unranked target has no number to sit next to, which
+the user fixes by ranking it first.
+
+The last check is the one that is easy to miss.  Being a sibling is
+not enough to be \emph{comparable}: the comparison set excludes done
+items and other workers' items (\cref{todo:placement}), so a target
+outside it has no position in the list we are inserting into.  Left
+unchecked, that case would reach the placement helper looking for an
+index that is not there.
+
+<<resolve the placement target>>=
+target = next(
+    (t for t in todos if t.id == target_id), None
+)
+if target is None:
+    typer.echo(
+        f"Error: todo #{target_id} not found",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.id == item.id:
+    typer.echo(
+        f"Error: cannot place #{todo_id} relative to "
+        "itself",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.parent_id != item.parent_id:
+    typer.echo(
+        f"Error: #{target_id} is not a sibling of "
+        f"#{todo_id}",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.priority is None:
+    typer.echo(
+        f"Error: #{target_id} is unranked; "
+        "reprioritize it first",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.id not in [
+    s.id for s in comparison_siblings(todos, item)
+]:
+    typer.echo(
+        f"Error: #{target_id} is not in the comparison "
+        f"set for #{todo_id}; done items and other "
+        "workers' items are excluded",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Let's verify the four placements against the shared sibling list
+(\cref{todo:placement}), so that the numbers can be read against each
+other rather than one at a time:
+
+<<test functions>>=
+def test_reprioritize_top(ranked_siblings):
+  """--top lands above the highest sibling."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--top"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_reprioritize_bottom(ranked_siblings):
+  """--bottom lands below the lowest sibling."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--bottom"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 1.0
+
+
+def test_reprioritize_above_target(ranked_siblings):
+  """--above splits the gap over the target."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 5.0
+
+
+def test_reprioritize_below_target(ranked_siblings):
+  """--below splits the gap under the target."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--below", "2"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 3.0
+
+
+def test_reprioritize_above_the_top(ranked_siblings):
+  """--above the highest sibling behaves like --top."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "1"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_reprioritize_ranks_an_unranked_item(
+  temp_todo_dir,
+):
+  """A placement flag ranks a previously unranked item."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Ranked", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "2", "--top"]
+  )
+
+  assert result.exit_code == 0
+  assert stored_priority(2) == 6.0
+  assert "None -> 6.0" in result.output
+@
+
+Now the ways a target can be wrong.  Each of them has to end in an
+exit code and a message, never in a traceback from deep inside the
+placement helper:
+
+<<test functions>>=
+def test_reprioritize_above_non_sibling(temp_todo_dir):
+  """A target under another parent is rejected."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Child", priority=4.5,
+      parent_id=1,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="Mover", priority=1.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "3", "--above", "2"]
+  )
+
+  assert result.exit_code == 1
+  assert "#2 is not a sibling of #3" in result.output
+  assert stored_priority(3) == 1.0
+
+
+def test_reprioritize_above_itself(ranked_siblings):
+  """An item cannot be placed relative to itself."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "4"]
+  )
+  assert result.exit_code == 1
+  assert (
+    "cannot place #4 relative to itself"
+    in result.output
+  )
+  assert stored_priority(4) == 0.0
+
+
+def test_reprioritize_above_unranked_target(
+  temp_todo_dir,
+):
+  """An unranked target is reported, not guessed at."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Mover", priority=1.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "2", "--above", "1"]
+  )
+
+  assert result.exit_code == 1
+  assert (
+    "#1 is unranked; reprioritize it first"
+    in result.output
+  )
+  assert stored_priority(2) == 1.0
+
+
+def test_reprioritize_above_done_target(ranked_siblings):
+  """A done target is outside the comparison set."""
+  _, todos = load_todos()
+  next(t for t in todos if t.id == 2).status = "done"
+  save_todos(5, todos)
+
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+
+  assert result.exit_code == 1
+  assert (
+    "#2 is not in the comparison set for #4"
+    in result.output
+  )
+
+
+def test_reprioritize_placement_needs_an_id(
+  ranked_siblings,
+):
+  """A placement flag without an ID is refused."""
+  result = runner.invoke(cli, ["reprioritize", "--top"])
+  assert result.exit_code == 1
+  assert "need a todo ID" in result.output
+
+
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--above", "1"],
+      "--top and --above cannot be used together",
+    ),
+    (
+      ["--top", "--below", "1"],
+      "--top and --below cannot be used together",
+    ),
+    (
+      ["--bottom", "--above", "1"],
+      "--bottom and --above cannot be used together",
+    ),
+    (
+      ["--bottom", "--below", "1"],
+      "--bottom and --below cannot be used together",
+    ),
+    (
+      ["--above", "1", "--below", "2"],
+      "--above and --below cannot be used together",
+    ),
+  ],
+)
+def test_reprioritize_rejects_flag_pairs(
+  ranked_siblings, flags, message,
+):
+  """Every pair of placement flags is refused."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", *flags]
+  )
+  assert result.exit_code == 1
+  assert message in result.output
+@
+
 We also register the [[reprio]] alias:
 
 <<subcommands>>=
@@ -10011,9 +11346,33 @@ We also register the [[reprio]] alias:
 def reprio(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    above: Annotated[int | None, above_opt] = None,
+    below: Annotated[int | None, below_opt] = None,
 ):
     """Alias for reprioritize."""
-    reprioritize(todo_id=todo_id)
+    reprioritize(
+        todo_id=todo_id,
+        top=top,
+        bottom=bottom,
+        above=above,
+        below=below,
+    )
+@
+
+The alias has to forward the flags, not merely the ID, or a script
+that says [[reprio 4 --top]] would silently get the interactive search
+instead:
+
+<<test functions>>=
+def test_reprio_alias_forwards_placement(ranked_siblings):
+  """The reprio alias passes the placement through."""
+  result = runner.invoke(
+    cli, ["reprio", "4", "--top"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
 @
 
 Let's verify the new no-argument batch mode: it should only touch the
@@ -17130,10 +18489,24 @@ from nytid.cli.todo import (
     get_siblings,
     get_active_siblings,
     check_parent_completion,
+    get_parent,
     assign_priority_at_position,
     binary_search_priority,
     compute_child_priority_range,
     distribute_priorities_in_range,
+    default_priority_without_siblings,
+    PLACE_TOP,
+    PLACE_BOTTOM,
+    PLACE_ABOVE,
+    PLACE_BELOW,
+    PRIORITY_HELP,
+    require_stored_priority,
+    sort_siblings_by_stored_priority,
+    sibling_insert_position,
+    place_among_siblings,
+    comparison_siblings,
+    place_existing_item,
+    reject_conflicting_flags,
     parse_editor_content,
     render_todo_markdown,
     parse_yaml_block,
@@ -17663,7 +19036,7 @@ def test_add_rejects_prio_with_append(temp_todo_dir):
 
     assert result.exit_code == 1
     assert (
-        "--prio and --append cannot be used together"
+        "--prio and --bottom cannot be used together"
         in result.output
     )
 
@@ -17705,7 +19078,7 @@ def test_add_rejects_skip_priority_with_append(
 
     assert result.exit_code == 1
     assert (
-        "--skip-priority and --append cannot be used together"
+        "--skip-priority and --bottom cannot be used together"
         in result.output
     )
 
