@@ -2148,38 +2148,158 @@ class ParsedTodo:
 @
 
 \subsection{Minimal YAML Parser}
+\label{sec:parse-yaml}
 
 We need to parse YAML front matter blocks, but only a small subset:
-flat key-value pairs with strings, numbers, and bracketed lists.
+flat key-value pairs with strings, numbers, and bracketed lists, plus
+\emph{literal block scalars} for free text that spans several lines.
 Rather than adding a PyYAML dependency for this narrow use case, we
 implement a minimal parser. This keeps the dependency footprint small
 and avoids YAML's many surprising edge cases (the \enquote{Norway
 problem}, implicit type coercion, etc.).
 
+The block scalars exist for long free text such as a description.
+Every other value fits on its [[key: value]] line, but a description
+is prose with paragraphs.  The parser is line oriented, so if such a
+value were rendered inline and the user broke it into lines in the
+editor, each continuation line would be silently dropped (no colon)
+or, worse, become a bogus key (a colon somewhere in the sentence).  A
+literal block, [[key: |]] followed by indented lines, gives the user a
+clearly delimited region in which added lines are safe.
+
 <<editor infrastructure>>=
 def parse_yaml_block(text):
     """Parse a minimal YAML block into a dictionary.
 
-    Handles only flat key-value pairs with string,
-    number, and bracket-list values. This is sufficient
-    for our front matter format.
+    Handles flat key-value pairs with string, number,
+    bracket-list and brace-dict values, and literal
+    block scalars (``key: |``) whose indented lines are
+    kept verbatim. This is sufficient for our front
+    matter format.
     """
     result = {}
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        idx += 1
+        if not stripped or stripped.startswith("#"):
             continue
-        if ":" not in line:
+        if ":" not in stripped:
             continue
-        key, _, value = line.partition(":")
+        key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
         if not key:
             continue
-        result[key] = parse_yaml_value(value)
+        indicator = parse_block_indicator(value)
+        if indicator is None:
+            result[key] = parse_yaml_value(value)
+        else:
+            <<collect the literal block>>
     return result
+@
 
+Where does a block end?  The tempting rule, \enquote{while the line is
+indented at least as far as the first line}, fails on a value whose
+first line is deeper than the rest---a pasted code line, an indented
+list continuation: the block would end early and the rest would be
+dropped without a word.  Instead the block runs through blank lines
+and \emph{any} line that starts with whitespace, and ends only at the
+first non-blank line in column~0.  This works because the renderer
+(\cref{sec:render-yaml}) indents every content line by two spaces and
+emits exactly one column-0 line after a block, the closing [[---]], so
+whatever text the block holds, it comes back unchanged.  The price is
+that a key following a block must sit in column~0, which the renderer
+guarantees and a hand-written buffer must respect.
 
+<<collect the literal block>>=
+block = []
+while idx < len(lines):
+    line = lines[idx]
+    if line.strip() and not line[0].isspace():
+        break
+    block.append(line)
+    idx += 1
+result[key] = join_literal_block(block, *indicator)
+@
+
+The indicator after the colon is [[|]] alone or with a single digit
+and a chomping sign, in either order, as in YAML: [[|-]], [[|2]],
+[[|2+]].  The digit is the block's indentation.  Without it we take
+the \emph{smallest} indentation of any content line; YAML itself
+requires the digit precisely when the first content line starts with
+whitespace, because no parser can otherwise tell block indentation
+from content, and the renderer emits it in that case.  We do not
+recognise the folded indicator [[>]], since folding rewrites line
+breaks and silently guessing would be worse than leaving the value
+alone.
+
+<<editor infrastructure>>=
+def parse_block_indicator(value):
+    """Return ``(indent, chomp)`` for a literal block indicator.
+
+    Recognizes ``|`` with an optional indentation digit
+    (1--9) and an optional chomping sign, in either
+    order. Returns ``None`` for anything else.
+    """
+    if not value.startswith("|") or len(value) > 3:
+        return None
+    rest = value[1:]
+    digits = [c for c in rest if c in "123456789"]
+    signs = [c for c in rest if c in "+-"]
+    if len(digits) > 1 or len(signs) > 1:
+        return None
+    if len(digits) + len(signs) != len(rest):
+        return None
+    indent = int(digits[0]) if digits else None
+    chomp = signs[0] if signs else ""
+    return indent, chomp
+@
+
+Joining strips \emph{up to} the block indentation from each line, not
+exactly that much, so that a hand-written block with a first line
+deeper than the rest does not come back truncated.  Blank lines come
+back empty so that paragraph breaks survive.  A tab counts as one
+character; the renderer never emits tabs, so a hand-typed tab can at
+most leave a line with extra leading spaces, never truncate the block.
+Trailing newlines are dropped, as [[notes]] are stripped, because a
+trailing newline in a description is never meaningful; the [[+]]
+chomping sign keeps them for a user who insists.  The value bypasses
+[[parse_yaml_value]]: literal means literal, so a description that
+happens to look like a number stays a string.
+
+<<editor infrastructure>>=
+def join_literal_block(block, indent=None, chomp=""):
+    """Dedent and join the lines of a literal block.
+
+    Strips up to ``indent`` leading characters from each
+    line (the smallest indentation found when ``None``),
+    turns whitespace-only lines into empty ones, and
+    drops trailing newlines unless ``chomp`` is ``+``.
+    """
+    content = [line for line in block if line.strip()]
+    if indent is None:
+        indent = min(
+            (len(line) - len(line.lstrip()) for line in content),
+            default=0,
+        )
+    dedented = []
+    for line in block:
+        if not line.strip():
+            dedented.append("")
+        else:
+            lead = len(line) - len(line.lstrip())
+            dedented.append(line[min(indent, lead):])
+    text = "\n".join(dedented)
+    if chomp == "+":
+        return text + "\n" if content else ""
+    return text.rstrip("\n")
+@
+
+Inline values are coerced by type, as far as the subset goes:
+
+<<editor infrastructure>>=
 def parse_yaml_value(value):
     """Parse a single YAML value.
 
@@ -2222,6 +2342,7 @@ def parse_yaml_value(value):
 @
 
 \subsection{Rendering YAML}
+\label{sec:render-yaml}
 
 We need the inverse of parsing to support round-trip editing: render
 a todo back to the same document format so the user can re-edit it.
@@ -2249,12 +2370,169 @@ def render_yaml_block(metadata):
                 f"{k}: {v}" for k, v in value.items()
             )
             lines.append(f"{key}: {{{items}}}")
+        elif needs_literal_block(key, value):
+            lines.extend(render_literal_block(key, value))
         else:
             lines.append(f"{key}: {value}")
     lines.append("---")
     if len(lines) == 2:
         return ""
     return "\n".join(lines)
+@
+
+A string goes out as a literal block in three cases.  The description
+always does, even when it is a single line: the block is what makes it
+safe for the user to add lines (\cref{sec:parse-yaml}), and if the
+form depended on the current value, so would the failure mode---a
+description that is safe to expand today would silently lose text
+tomorrow.  Any string spanning several lines does too, which also
+closes a latent hole: [[command]] and [[wd]] may legally contain
+newlines, and the inline form used to truncate them at the first
+newline on the next round trip.  Finally, a string that would itself
+read as a block indicator, such as a bare [[|]], would otherwise come
+back as the start of a block that swallows the keys after it.
+
+We split with [[splitlines()]] on both sides rather than on [[\n]]
+alone: the parser sees the buffer through [[splitlines()]], which also
+breaks at form feeds and Unicode line separators, so a value containing
+one would be emitted as one physical line but read back as two, the
+second unindented and the block cut short.  Blank lines go out empty
+rather than as two spaces, since many editors strip trailing whitespace
+on save and either form parses the same.  When the first content line
+starts with whitespace we emit the indentation digit, as YAML requires
+(\cref{sec:parse-yaml}).
+
+<<editor infrastructure>>=
+def needs_literal_block(key, value):
+    """Return whether ``value`` must be rendered as a literal block."""
+    if not isinstance(value, str):
+        return False
+    if key in LITERAL_BLOCK_KEYS:
+        return True
+    if len(value.splitlines()) > 1:
+        return True
+    return parse_block_indicator(value.strip()) is not None
+
+
+def render_literal_block(key, value):
+    """Render ``value`` as an indented literal block under ``key``."""
+    lines = value.splitlines()
+    first = next((line for line in lines if line.strip()), "")
+    indicator = "|"
+    if first[:1].isspace():
+        indicator += str(len(LITERAL_BLOCK_INDENT))
+    rendered = [f"{key}: {indicator}"]
+    for line in lines:
+        rendered.append(
+            LITERAL_BLOCK_INDENT + line if line.strip() else ""
+        )
+    return rendered
+<<constants>>=
+LITERAL_BLOCK_KEYS = ("description",)
+LITERAL_BLOCK_INDENT = "  "
+@
+
+\subsection{Testing the YAML Subset}
+
+The block rules are exactly the kind of detail that drifts, so we pin
+them down one by one, then check that whatever the renderer emits the
+parser reads back unchanged.
+
+<<test functions>>=
+def test_parse_yaml_block_literal_block():
+    """A block keeps paragraphs, inner indentation and # lines."""
+    text = """description: |
+  First paragraph.
+
+  Second paragraph:
+    indented line
+  # not a comment
+deadline: 2026-03-01
+"""
+    result = parse_yaml_block(text)
+    assert result["description"] == (
+        "First paragraph.\n\nSecond paragraph:\n"
+        "  indented line\n# not a comment"
+    )
+    assert result["deadline"] == "2026-03-01"
+
+
+def test_parse_yaml_block_literal_first_line_deeper():
+    """A first line deeper than the rest does not cut the block."""
+    text = "description: |\n      code\n  more\n"
+    result = parse_yaml_block(text)
+    assert result["description"] == "    code\nmore"
+
+
+def test_parse_yaml_block_literal_indicators():
+    """The indentation digit and chomping sign are honoured."""
+    assert parse_yaml_block(
+        "description: |2\n    a\n    b\n"
+    )["description"] == "  a\n  b"
+    assert parse_yaml_block(
+        "description: |-\n  a\n\n"
+    )["description"] == "a"
+    assert parse_yaml_block(
+        "description: |+\n  a\n\n"
+    )["description"] == "a\n\n"
+    assert parse_yaml_block("wd: |>")["wd"] == "|>"
+
+
+def test_parse_yaml_block_literal_is_text():
+    """Block content bypasses value coercion."""
+    result = parse_yaml_block("description: |\n  42\nwd: /tmp\n")
+    assert result["description"] == "42"
+    assert result["wd"] == "/tmp"
+
+
+def test_render_yaml_block_literal_block():
+    """Descriptions, multi-line strings and bare | become blocks."""
+    text = render_yaml_block({
+        "description": "One line.",
+        "command": "first\nsecond",
+        "wd": "|",
+        "who": "dbosk",
+    })
+    assert text == (
+        "---\n"
+        "description: |\n"
+        "  One line.\n"
+        "command: |\n"
+        "  first\n"
+        "  second\n"
+        "wd: |\n"
+        "  |\n"
+        "who: dbosk\n"
+        "---"
+    )
+
+
+def test_render_yaml_block_literal_indentation_digit():
+    """A first line starting with whitespace gets the digit."""
+    text = render_yaml_block({"description": "  code\n\nmore"})
+    assert text == (
+        "---\ndescription: |2\n    code\n\n  more\n---"
+    )
+
+
+def test_yaml_block_round_trip():
+    """Whatever the renderer emits, the parser reads back."""
+    hostile = [
+        "One line.",
+        "Two paragraphs.\n\nSecond one: with a colon.",
+        "  code first\nthen text",
+        "  all\n  indented",
+        "42",
+        "[not, a, list]",
+        "# not a heading\n---\nnot a delimiter",
+        "|",
+        "trailing newline\n",
+    ]
+    for value in hostile:
+        rendered = render_yaml_block({"description": value})
+        inner = "\n".join(rendered.splitlines()[1:-1])
+        parsed = parse_yaml_block(inner)
+        assert parsed["description"] == value.rstrip("\n")
 @
 
 \subsection{Parsing Editor Content}
@@ -2276,7 +2554,7 @@ def parse_editor_content(text):
 
     Format:
     - First non-empty line = title
-    - Optional ``---``...``---`` = YAML front matter
+    - Optional ``---``...``---`` in column 0 = YAML front matter
     - Text until first heading = parent notes
     - ``# Heading`` = level-1 child
     - ``## Heading`` = level-2 child (of preceding #)
@@ -2311,17 +2589,22 @@ while idx < len(lines):
 
 After the title, an optional YAML front matter block provides
 metadata. We detect it by looking for a line that is exactly
-[[---]]:
+[[---]] in column~0.  The column matters: a literal block inside the
+front matter (\cref{sec:parse-yaml}) may contain a [[---]] line of
+its own, say a Markdown rule in a description, and that line is
+indented, so requiring the delimiter to start the line is what keeps
+block content from closing the front matter early.  Trailing
+whitespace is still tolerated, since editors add and strip it freely.
 
 <<parse optional yaml block>>=
 parent_metadata = {}
 while idx < len(lines) and not lines[idx].strip():
     idx += 1
-if idx < len(lines) and lines[idx].strip() == "---":
+if idx < len(lines) and lines[idx].rstrip() == "---":
     yaml_start = idx + 1
     idx = yaml_start
     while idx < len(lines):
-        if lines[idx].strip() == "---":
+        if lines[idx].rstrip() == "---":
             yaml_text = "\n".join(
                 lines[yaml_start:idx]
             )
@@ -2395,14 +2678,18 @@ stack.append((level, current_item.children))
 
 Content lines go to either the parent notes (if no heading seen
 yet) or the current item's notes. We also detect YAML blocks
-within heading sections:
+within heading sections, again only in column~0.  Note that the
+heading test above runs on every line, including those inside a
+child's YAML block, and its regex is anchored at the start of the
+line; this is why a literal block indents its content.  A [[#]] in
+column~0 inside a child's block would not be content but a new
+heading, finalizing the half-read child and creating a bogus one.
 
 <<handle content line>>=
 if current_item is None:
     parent_notes_lines.append(line)
 else:
-    stripped = line.strip()
-    if stripped == "---":
+    if line.rstrip() == "---":
         if in_yaml:
             in_yaml = False
         elif current_yaml_lines is None:
@@ -2514,6 +2801,37 @@ Child notes.
     assert child.metadata.get("command") == "claude"
     assert child.metadata.get("wd") == "/tmp"
     assert "Child notes" in child.notes
+
+
+def test_parse_editor_indented_dashes_are_content():
+    """Only a column-0 --- delimits front matter."""
+    text = """Parent
+---
+description: |
+  Above the rule.
+  ---
+  Below the rule.
+wd: /tmp
+---
+
+# Child
+---
+description: |
+  ---
+command: claude
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.metadata["description"] == (
+        "Above the rule.\n---\nBelow the rule."
+    )
+    assert result.metadata["wd"] == "/tmp"
+    child = result.children[0]
+    assert child.metadata["description"] == "---"
+    assert child.metadata["command"] == "claude"
+    assert "Child notes" in child.notes
 @
 
 \subsection{Rendering Todo as Markdown}
@@ -2530,7 +2848,26 @@ not just a text blob; it is another view of the same priority model.
 
 We only include metadata fields that differ from defaults to keep
 the output clean. The [[wd]], [[command]], [[deadline]],
-[[estimated]], [[who]], and [[labels]] fields are emitted when set.
+[[estimated]], [[who]], [[labels]], and [[description]] fields are
+emitted when set.
+
+\label{sec:editor-description}
+The description is the one field that is neither the title nor the
+body, and the body already has an owner: the text between the front
+matter and the first heading is the notes, the running log that
+[[note]] appends to, and [[#]] headings are children, so a
+[[# Description]] section would simply be a child called
+\enquote{Description}.  That leaves the front matter, where a literal
+block (\cref{sec:render-yaml}) keeps the description editable as
+prose.  The cost is that a long description must keep its two-space
+indentation when edited or pasted; the benefit is that the standing
+statement of the task and its running log are both in the buffer,
+each in its own place.  The description goes last so that the short
+keys stay in view above a block that may run for a screen.  As with
+the other keys, an item without a description does not advertise the
+key.  The discovery argument that makes [[add --edit]] always show
+[[who]] (\cref{sec:add-via-editor}) does not carry here: two more
+lines in every buffer would cost more than a rarely used field gains.
 
 <<editor infrastructure>>=
 def render_todo_markdown(
@@ -2587,6 +2924,8 @@ def build_item_metadata(item):
         meta["who"] = item.who
     if item.github:
         meta["github"] = item.github
+    if item.description:
+        meta["description"] = item.description
     return meta
 @
 
@@ -2661,6 +3000,35 @@ def test_render_todo_markdown():
     assert len(parsed.children) == 2
     assert parsed.children[0].title == "Run tests"
     assert parsed.children[1].title == "Download"
+
+
+def test_render_todo_markdown_description():
+    """Descriptions of parent and child round-trip as blocks."""
+    parent = TodoItem(
+        id=1, title="Grade labs",
+        description="Standing statement.\n\nTwo paragraphs.",
+        notes="Running log.",
+    )
+    child = TodoItem(
+        id=2, title="Download",
+        parent_id=1, priority=1.0,
+        description="What to check once fetched.",
+    )
+    todos = [parent, child]
+
+    md = render_todo_markdown(parent, todos)
+    assert "description: |\n  Standing statement." in md
+    assert md.index("description:") > md.index("---")
+    assert md.index("Running log.") > md.index("Two paragraphs.")
+
+    parsed = parse_editor_content(md)
+    assert parsed.metadata["description"] == (
+        "Standing statement.\n\nTwo paragraphs."
+    )
+    assert parsed.notes == "Running log."
+    assert parsed.children[0].metadata["description"] == (
+        "What to check once fetched."
+    )
 
 
 def test_github_field_roundtrip():
@@ -5361,11 +5729,12 @@ def test_todo_item_without_worktree_key_loads():
 @
 
 \subsubsection{Adding via Editor}
+\label{sec:add-via-editor}
 
 When [[--edit]] is used, the editor opens with the title pre-filled
 (if given on the command line). Any CLI flags such as [[--deadline]],
-[[--estimate]], and [[--wd]], along with positional labels, are
-rendered as a YAML
+[[--estimate]], [[--wd]], and [[--description]], along with positional
+labels, are rendered as a YAML
 front\-matter block so the user can review and adjust them before
 saving. Without this pre-population the flags would still take effect
 (they are merged in [[<<create parent from parsed>>]]), but the user
@@ -5434,10 +5803,13 @@ if worktree:
     )
 if run_command:
     initial_meta["command"] = run_command
+if description:
+    initial_meta["description"] = description
 @
 
 We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided.
+with CLI flags taking precedence where provided.  The description is
+coerced to text for the reason given in \cref{sec:edit-via-editor}.
 
 The estimate needs the same [[parse_hours]] treatment on both branches,
 not just on the CLI one.  Our minimal YAML parser deliberately returns a
@@ -5481,7 +5853,9 @@ parent_item = TodoItem(
         if "estimate" in meta
         else None
     ),
-    description=description or "",
+    description=(
+        description or str(meta.get("description", ""))
+    ),
     parent_id=resolved_parent,
     who=who or meta.get("who"),
     notes=parsed.notes,
@@ -5534,6 +5908,67 @@ def test_add_edit_yaml_estimate_parses_suffix(
   listing = runner.invoke(cli, ["ls", "--who", ""])
   assert listing.exit_code == 0
   assert "1.5" in listing.output
+@
+
+A [[--description]] given on the command line must show up in the
+buffer, and a description typed into the buffer, for the parent or for
+a child section, must be stored:
+
+<<test functions>>=
+def test_add_edit_description_prepopulated_and_stored(
+  temp_todo_dir,
+):
+  """add --edit shows --description and stores child blocks."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text + (
+      "\n# Sub\n---\ndescription: |\n  Check the parameters.\n---\n"
+    )
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      [
+        "add", "--edit", "--top-level", "--prio", "1",
+        "-t", "Fetch paper",
+        "--description", "Where: the library.\n\nWhy: citation.",
+      ],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert "description: |\n  Where: the library." in seen["text"]
+  _, todos = load_todos()
+  by_title = {t.title: t for t in todos}
+  assert by_title["Fetch paper"].description == (
+    "Where: the library.\n\nWhy: citation."
+  )
+  assert by_title["Sub"].description == "Check the parameters."
+
+
+def test_add_edit_description_from_buffer(temp_todo_dir):
+  """A description typed into the front matter is stored."""
+  buffer = (
+    "Typed task\n"
+    "---\n"
+    "description: |\n"
+    "  From the buffer.\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].description == "From the buffer."
 @
 
 Children are created recursively. Each child inherits the parent's
@@ -5604,8 +6039,10 @@ def create_children_from_parsed(
 @
 
 Each child overrides its metadata (labels, deadline, working
-directory, assignee, environment) from the YAML block in the editor,
-falling back to the parent's values when not specified.  The [[who]]
+directory, assignee, environment, description) from the YAML block in
+the editor, falling back to the parent's values when not specified.
+A description is the one value that is never inherited: it states
+what \emph{this} item is, so a child without one simply has none.  The [[who]]
 inheritance is especially important: without it, children typed
 in the editor without an explicit [[who:]] key would be created
 unassigned, even though the user intended the whole task tree to
@@ -5626,6 +6063,9 @@ child_worktree = normalize_worktree_name(
     child_meta.get("worktree")
 )
 child_env = child_meta.get("env", parent_env)
+child_description = str(
+    child_meta.get("description", "")
+)
 @
 
 We append the new item to [[todos]] immediately so that recursive
@@ -5651,6 +6091,7 @@ child = TodoItem(
     worktree=child_worktree,
     env=child_env,
     command=child_meta.get("command"),
+    description=child_description,
 )
 todos.append(child)
 child_id = next_id
@@ -7692,6 +8133,148 @@ def test_edit_yaml_worktree_round_trips(temp_todo_dir):
     assert todos[0].worktree == "fix-43"
 @
 
+The description is applied at five sites (parent and children, in
+[[edit]] and in [[add]]), which is exactly the kind of duplication
+that drifts.  A fixed-point test guards all of them at once: an item
+whose description contains everything the format could trip on---a
+[[---]] line, a column-0 heading, an indented line, a colon---goes
+through an unchanged editor buffer and must come back byte for byte,
+along with every other field, and must render identically again.
+
+<<test functions>>=
+def test_edit_editor_description_fixed_point(temp_todo_dir):
+    """A hostile description survives an unchanged buffer."""
+    hostile = (
+        "Standing statement.\n\n"
+        "---\n"
+        "# Not a heading\n"
+        "    indented code\n"
+        "Colon: in text.\n"
+    )
+    original = TodoItem(
+        id=1, title="Parent",
+        description=hostile, notes="Running log.",
+        labels=["DD1310"],
+        deadline=normalize_deadline("2026-03-01"),
+        estimated=1.5, who="dbosk",
+        wd=canonicalize_wd("/tmp/project"),
+        worktree=normalize_worktree_name("fix-42"),
+        command="claude",
+        created="2026-02-20T10:00:00",
+    )
+    child = TodoItem(
+        id=2, title="Child", parent_id=1, priority=1.0,
+        description="  starts indented\nthen not",
+        notes="Child log.",
+        created="2026-02-20T10:00:00",
+    )
+    save_todos(3, [original, child])
+    first_render = render_todo_markdown(
+        original, [original, child]
+    )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=lambda text: text,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+
+    _, todos = load_todos()
+    reloaded = {t.id: t for t in todos}
+    assert reloaded[1].description == hostile.rstrip("\n")
+    for field_name in (
+        "title", "notes", "labels", "deadline", "estimated",
+        "who", "wd", "worktree", "command",
+    ):
+        assert getattr(reloaded[1], field_name) == getattr(
+            original, field_name
+        ), field_name
+    assert reloaded[2].description == child.description
+    assert reloaded[2].notes == "Child log."
+    assert render_todo_markdown(
+        reloaded[1], todos
+    ) == first_render
+@
+
+The point of the exercise is that a user can now break a one-line
+description into paragraphs in the editor and see them in [[view]]:
+
+<<test functions>>=
+def test_edit_editor_description_paragraph_break(temp_todo_dir):
+    """A paragraph break added in the block is stored and shown."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Long one",
+            description="One sentence. Another one.",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def fake_editor(text):
+        assert "description: |\n  One sentence. Another one." in text
+        return text.replace(
+            "  One sentence. Another one.",
+            "  One sentence.\n\n  Another one.",
+        )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].description == (
+        "One sentence.\n\nAnother one."
+    )
+
+    view = runner.invoke(cli, ["view", "1"])
+    assert view.exit_code == 0, view.output
+    assert (
+        "Description: One sentence.\n\nAnother one."
+        in view.output
+    )
+
+
+def test_edit_editor_child_description(temp_todo_dir):
+    """Child sections read and write their own description blocks."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent", priority=1.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Existing", parent_id=1, priority=1.0,
+            description="Old text.",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def fake_editor(text):
+        assert "# Existing\n---\ndescription: |\n  Old text.\n---" in text
+        return text.replace(
+            "  Old text.", "  New text."
+        ) + (
+            "\n# Added\n---\ndescription: |\n  Fresh: with colon.\n\n"
+            "  Second paragraph.\n---\n"
+        )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    by_title = {t.title: t for t in todos}
+    assert by_title["Existing"].id == 2
+    assert by_title["Existing"].description == "New text."
+    assert by_title["Added"].description == (
+        "Fresh: with colon.\n\nSecond paragraph."
+    )
+@
+
 Labels accept three flags whose interaction we resolved earlier:
 [[--label]] replaces, [[--add-label]]/[[--remove-label]] adjust relative to
 the current set.  We reject the contradictory [[-l]]-with-[[-a]]/[[-r]]
@@ -7760,6 +8343,7 @@ typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
 \subsubsection{Editing via the Editor}
+\label{sec:edit-via-editor}
 
 We render the todo as markdown, open the editor, parse the result,
 and reconcile. Reconciliation matches existing children by title
@@ -7780,6 +8364,16 @@ if not parsed.title:
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
+
+The description follows the rule the other keys already follow: a key
+present in the front matter is applied, an absent one leaves the field
+alone.  Deleting the block therefore does not clear the description,
+just as deleting [[deadline:]] does not clear the deadline;
+[[edit N --description ""]] remains the way to do that.  The value is
+coerced to text.  A block is always text, but a user may type
+[[description: 42]] inline, which [[parse_yaml_value]] turns into an
+integer, and that integer would reach the Markdown renderer, the
+calendar export, and the argument list of a spawned agent.
 
 <<update parent from parsed>>=
 item.title = parsed.title
@@ -7805,6 +8399,8 @@ if "who" in meta:
     item.who = meta["who"]
 if "github" in meta:
     item.github = meta["github"]
+if "description" in meta:
+    item.description = str(meta["description"])
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -7955,6 +8551,10 @@ for parsed_child in parsed_children:
             )
         if "who" in child_meta:
             child.who = child_meta["who"]
+        if "description" in child_meta:
+            child.description = str(
+                child_meta["description"]
+            )
     else:
         now = datetime.datetime.now().isoformat()
         child_meta = parsed_child.metadata
@@ -7980,6 +8580,9 @@ for parsed_child in parsed_children:
                 child_meta.get("worktree")
             ),
             command=child_meta.get("command"),
+            description=str(
+                child_meta.get("description", "")
+            ),
         )
         todos.append(child)
         next_id += 1
@@ -11771,7 +12374,11 @@ todo text itself is the prompt source, so later edits to notes or
 description automatically change what the agent sees.  Storing
 [[claude -p "..."]], by contrast, freezes the prompt in the command,
 which is useful when the launcher instruction should stay stable even if
-the todo text evolves.
+the todo text evolves.  Both fields are visible in [[edit --edit]]
+(\cref{sec:editor-description}), the notes as the body and the
+description in the front matter, and the notes win when both are set:
+a prompt typed into the description of an item that already has notes
+is not what the agent sees.
 
 When no command is named, we defer to [[build_launch_shell]]---the same
 helper [[track start]] uses---so that the plain-versus-prompted shell
