@@ -3854,8 +3854,8 @@ def stored_priority(todo_id):
 Every command that can place an item offers several ways to say where,
 and no two of them can be honoured at once: [[--prio]] says
 \enquote{this exact number}, [[--top]] and [[--bottom]] say
-\enquote{derive one from the siblings}, and [[--skip-priority]] says
-\enquote{do not derive one at all}.  Silently
+\enquote{derive one from the siblings}, and [[--skip-priority]] and
+[[--keep-prio]] say \enquote{do not derive one at all}.  Silently
 letting one win would make a script's mistake invisible for as long as
 the two flags happen to agree, so we refuse the combination instead.
 
@@ -8553,6 +8553,10 @@ edit_who_opt = typer.Option(
 edit_parent_opt = typer.Option(
     "--parent", "-p",
     help="New parent ID (0 = make top-level)")
+keep_prio_opt = typer.Option(
+    "--keep-prio",
+    help="Keep the stored priority when moving "
+         "with --parent")
 @
 
 <<edit command>>=
@@ -8593,6 +8597,7 @@ def edit(
                                  prio_opt] = None,
     top: Annotated[bool, top_opt] = False,
     bottom: Annotated[bool, bottom_opt] = False,
+    keep_prio: Annotated[bool, keep_prio_opt] = False,
 ):
     """Edit an existing todo item.
 
@@ -8637,6 +8642,7 @@ command line cannot half-apply.
 
 <<edit via cli flags>>=
 reject_conflicting_flags({
+    "--keep-prio": keep_prio,
     "--prio": explicit_priority is not None,
     "--top": top,
     "--bottom": bottom,
@@ -8933,10 +8939,7 @@ losing its creation timestamp and any notes.
 We use [[0]] as a sentinel for \enquote{promote to top-level}
 because valid IDs always start from [[1]], so [[0]] is unambiguous.
 Passing a positive integer instead reassigns the item under a
-different parent.  Because the item's existing priority was computed
-relative to its old siblings, it may sort oddly after a reparent ---
-the user can run [[reprioritize]] afterwards to restore the intended
-ordering:
+different parent:
 
 <<edit via cli flags>>=
 if parent is not None:
@@ -8956,15 +8959,31 @@ if parent is not None:
         item.parent_id = parent
 @
 
-The placement flags rank the item where it already is.  [[--prio]]
-sets the number outright, while [[--top]] and [[--bottom]] derive one
-from the item's current siblings by the same rule [[add]] uses.  With
-none of them, [[edit]] leaves the stored priority alone, which is what
-every other field of this command does with a flag the user did not
-pass.
+A priority is a position in one list, not a property of the item.  The
+number~[[5.0]] means \enquote{above the [[4.5]] next to me}; carried
+into a different set of siblings it means whatever those siblings
+happen to be numbered, which is to say nothing.  Moving an item with
+[[--parent]] therefore invalidates its priority, and leaving the stale
+number behind made every move cost a follow-up [[reprioritize]] the
+user had to remember.  We re-rank as part of the move instead, running
+the same binary search [[add]] runs, so that the default outcome of a
+move is a placed item rather than an arbitrary one.
+
+The placement flags say what to do instead of asking.  [[--keep-prio]]
+keeps the stored number---the old behaviour, and still the right answer
+when the caller has already decided where the item lands, as a script
+moving items it just numbered has.  [[--prio]] sets the number
+outright; [[--top]] and [[--bottom]] derive it from the new siblings.
+All three also work \emph{without} [[--parent]], where they re-rank the
+item among the siblings it already has, which is what makes [[edit]]
+enough for the whole flow of moving and ranking a batch.
+[[--keep-prio]] without [[--parent]] asks for exactly what would happen
+anyway, so it is a no-op rather than an error.
 
 <<edit via cli flags>>=
-rerank = top or bottom
+rerank = top or bottom or (
+    parent is not None and not keep_prio
+)
 if explicit_priority is not None:
     item.priority = explicit_priority
 elif rerank:
@@ -8974,8 +8993,8 @@ save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
-The item can also sit under a parent that is itself unranked, and
-[[place_existing_item]] answers [[None]] for that case
+The move can also land the item under a parent that is itself
+unranked, and [[place_existing_item]] answers [[None]] for that case
 (\cref{todo:placement}).  Storing that [[None]] is what keeps the
 hierarchy consistent---no ranked child under an unranked parent---but
 it silently drops a number the user chose, so we say so when it
@@ -9046,12 +9065,141 @@ def test_edit_negative_prio(ranked_siblings):
   assert stored_priority(4) == -3.0
 @
 
+A move is where the flags earn their place.  Without one, the item is
+re-ranked among its new siblings by the interactive search; with
+[[--keep-prio]] it arrives carrying the number it had, which is the
+behaviour this command had before; and with [[--top]] or [[--bottom]]
+it arrives at a known end of the new list:
+
+<<test functions>>=
+@pytest.fixture
+def two_parents(temp_todo_dir):
+  """Two ranked parents, one with a ranked child."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="Parent A", priority=10.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Parent B", priority=6.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="B child", priority=8.0,
+      parent_id=2,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=4, title="Mover", priority=1.0,
+      parent_id=1,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  return temp_todo_dir
+
+
+def test_edit_parent_runs_the_search(two_parents):
+  """A move re-ranks interactively by default."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2"], input="y\n",
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" in result.output
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_keep_prio(two_parents):
+  """--keep-prio moves without asking or re-ranking."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--keep-prio"],
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" not in result.output
+  assert stored_priority(4) == 1.0
+
+
+def test_edit_parent_top(two_parents):
+  """--top places the moved item above its new siblings."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--top"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_bottom(two_parents):
+  """--bottom places the moved item below them."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--bottom"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_edit_keep_prio_alone_is_a_no_op(
+  ranked_siblings,
+):
+  """--keep-prio without --parent changes nothing."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--keep-prio"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 0.0
+@
+
+Moving under an unranked parent is the case that has to give up the
+number rather than invent one, and it says so instead of doing it
+quietly:
+
+<<test functions>>=
+def test_edit_parent_unranked_unranks_the_item(
+  temp_todo_dir,
+):
+  """A move under an unranked parent unranks the item."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked parent", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Mover", priority=4.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["edit", "2", "--parent", "1"]
+  )
+
+  assert result.exit_code == 0
+  assert stored_priority(2) is None
+  assert "#2 is now unranked" in result.output
+@
+
 The pairs are refused the same way [[add]] refuses its own:
 
 <<test functions>>=
 @pytest.mark.parametrize(
   "flags,message",
   [
+    (
+      ["--keep-prio", "--prio", "5"],
+      "--keep-prio and --prio cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--top"],
+      "--keep-prio and --top cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--bottom"],
+      "--keep-prio and --bottom cannot be used together",
+    ),
     (
       ["--prio", "5", "--top"],
       "--prio and --top cannot be used together",
@@ -9615,9 +9763,12 @@ def test_child_who_override():
 Reparenting addresses the common accident of creating a todo as a
 child of an active item when a top-level item was intended.  We
 verify both directions: promoting a child to the top level and
-moving it under a different parent.  We also confirm that supplying
-an invalid parent ID is rejected with a non-zero exit code rather
-than silently storing a dangling reference.
+moving it under a different parent.  Both re-rank as part of the
+move, which the first test meets as a binary-search question and the
+second as a silent placement in the new parent's still-empty child
+range.  We also confirm that supplying an invalid parent ID is
+rejected with a non-zero exit code rather than silently storing a
+dangling reference.
 
 <<test functions>>=
 def test_edit_reparent_toplevel(temp_todo_dir):
@@ -9636,11 +9787,15 @@ def test_edit_reparent_toplevel(temp_todo_dir):
 
     result = runner.invoke(
         cli, ["edit", "2", "--parent", "0"],
+        input="y\n",
     )
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
     assert child.parent_id is None
+    # The move re-ranks: answering "yes" puts the child
+    # above its new sibling instead of keeping 0.5.
+    assert child.priority == 1.0
 
 def test_edit_reparent_to_other(temp_todo_dir):
     """--parent N moves a child under a new parent."""
@@ -9667,6 +9822,9 @@ def test_edit_reparent_to_other(temp_todo_dir):
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 3)
     assert child.parent_id == 2
+    # First child of B: the middle of B's child range,
+    # asked for without a single question.
+    assert child.priority == -5.0
 
 def test_edit_reparent_invalid(temp_todo_dir):
     """--parent with a non-existent ID is an error."""
