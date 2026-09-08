@@ -5808,7 +5808,8 @@ if description:
 @
 
 We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided.
+with CLI flags taking precedence where provided.  The description is
+coerced to text for the reason given in \cref{sec:edit-via-editor}.
 
 The estimate needs the same [[parse_hours]] treatment on both branches,
 not just on the CLI one.  Our minimal YAML parser deliberately returns a
@@ -5852,7 +5853,9 @@ parent_item = TodoItem(
         if "estimate" in meta
         else None
     ),
-    description=description or "",
+    description=(
+        description or str(meta.get("description", ""))
+    ),
     parent_id=resolved_parent,
     who=who or meta.get("who"),
     notes=parsed.notes,
@@ -5905,6 +5908,67 @@ def test_add_edit_yaml_estimate_parses_suffix(
   listing = runner.invoke(cli, ["ls", "--who", ""])
   assert listing.exit_code == 0
   assert "1.5" in listing.output
+@
+
+A [[--description]] given on the command line must show up in the
+buffer, and a description typed into the buffer, for the parent or for
+a child section, must be stored:
+
+<<test functions>>=
+def test_add_edit_description_prepopulated_and_stored(
+  temp_todo_dir,
+):
+  """add --edit shows --description and stores child blocks."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text + (
+      "\n# Sub\n---\ndescription: |\n  Check the parameters.\n---\n"
+    )
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      [
+        "add", "--edit", "--top-level", "--prio", "1",
+        "-t", "Fetch paper",
+        "--description", "Where: the library.\n\nWhy: citation.",
+      ],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert "description: |\n  Where: the library." in seen["text"]
+  _, todos = load_todos()
+  by_title = {t.title: t for t in todos}
+  assert by_title["Fetch paper"].description == (
+    "Where: the library.\n\nWhy: citation."
+  )
+  assert by_title["Sub"].description == "Check the parameters."
+
+
+def test_add_edit_description_from_buffer(temp_todo_dir):
+  """A description typed into the front matter is stored."""
+  buffer = (
+    "Typed task\n"
+    "---\n"
+    "description: |\n"
+    "  From the buffer.\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].description == "From the buffer."
 @
 
 Children are created recursively. Each child inherits the parent's
@@ -5975,8 +6039,10 @@ def create_children_from_parsed(
 @
 
 Each child overrides its metadata (labels, deadline, working
-directory, assignee, environment) from the YAML block in the editor,
-falling back to the parent's values when not specified.  The [[who]]
+directory, assignee, environment, description) from the YAML block in
+the editor, falling back to the parent's values when not specified.
+A description is the one value that is never inherited: it states
+what \emph{this} item is, so a child without one simply has none.  The [[who]]
 inheritance is especially important: without it, children typed
 in the editor without an explicit [[who:]] key would be created
 unassigned, even though the user intended the whole task tree to
@@ -5997,6 +6063,9 @@ child_worktree = normalize_worktree_name(
     child_meta.get("worktree")
 )
 child_env = child_meta.get("env", parent_env)
+child_description = str(
+    child_meta.get("description", "")
+)
 @
 
 We append the new item to [[todos]] immediately so that recursive
@@ -6022,6 +6091,7 @@ child = TodoItem(
     worktree=child_worktree,
     env=child_env,
     command=child_meta.get("command"),
+    description=child_description,
 )
 todos.append(child)
 child_id = next_id
@@ -8063,6 +8133,148 @@ def test_edit_yaml_worktree_round_trips(temp_todo_dir):
     assert todos[0].worktree == "fix-43"
 @
 
+The description is applied at five sites (parent and children, in
+[[edit]] and in [[add]]), which is exactly the kind of duplication
+that drifts.  A fixed-point test guards all of them at once: an item
+whose description contains everything the format could trip on---a
+[[---]] line, a column-0 heading, an indented line, a colon---goes
+through an unchanged editor buffer and must come back byte for byte,
+along with every other field, and must render identically again.
+
+<<test functions>>=
+def test_edit_editor_description_fixed_point(temp_todo_dir):
+    """A hostile description survives an unchanged buffer."""
+    hostile = (
+        "Standing statement.\n\n"
+        "---\n"
+        "# Not a heading\n"
+        "    indented code\n"
+        "Colon: in text.\n"
+    )
+    original = TodoItem(
+        id=1, title="Parent",
+        description=hostile, notes="Running log.",
+        labels=["DD1310"],
+        deadline=normalize_deadline("2026-03-01"),
+        estimated=1.5, who="dbosk",
+        wd=canonicalize_wd("/tmp/project"),
+        worktree=normalize_worktree_name("fix-42"),
+        command="claude",
+        created="2026-02-20T10:00:00",
+    )
+    child = TodoItem(
+        id=2, title="Child", parent_id=1, priority=1.0,
+        description="  starts indented\nthen not",
+        notes="Child log.",
+        created="2026-02-20T10:00:00",
+    )
+    save_todos(3, [original, child])
+    first_render = render_todo_markdown(
+        original, [original, child]
+    )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=lambda text: text,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+
+    _, todos = load_todos()
+    reloaded = {t.id: t for t in todos}
+    assert reloaded[1].description == hostile.rstrip("\n")
+    for field_name in (
+        "title", "notes", "labels", "deadline", "estimated",
+        "who", "wd", "worktree", "command",
+    ):
+        assert getattr(reloaded[1], field_name) == getattr(
+            original, field_name
+        ), field_name
+    assert reloaded[2].description == child.description
+    assert reloaded[2].notes == "Child log."
+    assert render_todo_markdown(
+        reloaded[1], todos
+    ) == first_render
+@
+
+The point of the exercise is that a user can now break a one-line
+description into paragraphs in the editor and see them in [[view]]:
+
+<<test functions>>=
+def test_edit_editor_description_paragraph_break(temp_todo_dir):
+    """A paragraph break added in the block is stored and shown."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Long one",
+            description="One sentence. Another one.",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def fake_editor(text):
+        assert "description: |\n  One sentence. Another one." in text
+        return text.replace(
+            "  One sentence. Another one.",
+            "  One sentence.\n\n  Another one.",
+        )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].description == (
+        "One sentence.\n\nAnother one."
+    )
+
+    view = runner.invoke(cli, ["view", "1"])
+    assert view.exit_code == 0, view.output
+    assert (
+        "Description: One sentence.\n\nAnother one."
+        in view.output
+    )
+
+
+def test_edit_editor_child_description(temp_todo_dir):
+    """Child sections read and write their own description blocks."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent", priority=1.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Existing", parent_id=1, priority=1.0,
+            description="Old text.",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def fake_editor(text):
+        assert "# Existing\n---\ndescription: |\n  Old text.\n---" in text
+        return text.replace(
+            "  Old text.", "  New text."
+        ) + (
+            "\n# Added\n---\ndescription: |\n  Fresh: with colon.\n\n"
+            "  Second paragraph.\n---\n"
+        )
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    by_title = {t.title: t for t in todos}
+    assert by_title["Existing"].id == 2
+    assert by_title["Existing"].description == "New text."
+    assert by_title["Added"].description == (
+        "Fresh: with colon.\n\nSecond paragraph."
+    )
+@
+
 Labels accept three flags whose interaction we resolved earlier:
 [[--label]] replaces, [[--add-label]]/[[--remove-label]] adjust relative to
 the current set.  We reject the contradictory [[-l]]-with-[[-a]]/[[-r]]
@@ -8131,6 +8343,7 @@ typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
 \subsubsection{Editing via the Editor}
+\label{sec:edit-via-editor}
 
 We render the todo as markdown, open the editor, parse the result,
 and reconcile. Reconciliation matches existing children by title
@@ -8151,6 +8364,16 @@ if not parsed.title:
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
+
+The description follows the rule the other keys already follow: a key
+present in the front matter is applied, an absent one leaves the field
+alone.  Deleting the block therefore does not clear the description,
+just as deleting [[deadline:]] does not clear the deadline;
+[[edit N --description ""]] remains the way to do that.  The value is
+coerced to text.  A block is always text, but a user may type
+[[description: 42]] inline, which [[parse_yaml_value]] turns into an
+integer, and that integer would reach the Markdown renderer, the
+calendar export, and the argument list of a spawned agent.
 
 <<update parent from parsed>>=
 item.title = parsed.title
@@ -8176,6 +8399,8 @@ if "who" in meta:
     item.who = meta["who"]
 if "github" in meta:
     item.github = meta["github"]
+if "description" in meta:
+    item.description = str(meta["description"])
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -8326,6 +8551,10 @@ for parsed_child in parsed_children:
             )
         if "who" in child_meta:
             child.who = child_meta["who"]
+        if "description" in child_meta:
+            child.description = str(
+                child_meta["description"]
+            )
     else:
         now = datetime.datetime.now().isoformat()
         child_meta = parsed_child.metadata
@@ -8351,6 +8580,9 @@ for parsed_child in parsed_children:
                 child_meta.get("worktree")
             ),
             command=child_meta.get("command"),
+            description=str(
+                child_meta.get("description", "")
+            ),
         )
         todos.append(child)
         next_id += 1
