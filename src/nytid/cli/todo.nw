@@ -141,6 +141,7 @@ cli = typer.Typer(
 <<child priority helpers>>
 <<editor infrastructure>>
 <<binary search priority>>
+<<placement helpers>>
 <<autocompletion functions>>
 <<helpers>>
 <<argument and option definitions>>
@@ -220,7 +221,9 @@ def get_max_boost() -> float:
 @
 
 Worker-specific defaults need a different treatment from the global
-settings above.  A teacher may want every task for [[dan-claude]] to run
+settings above.%
+\label{todo:worker-defaults}
+A teacher may want every task for [[dan-claude]] to run
 [[opencode]] in one working directory with one captured environment,
 without baking those choices into each todo item.
 
@@ -414,6 +417,10 @@ class TodoItem:
 
     Items are stored in a JSON file and sorted by
     effective priority for display and scheduling.
+
+    A `priority` of `None` means unranked; omitting it
+    ranks the item at `0.0` instead, so an unranked
+    item has to ask for `None` explicitly.
     """
 
     id: int
@@ -477,6 +484,58 @@ class TodoItem:
         filtered = {k: v for k, v in data.items() if k in known}
         <<coerce stored estimate to hours>>
         return cls(**filtered)
+@
+
+\subsection{Ranked and Unranked Priorities}%
+\label{sec:ranked-and-unranked}
+
+[[priority]] carries two states rather than one number.  An item is
+\emph{ranked} when it holds a float---which is [[0.0]] when nobody
+said otherwise---and \emph{unranked} when it holds [[None]].  These
+are not two ways of saying \enquote{no priority yet}: [[0.0]] is a
+position in the ordering like any other, while [[None]] means the item
+has no position at all and must not be compared numerically with
+anything.
+
+The constructor default is a number because the field predates the
+unranked state.  A [[todos.json]] written before [[None]] became
+possible has no [[priority]] key at all, and [[from_dict]] fills a
+missing key from this very default; making it [[None]] would silently
+unrank every item in every such file, which would move all of them to
+the tail of the display order at once.  The asymmetry that buys us is
+that the unranked state is reachable only by \emph{asking} for it:
+passing [[priority=None]] to the constructor, or writing an explicit
+[[null]] in the JSON.  Omitting the argument---in a caller, and just
+as easily in a test---yields an item ranked at zero, not an unranked
+one.
+
+The distinction is load-bearing rather than cosmetic.
+[[effective_priority]] returns [[None]] for an unranked item and
+[[todo_display_sort_key]] sorts those into a separate tail
+(\cref{todo:effective-priority}); [[require_stored_priority]] and the
+placement helpers raise instead of guessing a number
+(\cref{todo:placement}); [[compute_child_priority_range]] refuses an
+unranked parent and skips unranked siblings
+(\cref{sec:child-priority-helpers}); [[reprioritize]] with no ID
+selects exactly the unranked items; and [[--skip-priority]] exists to
+create them.  An item that fell into ranked-at-zero by accident is
+therefore not merely mislabelled---it is silently admitted to every
+comparison those helpers were written to keep it out of.
+
+Let's pin all three doors into the two states, since it is precisely
+the one that does \emph{not} lead where its shape suggests that costs
+callers their afternoon:
+
+<<test functions>>=
+def test_priority_default_is_ranked_at_zero():
+  """Only an explicit null yields an unranked item."""
+  assert TodoItem(id=1, title="Test").priority == 0.0
+  assert TodoItem.from_dict(
+    {"id": 1, "title": "Test"}
+  ).priority == 0.0
+  assert TodoItem.from_dict(
+    {"id": 1, "title": "Test", "priority": None}
+  ).priority is None
 @
 
 \subsection{Labels Are a Set, Not a List}
@@ -805,7 +864,8 @@ def test_normalize_deadline_passes_empty_through():
   assert normalize_deadline("") is None
 @
 
-\section{Effective Priority}
+\section{Effective Priority}%
+\label{todo:effective-priority}
 
 The effective priority determines display and scheduling order for
 ranked items. Without a deadline, it equals the base priority. With a
@@ -1585,7 +1645,8 @@ def test_active_stack_discards_unknown_ids(temp_todo_dir):
     assert load_active_stack() == []
 @
 
-\section{Sub-item Helpers}
+\section{Sub-item Helpers}%
+\label{todo:sub-item-helpers}
 
 Sub-items create a tree structure within the flat todo list. We need
 helpers to navigate this tree: finding children, finding siblings (for
@@ -1633,6 +1694,29 @@ def get_siblings(
         for t in todos
         if t.parent_id == item.parent_id and t.id != item.id
     ]
+@
+
+Going the other way---from an item to the parent whose range bounds
+it---is the lookup every re-ranking path needs before it can place
+anything, because the parent supplies both the interval and the
+question of whether a numeric position is available at all.  We give
+it a name so that the three commands that ask it cannot drift apart on
+what \enquote{no parent} means: a top-level item and an item whose
+parent has been deleted both answer [[None]], and both are placed
+against the top level.
+
+<<sub-item helpers>>=
+def get_parent(
+    todos: list[TodoItem], item: TodoItem
+) -> TodoItem | None:
+    """Get the parent of an item, or `None` at top
+    level."""
+    if item.parent_id is None:
+        return None
+    return next(
+        (t for t in todos if t.id == item.parent_id),
+        None,
+    )
 @
 
 Direct children are the right unit for display and for priority
@@ -1932,7 +2016,8 @@ def test_check_parent_completion():
     assert check_parent_completion(todos, 1)
 @
 
-\subsection{Context-Aware Child Priorities}
+\subsection{Context-Aware Child Priorities}%
+\label{sec:child-priority-helpers}
 
 When children are created via the editor or reconciled during edits,
 they need priorities that place them \emph{between} their parent and
@@ -1948,9 +2033,39 @@ so they always appear between~A and~B.
 
 The first helper finds the available priority range for children of
 a given parent. We look at the parent's siblings (same
-[[parent_id]] level) to find the next-lower-priority item. The range
-runs from the parent's priority down to that sibling's priority. If
-no sibling exists below, we use a generous default floor.
+[[parent_id]] level) to find the closest one at or below the parent.
+The range runs from the parent's priority down to that sibling's
+priority. If no such sibling exists, we use a generous default floor.
+
+Both bounds read \emph{stored} priorities, for the reason placement
+gives (\cref{todo:placement}): a deadline boost is temporary by design
+(\cref{todo:effective-priority}), and everything derived from this
+range---the child priorities from
+[[distribute_priorities_in_range]], the starting point from
+[[default_priority_without_siblings]]---is written straight into
+[[priority]] and outlives the deadline that justified it.  The upper
+bound was always the parent's stored number; taking the lower bound
+from [[require_effective_priority]] mixed the two scales in a single
+comparison.  A sibling one day from its deadline then reads as if it
+sat far above where it is stored, so it drops out of the lower set
+entirely and the floor collapses to the default: children of a parent
+at~5.0 whose neighbour sits at~4.0 would be spread from~$-5.0$
+upwards, below the very sibling the range exists to keep them above.
+Reading both bounds from the stored numbers makes the comparison
+meaningful again, and the range describes the same gap tomorrow as
+today.
+
+Siblings at exactly the parent's priority count as lower bounds too.
+Excluding them would send the floor to the default and let children
+sort below a sibling that the parent is level with---the same failure
+in a quieter form.  It does leave one degenerate outcome: the closest
+sibling can then equal the parent, and a zero-width (or, if the stored
+numbers ever invert, a backwards) interval gives
+[[distribute_priorities_in_range]] nothing to distribute over, since
+every division point would land on the bound itself.  We open a
+unit-wide range below the parent in that case, which is the same
+one-unit step [[assign_priority_at_position]] takes when it runs off
+the end of a list.
 
 <<child priority helpers>>=
 def compute_child_priority_range(
@@ -1959,9 +2074,11 @@ def compute_child_priority_range(
 ) -> tuple:
     """Find the priority range for children.
 
-    Returns ``(high, low)`` where high is the parent's
-    priority and low is the next-lower sibling's priority
-    (or a default floor if no lower sibling exists).
+    Returns ``(high, low)`` from stored priorities: high
+    is the parent's own, and low is that of the closest
+    sibling at or below it (or a default floor when no
+    sibling qualifies).  A degenerate result is widened
+    to a unit-wide range below the parent.
     """
     if parent.priority is None:
         raise ValueError(
@@ -1978,15 +2095,17 @@ def compute_child_priority_range(
     ]
     lower = [
         s for s in siblings
-        if require_effective_priority(s) < high
+        if require_stored_priority(s) <= high
     ]
     if lower:
         closest = max(
-            lower, key=require_effective_priority
+            lower, key=require_stored_priority
         )
-        low = require_effective_priority(closest)
+        low = require_stored_priority(closest)
     else:
         low = high - 10.0
+    if low >= high:
+        low = high - 1.0
     return (high, low)
 @
 
@@ -2011,6 +2130,47 @@ def distribute_priorities_in_range(
         return []
     step = (high - low) / (count + 1)
     return [high - step * (i + 1) for i in range(count)]
+@
+
+The third helper answers the degenerate case the first two cannot: a
+level with no ranked item in it yet.  There is no neighbour to take a
+midpoint against, so the question becomes where to start.  Starting in
+the \emph{middle} of the parent's range rather than at one end is what
+lets the second and third arrival be placed above or below the first
+without renumbering anything---the same reason
+[[distribute_priorities_in_range]] leaves room at both ends.  At the
+top level there is no range to halve, so we fall back to [[1.0]] and
+let later items grow the scale in either direction.
+
+An unranked parent has no range at all, and no number we could invent
+would mean anything relative to it.  We raise rather than guess,
+because the callers each have their own right answer: [[add]] and
+[[edit]] leave the item unranked, while [[reprioritize]] tells the
+user to rank the parent first.
+
+<<child priority helpers>>=
+def default_priority_without_siblings(
+    parent: TodoItem | None = None,
+    todos: list[TodoItem] | None = None,
+) -> float:
+    """Return the priority for the first ranked item at
+    a level.
+
+    With a ranked `parent` this is the middle of that
+    parent's child range; at the top level it is `1.0`.
+    Raises `ValueError` for an unranked parent.
+    """
+    if parent is None or todos is None:
+        return 1.0
+    if parent.priority is None:
+        raise ValueError(
+            "cannot assign numeric priority under "
+            "an unranked parent"
+        )
+    high, low = compute_child_priority_range(
+        todos, parent
+    )
+    return (high + low) / 2.0
 @
 
 \subsection{Testing Child Priority Helpers}
@@ -2048,6 +2208,79 @@ def test_compute_child_priority_range_no_sibling():
     )
     assert high == 5.0
     assert low == -5.0
+
+
+def test_compute_child_priority_range_ignores_boost():
+    """A boosted sibling still bounds the range where it
+    is stored."""
+    now = datetime.datetime.now()
+    created = (
+        now - datetime.timedelta(days=29)
+    ).isoformat()
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created=created,
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=4.0,
+            created=created,
+            deadline=(
+                now + datetime.timedelta(days=1)
+            ).isoformat(),
+        ),
+    ]
+    assert effective_priority(todos[1]) > 5.0
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 4.0
+
+
+def test_compute_child_priority_range_equal_sibling():
+    """A sibling at the parent's own priority opens a
+    unit-wide range."""
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 4.0
+
+
+def test_default_priority_without_siblings():
+    """An empty level starts in the middle of the range."""
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=3.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    assert default_priority_without_siblings(
+        todos[0], todos
+    ) == 4.0
+    assert default_priority_without_siblings() == 1.0
+    with pytest.raises(ValueError):
+        default_priority_without_siblings(
+            TodoItem(
+                id=3, title="Unranked", priority=None
+            ),
+            todos,
+        )
 
 
 def test_distribute_priorities_in_range():
@@ -2119,6 +2352,15 @@ transient (exists only during editor interaction) and doesn't carry
 IDs, timestamps, or status. Keeping them separate avoids polluting
 the domain model with editor concerns.
 
+[[ParsedTodo]] carries one thing the tree itself cannot: a list of
+[[warnings]].  The parser is deliberately forgiving---a buffer that
+breaks the format is still parsed as well as it can be, because the
+alternative is to throw away the editing session the user just spent
+their time on---but forgiving \emph{silently} would leave the user
+guessing why a key never took effect.  Each warning is one plain
+sentence, so the same list serves both [[add]] and [[edit]] without
+either of them having to know what can go wrong.
+
 <<editor infrastructure>>=
 @dataclass
 class ParsedItem:
@@ -2139,13 +2381,15 @@ class ParsedTodo:
     """Complete parsed result from editor content.
 
     The top-level item plus its tree of children from
-    markdown headings.
+    markdown headings, and the ``warnings`` the parser
+    raised about a buffer it could only parse in part.
     """
 
     title: str
     notes: str = ""
     metadata: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 @
 
 \subsection{Minimal YAML Parser}
@@ -2560,8 +2804,13 @@ def parse_editor_content(text):
     - ``# Heading`` = level-1 child
     - ``## Heading`` = level-2 child (of preceding #)
     - Each heading may have its own YAML block + notes
+
+    A front matter block that is never closed is kept as
+    notes and reported in ``warnings`` rather than
+    discarded.
     """
     lines = text.splitlines()
+    warnings = []
     <<parse title from first line>>
     <<parse optional yaml block>>
     <<parse notes and headings>>
@@ -2570,6 +2819,7 @@ def parse_editor_content(text):
         notes=parent_notes.strip(),
         metadata=parent_metadata,
         children=top_children,
+        warnings=warnings,
     )
 @
 
@@ -2597,24 +2847,65 @@ indented, so requiring the delimiter to start the line is what keeps
 block content from closing the front matter early.  Trailing
 whitespace is still tolerated, since editors add and strip it freely.
 
+The search for the closing delimiter stops at the end of the buffer or
+at the first column-0 line beginning with [[#]].  That second stop is
+what keeps a \emph{missing} closing delimiter from being catastrophic:
+without it, the next [[---]] in the document would close the block, and
+the next [[---]] after an unclosed parent block is the opening
+delimiter of the first sub-item's own block.  The parent's notes and
+the [[# Child]] heading between them would be handed to
+[[parse_yaml_block]] as metadata, and the sub-items would vanish.  A
+column-0 [[#]] is a safe place to stop because the renderer indents
+every literal block line by two spaces (\cref{sec:render-yaml}), so no
+line it emits inside front matter can start there; such a line can only
+be the heading that opens a sub-item.  The price is that a YAML comment
+written in column~0 inside the front matter would end the block early,
+but the renderer has never emitted one and the format has never
+promised them.
+
 <<parse optional yaml block>>=
 parent_metadata = {}
 while idx < len(lines) and not lines[idx].strip():
     idx += 1
 if idx < len(lines) and lines[idx].rstrip() == "---":
-    yaml_start = idx + 1
-    idx = yaml_start
+    opening = idx
+    idx += 1
+    closing = None
     while idx < len(lines):
         if lines[idx].rstrip() == "---":
-            yaml_text = "\n".join(
-                lines[yaml_start:idx]
-            )
-            parent_metadata = parse_yaml_block(
-                yaml_text
-            )
-            idx += 1
+            closing = idx
+            break
+        if lines[idx].startswith("#"):
             break
         idx += 1
+    if closing is None:
+        <<keep the parent block as notes>>
+    else:
+        yaml_text = "\n".join(
+            lines[opening + 1:closing]
+        )
+        parent_metadata = parse_yaml_block(yaml_text)
+        idx = closing + 1
+@
+
+When the delimiter never turns up we could report the buffer as
+malformed and exit non-zero, but that would discard the whole editing
+session---the user's only copy of the text they just typed---over one
+missing pair of dashes.  Rewinding costs nothing instead: [[idx]] goes
+back to the opening [[---]], and the loop below reads that line and
+everything after it as ordinary notes and headings.  No byte is lost,
+the sub-items are parsed as usual, and because the metadata stays empty
+[[<<update parent from parsed>>]] leaves every field of the item alone
+rather than overwriting it from a half-read block.  The stray [[---]]
+shows up in [[view]], where the user can see it and fix it on the next
+edit.
+
+<<keep the parent block as notes>>=
+idx = opening
+warnings.append(
+    "front matter opened with --- but never "
+    "closed; kept it as notes"
+)
 @
 
 The remaining content splits into parent notes (text before any
@@ -2704,15 +2995,44 @@ else:
         current_notes_lines.append(line)
 @
 
+A sub-item's block can be left open just as the parent's can, and the
+remedy mirrors the parent's for the same reason: the lines the parser
+had been setting aside as metadata are text the user typed, so they
+belong in the notes rather than in the bit bucket.  Only the detection
+differs.  The parent's block has to be scanned ahead for a delimiter
+that may not be there, whereas a sub-item's block is closed implicitly
+by the next heading or by the end of the buffer, so by the time we
+finalize the item [[in_yaml]] already answers the question.  We splice
+the [[---]] back in where it stood, after the notes collected before it
+and before the lines collected after it, so that the notes read exactly
+as they were typed.
+
 <<finalize current item>>=
 if current_item is not None:
-    if current_yaml_lines is not None:
+    if in_yaml:
+        <<keep the child block as notes>>
+    elif current_yaml_lines is not None:
         current_item.metadata = parse_yaml_block(
             "\n".join(current_yaml_lines)
         )
     current_item.notes = "\n".join(
         current_notes_lines
     ).strip()
+@
+
+The warning names the sub-item, since a document may hold many of them
+and the user needs to know which one to go and look at.
+
+<<keep the child block as notes>>=
+current_notes_lines = (
+    current_notes_lines
+    + ["---"]
+    + current_yaml_lines
+)
+warnings.append(
+    f"sub-item {current_item.title!r}: front matter "
+    "never closed; kept it as notes"
+)
 @
 
 <<finalize last item notes>>=
@@ -2835,6 +3155,90 @@ Child notes.
     assert "Child notes" in child.notes
 @
 
+The unclosed cases are worth pinning down one at a time, because the
+whole point of the rewind is what it \emph{does not} do.  First, a
+parent block with no closing delimiter: nothing may be read as
+metadata, and the sub-item below it must survive.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_block():
+    """An unclosed parent block becomes notes, not metadata."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+who: dbosk
+
+Parent notes here.
+
+# Child
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.title == "Parent Task"
+    assert result.metadata == {}
+    assert "---" in result.notes
+    assert "deadline: 2026-03-01" in result.notes
+    assert "who: dbosk" in result.notes
+    assert "Parent notes here." in result.notes
+    assert len(result.children) == 1
+    assert result.children[0].title == "Child"
+    assert "Child notes." in result.children[0].notes
+    assert len(result.warnings) == 1
+@
+
+Next, the case the heading stop exists for: the parent block is
+unclosed and the next [[---]] in the buffer belongs to a sub-item.  The
+sub-item's own metadata must still be read, which it can only be if the
+parent's scan stopped at the heading instead of consuming it.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_keeps_child_block():
+    """A sub-item's --- does not close the parent's block."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+
+# Child
+---
+command: x
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.metadata == {}
+    assert "deadline: 2026-03-01" in result.notes
+    child = result.children[0]
+    assert child.metadata.get("command") == "x"
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+@
+
+Finally the mirror image, an unclosed block inside a sub-item, whose
+warning has to name the sub-item it came from.
+
+<<test functions>>=
+def test_parse_editor_unclosed_child_block():
+    """An unclosed sub-item block becomes that item's notes."""
+    text = """Parent Task
+
+# Child
+---
+command: x
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    child = result.children[0]
+    assert child.metadata == {}
+    assert "---" in child.notes
+    assert "command: x" in child.notes
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+    assert "Child" in result.warnings[0]
+@
+
 \subsection{Rendering Todo as Markdown}
 
 The renderer is the inverse of the parser: given a [[TodoItem]]
@@ -2902,19 +3306,42 @@ We extract only non-default metadata fields so the YAML block stays
 minimal---an empty dict produces no block at all, keeping the editor
 document uncluttered for simple todos.
 
+Two of the keys are read out of [[__dict__]] rather than off the item.
+The buffer is not a report on the item, it is the item's editable
+state: whatever it shows is what [[apply_metadata]] reads back and
+stores when the user saves, so a line the user never typed is
+indistinguishable from one they did.  For [[wd]] and [[command]]---the
+two members of [[WORKER_DEFAULT_ATTRIBUTES]] this function can
+emit---an ordinary attribute read answers with the worker's configured
+default whenever the item stores nothing, and rendering \emph{that}
+would let an unrelated edit freeze runtime policy into
+[[todos.json]], which is exactly what [[to_dict]] refuses to do
+(\cref{todo:worker-defaults}).  Asking [[__dict__]] asks the question
+the buffer is actually posing: what does this item carry of its own?
+
+The remaining keys stay plain reads.  No policy stands behind them, so
+the stored value and the resolved value are the same value, and
+writing them any other way would suggest a distinction that is not
+there.
+
 <<editor infrastructure>>=
 def build_item_metadata(item):
     """Extract non-default metadata from a TodoItem.
 
+    Worker defaults are deliberately not rendered: the
+    buffer shows what the item stores, since whatever it
+    shows is stored back on save.
+
     Returns a dict suitable for YAML front matter.
     """
+    stored = item.__dict__
     meta = {}
-    if item.wd:
-        meta["wd"] = item.wd
+    if stored.get("wd"):
+        meta["wd"] = stored["wd"]
     if item.worktree:
         meta["worktree"] = item.worktree
-    if item.command:
-        meta["command"] = item.command
+    if stored.get("command"):
+        meta["command"] = stored["command"]
     if item.labels:
         meta["labels"] = item.labels
     if item.deadline:
@@ -2928,6 +3355,88 @@ def build_item_metadata(item):
     if item.description:
         meta["description"] = item.description
     return meta
+@
+
+Let's verify that the buffer really is free of policy.  With a command
+configured for the worker but nothing stored on the item, an editing
+session that changes nothing must leave the item exactly as unset as
+it found it---which it can only do if the key never appeared:
+
+<<test functions>>=
+def test_edit_buffer_hides_worker_default_command(
+  temp_todo_dir,
+):
+  """A worker-default command is neither shown nor stored."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command:" not in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] is None
+@
+
+The complement matters just as much: hiding the default must not hide
+a command the item actually carries, or the user could no longer edit
+the field at all.
+
+<<test functions>>=
+def test_edit_buffer_keeps_explicit_command(
+  temp_todo_dir,
+):
+  """An explicit command is shown and survives the trip."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      command="claude",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command: claude" in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] == "claude"
 @
 
 Children are rendered recursively, with the heading level increasing
@@ -3052,6 +3561,256 @@ def test_github_field_roundtrip():
     assert parsed["github"]["number"] == "42"
 @
 
+\subsection{Applying Metadata to an Item}
+\label{sec:apply-metadata}
+
+[[build_item_metadata]] turns an item into front matter; this is the
+inverse direction, and until now it had no home.  Front-matter keys were
+applied by an if-chain written out five times over---for the parent and
+for the matched children of [[edit]], and for the parent and the new
+children of [[add]], the latter twice because [[add]] creates children
+in its own recursion.  Five copies of one rule drift, and these had
+drifted: [[github]] was applied for the parent but for none of the
+children, so a user who linked a sub-item to an issue in the editor
+watched the link vanish on save.  Collecting the per-key normalizers
+into a single table is what stops the next key from drifting the same
+way: adding a key becomes one edit instead of five, and forgetting a
+site stops being possible.
+
+The contract is that a key \emph{present} in [[meta]] overwrites the
+field while an \emph{absent} key leaves it alone.  Deleting
+[[deadline:]] from the buffer therefore does not clear the deadline,
+and deleting the description block does not clear the description;
+[[edit N --deadline ""]] and [[edit N --description ""]] are how a
+field is cleared.  The asymmetry is deliberate: the buffer is rendered
+from the item and shows only the keys that are set, so a user who has
+never seen a key cannot be said to have deleted it.  Keys the table
+does not know are ignored rather than rejected, which leaves the front
+matter open for a user's own annotations.
+
+Each key carries the normalizer its own site already applied: [[wd]] is
+canonicalized to an absolute path, [[worktree]] is validated as a name
+without path separators, [[deadline]] is normalized to a comparable
+string, and [[estimate]] is parsed into hours.  Gathering them here
+changes none of them; it only stops them from being written out five
+times, and makes the set of keys something a reader can take in at a
+glance.
+
+Every string-valued key coerces its value with [[str]] before storing
+it.  That is not defensive habit but a consequence of the parser: our
+minimal YAML subset (\cref{sec:parse-yaml}) types a bare number for
+\emph{every} key, so a hand-typed [[wd: 2026]] arrives here as an
+[[int]].  Coercing at this one point is what keeps the field types the
+rest of the module assumes; without it the integer surfaces far from
+the editor session that stored it, in [[canonicalize_wd]], in the
+[[subprocess]] call that [[command]] feeds, or in the Markdown renderer
+and the calendar export that read [[description]].  A list-valued key
+gets the same treatment in its own shape: [[labels: grading]] is a
+string, not a list, and wrapping it makes it the one label the user
+meant rather than the six letters [[sorted(set(...))]] would otherwise
+store.
+
+[[github]] and [[env]] are the two dictionary-valued keys, and they get
+the opposite treatment---a value that is not a dictionary is left
+alone.  There is no honest dictionary to make out of [[github: 5]], and
+storing something else in a field the [[gh]] wrappers index by [[repo]]
+and [[number]] would only move the failure to the next [[sync]].  The
+sentinel [[METADATA_UNCHANGED]] lets the table say that in the same
+shape as every other entry: a normalizer that declines to produce a
+value.
+
+<<editor infrastructure>>=
+METADATA_UNCHANGED = object()
+
+
+def dict_or_unchanged(value):
+    """Return `value` when it is a dict, else the sentinel.
+
+    The sentinel `METADATA_UNCHANGED` tells
+    `apply_metadata` to leave the field untouched.
+    """
+    if isinstance(value, dict):
+        return value
+    return METADATA_UNCHANGED
+@
+
+The table maps a front-matter key to the attribute it writes and the
+normalizer that guards it.  Only [[estimate]] has a name of its own:
+the key reads as a noun in the buffer while the field it feeds,
+[[estimated]], reads as a stored fact, and renaming either now would
+break every todo file and every buffer already written.
+
+<<editor infrastructure>>=
+METADATA_FIELDS = {
+    "wd": ("wd", lambda v: canonicalize_wd(str(v))),
+    "worktree": (
+        "worktree",
+        lambda v: normalize_worktree_name(str(v)),
+    ),
+    "command": ("command", str),
+    "labels": (
+        "labels",
+        lambda v: list(v) if isinstance(v, list) else [str(v)],
+    ),
+    "deadline": (
+        "deadline",
+        lambda v: normalize_deadline(str(v)),
+    ),
+    "estimate": (
+        "estimated",
+        lambda v: parse_hours(str(v)),
+    ),
+    "who": ("who", str),
+    "github": ("github", dict_or_unchanged),
+    "env": ("env", dict_or_unchanged),
+    "description": ("description", str),
+}
+
+
+def apply_metadata(item, meta):
+    """Apply editor front-matter keys to `item` in place.
+
+    Each key present in `meta` overwrites the matching
+    field; an absent key leaves the field alone, and an
+    unknown key is ignored.
+    """
+    for key, (attribute, normalize) in METADATA_FIELDS.items():
+        if key not in meta:
+            continue
+        value = normalize(meta[key])
+        if value is not METADATA_UNCHANGED:
+            setattr(item, attribute, value)
+@
+
+Creation sites cannot simply call the helper, because a new item also
+inherits: a child takes its parent's labels, deadline and assignee, and
+[[add]] takes whatever its command line said.  They construct the item
+with the inherited values, then call [[apply_metadata]], then---on the
+[[add]] parent, the only site with flags to consider---re-apply the
+flags.  That order is the precedence rule made executable: inherited
+default below front matter below command-line flag.
+
+Let's verify the table end to end, one key at a time:
+
+<<test functions>>=
+def test_apply_metadata_applies_every_key(tmp_path):
+    """Each known key reaches its field, normalized."""
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": str(tmp_path),
+        "worktree": "fix-42",
+        "command": "claude",
+        "labels": ["DD1310", "grading"],
+        "deadline": "2026-03-01",
+        "estimate": "90m",
+        "who": "dbosk",
+        "github": {
+            "repo": "o/r", "type": "issue", "number": "7",
+        },
+        "env": {"COURSE": "DD1310"},
+        "description": "Standing statement.",
+    })
+    assert item.wd == str(tmp_path)
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.labels == ["DD1310", "grading"]
+    assert item.deadline == "2026-03-01"
+    assert isinstance(item.estimated, float)
+    assert item.estimated == pytest.approx(1.5)
+    assert item.who == "dbosk"
+    assert item.github["number"] == "7"
+    assert item.env == {"COURSE": "DD1310"}
+    assert item.description == "Standing statement."
+@
+
+The absent-key half of the contract needs an item that already has
+something to lose, so we populate every field and then hand the helper
+a document that mentions none of them:
+
+<<test functions>>=
+def test_apply_metadata_leaves_absent_keys_alone():
+    """Absent keys keep their fields; unknown keys are ignored."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=2.0,
+        who="dbosk",
+        description="Kept.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+        env={"COURSE": "DD1310"},
+    )
+    apply_metadata(item, {"mystery": "ignored"})
+    assert item.labels == ["DD1310"]
+    assert item.deadline == "2026-03-01"
+    assert item.estimated == 2.0
+    assert item.who == "dbosk"
+    assert item.description == "Kept."
+    assert item.wd == "/tmp/project"
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.github == {"repo": "o/r", "number": "7"}
+    assert item.env == {"COURSE": "DD1310"}
+    assert not hasattr(item, "mystery")
+@
+
+The table is also where the round trip closes, so it is worth asserting
+that it does: every key the renderer can put in the buffer must be a key
+the applier knows, or the editor would show the user a field it then
+quietly refuses to read back.
+
+<<test functions>>=
+def test_metadata_fields_covers_rendered_keys():
+    """Every rendered front-matter key is one the table knows."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=1.5,
+        who="dbosk",
+        description="Standing statement.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+    )
+    assert set(build_item_metadata(item)) <= set(
+        METADATA_FIELDS
+    )
+@
+
+Finally the coercion rule, exercised with exactly what the YAML
+subset produces for hand-typed numbers.  We change directory first
+because [[canonicalize_wd]] resolves [[2026]] as a relative path, and
+what we are checking is that it arrives there as a string at all:
+
+<<test functions>>=
+def test_apply_metadata_coerces_yaml_scalars(
+    tmp_path, monkeypatch,
+):
+    """Bare numbers become strings and a lone label a list."""
+    monkeypatch.chdir(tmp_path)
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": 2026,
+        "command": 42,
+        "who": 7,
+        "description": 3.5,
+        "labels": "grading",
+        "github": 5,
+    })
+    assert isinstance(item.wd, str)
+    assert item.wd == str(tmp_path / "2026")
+    assert item.command == "42"
+    assert item.who == "7"
+    assert item.description == "3.5"
+    assert item.labels == ["grading"]
+    assert item.github is None
+@
+
 \subsection{Editor Invocation}
 
 Opening the user's preferred editor follows the standard UNIX
@@ -3111,7 +3870,25 @@ def open_editor(initial_content=""):
             pass
 @
 
-\section{Binary Search Priority}
+The other half of the round trip is telling the user what the parser
+had to tolerate.  Both [[add --edit]] and [[edit --edit]] report it the
+same way, so the report is a chunk they share.  The warnings are
+advisory rather than fatal: the parse kept every line the user typed,
+so there is nothing to roll back and the save goes ahead as usual.
+They go to stderr, alongside the module's other diagnostics, so that
+they stay out of the item and sub-item lines the commands print as
+their result.
+
+The chunk reads [[parsed]], which both call sites bind immediately
+before they expand it.
+
+<<echo parse warnings>>=
+for warning in parsed.warnings:
+    typer.echo(f"Warning: {warning}", err=True)
+@
+
+\section{Binary Search Priority}%
+\label{todo:binary-search}
 
 When a user adds a new todo, we need to determine where it falls in
 the priority order relative to existing items. Rather than asking the
@@ -3184,17 +3961,9 @@ def binary_search_priority(
         if sibling.priority is not None
     ]
     if not ranked_siblings:
-        if parent is not None and todos is not None:
-            if parent.priority is None:
-                raise ValueError(
-                    "cannot assign numeric priority under "
-                    "an unranked parent"
-                )
-            high, low = compute_child_priority_range(
-                todos, parent
-            )
-            return (high + low) / 2.0
-        return 1.0
+        return default_priority_without_siblings(
+            parent, todos
+        )
 
     sorted_items = sorted(
         ranked_siblings,
@@ -3233,49 +4002,32 @@ def binary_search_priority(
 def assign_priority_at_position(
     sorted_items: list[TodoItem],
     position: int,
+    priority_of=require_effective_priority,
 ) -> float:
     """Compute a priority value at the given insertion
     position in a sorted (descending) list.
 
     The priority is the midpoint between neighbors,
-    or offset by 1.0 at the edges.
+    or offset by 1.0 at the edges.  `priority_of` reads
+    the number to interpolate between; the binary search
+    compares what the user sees, so it keeps the default
+    effective priority, while the non-interactive
+    placement flags pass the stored one.
     """
     if not sorted_items:
         return 1.0
 
     if position == 0:
-        top = require_effective_priority(sorted_items[0])
+        top = priority_of(sorted_items[0])
         return top + 1.0
 
     if position >= len(sorted_items):
-        bottom = require_effective_priority(
-            sorted_items[-1]
-        )
+        bottom = priority_of(sorted_items[-1])
         return bottom - 1.0
 
-    above = require_effective_priority(
-        sorted_items[position - 1]
-    )
-    below = require_effective_priority(
-        sorted_items[position]
-    )
+    above = priority_of(sorted_items[position - 1])
+    below = priority_of(sorted_items[position])
     return (above + below) / 2.0
-
-
-def append_priority_after_siblings(
-    siblings: list[TodoItem],
-) -> float:
-    """Return a base priority below all sibling bases."""
-    ranked_siblings = [
-        item for item in siblings
-        if item.priority is not None
-    ]
-    if not ranked_siblings:
-        return 1.0
-    bottom = min(
-        item.priority for item in ranked_siblings
-    )
-    return bottom - 1.0
 @
 
 After the binary search narrows down the position, we compute the
@@ -3376,6 +4128,464 @@ def test_assign_priority_between():
     ]
     p = assign_priority_at_position(items, 1)
     assert p == 4.0
+@
+
+\section{Placing an Item Without Asking}%
+\label{todo:placement}
+
+The binary search is the right tool when a human is at the keyboard
+and the wrong one for a script.  An agent that creates a module's
+worth of tasks already knows where each one belongs; what it lacks is
+a way to say so, and the workaround---piping a stream of [[y]] or
+[[n]] answers into the prompt---reaches only the two extremes and
+exits on a broken pipe.
+
+Four requests turn out to be the same request.  [[add --top]] and
+[[add --bottom]] place a new item at one end of its sibling list;
+[[reprioritize --above]] and [[--below]] place an existing item next
+to a named neighbour; [[edit --top]] and [[--bottom]] re-rank where
+the item already is; and the re-ranking after [[edit --parent]] does
+it among siblings the item has just joined.  All of them ask
+\enquote{put this item at this position among these siblings}, so they
+share one helper.  Sharing is not merely tidy here: the interesting
+placements are the ones \emph{between} two neighbours, and a caller
+that computes its own midpoint is a caller that will eventually
+disagree with the others about the empty list, the outer edges, or
+which of the two priority numbers to interpolate.
+
+\subsection{Naming a Position}
+
+[[assign_priority_at_position]] already takes an insertion index, so
+each flag only has to name one.  [[--top]] and [[--bottom]] name the
+ends directly.  [[--above]] and [[--below]] name a neighbour instead,
+which is the same thing once the siblings are sorted: the slot just
+above a target is the target's own index, and the slot just below it
+is the next one.
+
+<<constants>>=
+PLACE_TOP = "top"
+PLACE_BOTTOM = "bottom"
+PLACE_ABOVE = "above"
+PLACE_BELOW = "below"
+<<placement helpers>>=
+def sibling_insert_position(
+    ordered: list[TodoItem],
+    placement: str,
+    target: TodoItem | None = None,
+) -> int:
+    """Return the insertion index named by `placement`.
+
+    `ordered` holds ranked siblings, highest stored
+    priority first.  `PLACE_ABOVE` and `PLACE_BELOW`
+    need `target`, a sibling present in `ordered`.
+    """
+    if placement == PLACE_TOP:
+        return 0
+    if placement == PLACE_BOTTOM:
+        return len(ordered)
+    index = next(
+        i
+        for i, sibling in enumerate(ordered)
+        if sibling.id == target.id
+    )
+    if placement == PLACE_ABOVE:
+        return index
+    return index + 1
+@
+
+\subsection{Ordering by Stored Priority}
+
+Placement reads the \emph{stored} priorities, not the effective ones.
+A deadline boost is temporary by design
+(\cref{todo:effective-priority}): interpolating between boosted scores
+and storing the result would let a sibling one day from its deadline
+donate its urgency to the item we are placing, and that borrowed
+urgency would outlive the deadline that justified it.  This is the
+argument the [[--append]] path has always made; what changes is that
+it now covers every non-interactive placement instead of one of them.
+
+<<placement helpers>>=
+def require_stored_priority(item: TodoItem) -> float:
+    """Return the stored base priority of a ranked item."""
+    if item.priority is None:
+        raise ValueError(
+            f"todo #{item.id} has no numeric priority"
+        )
+    return item.priority
+
+
+def sort_siblings_by_stored_priority(
+    siblings: list[TodoItem],
+) -> list[TodoItem]:
+    """Return the ranked siblings, highest stored
+    priority first."""
+    ranked = [
+        sibling
+        for sibling in siblings
+        if sibling.priority is not None
+    ]
+    return sorted(
+        ranked,
+        key=require_stored_priority,
+        reverse=True,
+    )
+@
+
+\subsection{The Shared Placement Helper}
+
+With a position and an ordering, placement is one call.  The empty
+comparison set is the only case needing separate treatment, and it
+gets the rule the interactive path already uses
+(\cref{sec:child-priority-helpers}) rather than a second opinion of
+its own.
+
+<<placement helpers>>=
+def place_among_siblings(
+    siblings: list[TodoItem],
+    placement: str,
+    target: TodoItem | None = None,
+    parent: TodoItem | None = None,
+    todos: list[TodoItem] | None = None,
+) -> float:
+    """Return a stored priority placing an item at
+    `placement` among `siblings`.
+
+    `placement` is one of the `PLACE_*` values;
+    `PLACE_ABOVE` and `PLACE_BELOW` need `target`.
+    `parent` and `todos` supply the fallback range for a
+    level with no ranked sibling yet.
+    """
+    ordered = sort_siblings_by_stored_priority(siblings)
+    if not ordered:
+        return default_priority_without_siblings(
+            parent, todos
+        )
+    return assign_priority_at_position(
+        ordered,
+        sibling_insert_position(
+            ordered, placement, target
+        ),
+        priority_of=require_stored_priority,
+    )
+@
+
+Let's verify that the ends and the interior all read stored numbers,
+and that a placement next to a named neighbour lands strictly between
+that neighbour and the one beyond it:
+
+<<test functions>>=
+def test_place_among_siblings_at_the_ends():
+    """--top and --bottom step past the outermost sibling."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_TOP
+    ) == 6.0
+    assert place_among_siblings(
+        siblings, PLACE_BOTTOM
+    ) == 2.0
+
+
+def test_place_among_siblings_beside_a_target():
+    """--above and --below split the neighbouring gap."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=6.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=4.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=3, title="C", priority=2.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_ABOVE, siblings[1]
+    ) == 5.0
+    assert place_among_siblings(
+        siblings, PLACE_BELOW, siblings[1]
+    ) == 3.0
+
+
+def test_place_among_siblings_beside_an_extreme():
+    """A target at the end behaves like --top or --bottom."""
+    siblings = [
+        TodoItem(id=1, title="A", priority=5.0,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="B", priority=3.0,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_among_siblings(
+        siblings, PLACE_ABOVE, siblings[0]
+    ) == 6.0
+    assert place_among_siblings(
+        siblings, PLACE_BELOW, siblings[1]
+    ) == 2.0
+
+
+def test_place_among_siblings_ignores_deadline_boost():
+    """Placement interpolates stored, not effective, values."""
+    now = datetime.datetime.now()
+    created = (
+        now - datetime.timedelta(days=29)
+    ).isoformat()
+    siblings = [
+        TodoItem(
+            id=1, title="Stable", priority=5.0,
+            created=created,
+        ),
+        TodoItem(
+            id=2, title="Urgent soon", priority=1.0,
+            created=created,
+            deadline=(
+                now + datetime.timedelta(days=1)
+            ).isoformat(),
+        ),
+    ]
+    assert effective_priority(siblings[1]) > 1.0
+    assert place_among_siblings(
+        siblings, PLACE_BOTTOM
+    ) == 0.0
+
+
+def test_place_among_siblings_without_siblings():
+    """An empty level starts in the parent's range."""
+    parent = TodoItem(
+        id=1, title="Parent", priority=5.0,
+        created="2026-01-01T00:00:00",
+    )
+    assert place_among_siblings(
+        [], PLACE_TOP, parent=parent, todos=[parent]
+    ) == 0.0
+    assert place_among_siblings([], PLACE_BOTTOM) == 1.0
+@
+
+\subsection{Re-ranking an Item That Already Exists}
+
+Two commands re-rank an item already on disk.  [[reprioritize]] does
+it on request; [[edit]] does it after [[--parent]] has moved the item,
+because a number chosen among the old siblings says nothing about the
+new ones.  Both need the same three answers---which parent bounds the
+range, which siblings form the comparison set, and how a placement
+becomes a number---so both ask one function rather than assembling
+their own.
+
+The comparison set is the item's active, ranked siblings for its own
+worker.  Restricting it to one worker is what makes the resulting
+number mean anything at all (\cref{todo:sub-item-helpers}); excluding
+done siblings keeps the ordering about work that is still ahead.
+
+<<placement helpers>>=
+def comparison_siblings(
+    todos: list[TodoItem], item: TodoItem
+) -> list[TodoItem]:
+    """Return the siblings `item` is ranked against.
+
+    These are the active, ranked siblings assigned to the
+    same worker, highest stored priority first.
+    """
+    return sort_siblings_by_stored_priority(
+        get_active_siblings(
+            todos,
+            item,
+            who=item.who or default_username,
+            ranked_only=True,
+        )
+    )
+@
+
+An unranked parent is a boundary rather than an error at this level.
+Children of an unranked parent stay unranked---that is the invariant
+[[add]] enforces when it creates them---so a re-ranking helper that
+raised here would only force every caller to pre-check the same
+condition.  Returning [[None]] instead lets the caller store exactly
+what it was handed: an item that has just moved under an unranked
+parent becomes unranked itself, and the invariant survives the move.
+
+<<placement helpers>>=
+def place_existing_item(
+    todos: list[TodoItem],
+    item: TodoItem,
+    placement: str | None = None,
+    target: TodoItem | None = None,
+) -> float | None:
+    """Return a new stored priority for `item`.
+
+    `placement` is one of the `PLACE_*` values, or `None`
+    to ask the user through the interactive binary
+    search.  Returns `None` when the item's parent is
+    itself unranked, since a ranked child of an unranked
+    parent has no interval to live in.
+    """
+    parent_ctx = get_parent(todos, item)
+    if (
+        parent_ctx is not None
+        and parent_ctx.priority is None
+    ):
+        return None
+    siblings = comparison_siblings(todos, item)
+    if placement is None:
+        return binary_search_priority(
+            siblings,
+            item,
+            parent=parent_ctx,
+            todos=todos,
+        )
+    return place_among_siblings(
+        siblings,
+        placement,
+        target,
+        parent=parent_ctx,
+        todos=todos,
+    )
+@
+
+Let's verify that the comparison set excludes what it should, and that
+an unranked parent short-circuits the whole computation instead of
+reaching the binary search:
+
+<<test functions>>=
+def test_comparison_siblings_excludes_others():
+    """Done, unranked and other workers' items are out."""
+    todos = [
+        TodoItem(id=1, title="Me", priority=5.0,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=2, title="Also me", priority=3.0,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=3, title="Done", priority=4.0,
+                 status="done",
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=4, title="Unranked",
+                 priority=None,
+                 created="2026-01-01T00:00:00",
+                 who=default_username),
+        TodoItem(id=5, title="Theirs", priority=9.0,
+                 created="2026-01-01T00:00:00",
+                 who="other-worker"),
+    ]
+    assert [
+        s.id for s in comparison_siblings(todos, todos[0])
+    ] == [2]
+
+
+def test_place_existing_item_under_unranked_parent():
+    """An unranked parent leaves the child unranked."""
+    todos = [
+        TodoItem(id=1, title="Unranked parent",
+                 priority=None,
+                 created="2026-01-01T00:00:00"),
+        TodoItem(id=2, title="Child", priority=3.0,
+                 parent_id=1,
+                 created="2026-01-01T00:00:00"),
+    ]
+    assert place_existing_item(
+        todos, todos[1], PLACE_TOP
+    ) is None
+@
+
+\subsection{A Sibling List for the Command Tests}
+
+Three commands place items now, and each of them is easiest to read
+against the same four siblings: the gaps between them are two units
+wide, so every midpoint is a whole number and a test can assert
+[[== 5.0]] instead of explaining the arithmetic first.  The item that
+moves starts at the bottom, which makes every placement a visible
+change.
+
+<<test functions>>=
+@pytest.fixture
+def ranked_siblings(temp_todo_dir):
+  """Four ranked top-level items for one worker."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="First", priority=6.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Second", priority=4.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="Third", priority=2.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=4, title="Mover", priority=0.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  return temp_todo_dir
+
+
+def stored_priority(todo_id):
+  """Read one item's stored priority back from disk."""
+  _, todos = load_todos()
+  return next(
+    t for t in todos if t.id == todo_id
+  ).priority
+@
+
+\subsection{Refusing Contradictory Instructions}
+
+Every command that can place an item offers several ways to say where,
+and no two of them can be honoured at once: [[--prio]] says
+\enquote{this exact number}, [[--top]] and [[--bottom]] say
+\enquote{derive one from the siblings}, and [[--skip-priority]] and
+[[--keep-prio]] say \enquote{do not derive one at all}.  Silently
+letting one win would make a script's mistake invisible for as long as
+the two flags happen to agree, so we refuse the combination instead.
+
+The check is table-driven because the three commands offer different
+subsets of the flags and would otherwise each grow their own ladder of
+pairwise comparisons; a caller lists the flags it accepts, in the order
+it wants them named, and gets the same message shape everywhere.
+
+<<placement helpers>>=
+def reject_conflicting_flags(flags: dict) -> None:
+    """Exit when more than one placement flag is set.
+
+    `flags` maps option spellings to whether the caller
+    used them; the first two that are set are named in
+    the error.
+    """
+    used = [
+        name for name, active in flags.items() if active
+    ]
+    if len(used) > 1:
+        typer.echo(
+            f"Error: {used[0]} and {used[1]} cannot be "
+            "used together",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+Let's verify that one flag passes, that two are rejected in the order
+the caller listed them, and that the rejection is an exit rather than
+an exception the CLI would show as a traceback:
+
+<<test functions>>=
+def test_reject_conflicting_flags_allows_one():
+    """A single placement flag is not a conflict."""
+    reject_conflicting_flags(
+        {"--top": True, "--bottom": False}
+    )
+
+
+def test_reject_conflicting_flags_names_both():
+    """Two flags exit and are named in listing order."""
+    with pytest.raises(typer.Exit):
+        reject_conflicting_flags(
+            {"--top": True, "--bottom": True}
+        )
 @
 
 \section{Shell Autocompletion}
@@ -5018,7 +6228,9 @@ def add(
     """Add a new todo item.
 
     Priority is determined by interactive binary search
-    comparison with existing items at the same level.
+    comparison with existing items at the same level,
+    unless --prio, --top, --bottom or --skip-priority
+    says otherwise.
 
     \b
     Examples:
@@ -5057,9 +6269,6 @@ estimate_opt = typer.Option(
     "--estimate", "-e",
     help="Estimate (hours unless suffixed, "
          "e.g. 1.5, 1.5h, 90m, 1h30m)")
-description_opt = typer.Option(
-    "--description",
-    help="Body text of the item")
 @
 
 <<add command options>>=
@@ -5067,29 +6276,201 @@ deadline: Annotated[str | None,
                     deadline_opt] = None,
 estimate: Annotated[str | None,
                     estimate_opt] = None,
+@
+
+\enquote{Description} and \enquote{notes} name two fields whose
+contents are easy to confuse, and the difference decides which of them
+a piece of text belongs in.  The description is the item's standing
+statement: one line saying what the task is and why it exists, short
+enough to sit beside the title wherever the item is shown.  The notes
+are everything that accumulates afterwards---what was found while
+planning it, what [[note]] appended while working on it, what has to
+happen before it can be called done.  A description is \emph{rewritten}
+when the task changes; notes only ever \emph{grow}.
+
+The help text has to carry that distinction, because the field names
+alone do not: a user who reaches for [[--description]] to record three
+paragraphs of detail is putting a growing log into the field the
+listings expect to be one line.  It also records the one editing idiom
+that cannot be guessed, that [[edit --description ""]] clears the
+field.  Everywhere else in [[edit]] an omitted option means
+\enquote{leave this alone}, so without the sentence the empty string
+looks like the same no-op rather than the one way to erase a
+description.
+
+<<argument and option definitions>>=
+description_opt = typer.Option(
+    "--description",
+    help="One-line statement of the item (what and "
+         "why); put details in --note or the note "
+         "command. On edit, an empty string clears it.")
+@
+
+<<add command options>>=
 description: Annotated[str | None,
                        description_opt] = "",
 @
 
+Let's verify that the sentence reaches the user whole.  Typer wraps
+option help into a bordered panel, so the assertion compares against
+the output with the border characters and the line breaks flattened
+away; matching a short fragment instead would pass just as happily
+on a sentence that had lost its second half.
+
+<<test functions>>=
+def test_add_help_points_at_notes_and_clearing(temp_todo_dir):
+  """--description's help names --note and the clearing idiom."""
+  result = runner.invoke(cli, ["add", "--help"])
+  assert result.exit_code == 0
+  ascii_only = "".join(
+    c if c.isascii() else " " for c in result.output
+  )
+  helptext = " ".join(ascii_only.split())
+  assert (
+    "One-line statement of the item (what and why); "
+    "put details in --note or the note command. "
+    "On edit, an empty string clears it." in helptext
+  )
+@
+
+If the details belong in the notes, then creating an item with details
+takes two commands---[[add]], then [[note]]---and what is a minor
+annoyance once becomes the dominant cost when a script creates a
+hundred items and pays two invocations for each.  [[--note]] closes
+that gap by taking the note text at creation time.
+
+The option repeats instead of taking one long string because a note is
+a paragraph.  Each [[--note]] is one thought---a link, a constraint,
+something to check---and several short quoted arguments are far easier
+to type at a shell than one argument with embedded newlines.
+
+<<argument and option definitions>>=
+note_opt = typer.Option(
+    "--note",
+    help="Note paragraph, repeatable "
+         "(joined by blank lines)")
+@
+
+<<add command options>>=
+note: Annotated[list[str] | None,
+                note_opt] = None,
+@
+
+Those paragraphs are joined with a blank line between them, not with a
+single newline, because notes are read back as Markdown by [[view]].
+Markdown folds consecutive lines into one paragraph, so joining
+[[--note a --note b]] with a newline would render as \enquote{a b};
+the blank line is what keeps two notes two notes.
+
+<<join note paragraphs>>=
+notes_text = "\n\n".join(note) if note else ""
+@
+
 Most of the time we infer priority interactively by comparing the new
 item with its siblings. Sometimes, however, the caller already knows the
-numeric value or simply wants to add the item after the current lowest-
-priority sibling. The [[--prio]] option handles the former case, while
-[[--append]] keeps the latter non-interactive.
+numeric value, or knows only that the item belongs at one end of the
+list.  The [[--prio]] option handles the first case; [[--top]] and
+[[--bottom]] keep the second non-interactive.
 
-The new [[--skip-priority]] flag covers a third case: capturing a task
+The [[--skip-priority]] flag covers a third case: capturing a task
 without ranking it yet.  That is useful when triaging a backlog or when
 the right comparison set is not available at creation time.  Unranked
 items sort after ranked ones until [[reprioritize]] assigns them a numeric
-position:
+position.
+
+\paragraph{What the number means.}
+A priority is a bare float with no scale attached, which leaves three
+questions a caller cannot answer by experiment without writing to the
+real task list: which direction is urgent, whether values below zero
+are allowed, and why the number that comes back out of [[ls]] is
+larger than the one that went in (\cref{todo:effective-priority}).  One
+paragraph answers all three, and it lives in a constant so that the
+four places a priority surfaces cannot answer them differently.
+
+The paragraph deliberately says nothing about spelling, because
+[[ls -p]] uses it too and has no value to spell.  Options that take a
+value add that sentence themselves: a leading minus makes the argument
+look like another option to the parser, so [[--prio=-10]] is the form
+that works---the one thing a caller cannot discover from the type
+annotation.
+
+<<constants>>=
+PRIORITY_HELP = (
+    "Priority is a float and higher means more urgent; "
+    "any value is allowed, negative ones included. "
+    "Listings show the effective priority: the stored "
+    "number plus a boost that grows as a deadline "
+    "approaches."
+)
+PRIORITY_VALUE_HELP = (
+    PRIORITY_HELP
+    + " Write a negative value as --prio=-10; "
+    "'ls -p' shows the effective one."
+)
+@
+
+Let's verify that the paragraph actually reaches all four places.  The
+help is rendered into a box and wrapped to the terminal width, so the
+assertion compares whitespace-normalised text with the box rules
+stripped; comparing the raw string would only test how wide the
+terminal happened to be.
+
+<<test functions>>=
+def normalized_help(args):
+  """Return one command's help as a single line."""
+  result = runner.invoke(cli, args)
+  assert result.exit_code == 0
+  return " ".join(
+    result.output.replace("│", " ").split()
+  )
+
+
+@pytest.mark.parametrize(
+  "args",
+  [
+    ["add", "--help"],
+    ["edit", "--help"],
+    ["reprioritize", "--help"],
+    ["ls", "--help"],
+  ],
+)
+def test_priority_help_is_shared(args):
+  """Every priority-bearing command explains the scale."""
+  assert (
+    " ".join(PRIORITY_HELP.split())
+    in normalized_help(args)
+  )
+
+
+@pytest.mark.parametrize(
+  "command", ["add", "edit"],
+)
+def test_prio_help_shows_the_negative_spelling(command):
+  """The options taking a value document --prio=-10."""
+  assert "--prio=-10" in normalized_help(
+    [command, "--help"]
+  )
+@
+
+[[--append]] was the original name of [[--bottom]], from a time when
+placing an item last was the only non-interactive choice.  Now that
+[[--top]] exists, a pair of opposites reads better than a verb and its
+missing mirror image, but the old name stays registered on the same
+option: it appears in scripts, in the shell history of everyone who has
+used it, and in this document's own tests, and an alias costs one
+string.
 
 <<argument and option definitions>>=
 prio_opt = typer.Option(
     "--prio",
-    help="Set explicit priority")
-append_opt = typer.Option(
-    "--append",
-    help="Append after lowest-priority sibling")
+    help=PRIORITY_VALUE_HELP)
+top_opt = typer.Option(
+    "--top",
+    help="Place above the highest-priority sibling")
+bottom_opt = typer.Option(
+    "--bottom", "--append",
+    help="Place below the lowest-priority sibling "
+         "(--append is the old name)")
 skip_prio_opt = typer.Option(
     "--skip-priority",
     help="Create without assigning a numeric priority")
@@ -5098,7 +6479,8 @@ skip_prio_opt = typer.Option(
 <<add command options>>=
 explicit_priority: Annotated[float | None,
                              prio_opt] = None,
-append: Annotated[bool, append_opt] = False,
+top: Annotated[bool, top_opt] = False,
+bottom: Annotated[bool, bottom_opt] = False,
 skip_priority: Annotated[bool, skip_prio_opt] = False,
 @
 
@@ -5209,16 +6591,30 @@ who_filter_opt = typer.Option(
     autocompletion=complete_todo_workers)
 @
 
+[[add]] is the one command whose [[--who]] must default to [[None]]
+rather than to [[default_username]].  Its editor buffer carries a
+[[who:]] key (\cref{sec:add-via-editor}) and the flags are applied
+\emph{after} the front matter, so a default value would be
+indistinguishable from a typed [[-w]] and would overwrite whatever the
+user changed that key to: the one field the buffer advertises would be
+the one field the buffer could not set.  [[None]] is what makes
+\enquote{the user did not choose} expressible at all, and the price is
+that resolving it to a name moves out of the signature and into the
+three places that need one---the sibling set to compare against, the
+[[who:]] line the buffer opens with, and the item finally stored.
+
 <<add command options>>=
 parent: Annotated[int | None,
                   parent_opt] = None,
 top_level: Annotated[bool, top_level_opt] = False,
-who: Annotated[str | None,
-               who_opt] = default_username,
+who: Annotated[str | None, who_opt] = None,
 @
 
-Now the implementation. We first reject contradictory flags, then
-resolve the parent ID, determine the priority, and finally save.
+Now the implementation. We first reject contradictory flags and fold
+the [[--note]] paragraphs into one string, then resolve the parent ID,
+determine the priority, and finally save.  The fold happens before the
+branch because both ways of creating an item need the result: the
+flag path stores it, and the editor path shows it.
 
 <<add command implementation>>=
 next_id, todos = load_todos()
@@ -5232,6 +6628,7 @@ except typer.BadParameter as exc:
     raise typer.Exit(1)
 
 <<validate add options>>
+<<join note paragraphs>>
 
 if edit_mode:
     <<add via editor>>
@@ -5239,37 +6636,69 @@ else:
     <<add via cli flags>>
 @
 
-Some combinations would give contradictory instructions. In
-particular, [[--prio]] says 
-\enquote{use exactly this numeric value} while
-[[--append]] says 
-\enquote{derive a value by placing the item after its
-siblings}. Rather than silently picking one interpretation, we reject
-the combination and ask the user to choose.  [[--skip-priority]] is also
-exclusive with both numeric modes: either we store a number now, or we
-store no number and leave the item for later ranking:
+Some combinations would give contradictory instructions, and the shared
+validator (\cref{todo:placement}) rejects them all.  The listing order
+decides how a conflict is phrased, so we put the flag that suppresses
+ranking first and the two derived placements last, which reads as a
+progression from \enquote{no number} through \enquote{this number} to
+\enquote{work one out}:
 
 <<validate add options>>=
-if explicit_priority is not None and append:
-    typer.echo(
-        "Error: --prio and --append cannot be used together",
-        err=True,
-    )
-    raise typer.Exit(1)
-if skip_priority and explicit_priority is not None:
-    typer.echo(
-        "Error: --skip-priority and --prio cannot be "
-        "used together",
-        err=True,
-    )
-    raise typer.Exit(1)
-if skip_priority and append:
-    typer.echo(
-        "Error: --skip-priority and --append cannot be "
-        "used together",
-        err=True,
-    )
-    raise typer.Exit(1)
+reject_conflicting_flags({
+    "--skip-priority": skip_priority,
+    "--prio": explicit_priority is not None,
+    "--top": top,
+    "--bottom": bottom,
+})
+@
+
+The three tests further down that spell the flag [[--append]] pin the
+alias itself; this table pins the matrix, using the canonical names so
+that a message read from a terminal can be matched against it word for
+word:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--skip-priority", "--prio", "5"],
+      "--skip-priority and --prio cannot be used together",
+    ),
+    (
+      ["--skip-priority", "--top"],
+      "--skip-priority and --top cannot be used together",
+    ),
+    (
+      ["--skip-priority", "--bottom"],
+      "--skip-priority and --bottom cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--top"],
+      "--prio and --top cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--bottom"],
+      "--prio and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+  ],
+)
+def test_add_rejects_flag_pairs(
+  temp_todo_dir, flags, message,
+):
+  """Every pair of priority flags is refused."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Conflicting", "--top-level", *flags],
+  )
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert todos == []
 @
 
 The CLI-flag path is the original flow: resolve parent, determine the
@@ -5395,13 +6824,20 @@ def test_ls_survives_unparseable_deadline(temp_todo_dir):
 @
 
 Priority selection has three modes. [[--prio]] bypasses all inference.
-[[--append]] keeps the operation non-interactive by placing the item at
-the bottom of the current sibling list. Otherwise we fall back to the
-interactive binary search, which remains the default because it
-preserves the existing 
+[[--top]] and [[--bottom]] keep the operation non-interactive by placing
+the item at one end of the current sibling list. Otherwise we fall back
+to the interactive binary search, which remains the default because it
+preserves the existing
 \enquote{compare against nearby tasks} workflow.  In all three modes
 the sibling set is scoped to the target worker ([[--who]]) so that
 priorities stay meaningful within one person's task list.
+
+That scoping is why the first of the three resolutions of [[who]] sits
+here.  [[get_active_siblings]] reads a [[None]] worker as
+\enquote{every worker} rather than as \enquote{the current one}, so
+handing it the unresolved flag would silently compare the new item
+against other people's tasks whenever [[--who]] was omitted---which is
+almost always.
 
 [[--skip-priority]] is the one exception: it deliberately bypasses all
 numeric placement and stores [[None]] instead.
@@ -5409,23 +6845,16 @@ numeric placement and stores [[None]] instead.
 An unranked parent is an even stronger constraint.  Until the parent
 itself has a numeric priority there is no child interval to place new
 work into, so every newly added child stays unranked regardless of
-whether the caller asked for [[--prio]], [[--append]], or the default
-interactive comparison.
+whether the caller asked for [[--prio]], [[--top]], [[--bottom]], or
+the default interactive comparison.
 
-The append path works from stored base priorities, not
-[[effective_priority]].  Deadline boost is intentionally temporary; if we
-reused an effective score as a newly stored base priority, an urgent
-sibling could donate its temporary boost to the appended item and change
-the long-term ordering.
-
-The empty-sibling case under a parent is different.  There the child
-range is still completely unused, so 
-placing the first child at the midpoint is not a failure to append.
-Instead it preserves room on both sides for later siblings, mirroring
-the same 
-binary-search insertion strategy we use elsewhere: the first placement
-creates a balanced starting point, and later children can still be added
-above or below it without forcing an early renumbering.
+Both ends go through [[place_among_siblings]]
+(\cref{todo:placement}), which is where the reasoning about stored
+versus effective priorities and about the still-empty level now lives.
+Routing [[--bottom]] through it rather than through a bespoke
+\enquote{one below the minimum} calculation is what guarantees that
+[[--top]] and [[--bottom]] remain exact mirror images of each other as
+that reasoning evolves.
 
 <<resolve priority for new todo>>=
 # Build a candidate item once so sibling lookup and interactive
@@ -5441,7 +6870,9 @@ candidate = TodoItem(
     ),
 )
 siblings = get_active_siblings(
-    todos, candidate, who=who, ranked_only=True,
+    todos, candidate,
+    who=who or default_username,
+    ranked_only=True,
 )
 parent_ctx = (
     parent_item if resolved_parent is not None
@@ -5453,24 +6884,71 @@ elif skip_priority:
     priority = None
 elif explicit_priority is not None:
     priority = explicit_priority
-elif append:
-    if siblings:
-        priority = append_priority_after_siblings(
-            siblings
-        )
-    elif parent_ctx is not None:
-        high, low = compute_child_priority_range(
-            todos, parent_ctx
-        )
-        priority = (high + low) / 2.0
-    else:
-        priority = 1.0
+elif top or bottom:
+    priority = place_among_siblings(
+        siblings,
+        PLACE_TOP if top else PLACE_BOTTOM,
+        parent=parent_ctx,
+        todos=todos,
+    )
 else:
     priority = binary_search_priority(
         siblings,
         candidate,
         parent=parent_ctx, todos=todos,
     )
+@
+
+Let's verify that the two ends are mirror images: with siblings at
+[[6.0]] and [[4.0]] and [[2.0]], [[--top]] must land above the first
+and [[--bottom]] below the last, and the old spelling must land in the
+same place as the new one.  The last test covers the spelling a
+negative value needs: a bare [[--prio -10]] is read as another option
+by the parser, so [[--prio=-10]] is the form the help text shows:
+
+<<test functions>>=
+def test_add_top_lands_above_the_highest(ranked_siblings):
+  """--top places the new item above every sibling."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Topped", "--top", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == 7.0
+
+
+def test_add_bottom_lands_below_the_lowest(
+  ranked_siblings,
+):
+  """--bottom places the new item below every sibling."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Bottomed", "--bottom", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == -1.0
+
+
+def test_add_append_matches_bottom(ranked_siblings):
+  """The --append alias still means --bottom."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Appended", "--append", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(5) == -1.0
+
+
+def test_add_negative_prio_with_equals_sign(
+  temp_todo_dir,
+):
+  """--prio=-10 stores a negative priority."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Sunk", "--prio=-10", "--top-level"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(1) == -10.0
 @
 
 When [[--here]] is used, we capture the current working directory and
@@ -5640,9 +7118,19 @@ if capture_env:
     resolved_env = dict(os.environ)
 @
 
+Here is the second of the three resolutions of [[who]].  The flag path
+has no front matter to wait for, so it can settle the assignee at
+once.  We bind the result under a new name instead of reassigning
+[[who]] because the two mean different things---one is what the user
+asked for, the other is who the item ends up belonging to---and only
+the second may be stored.  An item is always assigned to somebody: an
+ownerless one would be invisible to [[ls]] and [[next]], which filter
+by worker.
+
 <<create and save new todo>>=
 now = datetime.datetime.now().isoformat()
 <<resolve wd and env for new todo>>
+resolved_who = who or default_username
 estimated_hours = (
     parse_hours(estimate) if estimate else None
 )
@@ -5656,8 +7144,9 @@ item = TodoItem(
     deadline=inherited_deadline,
     estimated=estimated_hours,
     description=description or "",
+    notes=notes_text,
     parent_id=resolved_parent,
-    who=who,
+    who=resolved_who,
     wd=resolved_wd,
     worktree=normalize_worktree_name(worktree),
     env=resolved_env,
@@ -5673,8 +7162,8 @@ if inherited_deadline:
     typer.echo(f"  Deadline: {inherited_deadline}")
 if estimated_hours:
     typer.echo(f"  Estimate: {estimated_hours}h")
-if who:
-    typer.echo(f"  Assigned: {who}")
+if resolved_who:
+    typer.echo(f"  Assigned: {resolved_who}")
 if resolved_wd:
     typer.echo(f"  WD: {resolved_wd}")
 if item.worktree:
@@ -5729,6 +7218,22 @@ def test_todo_item_without_worktree_key_loads():
     assert TodoItem.from_dict(item.to_dict()).worktree is None
 @
 
+Let's verify that repeated [[--note]] arguments reach the stored
+[[notes]] field as separate paragraphs:
+
+<<test functions>>=
+def test_add_note_flags_join_as_paragraphs(temp_todo_dir):
+  """Repeated --note becomes one blank-line-separated body."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--top-level",
+     "--prio", "1", "--note", "a", "--note", "b"],
+  )
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert todos[0].notes == "a\n\nb"
+@
+
 \subsubsection{Adding via Editor}
 \label{sec:add-via-editor}
 
@@ -5753,12 +7258,14 @@ initial = title if title else ""
 yaml_header = render_yaml_block(initial_meta)
 if yaml_header:
     initial = initial + "\n" + yaml_header
+<<prefill notes into the buffer>>
 content = open_editor(initial + "\n")
 parsed = parse_editor_content(content)
 if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
@@ -5782,6 +7289,13 @@ assign a sub-item to someone else.  Without a visible [[who:]]
 key in the parent block, a user adding children has no obvious
 cue that children can carry their own [[who]] field.
 
+\enquote{Always} is why this is the third resolution of [[who]] and
+the only one written as an unconditional assignment.  Every other key
+here is omitted when its flag was not given, and [[who]] used to
+follow that shape only because the flag could not be absent; now that
+it can, the guard would hide exactly the line the paragraph above
+argues must be shown.
+
 <<build initial editor metadata>>=
 initial_meta = {}
 if label:
@@ -5792,8 +7306,7 @@ if deadline:
     )
 if estimate:
     initial_meta["estimate"] = parse_hours(estimate)
-if who:
-    initial_meta["who"] = who
+initial_meta["who"] = who or default_username
 if wd_path:
     initial_meta["wd"] = canonicalize_wd(wd_path)
 elif here:
@@ -5808,67 +7321,89 @@ if description:
     initial_meta["description"] = description
 @
 
-We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided.  The description is
-coerced to text for the reason given in \cref{sec:edit-via-editor}.
+The notes go below the front matter rather than into it, because that
+is where the body already lives (\cref{sec:editor-description}): the
+text between the front matter and the first heading is what
+[[parse_editor_content]] reads back as [[notes]].  Pre-filling it
+serves the same purpose as pre-filling the metadata keys---a flag
+whose effect were invisible in the buffer would look like the editor
+had thrown it away---and it has the same consequence: what the user
+leaves in the buffer is what gets stored, so an edited or deleted
+paragraph wins over what [[--note]] put there.
 
-The estimate needs the same [[parse_hours]] treatment on both branches,
-not just on the CLI one.  Our minimal YAML parser deliberately returns a
-plain string for anything that is not a bare number, so the
-[[1h30m]] and [[90m]] forms that [[--estimate]] advertises arrive here
-as text.  Storing that text in a field the rest of the module formats
-with [[:.1f]] would write a value that every later [[ls]], [[view]],
-and [[export]] chokes on, so the front-matter branch converts it to
-hours exactly as its sibling child and [[edit]] paths already do.
+<<prefill notes into the buffer>>=
+if notes_text:
+    initial = initial + "\n" + notes_text
+@
+
+Let's verify both halves of that: the flag's text is in the buffer
+handed to the editor, and the buffer's version is what is stored.
+
+<<test functions>>=
+def test_add_edit_note_prefills_buffer(temp_todo_dir):
+  """--note fills the editor body, and the buffer wins."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text.replace("From the flag.", "From the buffer.")
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Fetch paper", "--note", "From the flag."],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert "From the flag." in seen["text"]
+  _, todos = load_todos()
+  assert todos[0].notes == "From the buffer."
+@
+
+The parent is built in three layers, in the order that makes the
+precedence rule executable: the fields nobody else supplies, then the
+front matter through [[apply_metadata]]
+(\cref{sec:apply-metadata}), then the command-line flags on top.
+Reading the layers downwards therefore reads the precedence upwards,
+and the flags win because they are last, not because each field
+remembers to check them.
+
+Only the flags the user actually gave may overwrite, so each one is
+guarded by its own truth test.  This is also why the flags cannot
+simply be folded into the constructor: an unset flag must leave the
+front-matter value standing, and a constructor argument has no way to
+say \enquote{nothing}.
+
+The bottom layer is not empty.  When [[--parent]] or auto-parenting
+resolved a parent, [[<<inherit from parent>>]] has already worked out
+the labels and deadline this item takes from it, and the constructor
+is where they belong: inheritance is precisely what the front matter
+and the flags are allowed to overrule, so a value assigned after them
+would win where it should lose.  Passing them here is also what makes
+the two halves of [[add]] agree---[[<<create and save new todo>>]] has
+always constructed with the same two values, and a user should not
+have to know whether [[--edit]] was given to predict whether a child
+of [[#42]] arrives carrying [[#42]]'s deadline.
 
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
-meta = parsed.metadata
-resolved_wd = canonicalize_wd(meta.get("wd")) or (
-    os.getcwd() if here else None
-)
-resolved_env = None
-if wd_path:
-    resolved_wd = canonicalize_wd(wd_path)
-if here:
-    resolved_env = dict(os.environ)
-elif capture_env:
-    resolved_env = dict(os.environ)
 parent_item = TodoItem(
     id=next_id,
     title=parsed.title,
-    labels=(
-        list(label) if label
-        else meta.get("labels", [])
-    ),
+    labels=list(inherited_labels),
     priority=priority,
     status="pending",
     created=now,
-    deadline=normalize_deadline(
-        deadline or meta.get("deadline")
-    ),
-    estimated=(
-        parse_hours(estimate)
-        if estimate
-        else parse_hours(str(meta["estimate"]))
-        if "estimate" in meta
-        else None
-    ),
-    description=(
-        description or str(meta.get("description", ""))
-    ),
+    deadline=inherited_deadline,
     parent_id=resolved_parent,
-    who=who or meta.get("who"),
     notes=parsed.notes,
-    wd=resolved_wd,
-    worktree=normalize_worktree_name(
-        worktree or meta.get("worktree")
-    ),
-    env=resolved_env,
-    command=(
-        run_command or meta.get("command")
-    ),
 )
+apply_metadata(parent_item, parsed.metadata)
+<<let add flags win over the front matter>>
+<<give the parent an assignee>>
 todos.append(parent_item)
 parent_id_for_children = next_id
 next_id += 1
@@ -5876,6 +7411,262 @@ typer.echo(
     f"Added todo #{parent_item.id}: "
     f"{parent_item.title}"
 )
+@
+
+Two of the flags are not simple overrides.  [[--here]] is a shorthand
+for \enquote{capture both the directory and the environment}, so its
+directory yields to a [[wd:]] the user typed in the buffer: a shorthand
+should not beat something explicit.  Its environment capture is not
+conditioned the same way---a hand-written [[env:]] block loses to
+[[--here]]---which is the older rule kept as it was, from a time when
+the front matter's [[env]] was not read here at all.  Since we
+deliberately never render [[env]] into the buffer, this affects only a
+buffer someone typed the key into by hand.
+
+The [[--here]] guard reads the \emph{stored} directory out of
+[[__dict__]] rather than [[parent_item.wd]].  Attribute reads for
+[[wd]], [[env]] and [[command]]---the members of
+[[WORKER_DEFAULT_ATTRIBUTES]]---fall back to the worker's configured
+default, so a worker with a configured [[wd]]
+would make the item look as though the front matter had set one, and
+[[--here]] would then silently do nothing.  Worker defaults are runtime
+policy; what we are asking here is what this item explicitly carries.
+
+<<let add flags win over the front matter>>=
+if here and parent_item.__dict__.get("wd") is None:
+    parent_item.wd = os.getcwd()
+if wd_path:
+    parent_item.wd = canonicalize_wd(wd_path)
+if here or capture_env:
+    parent_item.env = dict(os.environ)
+if label:
+    parent_item.labels = list(label)
+if deadline:
+    parent_item.deadline = normalize_deadline(deadline)
+if estimate:
+    parent_item.estimated = parse_hours(estimate)
+if who:
+    parent_item.who = who
+if worktree:
+    parent_item.worktree = normalize_worktree_name(
+        worktree
+    )
+if run_command:
+    parent_item.command = run_command
+if description:
+    parent_item.description = description
+@
+
+All three layers can still leave [[who]] unset: no [[-w]], no [[who:]]
+key---the user deleted the line the buffer opened with---and nothing
+to inherit, since a parent contributes labels and a deadline but never
+an assignee.  Only now, with every source that could name someone
+exhausted, is [[default_username]] the right answer; asking for it any
+earlier is what made a typed [[who:]] unable to survive the layer
+above it.
+
+An owner is not a nicety here.  [[ls]] and [[next]] filter by worker,
+so an item left unassigned would be invisible to the person who just
+created it.  The fallback also has to run before the children are
+built, because they take their assignee from [[parent_item.who]]
+(\cref{sec:add-via-editor}) and would otherwise inherit the hole.
+
+<<give the parent an assignee>>=
+if parent_item.who is None:
+    parent_item.who = default_username
+@
+
+Let's verify the assignee through all three layers, starting with the
+one the buffer exists to make possible.  The editor is handed the
+pre-populated line and hands back a changed one, so the same test pins
+both halves of the discovery argument above: the key is there to be
+found, and changing it has an effect.
+
+<<test functions>>=
+def test_add_edit_buffer_who_is_stored(temp_todo_dir):
+  """Editing the pre-populated who: key stores the new name."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text.replace(
+      f"who: {default_username}", "who: alice"
+    )
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Grade labs"],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert f"who: {default_username}" in seen["text"]
+  _, todos = load_todos()
+  assert todos[0].who == "alice"
+@
+
+An explicit flag is still the top layer, so it has to beat a buffer
+that names someone else:
+
+<<test functions>>=
+def test_add_edit_who_flag_beats_buffer(temp_todo_dir):
+  """An explicit --who wins over the buffer's key."""
+  buffer = (
+    "Grade labs\n"
+    "---\n"
+    "who: alice\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "--who", "bob"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == "bob"
+@
+
+And with nothing to say who owns the item---the user deleted the
+line---the fallback still has to produce a name, on both paths through
+the command:
+
+<<test functions>>=
+def test_add_edit_without_who_falls_back(temp_todo_dir):
+  """No flag and no key leaves the default owner."""
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Grade labs\n",
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+
+
+def test_add_without_who_flag_falls_back(temp_todo_dir):
+  """The flag path assigns the default owner too."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--top-level",
+     "--prio", "1"],
+  )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+@
+
+Let's verify the three layers where they are easiest to tell apart:
+[[labels]] and [[deadline]], the two fields a parent contributes.  One
+ranked parent carrying both serves all three cases, so we set it up
+once:
+
+<<test functions>>=
+@pytest.fixture
+def parent_with_metadata(temp_todo_dir):
+  """A ranked parent carrying labels and a deadline."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Course work", priority=5.0,
+      labels=["DD1310"],
+      deadline=normalize_deadline("2026-03-01"),
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+@
+
+A buffer that mentions neither key leaves inheritance standing, which
+is the case that used to differ between the two halves of [[add]]:
+
+<<test functions>>=
+def test_add_edit_inherits_parent_metadata(
+  parent_with_metadata,
+):
+  """A buffer naming neither key inherits both."""
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Sub-task\n",
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["DD1310"]
+  assert child.deadline == normalize_deadline("2026-03-01")
+@
+
+The front matter is the middle layer, so what the user typed must
+replace what the parent offered rather than join it:
+
+<<test functions>>=
+def test_add_edit_buffer_beats_inherited_metadata(
+  parent_with_metadata,
+):
+  """Front matter replaces the inherited values."""
+  buffer = (
+    "Sub-task\n"
+    "---\n"
+    "labels: [grading]\n"
+    "deadline: 2026-04-01\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["grading"]
+  assert child.deadline == normalize_deadline("2026-04-01")
+@
+
+And the flags are the top layer, so they beat the buffer as well as
+the parent:
+
+<<test functions>>=
+def test_add_edit_flags_beat_buffer_metadata(
+  parent_with_metadata,
+):
+  """Command-line flags win over the front matter."""
+  buffer = (
+    "Sub-task\n"
+    "---\n"
+    "labels: [grading]\n"
+    "deadline: 2026-04-01\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1",
+       "urgent", "-d", "2026-05-01"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["urgent"]
+  assert child.deadline == normalize_deadline("2026-05-01")
 @
 
 Let's verify that a suffixed front-matter estimate is stored as a
@@ -6024,50 +7815,23 @@ def create_children_from_parsed(
         parsed_children
     ):
         prio = priorities[i]
-        <<resolve child metadata>>
         <<create and append child item>>
         if parsed_child.children:
             <<nested child priority range>>
-            create_children_from_parsed(
-                parsed_child.children,
-                child_id,
-                child_labels,
-                child_deadline,
-                nested_high, nested_low,
-                child_who,
-                child_env,
-            )
+            <<recurse into the grandchildren>>
 @
 
-Each child overrides its metadata (labels, deadline, working
-directory, assignee, environment, description) from the YAML block in
-the editor, falling back to the parent's values when not specified.
-A description is the one value that is never inherited: it states
-what \emph{this} item is, so a child without one simply has none.  The [[who]]
-inheritance is especially important: without it, children typed
-in the editor without an explicit [[who:]] key would be created
-unassigned, even though the user intended the whole task tree to
-belong to the same person.  Environment inheritance follows the same
-logic: changing the directory should not silently replace the stored
-environment, so [[wd]] and [[env]] are inherited independently.
-<<resolve child metadata>>=
-child_meta = parsed_child.metadata
-child_labels = child_meta.get(
-    "labels", list(parent_labels)
-)
-child_deadline = normalize_deadline(
-    child_meta.get("deadline", parent_deadline)
-)
-child_who = child_meta.get("who", parent_who)
-child_wd = canonicalize_wd(child_meta.get("wd"))
-child_worktree = normalize_worktree_name(
-    child_meta.get("worktree")
-)
-child_env = child_meta.get("env", parent_env)
-child_description = str(
-    child_meta.get("description", "")
-)
-@
+The child is built the same way the [[edit]] side builds a new one
+(\cref{sec:apply-metadata}): construct it with what it inherits, then
+let its own section override.  Labels, deadline, assignee and
+environment are what a child inherits; a description is not, because it
+states what \emph{this} item is, so a child without one simply has
+none.  The [[who]] inheritance is the one that matters most in
+practice---without it, children typed in the editor without an explicit
+[[who:]] key would be created unassigned, even though the user intended
+the whole task tree to belong to the same person.  Environment is
+inherited independently of the directory, so that pointing a child at
+another directory does not silently discard the captured environment.
 
 We append the new item to [[todos]] immediately so that recursive
 calls can see it as a parent when processing grandchildren.
@@ -6075,31 +7839,52 @@ calls can see it as a parent when processing grandchildren.
 child = TodoItem(
     id=next_id,
     title=parsed_child.title,
-    labels=child_labels,
+    labels=list(parent_labels),
     priority=prio,
     status="pending",
     created=now,
-    deadline=child_deadline,
-    estimated=(
-        parse_hours(str(child_meta["estimate"]))
-        if "estimate" in child_meta
-        else None
-    ),
+    deadline=parent_deadline,
     parent_id=parent_id,
-    who=child_who,
+    who=parent_who,
     notes=parsed_child.notes,
-    wd=child_wd,
-    worktree=child_worktree,
-    env=child_env,
-    command=child_meta.get("command"),
-    description=child_description,
+    env=parent_env,
 )
+apply_metadata(child, parsed_child.metadata)
 todos.append(child)
 child_id = next_id
 next_id += 1
 typer.echo(
     f"  Added sub-item #{child.id}: "
     f"{child.title}"
+)
+@
+
+The inherited deadline needs no [[normalize_deadline]] pass of its own.
+It comes either from the parent item, which normalized it when it was
+written, or from an ancestor child that went through
+[[apply_metadata]]---so whatever reaches a grandchild is already
+canonical, and normalizing again would only re-derive the same string.
+
+A grandchild inherits from the child, not from the child's parent, so
+the recursive call passes what the child ended up with after its own
+section was applied.  Three of those four values are plain reads, but
+[[env]] is one of [[WORKER_DEFAULT_ATTRIBUTES]]: reading
+[[child.env]] answers with the worker's configured environment when the
+child stored none, and passing \emph{that} down would write a runtime
+default into a grandchild as though the user had typed it---exactly the
+persistence [[TodoItem]] keeps [[to_dict]] free of.  Reading
+[[__dict__]] asks the question we mean: what does this child explicitly
+carry?
+
+<<recurse into the grandchildren>>=
+create_children_from_parsed(
+    parsed_child.children,
+    child_id,
+    child.labels,
+    child.deadline,
+    nested_high, nested_low,
+    child.who,
+    child.__dict__.get("env"),
 )
 @
 
@@ -6123,7 +7908,16 @@ else:
 
 The call site computes the parent's priority range from its sibling
 context and passes the parent's [[who]] so that any child lacking
-an explicit [[who:]] in its YAML block inherits the same assignee:
+an explicit [[who:]] in its YAML block inherits the same assignee.
+
+It reads the environment the same way the recursive call does, and for
+the same reason: [[env]] is the only one of these four fields that
+[[WORKER_DEFAULT_ATTRIBUTES]] covers, so [[parent_item.env]] answers
+with the worker's configured environment whenever the parent stored
+none, and every child would then be written to disk carrying a runtime
+default nobody typed.  The other three are plain reads because no
+policy stands behind them---[[labels]], [[deadline]] and [[who]] mean
+exactly what the item holds.
 
 <<create children from parsed>>=
 if parent_item.priority is None:
@@ -6140,8 +7934,47 @@ create_children_from_parsed(
     parent_item.deadline,
     prio_high, prio_low,
     parent_item.who,
-    parent_item.env,
+    parent_item.__dict__.get("env"),
 )
+@
+
+Let's verify that a configured environment stays out of the store.
+The parent has none of its own, so an attribute read would hand every
+child the worker's, and the children are the items we can check---the
+[[env]] they were given is written straight to disk:
+
+<<test functions>>=
+def test_add_edit_children_omit_worker_env(
+  temp_todo_dir,
+):
+  """A worker-default env is not written into children."""
+  buffer = (
+    "Parent task\n"
+    "\n"
+    "# Child task\n"
+  )
+  with patched_worker_config({
+    f"todo.worker.{default_username}.env": {
+      "MODE": "agent",
+    },
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      return_value=buffer,
+    ):
+      result = runner.invoke(
+        cli,
+        ["add", "--edit", "--top-level", "--prio", "1"],
+      )
+    assert result.exit_code == 0, result.stdout
+
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  child = [
+    t for t in data["todos"] if t["id"] == 2
+  ][0]
+  assert child["title"] == "Child task"
+  assert child["env"] is None
 @
 
 \subsection{The [[ls]] Command}
@@ -6276,7 +8109,8 @@ ls_status_opt = typer.Option(
          "pending, in-progress, done")
 ls_prio_opt = typer.Option(
     "--prio", "-p",
-    help="Show effective priority column")
+    help="Show the effective priority column. "
+         + PRIORITY_HELP)
 ls_output_opt = typer.Option(
     "--output", "-o",
     help="Write CSV output to file")
@@ -7698,6 +9532,44 @@ view_format_opt = typer.Option(
          "plain otherwise), rich, plain")
 @
 
+\paragraph{Reading a whole group}
+
+A sub-item's line carries its title and, for a direct child, the first
+line of its notes.  That preview answers \enquote{what is under
+here?}, which is what a parent is usually asked.  It does not answer
+\enquote{what is this group about?}---the question put to a parent
+whose dozen children each keep their details in their own notes---and
+answering that one today costs a separate [[view]] per child.
+
+[[--notes]] prints every visible sub-item's description and notes in
+full, underneath its line.  It is a flag rather than the default
+because the two questions want opposite amounts of text: a dozen
+children with a screen of notes each would push the parent's own
+metadata off the top of the terminal every time someone only wanted to
+see what was left to do.  With the flag off the preview line is
+exactly what it was.
+
+The other half of reading a group is the finished work.  [[view]]
+hides done sub-items, and [[done]] is the \emph{only} status it
+hides---no other value is filtered---so the whole history of a group is
+one flag away.  That flag already exists as [[--done]]; [[--all]] is a
+second spelling of it rather than a second flag, because \enquote{all}
+is the word that comes to mind beside [[--notes]] when what is wanted
+is everything, and one switch under two names can never disagree with
+itself.  Widening the set is all it does: it does not imply
+[[--notes]], and the sub-item lines still carry the bracketed
+[[done]] mark (green in the rich renderer), so finished children stay
+distinguishable from the rest.
+
+<<argument and option definitions>>=
+view_notes_opt = typer.Option(
+    "--notes",
+    help="Show each sub-item's description and notes")
+view_all_opt = typer.Option(
+    "--all", "--done", "-d",
+    help="Include done sub-items")
+@
+
 Both renderers show the same things, so the command first gathers
 what there is to show---the metadata fields, the notes or GitHub
 content, the visible sub-items---and only then renders it.
@@ -7712,7 +9584,9 @@ def view(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
     include_done: Annotated[bool,
-                            done_opt] = False,
+                            view_all_opt] = False,
+    show_notes: Annotated[bool,
+                          view_notes_opt] = False,
     output_format: Annotated[ViewFormat,
                              view_format_opt] = ViewFormat.auto,
 ):
@@ -7720,7 +9594,9 @@ def view(
 
     If no ID given, shows the current active task.
     Done sub-items are
-    hidden by default; pass --done to include them.
+    hidden by default; pass --done (or --all) to include them.
+    Sub-items show a one-line note preview; pass --notes to
+    print their descriptions and notes in full instead.
     Notes are rendered as Markdown on a terminal and printed as
     written when piped; --format rich or --format plain forces
     either.
@@ -7943,7 +9819,10 @@ elif item.notes:
 
 Only children, not grandchildren, get the first line of their notes as
 a preview: at two levels down the extra line would read as a fourth
-level of nesting.
+level of nesting.  Under [[--notes]] that restraint is beside the
+point---the reader has asked for the text---so every row gets its
+blocks, and the preview steps aside rather than repeating the first
+line above them.
 
 <<print sub-items as plain text>>=
 if rows:
@@ -7953,12 +9832,35 @@ if rows:
         indent = "  " * (depth + 1)
         mark = VIEW_STATUS_MARKS.get(child.status, child.status)
         typer.echo(f"{indent}#{child.id} [{mark}] {child.title}")
-        if depth == 0 and child.notes:
+        if show_notes:
+            <<print a sub-item's blocks as plain text>>
+        elif depth == 0 and child.notes:
             typer.echo(f"{indent}  {child.notes.splitlines()[0]}")
 if hidden_done:
     typer.echo(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)"
+    )
+@
+
+The blocks are indented one level past the line they belong to, so the
+nesting on the page matches the nesting in the tree, and they go
+through [[print_markdown]] in the same verbatim form as the parent's
+own notes: an agent reading this output means to quote or extend the
+text, and a rendering would have cost it the [[#]] markers and list
+punctuation it needs.  An empty description or an empty notes field
+prints nothing at all rather than an empty heading.
+
+<<print a sub-item's blocks as plain text>>=
+if child.description:
+    print_markdown(
+        child.description, indent=len(indent) + 2,
+        terminal=False,
+    )
+if child.notes:
+    print_markdown(
+        child.notes, indent=len(indent) + 2,
+        terminal=False,
     )
 @
 
@@ -7989,7 +9891,7 @@ console.print(Text.assemble(
 ))
 <<print metadata as a grid>>
 <<print description and notes richly>>
-<<print sub-items as a table>>
+<<print sub-items richly>>
 @
 
 A two-column grid lines the values up under each other, which the
@@ -8039,7 +9941,33 @@ elif item.notes:
     print_markdown(item.notes, indent=2, terminal=True)
 @
 
-The sub-item table uses the same [[Table]] arguments as [[ls]]
+The rich renderer has two shapes for the sub-items, because a table is
+the right container for one line each and the wrong one for a screen
+each.  A table's columns are sized against every row, so a single
+child with a long note squeezes every other row's title into a narrow
+ribbon; and a cell holds a rendered Markdown block only by giving it
+that column's width, which is not the width of the terminal the reader
+is looking at.  So [[--notes]] drops the table and prints each
+sub-item as a line followed by its blocks, and without it the table
+stays exactly as it was.
+
+<<print sub-items richly>>=
+if rows:
+    console.print()
+    console.print(Text("Sub-items", style="bold"))
+    if show_notes:
+        <<print each sub-item with its blocks>>
+    else:
+        <<print sub-items as a table>>
+if hidden_done:
+    console.print(Text(
+        f"  ({hidden_done} done sub-items hidden,"
+        f" use --done to show)",
+        style="dim",
+    ))
+@
+
+The table uses the same [[Table]] arguments as [[ls]]
 (\cref{sec:todo-code-outline}), so the two commands look like parts of
 one interface.
 Depth becomes indentation of the title, the way [[ls]] indents its
@@ -8047,34 +9975,57 @@ tree, and the note preview gets a folding column so a long first line
 wraps instead of being cut off.
 
 <<print sub-items as a table>>=
-if rows:
-    console.print()
-    console.print(Text("Sub-items", style="bold"))
-    table = Table(show_header=True, header_style="bold",
-                  box=box.SIMPLE, show_edge=False,
-                  pad_edge=False)
-    table.add_column("ID", justify="right", style="cyan")
-    table.add_column("Status")
-    table.add_column("Title")
-    table.add_column("Note", overflow="fold")
-    for depth, child in rows:
-        mark = VIEW_STATUS_MARKS.get(child.status, child.status)
-        note = ""
-        if depth == 0 and child.notes:
-            note = child.notes.splitlines()[0]
-        table.add_row(
-            str(child.id),
-            Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
-            Text("  " * depth + child.title),
-            Text(note),
-        )
-    console.print(Padding(table, (0, 0, 0, 2)))
-if hidden_done:
-    console.print(Text(
-        f"  ({hidden_done} done sub-items hidden,"
-        f" use --done to show)",
-        style="dim",
+table = Table(show_header=True, header_style="bold",
+              box=box.SIMPLE, show_edge=False,
+              pad_edge=False)
+table.add_column("ID", justify="right", style="cyan")
+table.add_column("Status")
+table.add_column("Title")
+table.add_column("Note", overflow="fold")
+for depth, child in rows:
+    mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+    note = ""
+    if depth == 0 and child.notes:
+        note = child.notes.splitlines()[0]
+    table.add_row(
+        str(child.id),
+        Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
+        Text("  " * depth + child.title),
+        Text(note),
+    )
+console.print(Padding(table, (0, 0, 0, 2)))
+@
+
+Without the table the sub-item line has to carry the columns itself,
+so it is assembled in the same order and colours the header row would
+have given them.
+The blocks below it are rendered rather than printed verbatim---this
+renderer was chosen precisely for that---and both line and blocks are
+padded by depth, which is what replaces the table's indented title
+column.
+
+<<print each sub-item with its blocks>>=
+for depth, child in rows:
+    mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+    console.print(Padding(
+        Text.assemble(
+            (f"#{child.id} ", "cyan"),
+            (f"[{mark}] ",
+             VIEW_STATUS_STYLES.get(child.status, "")),
+            child.title,
+        ),
+        (0, 0, 0, 2 + 2 * depth),
     ))
+    if child.description:
+        print_markdown(
+            child.description, indent=4 + 2 * depth,
+            terminal=True,
+        )
+    if child.notes:
+        print_markdown(
+            child.notes, indent=4 + 2 * depth,
+            terminal=True,
+        )
 @
 
 \subsection{Testing the [[view]] Command}
@@ -8350,6 +10301,119 @@ def test_view_shows_unset_priority_and_mixed_child_order(
     )
 @
 
+Let's verify what [[--notes]] adds and what it leaves alone.  Without
+it a child shows only the first line of its notes and nothing of its
+description; with it both children show both fields in full.
+
+<<integration tests>>=
+def test_view_notes_shows_sub_item_blocks(temp_todo_dir):
+    """--notes prints each sub-item's description and notes."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="First child", parent_id=1,
+            priority=2.0, created="2026-02-20T10:00:00",
+            description="What the first child is",
+            notes="First preview\nMore of the first note",
+        ),
+        TodoItem(
+            id=3, title="Second child", parent_id=1,
+            priority=1.0, created="2026-02-20T10:00:00",
+            description="What the second child is",
+            notes="The second note",
+        ),
+    ])
+
+    preview = runner.invoke(cli, ["view", "1"])
+    assert preview.exit_code == 0
+    assert "First preview" in preview.stdout
+    assert "More of the first note" not in preview.stdout
+    assert "What the first child is" not in preview.stdout
+
+    result = runner.invoke(cli, ["view", "1", "--notes"])
+    assert result.exit_code == 0
+    assert "What the first child is" in result.stdout
+    assert "More of the first note" in result.stdout
+    assert "What the second child is" in result.stdout
+    assert "The second note" in result.stdout
+@
+
+The rich renderer has to show the same fields, rendered rather than
+verbatim: the heading loses its marker and the list item gains a
+bullet, exactly as the parent's own notes do.
+
+<<integration tests>>=
+def test_view_notes_rich_renders_sub_item_blocks(
+    temp_todo_dir, monkeypatch,
+):
+    """--notes reaches the rich renderer's sub-items too."""
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child task", parent_id=1,
+            priority=1.0, created="2026-02-20T10:00:00",
+            description="Standing statement",
+            notes="# Heading\n\n- bullet\n",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["view", "1", "--format", "rich", "--notes"],
+    )
+    assert result.exit_code == 0
+    assert "Child task" in result.stdout
+    assert "Standing statement" in result.stdout
+    assert "# Heading" not in result.stdout
+    assert "Heading" in result.stdout
+    assert "\u2022 bullet" in result.stdout
+@
+
+And [[--all]] has to widen the set without turning the notes on by
+itself, so that the two flags compose into the whole history of a
+group:
+
+<<integration tests>>=
+def test_view_all_includes_done_sub_items(temp_todo_dir):
+    """--all shows done sub-items; --notes then shows their notes."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Done child", parent_id=1,
+            status="done", priority=1.0,
+            created="2026-02-20T10:00:00",
+            notes="Recap line\nWhat finishing it took",
+        ),
+    ])
+
+    hidden = runner.invoke(cli, ["view", "1"])
+    assert hidden.exit_code == 0
+    assert "Done child" not in hidden.stdout
+    assert "1 done sub-items hidden" in hidden.stdout
+
+    shown = runner.invoke(cli, ["view", "1", "--all"])
+    assert shown.exit_code == 0
+    assert "Done child" in shown.stdout
+    assert "[done]" in shown.stdout
+    assert "Recap line" in shown.stdout
+    assert "What finishing it took" not in shown.stdout
+
+    both = runner.invoke(cli, ["view", "1", "--all", "--notes"])
+    assert both.exit_code == 0
+    assert "Done child" in both.stdout
+    assert "What finishing it took" in both.stdout
+@
+
 \subsection{Merging Incremental Label Edits}
 
 The [[--add-label]]/[[--remove-label]] flags need a single, well-defined
@@ -8422,6 +10486,10 @@ edit_who_opt = typer.Option(
 edit_parent_opt = typer.Option(
     "--parent", "-p",
     help="New parent ID (0 = make top-level)")
+keep_prio_opt = typer.Option(
+    "--keep-prio",
+    help="Keep the stored priority when moving "
+         "with --parent")
 @
 
 <<edit command>>=
@@ -8458,6 +10526,11 @@ def edit(
                            command_opt] = None,
     parent: Annotated[int | None,
                       edit_parent_opt] = None,
+    explicit_priority: Annotated[float | None,
+                                 prio_opt] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    keep_prio: Annotated[bool, keep_prio_opt] = False,
 ):
     """Edit an existing todo item.
 
@@ -8495,11 +10568,25 @@ def edit(
         <<edit via cli flags>>
 @
 
-Each flag is optional and defaults to [[None]]. We only overwrite a
-field when the user explicitly supplied a value --- [[None]] means
-\enquote{leave this field alone}. This lets you update a single
-attribute (e.g.\ just the deadline) without touching the rest of the
-item:
+Four of the flags say where the item should rank, and the shared
+validator (\cref{todo:placement}) rejects any two of them together.  It
+runs first, before a single field is touched, so a contradictory
+command line cannot half-apply.
+
+<<edit via cli flags>>=
+reject_conflicting_flags({
+    "--keep-prio": keep_prio,
+    "--prio": explicit_priority is not None,
+    "--top": top,
+    "--bottom": bottom,
+})
+@
+
+The remaining flags are optional and default to [[None]]. We only
+overwrite a field when the user explicitly supplied a value ---
+[[None]] means \enquote{leave this field alone}. This lets you update a
+single attribute (e.g.\ just the deadline) without touching the rest of
+the item:
 
 <<edit via cli flags>>=
 if title is not None:
@@ -8785,10 +10872,7 @@ losing its creation timestamp and any notes.
 We use [[0]] as a sentinel for \enquote{promote to top-level}
 because valid IDs always start from [[1]], so [[0]] is unambiguous.
 Passing a positive integer instead reassigns the item under a
-different parent.  Because the item's existing priority was computed
-relative to its old siblings, it may sort oddly after a reparent ---
-the user can run [[reprioritize]] afterwards to restore the intended
-ordering:
+different parent:
 
 <<edit via cli flags>>=
 if parent is not None:
@@ -8806,9 +10890,271 @@ if parent is not None:
             )
             raise typer.Exit(1)
         item.parent_id = parent
+@
+
+A priority is a position in one list, not a property of the item.  The
+number~[[5.0]] means \enquote{above the [[4.5]] next to me}; carried
+into a different set of siblings it means whatever those siblings
+happen to be numbered, which is to say nothing.  Moving an item with
+[[--parent]] therefore invalidates its priority, and leaving the stale
+number behind made every move cost a follow-up [[reprioritize]] the
+user had to remember.  We re-rank as part of the move instead, running
+the same binary search [[add]] runs, so that the default outcome of a
+move is a placed item rather than an arbitrary one.
+
+The placement flags say what to do instead of asking.  [[--keep-prio]]
+keeps the stored number---the old behaviour, and still the right answer
+when the caller has already decided where the item lands, as a script
+moving items it just numbered has.  [[--prio]] sets the number
+outright; [[--top]] and [[--bottom]] derive it from the new siblings.
+All three also work \emph{without} [[--parent]], where they re-rank the
+item among the siblings it already has, which is what makes [[edit]]
+enough for the whole flow of moving and ranking a batch.
+[[--keep-prio]] without [[--parent]] asks for exactly what would happen
+anyway, so it is a no-op rather than an error.
+
+<<edit via cli flags>>=
+rerank = top or bottom or (
+    parent is not None and not keep_prio
+)
+if explicit_priority is not None:
+    item.priority = explicit_priority
+elif rerank:
+    <<place the edited item among its siblings>>
 
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+The move can also land the item under a parent that is itself
+unranked, and [[place_existing_item]] answers [[None]] for that case
+(\cref{todo:placement}).  Storing that [[None]] is what keeps the
+hierarchy consistent---no ranked child under an unranked parent---but
+it silently drops a number the user chose, so we say so when it
+happens.
+
+<<place the edited item among its siblings>>=
+if top:
+    placement = PLACE_TOP
+elif bottom:
+    placement = PLACE_BOTTOM
+else:
+    placement = None
+new_priority = place_existing_item(
+    todos, item, placement
+)
+if (
+    new_priority is None
+    and item.priority is not None
+):
+    typer.echo(
+        f"#{todo_id} is now unranked: parent "
+        f"#{item.parent_id} is unranked too"
+    )
+item.priority = new_priority
+@
+
+Let's verify the four ways of ranking an existing item.  The mover
+starts at the bottom of the shared sibling list
+(\cref{todo:placement}), so each flag has somewhere visible to move it:
+[[--top]] above [[6.0]], [[--bottom]] below the lowest \emph{other}
+sibling at [[2.0]], and [[--prio]] wherever it says, including below
+zero.
+
+<<test functions>>=
+def test_edit_top_reranks_current_siblings(
+  ranked_siblings,
+):
+  """--top re-ranks without a --parent move."""
+  result = runner.invoke(cli, ["edit", "4", "--top"])
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_edit_bottom_reranks_current_siblings(
+  ranked_siblings,
+):
+  """--bottom re-ranks below the other siblings."""
+  result = runner.invoke(cli, ["edit", "4", "--bottom"])
+  assert result.exit_code == 0
+  assert stored_priority(4) == 1.0
+
+
+def test_edit_prio_sets_the_number(ranked_siblings):
+  """--prio stores the value as given, with no search."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--prio", "5"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 5.0
+
+
+def test_edit_negative_prio(ranked_siblings):
+  """--prio=-3 stores a negative priority."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--prio=-3"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == -3.0
+@
+
+A move is where the flags earn their place.  Without one, the item is
+re-ranked among its new siblings by the interactive search; with
+[[--keep-prio]] it arrives carrying the number it had, which is the
+behaviour this command had before; and with [[--top]] or [[--bottom]]
+it arrives at a known end of the new list:
+
+<<test functions>>=
+@pytest.fixture
+def two_parents(temp_todo_dir):
+  """Two ranked parents, one with a ranked child."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="Parent A", priority=10.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Parent B", priority=6.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="B child", priority=8.0,
+      parent_id=2,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=4, title="Mover", priority=1.0,
+      parent_id=1,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  return temp_todo_dir
+
+
+def test_edit_parent_runs_the_search(two_parents):
+  """A move re-ranks interactively by default."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2"], input="y\n",
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" in result.output
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_keep_prio(two_parents):
+  """--keep-prio moves without asking or re-ranking."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--keep-prio"],
+  )
+  assert result.exit_code == 0
+  assert "Is this correct?" not in result.output
+  assert stored_priority(4) == 1.0
+
+
+def test_edit_parent_top(two_parents):
+  """--top places the moved item above its new siblings."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--top"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 9.0
+
+
+def test_edit_parent_bottom(two_parents):
+  """--bottom places the moved item below them."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--parent", "2", "--bottom"],
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_edit_keep_prio_alone_is_a_no_op(
+  ranked_siblings,
+):
+  """--keep-prio without --parent changes nothing."""
+  result = runner.invoke(
+    cli, ["edit", "4", "--keep-prio"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 0.0
+@
+
+Moving under an unranked parent is the case that has to give up the
+number rather than invent one, and it says so instead of doing it
+quietly:
+
+<<test functions>>=
+def test_edit_parent_unranked_unranks_the_item(
+  temp_todo_dir,
+):
+  """A move under an unranked parent unranks the item."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked parent", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Mover", priority=4.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["edit", "2", "--parent", "1"]
+  )
+
+  assert result.exit_code == 0
+  assert stored_priority(2) is None
+  assert "#2 is now unranked" in result.output
+@
+
+The pairs are refused the same way [[add]] refuses its own:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--keep-prio", "--prio", "5"],
+      "--keep-prio and --prio cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--top"],
+      "--keep-prio and --top cannot be used together",
+    ),
+    (
+      ["--keep-prio", "--bottom"],
+      "--keep-prio and --bottom cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--top"],
+      "--prio and --top cannot be used together",
+    ),
+    (
+      ["--prio", "5", "--bottom"],
+      "--prio and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+  ],
+)
+def test_edit_rejects_flag_pairs(
+  ranked_siblings, flags, message,
+):
+  """Every pair of priority flags is refused."""
+  result = runner.invoke(cli, ["edit", "4", *flags])
+  assert result.exit_code == 1
+  assert message in result.output
+  assert stored_priority(4) == 0.0
 @
 
 \subsubsection{Editing via the Editor}
@@ -8828,48 +11174,27 @@ if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 <<update parent from parsed>>
 <<reconcile children>>
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
-The description follows the rule the other keys already follow: a key
-present in the front matter is applied, an absent one leaves the field
-alone.  Deleting the block therefore does not clear the description,
-just as deleting [[deadline:]] does not clear the deadline;
-[[edit N --description ""]] remains the way to do that.  The value is
-coerced to text.  A block is always text, but a user may type
-[[description: 42]] inline, which [[parse_yaml_value]] turns into an
-integer, and that integer would reach the Markdown renderer, the
-calendar export, and the argument list of a spawned agent.
+The front matter is handed to [[apply_metadata]]
+(\cref{sec:apply-metadata}), which owns the present-versus-absent rule
+and the normalization of each key.  What stays here is what is not
+metadata.  The title and the notes come from the document body rather
+than from the front-matter block, and they are assigned
+unconditionally, which is the opposite of the metadata rule and
+deliberately so: the parser refuses a buffer with no title, and an
+emptied body really does mean an emptied [[notes]], since there is no
+key to delete or leave out.
 
 <<update parent from parsed>>=
 item.title = parsed.title
 item.notes = parsed.notes
-meta = parsed.metadata
-if "wd" in meta:
-    item.wd = canonicalize_wd(meta["wd"])
-if "worktree" in meta:
-    item.worktree = normalize_worktree_name(
-        meta["worktree"]
-    )
-if "command" in meta:
-    item.command = meta["command"]
-if "labels" in meta:
-    item.labels = meta["labels"]
-if "deadline" in meta:
-    item.deadline = normalize_deadline(
-        meta["deadline"]
-    )
-if "estimate" in meta:
-    item.estimated = parse_hours(str(meta["estimate"]))
-if "who" in meta:
-    item.who = meta["who"]
-if "github" in meta:
-    item.github = meta["github"]
-if "description" in meta:
-    item.description = str(meta["description"])
+apply_metadata(item, parsed.metadata)
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -8967,10 +11292,24 @@ priority_iter = iter(priorities)
 
 For each section in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
-New children inherit [[who]] from the parent when their
-YAML block does not specify one --- the same rule as in
-[[create_children_from_parsed]] --- so that adding a sub-task in
-the editor never silently leaves it unassigned.
+Both branches end in [[apply_metadata]] (\cref{sec:apply-metadata}),
+and the difference between them is only what the item holds before it
+is called.  A matched child holds what it already had, so an absent key
+keeps the value the user saw in the buffer.  A new child holds what it
+inherits: the parent's labels, deadline and assignee, so that adding a
+sub-task in the editor never silently leaves it unassigned or
+undated---and then its own section overrides any of them.  Inheriting
+in the constructor rather than through [[child_meta.get(key, default)]]
+is what lets one helper serve both branches, and it puts the fallback
+where a reader looks for it, next to the field it fills.
+
+Routing both branches through the helper also settles a difference
+that had no reason to exist: a matched child now takes [[github]] from
+its section, which the parent has always done and no child ever did, so
+linking a sub-item to an issue in the editor is no longer silently
+discarded on save.  Both branches gain [[env]] for the same reason,
+which no site read before.
+
 Popping each match out of [[existing_by_title]] doubles as the
 seen-marker: whatever is still in the index afterwards had no section
 and was therefore deleted in the editor.
@@ -8999,60 +11338,22 @@ for parsed_child in parsed_children:
         child.title = parsed_child.title
         child.notes = parsed_child.notes
         child.priority = prio
-        child_meta = parsed_child.metadata
-        if "wd" in child_meta:
-            child.wd = canonicalize_wd(child_meta["wd"])
-        if "worktree" in child_meta:
-            child.worktree = normalize_worktree_name(
-                child_meta["worktree"]
-            )
-        if "command" in child_meta:
-            child.command = child_meta["command"]
-        if "labels" in child_meta:
-            child.labels = child_meta["labels"]
-        if "deadline" in child_meta:
-            child.deadline = normalize_deadline(
-                child_meta["deadline"]
-            )
-        if "estimate" in child_meta:
-            child.estimated = parse_hours(
-                str(child_meta["estimate"])
-            )
-        if "who" in child_meta:
-            child.who = child_meta["who"]
-        if "description" in child_meta:
-            child.description = str(
-                child_meta["description"]
-            )
+        apply_metadata(child, parsed_child.metadata)
     else:
         now = datetime.datetime.now().isoformat()
-        child_meta = parsed_child.metadata
         child = TodoItem(
             id=next_id,
             title=parsed_child.title,
-            labels=child_meta.get(
-                "labels", list(parent.labels)
-            ),
+            labels=list(parent.labels),
             priority=prio,
             status="pending",
             created=now,
-            deadline=normalize_deadline(
-                child_meta.get(
-                    "deadline", parent.deadline
-                )
-            ),
+            deadline=parent.deadline,
             parent_id=parent.id,
-            who=child_meta.get("who", parent.who),
+            who=parent.who,
             notes=parsed_child.notes,
-            wd=canonicalize_wd(child_meta.get("wd")),
-            worktree=normalize_worktree_name(
-                child_meta.get("worktree")
-            ),
-            command=child_meta.get("command"),
-            description=str(
-                child_meta.get("description", "")
-            ),
         )
+        apply_metadata(child, parsed_child.metadata)
         todos.append(child)
         next_id += 1
         typer.echo(
@@ -9083,6 +11384,47 @@ for removed in existing_by_title.values():
 
 
 \subsection{Testing Editor Reconciliation}
+
+The [[github]] key is the one that had drifted: the parent took it from
+the front matter and the children did not, so a sub-item linked to an
+issue in the editor lost the link on save.  Now that every site shares
+one helper (\cref{sec:apply-metadata}), an existing child keeps what
+its section says:
+
+<<test functions>>=
+def test_edit_editor_child_github_applied(temp_todo_dir):
+  """An existing child's github block survives the save."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent", priority=5.0,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1, priority=4.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "---\n"
+    "github: {repo: o/r, type: issue, number: 7}\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = next(t for t in todos if t.id == 2)
+  assert child.github == {
+    "repo": "o/r", "type": "issue", "number": "7",
+  }
+@
 
 Let's verify the recursion in both directions: an edit to an existing
 grandchild reaches it and preserves its identity, and a brand-new
@@ -9200,6 +11542,65 @@ def test_edit_interactive_removes_subtree(
   assert result.exit_code == 0, result.stdout
   _, todos = load_todos()
   assert [t.id for t in todos] == [1]
+@
+
+Deleting a heading is how the user asks for a sub-item to be removed,
+which is exactly why a buffer the parser gives up on must never come
+back looking empty.  The test below is the one that would have caught
+the loss reported in the issue: an unclosed front matter block used to
+leave the parse with no notes and no sub-items, so [[edit]] blanked the
+item and removed both children as \enquote{deleted in the editor}.  It
+now warns and saves everything.
+
+<<test functions>>=
+def test_edit_editor_unclosed_block_keeps_children(
+    temp_todo_dir,
+):
+    """An unclosed block warns instead of emptying the item."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            notes="Original notes.",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="First child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=4.0,
+        ),
+        TodoItem(
+            id=3, title="Second child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=3.0,
+        ),
+    ])
+    buffer = (
+        "Parent\n"
+        "---\n"
+        "deadline: 2026-03-01\n"
+        "\n"
+        "Original notes.\n"
+        "\n"
+        "# First child\n"
+        "\n"
+        "# Second child\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    _, todos = load_todos()
+    assert {t.id for t in todos} == {1, 2, 3}
+    parent = next(t for t in todos if t.id == 1)
+    assert "---" in parent.notes
+    assert "deadline: 2026-03-01" in parent.notes
+    assert "Original notes." in parent.notes
+    assert parent.deadline is None
 @
 
 <<test functions>>=
@@ -9350,9 +11751,16 @@ def test_child_who_override():
 Reparenting addresses the common accident of creating a todo as a
 child of an active item when a top-level item was intended.  We
 verify both directions: promoting a child to the top level and
-moving it under a different parent.  We also confirm that supplying
-an invalid parent ID is rejected with a non-zero exit code rather
-than silently storing a dangling reference.
+moving it under a different parent.  Both re-rank as part of the
+move, which the first test meets as a binary-search question and the
+second as a silent placement in the new parent's still-empty child
+range.  Neither parent in the second test was given a priority, so
+both hold the constructor default
+(\cref{sec:ranked-and-unranked}) and that range is the unit-wide
+fallback below them (\cref{sec:child-priority-helpers}).  We also
+confirm that supplying an invalid parent ID is
+rejected with a non-zero exit code rather than silently storing a
+dangling reference.
 
 <<test functions>>=
 def test_edit_reparent_toplevel(temp_todo_dir):
@@ -9371,11 +11779,15 @@ def test_edit_reparent_toplevel(temp_todo_dir):
 
     result = runner.invoke(
         cli, ["edit", "2", "--parent", "0"],
+        input="y\n",
     )
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
     assert child.parent_id is None
+    # The move re-ranks: answering "yes" puts the child
+    # above its new sibling instead of keeping 0.5.
+    assert child.priority == 1.0
 
 def test_edit_reparent_to_other(temp_todo_dir):
     """--parent N moves a child under a new parent."""
@@ -9402,6 +11814,11 @@ def test_edit_reparent_to_other(temp_todo_dir):
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 3)
     assert child.parent_id == 2
+    # First child of B: the middle of B's child range,
+    # asked for without a single question.  A and B both
+    # took the default priority of 0.0, so that range is
+    # the unit-wide fallback (0.0, -1.0).
+    assert child.priority == -0.5
 
 def test_edit_reparent_invalid(temp_todo_dir):
     """--parent with a non-existent ID is an error."""
@@ -9481,11 +11898,83 @@ non-done items and ask the same binary-search questions for each.  We do
 parents before children so that a child can use its newly ranked parent
 as the upper bound of its own insertion range.
 
+Four flags answer the questions in advance.  [[--top]] and [[--bottom]]
+name the ends of the sibling list; [[--above]] and [[--below]] name a
+neighbour to sit next to, which is how a script expresses an ordering
+it already knows without having to know the numbers behind it.  All
+four go through the shared placement helper
+(\cref{todo:placement}), so they agree with [[add]] about what
+\enquote{the top} means.
+
+The command's own help text carries the shared priority paragraph,
+which the docstring cannot: a docstring is a literal, and the constant
+exists precisely so the wording has one home.  Typer prefers the
+[[help]] argument when both are present, so the docstring stays as the
+short summary a reader of [[help(reprioritize)]] wants.
+
+<<constants>>=
+REPRIORITIZE_HELP = (
+    "Set a todo item's priority.\n\n"
+    "With no placement flag this reruns the interactive "
+    "binary search. With no ID it reprioritizes every "
+    "unranked, non-done item for the current worker.\n\n"
+    + PRIORITY_HELP
+    + "\n\nAlias: reprio"
+)
+@
+
+\subsection{Naming the Priority That Was There Before}
+
+Both paths through the command end in the same sentence: which item was
+reprioritized, what its priority was, and what it is now.  The
+\enquote{what it was} half is the awkward one, because an unranked item
+has no number to print.  The batch path spelled that state
+\enquote{unset} while the single-item path interpolated the raw value
+and printed \enquote{None}, so one command reported the same transition
+two ways depending on how it was invoked.
+
+The state is a property of the stored priority, not of either code
+path, so the spelling belongs to a function of that value rather than
+to a format string at each echo site.  Giving it one home is also what
+keeps the two paths from drifting again the next time the number
+formatting changes.
+
+We format the number the way the batch path already did, with one
+decimal: priorities are midpoints of midpoints and can carry more
+digits than a user wants to read, and the echo is a confirmation of
+\emph{where} the item landed, not a value anyone retypes.
+
+<<helpers>>=
+def format_stored_priority(value: float | None) -> str:
+    """Return `value` as the reprioritize echo spells it.
+
+    An unset (unranked) priority reads `unset`; a
+    ranked one is rounded to one decimal.
+    """
+    if value is None:
+        return "unset"
+    return f"{value:.1f}"
+@
+
+Let's verify both states, since it is exactly their disagreement that
+this helper exists to remove:
+
+<<test functions>>=
+def test_format_stored_priority_spells_out_unset():
+  """The unranked state reads 'unset', not 'None'."""
+  assert format_stored_priority(None) == "unset"
+  assert format_stored_priority(6.0) == "6.0"
+@
+
 <<reprioritize command>>=
-@cli.command()
+@cli.command(help=REPRIORITIZE_HELP)
 def reprioritize(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    above: Annotated[int | None, above_opt] = None,
+    below: Annotated[int | None, below_opt] = None,
 ):
     """Rerun binary search priority for a todo item.
 
@@ -9496,6 +11985,7 @@ def reprioritize(
     Alias: reprio
     """
     next_id, todos = load_todos()
+    <<validate reprioritize placement>>
     if todo_id is None:
         targets = [
             t for t in todos
@@ -9515,13 +12005,7 @@ def reprioritize(
             key=lambda item: todo_depth(todos, item)
         )
         for item in targets:
-            parent_ctx = next(
-                (
-                    t for t in todos
-                    if t.id == item.parent_id
-                ),
-                None,
-            )
+            parent_ctx = get_parent(todos, item)
             if (
                 parent_ctx is not None
                 and parent_ctx.priority is None
@@ -9543,10 +12027,12 @@ def reprioritize(
                 parent=parent_ctx,
                 todos=todos,
             )
+            old_priority = item.priority
             item.priority = new_priority
             typer.echo(
                 f"Reprioritized #{item.id}: "
-                f"unset -> {new_priority:.1f}"
+                f"{format_stored_priority(old_priority)}"
+                f" -> {format_stored_priority(new_priority)}"
             )
         save_todos(next_id, todos)
         return
@@ -9560,10 +12046,7 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
-    parent_ctx = next(
-        (t for t in todos if t.id == item.parent_id),
-        None,
-    )
+    parent_ctx = get_parent(todos, item)
     if (
         parent_ctx is not None
         and parent_ctx.priority is None
@@ -9576,16 +12059,9 @@ def reprioritize(
         )
         raise typer.Exit(1)
 
-    siblings = get_active_siblings(
-        todos, item,
-        who=item.who or default_username,
-        ranked_only=True,
-    )
-    new_priority = binary_search_priority(
-        siblings,
-        item,
-        parent=parent_ctx,
-        todos=todos,
+    <<resolve the reprioritize placement>>
+    new_priority = place_existing_item(
+        todos, item, placement, target
     )
     old_priority = item.priority
     item.priority = new_priority
@@ -9593,9 +12069,349 @@ def reprioritize(
     save_todos(next_id, todos)
     typer.echo(
         f"Reprioritized #{todo_id}: "
-        f"{old_priority if old_priority is None else f'{old_priority:.1f}'}"
-        f" -> {new_priority:.1f}"
+        f"{format_stored_priority(old_priority)}"
+        f" -> {format_stored_priority(new_priority)}"
     )
+@
+
+
+The two options that name a neighbour take an ID, and completing that
+ID from the existing todos is what makes them usable by hand as well as
+from a script.
+
+<<argument and option definitions>>=
+above_opt = typer.Option(
+    "--above",
+    help="Place just above sibling ID",
+    autocompletion=complete_todo_ids)
+below_opt = typer.Option(
+    "--below",
+    help="Place just below sibling ID",
+    autocompletion=complete_todo_ids)
+@
+
+The flags are mutually exclusive, and all four need to know which item
+they are placing.  Without an ID the command means \enquote{rank
+everything that is unranked}, and a single placement cannot describe
+what should happen to a whole batch: applying [[--top]] to each item in
+turn would leave them stacked in visiting order, which is not what the
+flag says.  We refuse rather than invent an interpretation.
+
+<<validate reprioritize placement>>=
+reject_conflicting_flags({
+    "--top": top,
+    "--bottom": bottom,
+    "--above": above is not None,
+    "--below": below is not None,
+})
+places = (
+    top or bottom
+    or above is not None
+    or below is not None
+)
+if todo_id is None and places:
+    typer.echo(
+        "Error: --top, --bottom, --above and --below "
+        "need a todo ID",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Turning the flags into a placement is a small dispatch; the work is in
+validating what [[--above]] and [[--below]] point at.
+
+<<resolve the reprioritize placement>>=
+placement = None
+target = None
+if top:
+    placement = PLACE_TOP
+elif bottom:
+    placement = PLACE_BOTTOM
+elif above is not None or below is not None:
+    if above is not None:
+        placement = PLACE_ABOVE
+        target_id = above
+    else:
+        placement = PLACE_BELOW
+        target_id = below
+    <<resolve the placement target>>
+@
+
+A target has to be an item this one can actually be ranked against,
+and each way of failing that has its own remedy, so each gets its own
+message rather than one generic refusal.  An item is not its own
+neighbour; an item under a different parent is in a different ordering
+entirely; and an unranked target has no number to sit next to, which
+the user fixes by ranking it first.
+
+The last check is the one that is easy to miss.  Being a sibling is
+not enough to be \emph{comparable}: the comparison set excludes done
+items and other workers' items (\cref{todo:placement}), so a target
+outside it has no position in the list we are inserting into.  Left
+unchecked, that case would reach the placement helper looking for an
+index that is not there.
+
+<<resolve the placement target>>=
+target = next(
+    (t for t in todos if t.id == target_id), None
+)
+if target is None:
+    typer.echo(
+        f"Error: todo #{target_id} not found",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.id == item.id:
+    typer.echo(
+        f"Error: cannot place #{todo_id} relative to "
+        "itself",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.parent_id != item.parent_id:
+    typer.echo(
+        f"Error: #{target_id} is not a sibling of "
+        f"#{todo_id}",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.priority is None:
+    typer.echo(
+        f"Error: #{target_id} is unranked; "
+        "reprioritize it first",
+        err=True,
+    )
+    raise typer.Exit(1)
+if target.id not in [
+    s.id for s in comparison_siblings(todos, item)
+]:
+    typer.echo(
+        f"Error: #{target_id} is not in the comparison "
+        f"set for #{todo_id}; done items and other "
+        "workers' items are excluded",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Let's verify the four placements against the shared sibling list
+(\cref{todo:placement}), so that the numbers can be read against each
+other rather than one at a time:
+
+<<test functions>>=
+def test_reprioritize_top(ranked_siblings):
+  """--top lands above the highest sibling."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--top"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_reprioritize_bottom(ranked_siblings):
+  """--bottom lands below the lowest sibling."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--bottom"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 1.0
+
+
+def test_reprioritize_above_target(ranked_siblings):
+  """--above splits the gap over the target."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 5.0
+
+
+def test_reprioritize_below_target(ranked_siblings):
+  """--below splits the gap under the target."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--below", "2"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 3.0
+
+
+def test_reprioritize_above_the_top(ranked_siblings):
+  """--above the highest sibling behaves like --top."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "1"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
+
+
+def test_reprioritize_ranks_an_unranked_item(
+  temp_todo_dir,
+):
+  """A placement flag ranks a previously unranked item."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Ranked", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "2", "--top"]
+  )
+
+  assert result.exit_code == 0
+  assert stored_priority(2) == 6.0
+  assert "unset -> 6.0" in result.output
+@
+
+Now the ways a target can be wrong.  Each of them has to end in an
+exit code and a message, never in a traceback from deep inside the
+placement helper:
+
+<<test functions>>=
+def test_reprioritize_above_non_sibling(temp_todo_dir):
+  """A target under another parent is rejected."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Parent", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Child", priority=4.5,
+      parent_id=1,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=3, title="Mover", priority=1.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "3", "--above", "2"]
+  )
+
+  assert result.exit_code == 1
+  assert "#2 is not a sibling of #3" in result.output
+  assert stored_priority(3) == 1.0
+
+
+def test_reprioritize_above_itself(ranked_siblings):
+  """An item cannot be placed relative to itself."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "4"]
+  )
+  assert result.exit_code == 1
+  assert (
+    "cannot place #4 relative to itself"
+    in result.output
+  )
+  assert stored_priority(4) == 0.0
+
+
+def test_reprioritize_above_unranked_target(
+  temp_todo_dir,
+):
+  """An unranked target is reported, not guessed at."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Mover", priority=1.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "2", "--above", "1"]
+  )
+
+  assert result.exit_code == 1
+  assert (
+    "#1 is unranked; reprioritize it first"
+    in result.output
+  )
+  assert stored_priority(2) == 1.0
+
+
+def test_reprioritize_above_done_target(ranked_siblings):
+  """A done target is outside the comparison set."""
+  _, todos = load_todos()
+  next(t for t in todos if t.id == 2).status = "done"
+  save_todos(5, todos)
+
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+
+  assert result.exit_code == 1
+  assert (
+    "#2 is not in the comparison set for #4"
+    in result.output
+  )
+
+
+def test_reprioritize_placement_needs_an_id(
+  ranked_siblings,
+):
+  """A placement flag without an ID is refused."""
+  result = runner.invoke(cli, ["reprioritize", "--top"])
+  assert result.exit_code == 1
+  assert "need a todo ID" in result.output
+
+
+@pytest.mark.parametrize(
+  "flags,message",
+  [
+    (
+      ["--top", "--bottom"],
+      "--top and --bottom cannot be used together",
+    ),
+    (
+      ["--top", "--above", "1"],
+      "--top and --above cannot be used together",
+    ),
+    (
+      ["--top", "--below", "1"],
+      "--top and --below cannot be used together",
+    ),
+    (
+      ["--bottom", "--above", "1"],
+      "--bottom and --above cannot be used together",
+    ),
+    (
+      ["--bottom", "--below", "1"],
+      "--bottom and --below cannot be used together",
+    ),
+    (
+      ["--above", "1", "--below", "2"],
+      "--above and --below cannot be used together",
+    ),
+  ],
+)
+def test_reprioritize_rejects_flag_pairs(
+  ranked_siblings, flags, message,
+):
+  """Every pair of placement flags is refused."""
+  result = runner.invoke(
+    cli, ["reprioritize", "4", *flags]
+  )
+  assert result.exit_code == 1
+  assert message in result.output
 @
 
 We also register the [[reprio]] alias:
@@ -9605,9 +12421,33 @@ We also register the [[reprio]] alias:
 def reprio(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
+    top: Annotated[bool, top_opt] = False,
+    bottom: Annotated[bool, bottom_opt] = False,
+    above: Annotated[int | None, above_opt] = None,
+    below: Annotated[int | None, below_opt] = None,
 ):
     """Alias for reprioritize."""
-    reprioritize(todo_id=todo_id)
+    reprioritize(
+        todo_id=todo_id,
+        top=top,
+        bottom=bottom,
+        above=above,
+        below=below,
+    )
+@
+
+The alias has to forward the flags, not merely the ID, or a script
+that says [[reprio 4 --top]] would silently get the interactive search
+instead:
+
+<<test functions>>=
+def test_reprio_alias_forwards_placement(ranked_siblings):
+  """The reprio alias passes the placement through."""
+  result = runner.invoke(
+    cli, ["reprio", "4", "--top"]
+  )
+  assert result.exit_code == 0
+  assert stored_priority(4) == 7.0
 @
 
 Let's verify the new no-argument batch mode: it should only touch the
@@ -16285,7 +19125,9 @@ def test_sync_marks_done_from_github(
 
 The [[note]] command adds a note to a todo item. For
 GitHub-linked items, it posts a comment on the issue or PR. For
-local items, it appends to the [[notes]] field.
+local items, it records the text in the [[notes]] field: appended
+when the text arrives as a fragment, replacing the field when the
+user edited the notes as a whole.
 
 Like [[view]] and [[done]], [[note]] defaults to the currently active
 todo when no ID is given.  This keeps the common workflow short:
@@ -16311,7 +19153,12 @@ def note(
                        note_message_opt] = None,
     edit: Annotated[bool, editor_opt] = False,
 ):
-    """Add a note to a todo item."""
+    """Add a note to a todo item.
+
+    With `--edit`, a local item opens its current notes for
+    editing and the saved buffer becomes the new notes; a
+    GitHub-linked item opens an empty buffer for a new comment.
+    """
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "add a note",
@@ -16328,10 +19175,31 @@ def note(
         raise typer.Exit(1)
 
     <<resolve note text>>
-    <<post or append note>>
+    <<record the note>>
 @
 
+The three sources differ in more than where the characters come
+from.  [[--message]] and standard input hand us a fragment: the
+user typed it without seeing what is already stored, so the only
+thing it can mean is \enquote{add this to what is there.}  The
+editor on a local item is the opposite.  It opens on the whole of
+[[item.notes]], so what comes back \emph{is} the notes as the user
+now wants them---including the lines the user rewrote or deleted.
+Appending that buffer stored every pre-filled line a second time,
+which made the pre-fill a trap rather than a convenience.
+
+GitHub-linked items keep appending even under [[--edit]], because
+there the unit of writing is a comment and not the issue body.
+The buffer starts empty, the text becomes a new comment, and
+[[item.notes]] is only a local mirror of the comment stream;
+replacing that mirror with a single comment would drop the earlier
+ones that GitHub still shows.
+
+The editor branch therefore records not only the text but whether
+it stands for the whole of the notes:
+
 <<resolve note text>>=
+replace_notes = False
 if message:
     note_text = message
 elif edit:
@@ -16342,6 +19210,7 @@ elif edit:
     if not note_text.strip():
         typer.echo("Empty note, cancelled.")
         raise typer.Exit(0)
+    replace_notes = not item.github
 else:
     note_text = sys.stdin.read()
     if not note_text.strip():
@@ -16349,7 +19218,32 @@ else:
         raise typer.Exit(0)
 @
 
-<<post or append note>>=
+An empty buffer keeps the meaning it always had: the user is
+cancelling, not clearing.  That reading costs nothing, because
+clearing is already what [[edit -E]] does when the body under the
+front matter is deleted (\cref{sec:edit-via-editor}), and it
+protects the far more common case of an editor closed by accident
+on notes that took a week to accumulate.  What we do store is
+stripped, for the same reason [[parse_editor_content]] strips the
+notes it parses: the trailing newline an editor leaves behind is
+not part of what the user wrote.
+
+<<record the note>>=
+if replace_notes:
+    item.notes = note_text.strip()
+    save_todos(next_id, todos)
+    typer.echo(f"Notes of #{todo_id} updated")
+else:
+    <<post or append the note>>
+@
+
+The appending path is unchanged.  A GitHub-linked item needs a
+working [[gh]] before we promise that the comment was posted, and
+[[append_note_to_item]] both posts it and mirrors it locally.  The
+two messages name the outcome rather than the command, so a user
+who expected one path and got the other sees it immediately.
+
+<<post or append the note>>=
 if item.github:
     require_gh()
 append_note_to_item(item, note_text, next_id, todos)
@@ -16463,6 +19357,157 @@ def test_note_without_id_requires_active_todo(
     )
 @
 
+The editor path is the one that used to bite.  Its contract is
+that the buffer the user saves is exactly what ends up stored, so
+the tests pin both halves of that: what the editor is handed, and
+what survives the save.  The first case is the one from the bug
+report---a user who appends a line below the pre-filled text:
+
+<<test functions>>=
+def test_note_edit_replaces_local_notes(temp_todo_dir):
+    """note --edit stores the buffer instead of appending."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="First\nSecond\n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Notes of #1 updated" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+
+
+def test_note_edit_prefills_existing_notes(temp_todo_dir):
+    """The editor opens on the notes already stored."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    seen = {}
+
+    def fake_editor(initial=""):
+        seen["initial"] = initial
+        return initial + "\nSecond\n"
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert seen["initial"] == "First"
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+@
+
+Saving the buffer untouched is the same operation with nothing
+added, so it must leave the notes exactly as they were---and an
+emptied buffer must still read as \enquote{cancel}, not
+\enquote{clear}:
+
+<<test functions>>=
+def test_note_edit_unchanged_buffer_keeps_notes(temp_todo_dir):
+    """Saving the pre-filled buffer changes nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=lambda initial="": initial,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+
+
+def test_note_edit_empty_buffer_cancels(temp_todo_dir):
+    """An empty buffer cancels and keeps the notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="  \n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Empty note, cancelled." in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+@
+
+The other two paths must not have moved.  A [[--message]] note is
+still a fragment appended to what is there, and a GitHub-linked
+item still gets an empty buffer and a posted comment:
+
+<<test functions>>=
+def test_note_message_still_appends(temp_todo_dir):
+    """--message appends rather than replacing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    result = runner.invoke(cli, ["note", "1", "-m", "X"])
+    assert result.exit_code == 0, result.stdout
+    assert "Note added to #1" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nX"
+
+
+def test_note_edit_github_still_posts_comment(temp_todo_dir):
+    """--edit on a GitHub item posts and mirrors a comment."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="GH issue",
+            created="2026-02-20T10:00:00",
+            notes="Earlier comment",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "5",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ), patch(
+        "nytid.cli.todo.open_editor",
+        return_value="Fresh comment",
+    ) as mock_editor:
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Comment posted" in result.output
+    assert mock_editor.call_args.args[0] == ""
+    _, todos = load_todos()
+    assert "Earlier comment" in todos[0].notes
+    assert "Fresh comment" in todos[0].notes
+@
+
 \section{Tests}
 
 The test file follows the same pattern as [[track.nw]]: a fixture
@@ -16521,15 +19566,32 @@ from nytid.cli.todo import (
     get_siblings,
     get_active_siblings,
     check_parent_completion,
+    get_parent,
     assign_priority_at_position,
     binary_search_priority,
     compute_child_priority_range,
     distribute_priorities_in_range,
+    default_priority_without_siblings,
+    PLACE_TOP,
+    PLACE_BOTTOM,
+    PLACE_ABOVE,
+    PLACE_BELOW,
+    PRIORITY_HELP,
+    require_stored_priority,
+    sort_siblings_by_stored_priority,
+    sibling_insert_position,
+    place_among_siblings,
+    comparison_siblings,
+    place_existing_item,
+    reject_conflicting_flags,
+    format_stored_priority,
     parse_editor_content,
     render_todo_markdown,
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
+    apply_metadata,
+    METADATA_FIELDS,
     DEFAULT_MAX_BOOST,
     gh_available,
     gh_fetch_issue,
@@ -17052,7 +20114,7 @@ def test_add_rejects_prio_with_append(temp_todo_dir):
 
     assert result.exit_code == 1
     assert (
-        "--prio and --append cannot be used together"
+        "--prio and --bottom cannot be used together"
         in result.output
     )
 
@@ -17094,7 +20156,7 @@ def test_add_rejects_skip_priority_with_append(
 
     assert result.exit_code == 1
     assert (
-        "--skip-priority and --append cannot be used together"
+        "--skip-priority and --bottom cannot be used together"
         in result.output
     )
 
