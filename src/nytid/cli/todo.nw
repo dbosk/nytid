@@ -414,6 +414,10 @@ class TodoItem:
 
     Items are stored in a JSON file and sorted by
     effective priority for display and scheduling.
+
+    A `priority` of `None` means unranked; omitting it
+    ranks the item at `0.0` instead, so an unranked
+    item has to ask for `None` explicitly.
     """
 
     id: int
@@ -477,6 +481,58 @@ class TodoItem:
         filtered = {k: v for k, v in data.items() if k in known}
         <<coerce stored estimate to hours>>
         return cls(**filtered)
+@
+
+\subsection{Ranked and Unranked Priorities}%
+\label{sec:ranked-and-unranked}
+
+[[priority]] carries two states rather than one number.  An item is
+\emph{ranked} when it holds a float---which is [[0.0]] when nobody
+said otherwise---and \emph{unranked} when it holds [[None]].  These
+are not two ways of saying \enquote{no priority yet}: [[0.0]] is a
+position in the ordering like any other, while [[None]] means the item
+has no position at all and must not be compared numerically with
+anything.
+
+The constructor default is a number because the field predates the
+unranked state.  A [[todos.json]] written before [[None]] became
+possible has no [[priority]] key at all, and [[from_dict]] fills a
+missing key from this very default; making it [[None]] would silently
+unrank every item in every such file, which would move all of them to
+the tail of the display order at once.  The asymmetry that buys us is
+that the unranked state is reachable only by \emph{asking} for it:
+passing [[priority=None]] to the constructor, or writing an explicit
+[[null]] in the JSON.  Omitting the argument---in a caller, and just
+as easily in a test---yields an item ranked at zero, not an unranked
+one.
+
+The distinction is load-bearing rather than cosmetic.
+[[effective_priority]] returns [[None]] for an unranked item and
+[[todo_display_sort_key]] sorts those into a separate tail
+(\cref{todo:effective-priority}); [[require_stored_priority]] and the
+placement helpers raise instead of guessing a number
+(\cref{todo:placement}); [[compute_child_priority_range]] refuses an
+unranked parent and skips unranked siblings
+(\cref{sec:child-priority-helpers}); [[reprioritize]] with no ID
+selects exactly the unranked items; and [[--skip-priority]] exists to
+create them.  An item that fell into ranked-at-zero by accident is
+therefore not merely mislabelled---it is silently admitted to every
+comparison those helpers were written to keep it out of.
+
+Let's pin all three doors into the two states, since it is precisely
+the one that does \emph{not} lead where its shape suggests that costs
+callers their afternoon:
+
+<<test functions>>=
+def test_priority_default_is_ranked_at_zero():
+  """Only an explicit null yields an unranked item."""
+  assert TodoItem(id=1, title="Test").priority == 0.0
+  assert TodoItem.from_dict(
+    {"id": 1, "title": "Test"}
+  ).priority == 0.0
+  assert TodoItem.from_dict(
+    {"id": 1, "title": "Test", "priority": None}
+  ).priority is None
 @
 
 \subsection{Labels Are a Set, Not a List}
@@ -1974,9 +2030,39 @@ so they always appear between~A and~B.
 
 The first helper finds the available priority range for children of
 a given parent. We look at the parent's siblings (same
-[[parent_id]] level) to find the next-lower-priority item. The range
-runs from the parent's priority down to that sibling's priority. If
-no sibling exists below, we use a generous default floor.
+[[parent_id]] level) to find the closest one at or below the parent.
+The range runs from the parent's priority down to that sibling's
+priority. If no such sibling exists, we use a generous default floor.
+
+Both bounds read \emph{stored} priorities, for the reason placement
+gives (\cref{todo:placement}): a deadline boost is temporary by design
+(\cref{todo:effective-priority}), and everything derived from this
+range---the child priorities from
+[[distribute_priorities_in_range]], the starting point from
+[[default_priority_without_siblings]]---is written straight into
+[[priority]] and outlives the deadline that justified it.  The upper
+bound was always the parent's stored number; taking the lower bound
+from [[require_effective_priority]] mixed the two scales in a single
+comparison.  A sibling one day from its deadline then reads as if it
+sat far above where it is stored, so it drops out of the lower set
+entirely and the floor collapses to the default: children of a parent
+at~5.0 whose neighbour sits at~4.0 would be spread from~$-5.0$
+upwards, below the very sibling the range exists to keep them above.
+Reading both bounds from the stored numbers makes the comparison
+meaningful again, and the range describes the same gap tomorrow as
+today.
+
+Siblings at exactly the parent's priority count as lower bounds too.
+Excluding them would send the floor to the default and let children
+sort below a sibling that the parent is level with---the same failure
+in a quieter form.  It does leave one degenerate outcome: the closest
+sibling can then equal the parent, and a zero-width (or, if the stored
+numbers ever invert, a backwards) interval gives
+[[distribute_priorities_in_range]] nothing to distribute over, since
+every division point would land on the bound itself.  We open a
+unit-wide range below the parent in that case, which is the same
+one-unit step [[assign_priority_at_position]] takes when it runs off
+the end of a list.
 
 <<child priority helpers>>=
 def compute_child_priority_range(
@@ -1985,9 +2071,11 @@ def compute_child_priority_range(
 ) -> tuple:
     """Find the priority range for children.
 
-    Returns ``(high, low)`` where high is the parent's
-    priority and low is the next-lower sibling's priority
-    (or a default floor if no lower sibling exists).
+    Returns ``(high, low)`` from stored priorities: high
+    is the parent's own, and low is that of the closest
+    sibling at or below it (or a default floor when no
+    sibling qualifies).  A degenerate result is widened
+    to a unit-wide range below the parent.
     """
     if parent.priority is None:
         raise ValueError(
@@ -2004,15 +2092,17 @@ def compute_child_priority_range(
     ]
     lower = [
         s for s in siblings
-        if require_effective_priority(s) < high
+        if require_stored_priority(s) <= high
     ]
     if lower:
         closest = max(
-            lower, key=require_effective_priority
+            lower, key=require_stored_priority
         )
-        low = require_effective_priority(closest)
+        low = require_stored_priority(closest)
     else:
         low = high - 10.0
+    if low >= high:
+        low = high - 1.0
     return (high, low)
 @
 
@@ -2115,6 +2205,54 @@ def test_compute_child_priority_range_no_sibling():
     )
     assert high == 5.0
     assert low == -5.0
+
+
+def test_compute_child_priority_range_ignores_boost():
+    """A boosted sibling still bounds the range where it
+    is stored."""
+    now = datetime.datetime.now()
+    created = (
+        now - datetime.timedelta(days=29)
+    ).isoformat()
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created=created,
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=4.0,
+            created=created,
+            deadline=(
+                now + datetime.timedelta(days=1)
+            ).isoformat(),
+        ),
+    ]
+    assert effective_priority(todos[1]) > 5.0
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 4.0
+
+
+def test_compute_child_priority_range_equal_sibling():
+    """A sibling at the parent's own priority opens a
+    unit-wide range."""
+    todos = [
+        TodoItem(
+            id=1, title="Parent A", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+        TodoItem(
+            id=2, title="Parent B", priority=5.0,
+            created="2026-01-01T00:00:00",
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[0]
+    )
+    assert high == 5.0
+    assert low == 4.0
 
 
 def test_default_priority_without_siblings():
@@ -10730,7 +10868,11 @@ verify both directions: promoting a child to the top level and
 moving it under a different parent.  Both re-rank as part of the
 move, which the first test meets as a binary-search question and the
 second as a silent placement in the new parent's still-empty child
-range.  We also confirm that supplying an invalid parent ID is
+range.  Neither parent in the second test was given a priority, so
+both hold the constructor default
+(\cref{sec:ranked-and-unranked}) and that range is the unit-wide
+fallback below them (\cref{sec:child-priority-helpers}).  We also
+confirm that supplying an invalid parent ID is
 rejected with a non-zero exit code rather than silently storing a
 dangling reference.
 
@@ -10787,8 +10929,10 @@ def test_edit_reparent_to_other(temp_todo_dir):
     child = next(t for t in todos if t.id == 3)
     assert child.parent_id == 2
     # First child of B: the middle of B's child range,
-    # asked for without a single question.
-    assert child.priority == -5.0
+    # asked for without a single question.  A and B both
+    # took the default priority of 0.0, so that range is
+    # the unit-wide fallback (0.0, -1.0).
+    assert child.priority == -0.5
 
 def test_edit_reparent_invalid(temp_todo_dir):
     """--parent with a non-existent ID is an error."""
@@ -10893,6 +11037,49 @@ REPRIORITIZE_HELP = (
 )
 @
 
+\subsection{Naming the Priority That Was There Before}
+
+Both paths through the command end in the same sentence: which item was
+reprioritized, what its priority was, and what it is now.  The
+\enquote{what it was} half is the awkward one, because an unranked item
+has no number to print.  The batch path spelled that state
+\enquote{unset} while the single-item path interpolated the raw value
+and printed \enquote{None}, so one command reported the same transition
+two ways depending on how it was invoked.
+
+The state is a property of the stored priority, not of either code
+path, so the spelling belongs to a function of that value rather than
+to a format string at each echo site.  Giving it one home is also what
+keeps the two paths from drifting again the next time the number
+formatting changes.
+
+We format the number the way the batch path already did, with one
+decimal: priorities are midpoints of midpoints and can carry more
+digits than a user wants to read, and the echo is a confirmation of
+\emph{where} the item landed, not a value anyone retypes.
+
+<<helpers>>=
+def format_stored_priority(value: float | None) -> str:
+    """Return `value` as the reprioritize echo spells it.
+
+    An unset (unranked) priority reads `unset`; a
+    ranked one is rounded to one decimal.
+    """
+    if value is None:
+        return "unset"
+    return f"{value:.1f}"
+@
+
+Let's verify both states, since it is exactly their disagreement that
+this helper exists to remove:
+
+<<test functions>>=
+def test_format_stored_priority_spells_out_unset():
+  """The unranked state reads 'unset', not 'None'."""
+  assert format_stored_priority(None) == "unset"
+  assert format_stored_priority(6.0) == "6.0"
+@
+
 <<reprioritize command>>=
 @cli.command(help=REPRIORITIZE_HELP)
 def reprioritize(
@@ -10954,10 +11141,12 @@ def reprioritize(
                 parent=parent_ctx,
                 todos=todos,
             )
+            old_priority = item.priority
             item.priority = new_priority
             typer.echo(
                 f"Reprioritized #{item.id}: "
-                f"unset -> {new_priority:.1f}"
+                f"{format_stored_priority(old_priority)}"
+                f" -> {format_stored_priority(new_priority)}"
             )
         save_todos(next_id, todos)
         return
@@ -10994,8 +11183,8 @@ def reprioritize(
     save_todos(next_id, todos)
     typer.echo(
         f"Reprioritized #{todo_id}: "
-        f"{old_priority if old_priority is None else f'{old_priority:.1f}'}"
-        f" -> {new_priority:.1f}"
+        f"{format_stored_priority(old_priority)}"
+        f" -> {format_stored_priority(new_priority)}"
     )
 @
 
@@ -11193,7 +11382,7 @@ def test_reprioritize_ranks_an_unranked_item(
 
   assert result.exit_code == 0
   assert stored_priority(2) == 6.0
-  assert "None -> 6.0" in result.output
+  assert "unset -> 6.0" in result.output
 @
 
 Now the ways a target can be wrong.  Each of them has to end in an
@@ -18507,6 +18696,7 @@ from nytid.cli.todo import (
     comparison_siblings,
     place_existing_item,
     reject_conflicting_flags,
+    format_stored_priority,
     parse_editor_content,
     render_todo_markdown,
     parse_yaml_block,
