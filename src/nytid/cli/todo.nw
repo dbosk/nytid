@@ -15816,7 +15816,9 @@ def test_sync_marks_done_from_github(
 
 The [[note]] command adds a note to a todo item. For
 GitHub-linked items, it posts a comment on the issue or PR. For
-local items, it appends to the [[notes]] field.
+local items, it records the text in the [[notes]] field: appended
+when the text arrives as a fragment, replacing the field when the
+user edited the notes as a whole.
 
 Like [[view]] and [[done]], [[note]] defaults to the currently active
 todo when no ID is given.  This keeps the common workflow short:
@@ -15842,7 +15844,12 @@ def note(
                        note_message_opt] = None,
     edit: Annotated[bool, editor_opt] = False,
 ):
-    """Add a note to a todo item."""
+    """Add a note to a todo item.
+
+    With `--edit`, a local item opens its current notes for
+    editing and the saved buffer becomes the new notes; a
+    GitHub-linked item opens an empty buffer for a new comment.
+    """
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "add a note",
@@ -15859,10 +15866,31 @@ def note(
         raise typer.Exit(1)
 
     <<resolve note text>>
-    <<post or append note>>
+    <<record the note>>
 @
 
+The three sources differ in more than where the characters come
+from.  [[--message]] and standard input hand us a fragment: the
+user typed it without seeing what is already stored, so the only
+thing it can mean is \enquote{add this to what is there.}  The
+editor on a local item is the opposite.  It opens on the whole of
+[[item.notes]], so what comes back \emph{is} the notes as the user
+now wants them---including the lines the user rewrote or deleted.
+Appending that buffer stored every pre-filled line a second time,
+which made the pre-fill a trap rather than a convenience.
+
+GitHub-linked items keep appending even under [[--edit]], because
+there the unit of writing is a comment and not the issue body.
+The buffer starts empty, the text becomes a new comment, and
+[[item.notes]] is only a local mirror of the comment stream;
+replacing that mirror with a single comment would drop the earlier
+ones that GitHub still shows.
+
+The editor branch therefore records not only the text but whether
+it stands for the whole of the notes:
+
 <<resolve note text>>=
+replace_notes = False
 if message:
     note_text = message
 elif edit:
@@ -15873,6 +15901,7 @@ elif edit:
     if not note_text.strip():
         typer.echo("Empty note, cancelled.")
         raise typer.Exit(0)
+    replace_notes = not item.github
 else:
     note_text = sys.stdin.read()
     if not note_text.strip():
@@ -15880,7 +15909,32 @@ else:
         raise typer.Exit(0)
 @
 
-<<post or append note>>=
+An empty buffer keeps the meaning it always had: the user is
+cancelling, not clearing.  That reading costs nothing, because
+clearing is already what [[edit -E]] does when the body under the
+front matter is deleted (\cref{sec:edit-via-editor}), and it
+protects the far more common case of an editor closed by accident
+on notes that took a week to accumulate.  What we do store is
+stripped, for the same reason [[parse_editor_content]] strips the
+notes it parses: the trailing newline an editor leaves behind is
+not part of what the user wrote.
+
+<<record the note>>=
+if replace_notes:
+    item.notes = note_text.strip()
+    save_todos(next_id, todos)
+    typer.echo(f"Notes of #{todo_id} updated")
+else:
+    <<post or append the note>>
+@
+
+The appending path is unchanged.  A GitHub-linked item needs a
+working [[gh]] before we promise that the comment was posted, and
+[[append_note_to_item]] both posts it and mirrors it locally.  The
+two messages name the outcome rather than the command, so a user
+who expected one path and got the other sees it immediately.
+
+<<post or append the note>>=
 if item.github:
     require_gh()
 append_note_to_item(item, note_text, next_id, todos)
@@ -15992,6 +16046,157 @@ def test_note_without_id_requires_active_todo(
         "No active todo. Specify an ID to add a note."
         in result.output
     )
+@
+
+The editor path is the one that used to bite.  Its contract is
+that the buffer the user saves is exactly what ends up stored, so
+the tests pin both halves of that: what the editor is handed, and
+what survives the save.  The first case is the one from the bug
+report---a user who appends a line below the pre-filled text:
+
+<<test functions>>=
+def test_note_edit_replaces_local_notes(temp_todo_dir):
+    """note --edit stores the buffer instead of appending."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="First\nSecond\n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Notes of #1 updated" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+
+
+def test_note_edit_prefills_existing_notes(temp_todo_dir):
+    """The editor opens on the notes already stored."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    seen = {}
+
+    def fake_editor(initial=""):
+        seen["initial"] = initial
+        return initial + "\nSecond\n"
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert seen["initial"] == "First"
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+@
+
+Saving the buffer untouched is the same operation with nothing
+added, so it must leave the notes exactly as they were---and an
+emptied buffer must still read as \enquote{cancel}, not
+\enquote{clear}:
+
+<<test functions>>=
+def test_note_edit_unchanged_buffer_keeps_notes(temp_todo_dir):
+    """Saving the pre-filled buffer changes nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=lambda initial="": initial,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+
+
+def test_note_edit_empty_buffer_cancels(temp_todo_dir):
+    """An empty buffer cancels and keeps the notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="  \n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Empty note, cancelled." in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+@
+
+The other two paths must not have moved.  A [[--message]] note is
+still a fragment appended to what is there, and a GitHub-linked
+item still gets an empty buffer and a posted comment:
+
+<<test functions>>=
+def test_note_message_still_appends(temp_todo_dir):
+    """--message appends rather than replacing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    result = runner.invoke(cli, ["note", "1", "-m", "X"])
+    assert result.exit_code == 0, result.stdout
+    assert "Note added to #1" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nX"
+
+
+def test_note_edit_github_still_posts_comment(temp_todo_dir):
+    """--edit on a GitHub item posts and mirrors a comment."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="GH issue",
+            created="2026-02-20T10:00:00",
+            notes="Earlier comment",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "5",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ), patch(
+        "nytid.cli.todo.open_editor",
+        return_value="Fresh comment",
+    ) as mock_editor:
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Comment posted" in result.output
+    assert mock_editor.call_args.args[0] == ""
+    _, todos = load_todos()
+    assert "Earlier comment" in todos[0].notes
+    assert "Fresh comment" in todos[0].notes
 @
 
 \section{Tests}
