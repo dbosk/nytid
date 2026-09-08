@@ -2148,38 +2148,158 @@ class ParsedTodo:
 @
 
 \subsection{Minimal YAML Parser}
+\label{sec:parse-yaml}
 
 We need to parse YAML front matter blocks, but only a small subset:
-flat key-value pairs with strings, numbers, and bracketed lists.
+flat key-value pairs with strings, numbers, and bracketed lists, plus
+\emph{literal block scalars} for free text that spans several lines.
 Rather than adding a PyYAML dependency for this narrow use case, we
 implement a minimal parser. This keeps the dependency footprint small
 and avoids YAML's many surprising edge cases (the \enquote{Norway
 problem}, implicit type coercion, etc.).
 
+The block scalars exist for long free text such as a description.
+Every other value fits on its [[key: value]] line, but a description
+is prose with paragraphs.  The parser is line oriented, so if such a
+value were rendered inline and the user broke it into lines in the
+editor, each continuation line would be silently dropped (no colon)
+or, worse, become a bogus key (a colon somewhere in the sentence).  A
+literal block, [[key: |]] followed by indented lines, gives the user a
+clearly delimited region in which added lines are safe.
+
 <<editor infrastructure>>=
 def parse_yaml_block(text):
     """Parse a minimal YAML block into a dictionary.
 
-    Handles only flat key-value pairs with string,
-    number, and bracket-list values. This is sufficient
-    for our front matter format.
+    Handles flat key-value pairs with string, number,
+    bracket-list and brace-dict values, and literal
+    block scalars (``key: |``) whose indented lines are
+    kept verbatim. This is sufficient for our front
+    matter format.
     """
     result = {}
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        idx += 1
+        if not stripped or stripped.startswith("#"):
             continue
-        if ":" not in line:
+        if ":" not in stripped:
             continue
-        key, _, value = line.partition(":")
+        key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
         if not key:
             continue
-        result[key] = parse_yaml_value(value)
+        indicator = parse_block_indicator(value)
+        if indicator is None:
+            result[key] = parse_yaml_value(value)
+        else:
+            <<collect the literal block>>
     return result
+@
 
+Where does a block end?  The tempting rule, \enquote{while the line is
+indented at least as far as the first line}, fails on a value whose
+first line is deeper than the rest---a pasted code line, an indented
+list continuation: the block would end early and the rest would be
+dropped without a word.  Instead the block runs through blank lines
+and \emph{any} line that starts with whitespace, and ends only at the
+first non-blank line in column~0.  This works because the renderer
+(\cref{sec:render-yaml}) indents every content line by two spaces and
+emits exactly one column-0 line after a block, the closing [[---]], so
+whatever text the block holds, it comes back unchanged.  The price is
+that a key following a block must sit in column~0, which the renderer
+guarantees and a hand-written buffer must respect.
 
+<<collect the literal block>>=
+block = []
+while idx < len(lines):
+    line = lines[idx]
+    if line.strip() and not line[0].isspace():
+        break
+    block.append(line)
+    idx += 1
+result[key] = join_literal_block(block, *indicator)
+@
+
+The indicator after the colon is [[|]] alone or with a single digit
+and a chomping sign, in either order, as in YAML: [[|-]], [[|2]],
+[[|2+]].  The digit is the block's indentation.  Without it we take
+the \emph{smallest} indentation of any content line; YAML itself
+requires the digit precisely when the first content line starts with
+whitespace, because no parser can otherwise tell block indentation
+from content, and the renderer emits it in that case.  We do not
+recognise the folded indicator [[>]], since folding rewrites line
+breaks and silently guessing would be worse than leaving the value
+alone.
+
+<<editor infrastructure>>=
+def parse_block_indicator(value):
+    """Return ``(indent, chomp)`` for a literal block indicator.
+
+    Recognizes ``|`` with an optional indentation digit
+    (1--9) and an optional chomping sign, in either
+    order. Returns ``None`` for anything else.
+    """
+    if not value.startswith("|") or len(value) > 3:
+        return None
+    rest = value[1:]
+    digits = [c for c in rest if c in "123456789"]
+    signs = [c for c in rest if c in "+-"]
+    if len(digits) > 1 or len(signs) > 1:
+        return None
+    if len(digits) + len(signs) != len(rest):
+        return None
+    indent = int(digits[0]) if digits else None
+    chomp = signs[0] if signs else ""
+    return indent, chomp
+@
+
+Joining strips \emph{up to} the block indentation from each line, not
+exactly that much, so that a hand-written block with a first line
+deeper than the rest does not come back truncated.  Blank lines come
+back empty so that paragraph breaks survive.  A tab counts as one
+character; the renderer never emits tabs, so a hand-typed tab can at
+most leave a line with extra leading spaces, never truncate the block.
+Trailing newlines are dropped, as [[notes]] are stripped, because a
+trailing newline in a description is never meaningful; the [[+]]
+chomping sign keeps them for a user who insists.  The value bypasses
+[[parse_yaml_value]]: literal means literal, so a description that
+happens to look like a number stays a string.
+
+<<editor infrastructure>>=
+def join_literal_block(block, indent=None, chomp=""):
+    """Dedent and join the lines of a literal block.
+
+    Strips up to ``indent`` leading characters from each
+    line (the smallest indentation found when ``None``),
+    turns whitespace-only lines into empty ones, and
+    drops trailing newlines unless ``chomp`` is ``+``.
+    """
+    content = [line for line in block if line.strip()]
+    if indent is None:
+        indent = min(
+            (len(line) - len(line.lstrip()) for line in content),
+            default=0,
+        )
+    dedented = []
+    for line in block:
+        if not line.strip():
+            dedented.append("")
+        else:
+            lead = len(line) - len(line.lstrip())
+            dedented.append(line[min(indent, lead):])
+    text = "\n".join(dedented)
+    if chomp == "+":
+        return text + "\n" if content else ""
+    return text.rstrip("\n")
+@
+
+Inline values are coerced by type, as far as the subset goes:
+
+<<editor infrastructure>>=
 def parse_yaml_value(value):
     """Parse a single YAML value.
 
@@ -2222,6 +2342,7 @@ def parse_yaml_value(value):
 @
 
 \subsection{Rendering YAML}
+\label{sec:render-yaml}
 
 We need the inverse of parsing to support round-trip editing: render
 a todo back to the same document format so the user can re-edit it.
@@ -2249,12 +2370,169 @@ def render_yaml_block(metadata):
                 f"{k}: {v}" for k, v in value.items()
             )
             lines.append(f"{key}: {{{items}}}")
+        elif needs_literal_block(key, value):
+            lines.extend(render_literal_block(key, value))
         else:
             lines.append(f"{key}: {value}")
     lines.append("---")
     if len(lines) == 2:
         return ""
     return "\n".join(lines)
+@
+
+A string goes out as a literal block in three cases.  The description
+always does, even when it is a single line: the block is what makes it
+safe for the user to add lines (\cref{sec:parse-yaml}), and if the
+form depended on the current value, so would the failure mode---a
+description that is safe to expand today would silently lose text
+tomorrow.  Any string spanning several lines does too, which also
+closes a latent hole: [[command]] and [[wd]] may legally contain
+newlines, and the inline form used to truncate them at the first
+newline on the next round trip.  Finally, a string that would itself
+read as a block indicator, such as a bare [[|]], would otherwise come
+back as the start of a block that swallows the keys after it.
+
+We split with [[splitlines()]] on both sides rather than on [[\n]]
+alone: the parser sees the buffer through [[splitlines()]], which also
+breaks at form feeds and Unicode line separators, so a value containing
+one would be emitted as one physical line but read back as two, the
+second unindented and the block cut short.  Blank lines go out empty
+rather than as two spaces, since many editors strip trailing whitespace
+on save and either form parses the same.  When the first content line
+starts with whitespace we emit the indentation digit, as YAML requires
+(\cref{sec:parse-yaml}).
+
+<<editor infrastructure>>=
+def needs_literal_block(key, value):
+    """Return whether ``value`` must be rendered as a literal block."""
+    if not isinstance(value, str):
+        return False
+    if key in LITERAL_BLOCK_KEYS:
+        return True
+    if len(value.splitlines()) > 1:
+        return True
+    return parse_block_indicator(value.strip()) is not None
+
+
+def render_literal_block(key, value):
+    """Render ``value`` as an indented literal block under ``key``."""
+    lines = value.splitlines()
+    first = next((line for line in lines if line.strip()), "")
+    indicator = "|"
+    if first[:1].isspace():
+        indicator += str(len(LITERAL_BLOCK_INDENT))
+    rendered = [f"{key}: {indicator}"]
+    for line in lines:
+        rendered.append(
+            LITERAL_BLOCK_INDENT + line if line.strip() else ""
+        )
+    return rendered
+<<constants>>=
+LITERAL_BLOCK_KEYS = ("description",)
+LITERAL_BLOCK_INDENT = "  "
+@
+
+\subsection{Testing the YAML Subset}
+
+The block rules are exactly the kind of detail that drifts, so we pin
+them down one by one, then check that whatever the renderer emits the
+parser reads back unchanged.
+
+<<test functions>>=
+def test_parse_yaml_block_literal_block():
+    """A block keeps paragraphs, inner indentation and # lines."""
+    text = """description: |
+  First paragraph.
+
+  Second paragraph:
+    indented line
+  # not a comment
+deadline: 2026-03-01
+"""
+    result = parse_yaml_block(text)
+    assert result["description"] == (
+        "First paragraph.\n\nSecond paragraph:\n"
+        "  indented line\n# not a comment"
+    )
+    assert result["deadline"] == "2026-03-01"
+
+
+def test_parse_yaml_block_literal_first_line_deeper():
+    """A first line deeper than the rest does not cut the block."""
+    text = "description: |\n      code\n  more\n"
+    result = parse_yaml_block(text)
+    assert result["description"] == "    code\nmore"
+
+
+def test_parse_yaml_block_literal_indicators():
+    """The indentation digit and chomping sign are honoured."""
+    assert parse_yaml_block(
+        "description: |2\n    a\n    b\n"
+    )["description"] == "  a\n  b"
+    assert parse_yaml_block(
+        "description: |-\n  a\n\n"
+    )["description"] == "a"
+    assert parse_yaml_block(
+        "description: |+\n  a\n\n"
+    )["description"] == "a\n\n"
+    assert parse_yaml_block("wd: |>")["wd"] == "|>"
+
+
+def test_parse_yaml_block_literal_is_text():
+    """Block content bypasses value coercion."""
+    result = parse_yaml_block("description: |\n  42\nwd: /tmp\n")
+    assert result["description"] == "42"
+    assert result["wd"] == "/tmp"
+
+
+def test_render_yaml_block_literal_block():
+    """Descriptions, multi-line strings and bare | become blocks."""
+    text = render_yaml_block({
+        "description": "One line.",
+        "command": "first\nsecond",
+        "wd": "|",
+        "who": "dbosk",
+    })
+    assert text == (
+        "---\n"
+        "description: |\n"
+        "  One line.\n"
+        "command: |\n"
+        "  first\n"
+        "  second\n"
+        "wd: |\n"
+        "  |\n"
+        "who: dbosk\n"
+        "---"
+    )
+
+
+def test_render_yaml_block_literal_indentation_digit():
+    """A first line starting with whitespace gets the digit."""
+    text = render_yaml_block({"description": "  code\n\nmore"})
+    assert text == (
+        "---\ndescription: |2\n    code\n\n  more\n---"
+    )
+
+
+def test_yaml_block_round_trip():
+    """Whatever the renderer emits, the parser reads back."""
+    hostile = [
+        "One line.",
+        "Two paragraphs.\n\nSecond one: with a colon.",
+        "  code first\nthen text",
+        "  all\n  indented",
+        "42",
+        "[not, a, list]",
+        "# not a heading\n---\nnot a delimiter",
+        "|",
+        "trailing newline\n",
+    ]
+    for value in hostile:
+        rendered = render_yaml_block({"description": value})
+        inner = "\n".join(rendered.splitlines()[1:-1])
+        parsed = parse_yaml_block(inner)
+        assert parsed["description"] == value.rstrip("\n")
 @
 
 \subsection{Parsing Editor Content}
@@ -2276,7 +2554,7 @@ def parse_editor_content(text):
 
     Format:
     - First non-empty line = title
-    - Optional ``---``...``---`` = YAML front matter
+    - Optional ``---``...``---`` in column 0 = YAML front matter
     - Text until first heading = parent notes
     - ``# Heading`` = level-1 child
     - ``## Heading`` = level-2 child (of preceding #)
@@ -2311,17 +2589,22 @@ while idx < len(lines):
 
 After the title, an optional YAML front matter block provides
 metadata. We detect it by looking for a line that is exactly
-[[---]]:
+[[---]] in column~0.  The column matters: a literal block inside the
+front matter (\cref{sec:parse-yaml}) may contain a [[---]] line of
+its own, say a Markdown rule in a description, and that line is
+indented, so requiring the delimiter to start the line is what keeps
+block content from closing the front matter early.  Trailing
+whitespace is still tolerated, since editors add and strip it freely.
 
 <<parse optional yaml block>>=
 parent_metadata = {}
 while idx < len(lines) and not lines[idx].strip():
     idx += 1
-if idx < len(lines) and lines[idx].strip() == "---":
+if idx < len(lines) and lines[idx].rstrip() == "---":
     yaml_start = idx + 1
     idx = yaml_start
     while idx < len(lines):
-        if lines[idx].strip() == "---":
+        if lines[idx].rstrip() == "---":
             yaml_text = "\n".join(
                 lines[yaml_start:idx]
             )
@@ -2395,14 +2678,18 @@ stack.append((level, current_item.children))
 
 Content lines go to either the parent notes (if no heading seen
 yet) or the current item's notes. We also detect YAML blocks
-within heading sections:
+within heading sections, again only in column~0.  Note that the
+heading test above runs on every line, including those inside a
+child's YAML block, and its regex is anchored at the start of the
+line; this is why a literal block indents its content.  A [[#]] in
+column~0 inside a child's block would not be content but a new
+heading, finalizing the half-read child and creating a bogus one.
 
 <<handle content line>>=
 if current_item is None:
     parent_notes_lines.append(line)
 else:
-    stripped = line.strip()
-    if stripped == "---":
+    if line.rstrip() == "---":
         if in_yaml:
             in_yaml = False
         elif current_yaml_lines is None:
@@ -2513,6 +2800,37 @@ Child notes.
     child = result.children[0]
     assert child.metadata.get("command") == "claude"
     assert child.metadata.get("wd") == "/tmp"
+    assert "Child notes" in child.notes
+
+
+def test_parse_editor_indented_dashes_are_content():
+    """Only a column-0 --- delimits front matter."""
+    text = """Parent
+---
+description: |
+  Above the rule.
+  ---
+  Below the rule.
+wd: /tmp
+---
+
+# Child
+---
+description: |
+  ---
+command: claude
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.metadata["description"] == (
+        "Above the rule.\n---\nBelow the rule."
+    )
+    assert result.metadata["wd"] == "/tmp"
+    child = result.children[0]
+    assert child.metadata["description"] == "---"
+    assert child.metadata["command"] == "claude"
     assert "Child notes" in child.notes
 @
 
