@@ -220,7 +220,9 @@ def get_max_boost() -> float:
 @
 
 Worker-specific defaults need a different treatment from the global
-settings above.  A teacher may want every task for [[dan-claude]] to run
+settings above.%
+\label{todo:worker-defaults}
+A teacher may want every task for [[dan-claude]] to run
 [[opencode]] in one working directory with one captured environment,
 without baking those choices into each todo item.
 
@@ -3165,19 +3167,42 @@ We extract only non-default metadata fields so the YAML block stays
 minimal---an empty dict produces no block at all, keeping the editor
 document uncluttered for simple todos.
 
+Two of the keys are read out of [[__dict__]] rather than off the item.
+The buffer is not a report on the item, it is the item's editable
+state: whatever it shows is what [[apply_metadata]] reads back and
+stores when the user saves, so a line the user never typed is
+indistinguishable from one they did.  For [[wd]] and [[command]]---the
+two members of [[WORKER_DEFAULT_ATTRIBUTES]] this function can
+emit---an ordinary attribute read answers with the worker's configured
+default whenever the item stores nothing, and rendering \emph{that}
+would let an unrelated edit freeze runtime policy into
+[[todos.json]], which is exactly what [[to_dict]] refuses to do
+(\cref{todo:worker-defaults}).  Asking [[__dict__]] asks the question
+the buffer is actually posing: what does this item carry of its own?
+
+The remaining keys stay plain reads.  No policy stands behind them, so
+the stored value and the resolved value are the same value, and
+writing them any other way would suggest a distinction that is not
+there.
+
 <<editor infrastructure>>=
 def build_item_metadata(item):
     """Extract non-default metadata from a TodoItem.
 
+    Worker defaults are deliberately not rendered: the
+    buffer shows what the item stores, since whatever it
+    shows is stored back on save.
+
     Returns a dict suitable for YAML front matter.
     """
+    stored = item.__dict__
     meta = {}
-    if item.wd:
-        meta["wd"] = item.wd
+    if stored.get("wd"):
+        meta["wd"] = stored["wd"]
     if item.worktree:
         meta["worktree"] = item.worktree
-    if item.command:
-        meta["command"] = item.command
+    if stored.get("command"):
+        meta["command"] = stored["command"]
     if item.labels:
         meta["labels"] = item.labels
     if item.deadline:
@@ -3191,6 +3216,88 @@ def build_item_metadata(item):
     if item.description:
         meta["description"] = item.description
     return meta
+@
+
+Let's verify that the buffer really is free of policy.  With a command
+configured for the worker but nothing stored on the item, an editing
+session that changes nothing must leave the item exactly as unset as
+it found it---which it can only do if the key never appeared:
+
+<<test functions>>=
+def test_edit_buffer_hides_worker_default_command(
+  temp_todo_dir,
+):
+  """A worker-default command is neither shown nor stored."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command:" not in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] is None
+@
+
+The complement matters just as much: hiding the default must not hide
+a command the item actually carries, or the user could no longer edit
+the field at all.
+
+<<test functions>>=
+def test_edit_buffer_keeps_explicit_command(
+  temp_todo_dir,
+):
+  """An explicit command is shown and survives the trip."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      command="claude",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command: claude" in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] == "claude"
 @
 
 Children are rendered recursively, with the heading level increasing
@@ -7662,7 +7769,16 @@ else:
 
 The call site computes the parent's priority range from its sibling
 context and passes the parent's [[who]] so that any child lacking
-an explicit [[who:]] in its YAML block inherits the same assignee:
+an explicit [[who:]] in its YAML block inherits the same assignee.
+
+It reads the environment the same way the recursive call does, and for
+the same reason: [[env]] is the only one of these four fields that
+[[WORKER_DEFAULT_ATTRIBUTES]] covers, so [[parent_item.env]] answers
+with the worker's configured environment whenever the parent stored
+none, and every child would then be written to disk carrying a runtime
+default nobody typed.  The other three are plain reads because no
+policy stands behind them---[[labels]], [[deadline]] and [[who]] mean
+exactly what the item holds.
 
 <<create children from parsed>>=
 if parent_item.priority is None:
@@ -7679,8 +7795,47 @@ create_children_from_parsed(
     parent_item.deadline,
     prio_high, prio_low,
     parent_item.who,
-    parent_item.env,
+    parent_item.__dict__.get("env"),
 )
+@
+
+Let's verify that a configured environment stays out of the store.
+The parent has none of its own, so an attribute read would hand every
+child the worker's, and the children are the items we can check---the
+[[env]] they were given is written straight to disk:
+
+<<test functions>>=
+def test_add_edit_children_omit_worker_env(
+  temp_todo_dir,
+):
+  """A worker-default env is not written into children."""
+  buffer = (
+    "Parent task\n"
+    "\n"
+    "# Child task\n"
+  )
+  with patched_worker_config({
+    f"todo.worker.{default_username}.env": {
+      "MODE": "agent",
+    },
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      return_value=buffer,
+    ):
+      result = runner.invoke(
+        cli,
+        ["add", "--edit", "--top-level", "--prio", "1"],
+      )
+    assert result.exit_code == 0, result.stdout
+
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  child = [
+    t for t in data["todos"] if t["id"] == 2
+  ][0]
+  assert child["title"] == "Child task"
+  assert child["env"] is None
 @
 
 \subsection{The [[ls]] Command}
