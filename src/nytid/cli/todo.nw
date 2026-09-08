@@ -3222,6 +3222,256 @@ def test_github_field_roundtrip():
     assert parsed["github"]["number"] == "42"
 @
 
+\subsection{Applying Metadata to an Item}
+\label{sec:apply-metadata}
+
+[[build_item_metadata]] turns an item into front matter; this is the
+inverse direction, and until now it had no home.  Front-matter keys were
+applied by an if-chain written out five times over---for the parent and
+for the matched children of [[edit]], and for the parent and the new
+children of [[add]], the latter twice because [[add]] creates children
+in its own recursion.  Five copies of one rule drift, and these had
+drifted: [[github]] was applied for the parent but for none of the
+children, so a user who linked a sub-item to an issue in the editor
+watched the link vanish on save.  Collecting the per-key normalizers
+into a single table is what stops the next key from drifting the same
+way: adding a key becomes one edit instead of five, and forgetting a
+site stops being possible.
+
+The contract is that a key \emph{present} in [[meta]] overwrites the
+field while an \emph{absent} key leaves it alone.  Deleting
+[[deadline:]] from the buffer therefore does not clear the deadline,
+and deleting the description block does not clear the description;
+[[edit N --deadline ""]] and [[edit N --description ""]] are how a
+field is cleared.  The asymmetry is deliberate: the buffer is rendered
+from the item and shows only the keys that are set, so a user who has
+never seen a key cannot be said to have deleted it.  Keys the table
+does not know are ignored rather than rejected, which leaves the front
+matter open for a user's own annotations.
+
+Each key carries the normalizer its own site already applied: [[wd]] is
+canonicalized to an absolute path, [[worktree]] is validated as a name
+without path separators, [[deadline]] is normalized to a comparable
+string, and [[estimate]] is parsed into hours.  Gathering them here
+changes none of them; it only stops them from being written out five
+times, and makes the set of keys something a reader can take in at a
+glance.
+
+Every string-valued key coerces its value with [[str]] before storing
+it.  That is not defensive habit but a consequence of the parser: our
+minimal YAML subset (\cref{sec:parse-yaml}) types a bare number for
+\emph{every} key, so a hand-typed [[wd: 2026]] arrives here as an
+[[int]].  Coercing at this one point is what keeps the field types the
+rest of the module assumes; without it the integer surfaces far from
+the editor session that stored it, in [[canonicalize_wd]], in the
+[[subprocess]] call that [[command]] feeds, or in the Markdown renderer
+and the calendar export that read [[description]].  A list-valued key
+gets the same treatment in its own shape: [[labels: grading]] is a
+string, not a list, and wrapping it makes it the one label the user
+meant rather than the six letters [[sorted(set(...))]] would otherwise
+store.
+
+[[github]] and [[env]] are the two dictionary-valued keys, and they get
+the opposite treatment---a value that is not a dictionary is left
+alone.  There is no honest dictionary to make out of [[github: 5]], and
+storing something else in a field the [[gh]] wrappers index by [[repo]]
+and [[number]] would only move the failure to the next [[sync]].  The
+sentinel [[METADATA_UNCHANGED]] lets the table say that in the same
+shape as every other entry: a normalizer that declines to produce a
+value.
+
+<<editor infrastructure>>=
+METADATA_UNCHANGED = object()
+
+
+def dict_or_unchanged(value):
+    """Return `value` when it is a dict, else the sentinel.
+
+    The sentinel `METADATA_UNCHANGED` tells
+    `apply_metadata` to leave the field untouched.
+    """
+    if isinstance(value, dict):
+        return value
+    return METADATA_UNCHANGED
+@
+
+The table maps a front-matter key to the attribute it writes and the
+normalizer that guards it.  Only [[estimate]] has a name of its own:
+the key reads as a noun in the buffer while the field it feeds,
+[[estimated]], reads as a stored fact, and renaming either now would
+break every todo file and every buffer already written.
+
+<<editor infrastructure>>=
+METADATA_FIELDS = {
+    "wd": ("wd", lambda v: canonicalize_wd(str(v))),
+    "worktree": (
+        "worktree",
+        lambda v: normalize_worktree_name(str(v)),
+    ),
+    "command": ("command", str),
+    "labels": (
+        "labels",
+        lambda v: list(v) if isinstance(v, list) else [str(v)],
+    ),
+    "deadline": (
+        "deadline",
+        lambda v: normalize_deadline(str(v)),
+    ),
+    "estimate": (
+        "estimated",
+        lambda v: parse_hours(str(v)),
+    ),
+    "who": ("who", str),
+    "github": ("github", dict_or_unchanged),
+    "env": ("env", dict_or_unchanged),
+    "description": ("description", str),
+}
+
+
+def apply_metadata(item, meta):
+    """Apply editor front-matter keys to `item` in place.
+
+    Each key present in `meta` overwrites the matching
+    field; an absent key leaves the field alone, and an
+    unknown key is ignored.
+    """
+    for key, (attribute, normalize) in METADATA_FIELDS.items():
+        if key not in meta:
+            continue
+        value = normalize(meta[key])
+        if value is not METADATA_UNCHANGED:
+            setattr(item, attribute, value)
+@
+
+Creation sites cannot simply call the helper, because a new item also
+inherits: a child takes its parent's labels, deadline and assignee, and
+[[add]] takes whatever its command line said.  They construct the item
+with the inherited values, then call [[apply_metadata]], then---on the
+[[add]] parent, the only site with flags to consider---re-apply the
+flags.  That order is the precedence rule made executable: inherited
+default below front matter below command-line flag.
+
+Let's verify the table end to end, one key at a time:
+
+<<test functions>>=
+def test_apply_metadata_applies_every_key(tmp_path):
+    """Each known key reaches its field, normalized."""
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": str(tmp_path),
+        "worktree": "fix-42",
+        "command": "claude",
+        "labels": ["DD1310", "grading"],
+        "deadline": "2026-03-01",
+        "estimate": "90m",
+        "who": "dbosk",
+        "github": {
+            "repo": "o/r", "type": "issue", "number": "7",
+        },
+        "env": {"COURSE": "DD1310"},
+        "description": "Standing statement.",
+    })
+    assert item.wd == str(tmp_path)
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.labels == ["DD1310", "grading"]
+    assert item.deadline == "2026-03-01"
+    assert isinstance(item.estimated, float)
+    assert item.estimated == pytest.approx(1.5)
+    assert item.who == "dbosk"
+    assert item.github["number"] == "7"
+    assert item.env == {"COURSE": "DD1310"}
+    assert item.description == "Standing statement."
+@
+
+The absent-key half of the contract needs an item that already has
+something to lose, so we populate every field and then hand the helper
+a document that mentions none of them:
+
+<<test functions>>=
+def test_apply_metadata_leaves_absent_keys_alone():
+    """Absent keys keep their fields; unknown keys are ignored."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=2.0,
+        who="dbosk",
+        description="Kept.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+        env={"COURSE": "DD1310"},
+    )
+    apply_metadata(item, {"mystery": "ignored"})
+    assert item.labels == ["DD1310"]
+    assert item.deadline == "2026-03-01"
+    assert item.estimated == 2.0
+    assert item.who == "dbosk"
+    assert item.description == "Kept."
+    assert item.wd == "/tmp/project"
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.github == {"repo": "o/r", "number": "7"}
+    assert item.env == {"COURSE": "DD1310"}
+    assert not hasattr(item, "mystery")
+@
+
+The table is also where the round trip closes, so it is worth asserting
+that it does: every key the renderer can put in the buffer must be a key
+the applier knows, or the editor would show the user a field it then
+quietly refuses to read back.
+
+<<test functions>>=
+def test_metadata_fields_covers_rendered_keys():
+    """Every rendered front-matter key is one the table knows."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=1.5,
+        who="dbosk",
+        description="Standing statement.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+    )
+    assert set(build_item_metadata(item)) <= set(
+        METADATA_FIELDS
+    )
+@
+
+Finally the coercion rule, exercised with exactly what the YAML
+subset produces for hand-typed numbers.  We change directory first
+because [[canonicalize_wd]] resolves [[2026]] as a relative path, and
+what we are checking is that it arrives there as a string at all:
+
+<<test functions>>=
+def test_apply_metadata_coerces_yaml_scalars(
+    tmp_path, monkeypatch,
+):
+    """Bare numbers become strings and a lone label a list."""
+    monkeypatch.chdir(tmp_path)
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": 2026,
+        "command": 42,
+        "who": 7,
+        "description": 3.5,
+        "labels": "grading",
+        "github": 5,
+    })
+    assert isinstance(item.wd, str)
+    assert item.wd == str(tmp_path / "2026")
+    assert item.command == "42"
+    assert item.who == "7"
+    assert item.description == "3.5"
+    assert item.labels == ["grading"]
+    assert item.github is None
+@
+
 \subsection{Editor Invocation}
 
 Opening the user's preferred editor follows the standard UNIX
@@ -5996,67 +6246,33 @@ if description:
     initial_meta["description"] = description
 @
 
-We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided.  The description is
-coerced to text for the reason given in \cref{sec:edit-via-editor}.
+The parent is built in three layers, in the order that makes the
+precedence rule executable: the fields nobody else supplies, then the
+front matter through [[apply_metadata]]
+(\cref{sec:apply-metadata}), then the command-line flags on top.
+Reading the layers downwards therefore reads the precedence upwards,
+and the flags win because they are last, not because each field
+remembers to check them.
 
-The estimate needs the same [[parse_hours]] treatment on both branches,
-not just on the CLI one.  Our minimal YAML parser deliberately returns a
-plain string for anything that is not a bare number, so the
-[[1h30m]] and [[90m]] forms that [[--estimate]] advertises arrive here
-as text.  Storing that text in a field the rest of the module formats
-with [[:.1f]] would write a value that every later [[ls]], [[view]],
-and [[export]] chokes on, so the front-matter branch converts it to
-hours exactly as its sibling child and [[edit]] paths already do.
+Only the flags the user actually gave may overwrite, so each one is
+guarded by its own truth test.  This is also why the flags cannot
+simply be folded into the constructor: an unset flag must leave the
+front-matter value standing, and a constructor argument has no way to
+say \enquote{nothing}.
 
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
-meta = parsed.metadata
-resolved_wd = canonicalize_wd(meta.get("wd")) or (
-    os.getcwd() if here else None
-)
-resolved_env = None
-if wd_path:
-    resolved_wd = canonicalize_wd(wd_path)
-if here:
-    resolved_env = dict(os.environ)
-elif capture_env:
-    resolved_env = dict(os.environ)
 parent_item = TodoItem(
     id=next_id,
     title=parsed.title,
-    labels=(
-        list(label) if label
-        else meta.get("labels", [])
-    ),
     priority=priority,
     status="pending",
     created=now,
-    deadline=normalize_deadline(
-        deadline or meta.get("deadline")
-    ),
-    estimated=(
-        parse_hours(estimate)
-        if estimate
-        else parse_hours(str(meta["estimate"]))
-        if "estimate" in meta
-        else None
-    ),
-    description=(
-        description or str(meta.get("description", ""))
-    ),
     parent_id=resolved_parent,
-    who=who or meta.get("who"),
     notes=parsed.notes,
-    wd=resolved_wd,
-    worktree=normalize_worktree_name(
-        worktree or meta.get("worktree")
-    ),
-    env=resolved_env,
-    command=(
-        run_command or meta.get("command")
-    ),
 )
+apply_metadata(parent_item, parsed.metadata)
+<<let add flags win over the front matter>>
 todos.append(parent_item)
 parent_id_for_children = next_id
 next_id += 1
@@ -6064,6 +6280,50 @@ typer.echo(
     f"Added todo #{parent_item.id}: "
     f"{parent_item.title}"
 )
+@
+
+Two of the flags are not simple overrides.  [[--here]] is a shorthand
+for \enquote{capture both the directory and the environment}, so its
+directory yields to a [[wd:]] the user typed in the buffer: a shorthand
+should not beat something explicit.  Its environment capture is not
+conditioned the same way---a hand-written [[env:]] block loses to
+[[--here]]---which is the older rule kept as it was, from a time when
+the front matter's [[env]] was not read here at all.  Since we
+deliberately never render [[env]] into the buffer, this affects only a
+buffer someone typed the key into by hand.
+
+The [[--here]] guard reads the \emph{stored} directory out of
+[[__dict__]] rather than [[parent_item.wd]].  Attribute reads for
+[[wd]], [[env]] and [[command]]---the members of
+[[WORKER_DEFAULT_ATTRIBUTES]]---fall back to the worker's configured
+default, so a worker with a configured [[wd]]
+would make the item look as though the front matter had set one, and
+[[--here]] would then silently do nothing.  Worker defaults are runtime
+policy; what we are asking here is what this item explicitly carries.
+
+<<let add flags win over the front matter>>=
+if here and parent_item.__dict__.get("wd") is None:
+    parent_item.wd = os.getcwd()
+if wd_path:
+    parent_item.wd = canonicalize_wd(wd_path)
+if here or capture_env:
+    parent_item.env = dict(os.environ)
+if label:
+    parent_item.labels = list(label)
+if deadline:
+    parent_item.deadline = normalize_deadline(deadline)
+if estimate:
+    parent_item.estimated = parse_hours(estimate)
+if who:
+    parent_item.who = who
+if worktree:
+    parent_item.worktree = normalize_worktree_name(
+        worktree
+    )
+if run_command:
+    parent_item.command = run_command
+if description:
+    parent_item.description = description
 @
 
 Let's verify that a suffixed front-matter estimate is stored as a
@@ -6212,50 +6472,23 @@ def create_children_from_parsed(
         parsed_children
     ):
         prio = priorities[i]
-        <<resolve child metadata>>
         <<create and append child item>>
         if parsed_child.children:
             <<nested child priority range>>
-            create_children_from_parsed(
-                parsed_child.children,
-                child_id,
-                child_labels,
-                child_deadline,
-                nested_high, nested_low,
-                child_who,
-                child_env,
-            )
+            <<recurse into the grandchildren>>
 @
 
-Each child overrides its metadata (labels, deadline, working
-directory, assignee, environment, description) from the YAML block in
-the editor, falling back to the parent's values when not specified.
-A description is the one value that is never inherited: it states
-what \emph{this} item is, so a child without one simply has none.  The [[who]]
-inheritance is especially important: without it, children typed
-in the editor without an explicit [[who:]] key would be created
-unassigned, even though the user intended the whole task tree to
-belong to the same person.  Environment inheritance follows the same
-logic: changing the directory should not silently replace the stored
-environment, so [[wd]] and [[env]] are inherited independently.
-<<resolve child metadata>>=
-child_meta = parsed_child.metadata
-child_labels = child_meta.get(
-    "labels", list(parent_labels)
-)
-child_deadline = normalize_deadline(
-    child_meta.get("deadline", parent_deadline)
-)
-child_who = child_meta.get("who", parent_who)
-child_wd = canonicalize_wd(child_meta.get("wd"))
-child_worktree = normalize_worktree_name(
-    child_meta.get("worktree")
-)
-child_env = child_meta.get("env", parent_env)
-child_description = str(
-    child_meta.get("description", "")
-)
-@
+The child is built the same way the [[edit]] side builds a new one
+(\cref{sec:apply-metadata}): construct it with what it inherits, then
+let its own section override.  Labels, deadline, assignee and
+environment are what a child inherits; a description is not, because it
+states what \emph{this} item is, so a child without one simply has
+none.  The [[who]] inheritance is the one that matters most in
+practice---without it, children typed in the editor without an explicit
+[[who:]] key would be created unassigned, even though the user intended
+the whole task tree to belong to the same person.  Environment is
+inherited independently of the directory, so that pointing a child at
+another directory does not silently discard the captured environment.
 
 We append the new item to [[todos]] immediately so that recursive
 calls can see it as a parent when processing grandchildren.
@@ -6263,31 +6496,52 @@ calls can see it as a parent when processing grandchildren.
 child = TodoItem(
     id=next_id,
     title=parsed_child.title,
-    labels=child_labels,
+    labels=list(parent_labels),
     priority=prio,
     status="pending",
     created=now,
-    deadline=child_deadline,
-    estimated=(
-        parse_hours(str(child_meta["estimate"]))
-        if "estimate" in child_meta
-        else None
-    ),
+    deadline=parent_deadline,
     parent_id=parent_id,
-    who=child_who,
+    who=parent_who,
     notes=parsed_child.notes,
-    wd=child_wd,
-    worktree=child_worktree,
-    env=child_env,
-    command=child_meta.get("command"),
-    description=child_description,
+    env=parent_env,
 )
+apply_metadata(child, parsed_child.metadata)
 todos.append(child)
 child_id = next_id
 next_id += 1
 typer.echo(
     f"  Added sub-item #{child.id}: "
     f"{child.title}"
+)
+@
+
+The inherited deadline needs no [[normalize_deadline]] pass of its own.
+It comes either from the parent item, which normalized it when it was
+written, or from an ancestor child that went through
+[[apply_metadata]]---so whatever reaches a grandchild is already
+canonical, and normalizing again would only re-derive the same string.
+
+A grandchild inherits from the child, not from the child's parent, so
+the recursive call passes what the child ended up with after its own
+section was applied.  Three of those four values are plain reads, but
+[[env]] is one of [[WORKER_DEFAULT_ATTRIBUTES]]: reading
+[[child.env]] answers with the worker's configured environment when the
+child stored none, and passing \emph{that} down would write a runtime
+default into a grandchild as though the user had typed it---exactly the
+persistence [[TodoItem]] keeps [[to_dict]] free of.  Reading
+[[__dict__]] asks the question we mean: what does this child explicitly
+carry?
+
+<<recurse into the grandchildren>>=
+create_children_from_parsed(
+    parsed_child.children,
+    child_id,
+    child.labels,
+    child.deadline,
+    nested_high, nested_low,
+    child.who,
+    child.__dict__.get("env"),
 )
 @
 
@@ -8555,42 +8809,20 @@ save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
-The description follows the rule the other keys already follow: a key
-present in the front matter is applied, an absent one leaves the field
-alone.  Deleting the block therefore does not clear the description,
-just as deleting [[deadline:]] does not clear the deadline;
-[[edit N --description ""]] remains the way to do that.  The value is
-coerced to text.  A block is always text, but a user may type
-[[description: 42]] inline, which [[parse_yaml_value]] turns into an
-integer, and that integer would reach the Markdown renderer, the
-calendar export, and the argument list of a spawned agent.
+The front matter is handed to [[apply_metadata]]
+(\cref{sec:apply-metadata}), which owns the present-versus-absent rule
+and the normalization of each key.  What stays here is what is not
+metadata.  The title and the notes come from the document body rather
+than from the front-matter block, and they are assigned
+unconditionally, which is the opposite of the metadata rule and
+deliberately so: the parser refuses a buffer with no title, and an
+emptied body really does mean an emptied [[notes]], since there is no
+key to delete or leave out.
 
 <<update parent from parsed>>=
 item.title = parsed.title
 item.notes = parsed.notes
-meta = parsed.metadata
-if "wd" in meta:
-    item.wd = canonicalize_wd(meta["wd"])
-if "worktree" in meta:
-    item.worktree = normalize_worktree_name(
-        meta["worktree"]
-    )
-if "command" in meta:
-    item.command = meta["command"]
-if "labels" in meta:
-    item.labels = meta["labels"]
-if "deadline" in meta:
-    item.deadline = normalize_deadline(
-        meta["deadline"]
-    )
-if "estimate" in meta:
-    item.estimated = parse_hours(str(meta["estimate"]))
-if "who" in meta:
-    item.who = meta["who"]
-if "github" in meta:
-    item.github = meta["github"]
-if "description" in meta:
-    item.description = str(meta["description"])
+apply_metadata(item, parsed.metadata)
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -8688,10 +8920,24 @@ priority_iter = iter(priorities)
 
 For each section in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
-New children inherit [[who]] from the parent when their
-YAML block does not specify one --- the same rule as in
-[[create_children_from_parsed]] --- so that adding a sub-task in
-the editor never silently leaves it unassigned.
+Both branches end in [[apply_metadata]] (\cref{sec:apply-metadata}),
+and the difference between them is only what the item holds before it
+is called.  A matched child holds what it already had, so an absent key
+keeps the value the user saw in the buffer.  A new child holds what it
+inherits: the parent's labels, deadline and assignee, so that adding a
+sub-task in the editor never silently leaves it unassigned or
+undated---and then its own section overrides any of them.  Inheriting
+in the constructor rather than through [[child_meta.get(key, default)]]
+is what lets one helper serve both branches, and it puts the fallback
+where a reader looks for it, next to the field it fills.
+
+Routing both branches through the helper also settles a difference
+that had no reason to exist: a matched child now takes [[github]] from
+its section, which the parent has always done and no child ever did, so
+linking a sub-item to an issue in the editor is no longer silently
+discarded on save.  Both branches gain [[env]] for the same reason,
+which no site read before.
+
 Popping each match out of [[existing_by_title]] doubles as the
 seen-marker: whatever is still in the index afterwards had no section
 and was therefore deleted in the editor.
@@ -8720,60 +8966,22 @@ for parsed_child in parsed_children:
         child.title = parsed_child.title
         child.notes = parsed_child.notes
         child.priority = prio
-        child_meta = parsed_child.metadata
-        if "wd" in child_meta:
-            child.wd = canonicalize_wd(child_meta["wd"])
-        if "worktree" in child_meta:
-            child.worktree = normalize_worktree_name(
-                child_meta["worktree"]
-            )
-        if "command" in child_meta:
-            child.command = child_meta["command"]
-        if "labels" in child_meta:
-            child.labels = child_meta["labels"]
-        if "deadline" in child_meta:
-            child.deadline = normalize_deadline(
-                child_meta["deadline"]
-            )
-        if "estimate" in child_meta:
-            child.estimated = parse_hours(
-                str(child_meta["estimate"])
-            )
-        if "who" in child_meta:
-            child.who = child_meta["who"]
-        if "description" in child_meta:
-            child.description = str(
-                child_meta["description"]
-            )
+        apply_metadata(child, parsed_child.metadata)
     else:
         now = datetime.datetime.now().isoformat()
-        child_meta = parsed_child.metadata
         child = TodoItem(
             id=next_id,
             title=parsed_child.title,
-            labels=child_meta.get(
-                "labels", list(parent.labels)
-            ),
+            labels=list(parent.labels),
             priority=prio,
             status="pending",
             created=now,
-            deadline=normalize_deadline(
-                child_meta.get(
-                    "deadline", parent.deadline
-                )
-            ),
+            deadline=parent.deadline,
             parent_id=parent.id,
-            who=child_meta.get("who", parent.who),
+            who=parent.who,
             notes=parsed_child.notes,
-            wd=canonicalize_wd(child_meta.get("wd")),
-            worktree=normalize_worktree_name(
-                child_meta.get("worktree")
-            ),
-            command=child_meta.get("command"),
-            description=str(
-                child_meta.get("description", "")
-            ),
         )
+        apply_metadata(child, parsed_child.metadata)
         todos.append(child)
         next_id += 1
         typer.echo(
@@ -8804,6 +9012,47 @@ for removed in existing_by_title.values():
 
 
 \subsection{Testing Editor Reconciliation}
+
+The [[github]] key is the one that had drifted: the parent took it from
+the front matter and the children did not, so a sub-item linked to an
+issue in the editor lost the link on save.  Now that every site shares
+one helper (\cref{sec:apply-metadata}), an existing child keeps what
+its section says:
+
+<<test functions>>=
+def test_edit_editor_child_github_applied(temp_todo_dir):
+  """An existing child's github block survives the save."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent", priority=5.0,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1, priority=4.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "---\n"
+    "github: {repo: o/r, type: issue, number: 7}\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = next(t for t in todos if t.id == 2)
+  assert child.github == {
+    "repo": "o/r", "type": "issue", "number": "7",
+  }
+@
 
 Let's verify the recursion in both directions: an edit to an existing
 grandchild reaches it and preserves its identity, and a brand-new
@@ -16513,6 +16762,8 @@ from nytid.cli.todo import (
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
+    apply_metadata,
+    METADATA_FIELDS,
     DEFAULT_MAX_BOOST,
     gh_available,
     gh_fetch_issue,
