@@ -63,6 +63,7 @@ import click
 import csv
 import datetime
 import fcntl
+import io
 import json
 import logging
 import math
@@ -6264,8 +6265,9 @@ ls_flat_opt = typer.Option(
     help="Flat list (no tree); useful with --all")
 ls_format_opt = typer.Option(
     "--format", "-f",
-    help="Output format: table (auto-detects TTY),"
-         " rich, csv, json. "
+    help="Output format: table (rich on a TTY, "
+         "headerless TSV in a pipe), rich, "
+         "csv (header row and commas), json. "
          "[config: todo.ls.format]")
 ls_status_opt = typer.Option(
     "--status", "-s",
@@ -6312,8 +6314,9 @@ def ls(
     (`--who ''`) to show all assignees.
 
     Output format defaults to `table`, which auto-detects the
-    terminal: rich-formatted when stdout is a TTY, plain CSV
-    otherwise (suitable for piping).
+    terminal: a rich table when stdout is a TTY, and headerless
+    tab-separated rows in a pipe. `--format csv` adds a header row
+    and commas; `--format json` gives structure.
     """
     _, todos = load_todos()
 
@@ -6509,10 +6512,10 @@ To show tracked time, we load track data and sum durations for
 entries matching [[todo:<id>]] labels. This avoids duplicating the
 track system's storage logic.
 
-All three output formats consume [[tracked_times]]---JSON emits a
-[[tracked_hours]] field, the rich table has a Tracked column, and
-CSV a [[tracked_h]] column---so we cannot skip the query for any
-particular format.  What we can skip is loading a multi-megabyte
+All three output formats consume [[tracked_times]]---JSON and CSV
+both carry a [[tracked_hours]] field and the rich table has a
+Tracked column---so we cannot skip the query for any particular
+format.  What we can skip is loading a multi-megabyte
 tracking history to annotate a listing with nothing in it, which is
 why this step runs \emph{after} the filters and the top-level
 restriction: when [[filtered]] is empty, the load never happens.
@@ -6837,12 +6840,11 @@ def test_ls_csv_prio_leaves_unranked_blank(
     )
 
     assert result.exit_code == 0
-    rows = [line.split("\t") for line in result.stdout.splitlines()]
-    data_rows = rows[1:] if rows[0][0] == "id" else rows
-    assert data_rows[0][1] == "5.0"
-    assert data_rows[0][2] == "Ranked"
-    assert data_rows[1][1] == ""
-    assert data_rows[1][2] == "Unranked"
+    rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    assert rows[0]["title"] == "Ranked"
+    assert rows[0]["effective_priority"] == "5.0"
+    assert rows[1]["title"] == "Unranked"
+    assert rows[1]["effective_priority"] == ""
 
 
 def test_ls_done_flag_includes_done(temp_todo_dir):
@@ -6894,6 +6896,44 @@ else:
     )
 @
 
+\paragraph{One record, several encodings}%
+\label{sec:todo-ls-record}
+
+JSON, comma-separated CSV and the tab-separated rows a pipe receives
+are all read by scripts, and a script that switches between them
+should not have to learn a second set of fields.  So an item is
+described \emph{once}, as a dictionary, and every format encodes that
+same dictionary: JSON serializes it directly, and the two delimited
+forms write its values in its key order.  Spelling the delimited
+columns out separately is what let them drift apart until they offered
+eight fields where JSON offered seventeen, [[labels]] among the
+missing ones (\cref{sec:todo-ls-csv}).
+
+The record is [[to_dict()]] plus the two values that are not stored on
+the item: the numeric score, which only [[--prio]] asks for, and the
+hours the track system has recorded against it.  Adding them after
+[[to_dict()]] rather than in among the stored fields keeps the derived
+values at the end of every record, and hence at the end of the CSV
+header.
+
+<<helpers>>=
+def ls_record(item, now, tracked_times, show_prio):
+    """Return the dictionary `todo ls` serializes for `item`.
+
+    Both the JSON and the CSV format encode this record, so the two
+    always carry the same fields in the same order.  `now` dates the
+    effective-priority computation, `tracked_times` maps item ids to
+    tracked hours, and `show_prio` adds the numeric score.
+    """
+    record = item.to_dict()
+    if show_prio:
+        record["effective_priority"] = effective_priority(
+            item, now
+        )
+    record["tracked_hours"] = tracked_times.get(item.id, 0)
+    return record
+@
+
 JSON output uses the shared display order and respects the [[-n]] limit
 just like the rich and CSV paths.  We sort here because JSON consumers
 (scripts, agents) should receive items in the same priority order the
@@ -6909,16 +6949,13 @@ now = datetime.datetime.now()
 sorted_filtered = sort_todos_for_display(
     filtered, now
 )[:count]
-output = []
-for t in sorted_filtered:
-    d = t.to_dict()
-    if show_prio:
-        d["effective_priority"] = effective_priority(
-            t, now
-        )
-    d["tracked_hours"] = tracked_times.get(t.id, 0)
-    output.append(d)
-print(json_mod.dumps(output, indent=2))
+print(json_mod.dumps(
+    [
+        ls_record(t, now, tracked_times, show_prio)
+        for t in sorted_filtered
+    ],
+    indent=2,
+))
 @
 
 For rich table output we use [[rich.table.Table]] so the
@@ -7105,62 +7142,332 @@ table.add_row(
 )
 @
 
-CSV output is intended for pipelines and scripts. We write
-tab-separated values so that titles containing commas remain
-unambiguous. A [[parent_id]] column preserves hierarchy
-information that the tree view shows visually. Using
-[[csv.writer]] handles quoting of any fields that happen to
-contain tabs or newlines.
+\paragraph{Flattening the record into cells}%
+\label{sec:todo-ls-csv}
 
-When writing to a file (via [[--output]]) we always include the
-header row so the file is self-describing. When writing to a
-terminal the header is shown for readability. When piping to
-another process the header is omitted so that tools like [[awk]]
-and [[cut]] receive only data rows.
-Like the table and JSON paths, the priority field is omitted
-by default and included when [[--prio]] is passed.
+Two of the record's values are not strings, and a cell has to be.
+Labels are a list, joined here with semicolons rather than commas so
+that the value stays one word to a reader that splits on the delimiter
+even after the quoting has been stripped away.  The GitHub link is a
+dictionary of repository, type and number, rendered as [[repo#number]]:
+the spelling [[gh]] itself accepts and the one a reader would write in
+a commit message.  Flattening it drops the issue-versus-pull-request
+distinction, which is the price of a single cell; a consumer that needs
+that distinction reads JSON.
+
+That leaves [[env]], a dictionary of arbitrary environment variables
+with no one-line spelling at all.  Encoding it would mean inventing a
+nesting convention inside a cell, and the cell would routinely be
+longer than the rest of the row together, so the delimited formats omit
+the field and JSON stays the format that carries it.
+
+<<constants>>=
+CSV_OMITTED_FIELDS = ("env",)
+@
+
+<<helpers>>=
+def csv_cell(name, value):
+    """Return `value` rendered as the CSV cell of column `name`.
+
+    Labels are joined with semicolons, a GitHub link becomes
+    `repo#number`, and `None` becomes the empty string.  Every other
+    value is rendered with `str`, matching what JSON would show.
+    """
+    if name == "labels":
+        return ";".join(value or [])
+    if name == "github":
+        if not value:
+            return ""
+        return (f"{value.get('repo', '')}"
+                f"#{value.get('number', '')}")
+    return "" if value is None else str(value)
+@
+
+A pipe consumer counts lines, so a record has to \emph{be} a
+line---and two of these fields, [[notes]] and [[description]], are
+free text that routinely is not one.  The pipe form therefore
+renders each cell through a wrapper that writes a line break as the
+two characters [[\n]] and a tab as [[\t]], which is what shell
+readers of escaped text already expect and what keeps the row
+countable.  We spell the wrapper out rather than passing a flag to
+[[csv_cell]] so that the two dialects stay two named things, one per
+audience.
+
+The encoding is lossy in one direction: a description that already
+contained the two characters [[\n]] reads back as a line break.
+That is the right trade here, because this form exists to be cut
+apart rather than restored---fidelity is what the named form and
+[[--format json]] are for.
+
+<<helpers>>=
+def tsv_cell(name, value):
+    """Return `csv_cell(name, value)` as a single line.
+
+    Line breaks become the two characters backslash and n, tabs
+    backslash and t, so one record occupies one line and the text
+    stays legible.  The substitution is not reversible; use the
+    comma-separated form or JSON when it has to be.
+    """
+    return (
+        csv_cell(name, value)
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\t", "\\t")
+    )
+@
+
+\paragraph{Two encodings of the same rows}%
+\label{sec:todo-ls-dialect}
+
+One schema, then, but two ways of writing it down, and which one is
+right depends on who is going to read it.
+
+A pipe is a case nytid has already decided (\cref{cli.utils.output}):
+headerless, tab-separated rows.  The tab is the delimiter [[cut]] and
+[[awk]] already default to, and a header line is a row that every
+shell idiom counts, sorts or word-splits as if it were data.  That is
+what the auto-detected [[table]] format falls through to when stdout
+is not a terminal, so [[nytid todo ls | cut -f2]] keeps working and
+[[todo ls]] reads in a pipe the way [[track]]'s listings do.
+
+[[--format csv]] is a different request.  It names a format, by
+someone who will hand the result to a spreadsheet or to a
+[[csv.DictReader]], and such a reader looks a column up by name
+instead of counting fields.  Counting is what a consumer of the old
+headerless output had to do, and it is how the bug in this format was
+found: the empty [[estimated_h]] cell of an unestimated item was
+counted as a [[labels]] column, which the format did not have at all.
+So the explicit request gets commas and a header row, always---and
+because the header is taken from the record's keys, the absent column
+is absent no longer.
+
+An [[--output]] file is that same case whichever format asked for it.
+It outlives the command that wrote it and will be opened by something
+that was not watching it run, so it has to say what its columns are.
+
+<<choose the csv dialect>>=
+named = bool(output) or output_format == LsFormat.csv
+cell = csv_cell if named else tsv_cell
+@
+
+We build the whole table in memory before writing a byte of it, which
+is what lets the header be derived rather than declared: the column
+names are the keys of the records we just built, minus the omitted
+ones, so a field added to [[TodoItem]] reaches both encodings without
+anyone remembering to add it here.  Writing through a [[StringIO]]
+also keeps the rows on the same stream as every other message the
+command prints---[[typer.echo]]'s---instead of on whichever
+[[sys.stdout]] happened to be bound when [[csv.writer]] was
+constructed, which is what a test runner or any caller that redirects
+output needs.
+
+[[csv.writer]] does the quoting, so a title with a comma in it
+survives being read back by a parser that knows the dialect.  Only
+the named form relies on that: a quoted line break is still a line
+break, and the pipe form has no parser waiting for it, which is why
+its cells were escaped to one line above.
+
+An empty listing still prints nothing at all, header included.  A
+header with no rows under it looks like a one-line result to [[wc -l]],
+and tells a reader nothing that silence does not; this is the rule
+[[print_rows]] states for every other listing
+(\cref{cli.utils.output}).
 
 <<output csv>>=
-if not filtered:
-    return
-
 now = datetime.datetime.now()
 sorted_items = sort_todos_for_display(
     filtered, now
 )[:count]
-dest = open(output, "w", newline="") if output else sys.stdout
-writer = csv.writer(dest, delimiter="\t")
-if output or sys.stdout.isatty():
+if not sorted_items:
+    return
+records = [
+    ls_record(item, now, tracked_times, show_prio)
+    for item in sorted_items
+]
+<<choose the csv dialect>>
+<<write the records as csv>>
+<<deliver the csv text>>
+@
+
+<<write the records as csv>>=
+columns = [
+    name for name in records[0]
+    if name not in CSV_OMITTED_FIELDS
+]
+buffer = io.StringIO()
+writer = csv.writer(
+    buffer, delimiter="," if named else "\t"
+)
+if named:
+    writer.writerow(columns)
+for record in records:
     writer.writerow([
-        "id",
-        *( ["priority"] if show_prio else [] ),
-        "title", "who",
-        "deadline", "estimated_h", "tracked_h",
-        "status", "parent_id",
+        cell(name, record[name])
+        for name in columns
     ])
-for item in sorted_items:
-    ep = effective_priority(item, now)
-    tracked = tracked_times.get(item.id, 0)
-    writer.writerow([
-        item.id,
-        *([
-            "" if ep is None else f"{ep:.1f}"
-        ] if show_prio else []),
-        item.title,
-        item.who or "",
-        item.deadline or "",
-        (
-            f"{item.estimated:.1f}"
-            if item.estimated
-            else ""
-        ),
-        f"{tracked:.1f}" if tracked > 0 else "",
-        item.status,
-        item.parent_id if item.parent_id else "",
-    ])
+@
+
+A file named with [[--output]] is meant to be opened later, by a
+spreadsheet or by another program, so it receives the text and nothing
+else; the confirmation that it was written goes to the terminal
+instead.
+
+<<deliver the csv text>>=
 if output:
-    dest.close()
+    with open(output, "w", newline="") as dest:
+        dest.write(buffer.getvalue())
     typer.echo(f"Wrote todos to {output}")
+else:
+    typer.echo(buffer.getvalue(), nl=False)
+@
+
+Let's verify the pipe form: seventeen tab-separated fields, no header,
+and the flattened cells in their record positions.
+
+<<test functions>>=
+def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
+  """The auto-detected pipe form keeps cut(1) working."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Labelled task",
+      created="2026-02-20T10:00:00",
+      status="pending", who="me",
+      labels=["b", "a"],
+    ),
+  ])
+
+  result = runner.invoke(cli, ["ls", "--who", ""])
+
+  assert result.exit_code == 0
+  lines = result.output.splitlines()
+  assert len(lines) == 1
+  fields = lines[0].split("\t")
+  assert len(fields) == 17
+  assert fields[1] == "Labelled task"
+  assert fields[2] == "a;b"
+@
+
+Free text is the case that rule exists for.  A note that spans two
+lines, and a tab inside a title, must leave the piped record one
+line wide---while the named form hands back the characters
+themselves:
+
+<<test functions>>=
+def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
+  """A multi-line cell stays inside one piped record."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Tabbed\ttitle",
+      created="2026-02-20T10:00:00",
+      status="pending", who="me",
+      notes="one\ntwo",
+    ),
+  ])
+
+  piped = runner.invoke(cli, ["ls", "--who", ""])
+  assert piped.exit_code == 0
+  lines = piped.output.splitlines()
+  assert len(lines) == 1
+  fields = lines[0].split("\t")
+  assert len(fields) == 17
+  assert fields[1] == "Tabbed\\ttitle"
+  assert fields[11] == "one\\ntwo"
+
+  named = runner.invoke(
+    cli, ["ls", "--format", "csv", "--who", ""]
+  )
+  assert named.exit_code == 0
+  rows = list(csv.DictReader(io.StringIO(named.stdout)))
+  assert rows[0]["title"] == "Tabbed\ttitle"
+  assert rows[0]["notes"] == "one\ntwo"
+@
+
+An [[--output]] file is the named form even when nobody asked for
+[[--format csv]]:
+
+<<test functions>>=
+def test_ls_output_file_is_named_csv(temp_todo_dir, tmp_path):
+  """--output writes a self-describing comma-separated file."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Filed task",
+      created="2026-02-20T10:00:00",
+      status="pending", who="me",
+    ),
+  ])
+  destination = tmp_path / "todos.csv"
+
+  result = runner.invoke(
+    cli, ["ls", "--who", "", "-o", str(destination)]
+  )
+
+  assert result.exit_code == 0
+  with destination.open(newline="") as f:
+    rows = list(csv.DictReader(f))
+  assert rows[0]["title"] == "Filed task"
+@
+
+Let's verify that the CSV round-trips: the header names the JSON
+fields in the JSON order, the two flattened fields carry their values,
+and a note spanning several lines survives the quoting.
+
+<<test functions>>=
+def test_ls_csv_header_matches_json_fields(temp_todo_dir):
+    """CSV columns are the JSON keys, with env dropped."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Labelled task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            labels=["b", "a"],
+            notes="first line\nsecond line",
+            github={"repo": "o/r", "number": "7",
+                    "type": "issue"},
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["ls", "--format", "csv", "--who", ""]
+    )
+
+    assert result.exit_code == 0
+    rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    assert list(rows[0]) == [
+        "id", "title", "labels", "priority", "status",
+        "created", "deadline", "estimated", "description",
+        "parent_id", "who", "notes", "wd", "worktree",
+        "command", "github", "tracked_hours",
+    ]
+    assert rows[0]["labels"] == "a;b"
+    assert rows[0]["notes"] == "first line\nsecond line"
+    assert rows[0]["github"] == "o/r#7"
+@
+
+An item with no labels and no GitHub link leaves those cells empty
+rather than showing an empty list or [[None]]:
+
+<<test functions>>=
+def test_ls_csv_blank_cells_for_unset_fields(temp_todo_dir):
+    """Unset list, dict and optional fields render as empty."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Bare task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["ls", "--format", "csv", "--who", ""]
+    )
+
+    assert result.exit_code == 0
+    rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    assert rows[0]["labels"] == ""
+    assert rows[0]["github"] == ""
+    assert rows[0]["deadline"] == ""
+    assert "env" not in rows[0]
 @
 
 \subsection{The [[view]] Command}
@@ -16010,7 +16317,9 @@ directory.
 
 <<test [[clitodo.py]]>>=
 import contextlib
+import csv
 import datetime
+import io
 import json
 import os
 import pathlib
