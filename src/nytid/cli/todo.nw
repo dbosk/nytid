@@ -3635,7 +3635,14 @@ def dict_or_unchanged(value):
 @
 
 The table maps a front-matter key to the attribute it writes and the
-normalizer that guards it.  Only [[estimate]] has a name of its own:
+normalizer that guards it.  [[command]] goes through
+[[normalize_command]] (defined next to [[normalize_worktree_name]],
+its worktree counterpart) rather than bare [[str]], so that a
+[[command:]] line left empty clears the field instead of storing an
+empty string that would shadow the worker default.  Like its
+neighbours it is wrapped in a lambda: the table is built at import
+time, before the helpers are defined, and the lambda defers the lookup
+to the call.  Only [[estimate]] has a name of its own:
 the key reads as a noun in the buffer while the field it feeds,
 [[estimated]], reads as a stored fact, and renaming either now would
 break every todo file and every buffer already written.
@@ -3647,7 +3654,10 @@ METADATA_FIELDS = {
         "worktree",
         lambda v: normalize_worktree_name(str(v)),
     ),
-    "command": ("command", str),
+    "command": (
+        "command",
+        lambda v: normalize_command(v),
+    ),
     "labels": (
         "labels",
         lambda v: list(v) if isinstance(v, list) else [str(v)],
@@ -3721,6 +3731,13 @@ def test_apply_metadata_applies_every_key(tmp_path):
     assert item.github["number"] == "7"
     assert item.env == {"COURSE": "DD1310"}
     assert item.description == "Standing statement."
+
+
+def test_apply_metadata_empty_command_clears():
+    """An emptied command line stores None, not an empty string."""
+    item = TodoItem(id=1, title="Task", command="claude")
+    apply_metadata(item, {"command": ""})
+    assert item.__dict__["command"] is None
 @
 
 The absent-key half of the contract needs an item that already has
@@ -6505,7 +6522,8 @@ command_opt = typer.Option(
     "--command", "-c",
     help="Default command to run on start "
          "(worker default: "
-         "todo.worker.<worker>.command)")
+         "todo.worker.<worker>.command); "
+         "on edit, an empty value clears it")
 @
 
 <<add command options>>=
@@ -7100,6 +7118,53 @@ def test_normalize_worktree_name_rejects_non_string():
     """A YAML integer is a clean error, not a TypeError."""
     with pytest.raises(typer.Exit):
         normalize_worktree_name(42)
+@
+
+The stored command needs the same treatment, but for a different
+reason.  A worktree name is validated because it becomes a path; a
+command is never validated here, since the [[track]] module's
+[[resolve_command_argv]] parses it at start time.  What the two
+share is the question of what \emph{nothing} looks like.  [[None]] is
+the only value the runtime fallback recognises: [[TodoItem]] consults
+the worker default when the stored value is [[None]]
+(\cref{todo:worker-defaults}), so an empty string stored in its place
+would silently disable [[todo.worker.<worker>.command]] while showing
+up nowhere---the editor buffer omits falsy commands, and [[start]]
+skips them.  Mapping a blank to [[None]] is what lets
+[[edit --command ""]] and an emptied [[command:]] line in the editor
+both mean \enquote{back to the default}.  The [[str]] coercion is for
+the front-matter table, whose parser types a bare number
+(\cref{sec:apply-metadata}).
+
+<<helpers>>=
+def normalize_command(command):
+    """Return the command string, or `None` when blank.
+
+    `None` and a blank string both mean no stored command,
+    so the worker default applies again at runtime.  Any
+    other value is stored as a string.
+    """
+    if command is None or not str(command).strip():
+        return None
+    return str(command)
+@
+
+<<test functions>>=
+def test_normalize_command_blank_is_none():
+    """None, the empty string and whitespace all clear."""
+    assert normalize_command(None) is None
+    assert normalize_command("") is None
+    assert normalize_command("   ") is None
+
+
+def test_normalize_command_keeps_text():
+    """A real command passes through unchanged."""
+    assert normalize_command("claude -p x") == "claude -p x"
+
+
+def test_normalize_command_coerces_to_string():
+    """A YAML integer becomes a string, as before."""
+    assert normalize_command(42) == "42"
 @
 
 With the helper in place, the resolve step simply routes the CLI
@@ -10454,6 +10519,18 @@ still checks [[todo.worker.<worker>.wd]],
 [[todo.worker.<worker>.env]], and
 [[todo.worker.<worker>.command]].
 
+An empty [[--command ""]] clears the stored command, the same way an
+empty [[--worktree]] clears the worktree.  There is no other way to
+say \enquote{stop launching this}: the pass-through form needs at
+least one word, and [[resolve_command_argv]] in the [[track]] module
+rejects an empty string for exactly that reason.  So [[edit]] answers
+the question before asking the resolver: a blank value means clear,
+anything else is parsed as before.  The cleared item falls back to
+the worker default at runtime
+(\cref{todo:worker-defaults}); to run nothing even then, use
+[[start --no-command]].  [[add]] keeps
+rejecting an empty command, since a new item has nothing to clear.
+
 Labels deserve a finer instrument than [[--label]].  [[--label]]/[[-l]]
 \emph{replaces} the whole set, so adding one label to an item that already
 has five means re-typing all six.  For incremental edits we add
@@ -10538,7 +10615,14 @@ def edit(
 
     The canonical command override form is
     ``nytid todo edit 7 -- prog args``.
+
+    An empty ``--command ""`` clears the stored command.
     """
+    clear_command = (
+        run_command is not None and not run_command.strip()
+    )
+    if clear_command:
+        run_command = None
     try:
         _, run_command = resolve_command_argv(run_command, ctx)
     except ValueError as exc:
@@ -10610,8 +10694,32 @@ else:
         item.env = dict(os.environ)
 if worktree is not None:
     item.worktree = normalize_worktree_name(worktree)
-if run_command is not None:
+if clear_command:
+    item.command = None
+elif run_command is not None:
     item.command = run_command
+@
+
+Clearing must leave the JSON with [[None]], not [[""]], and we check
+the stored value through [[__dict__]] so that a worker default cannot
+mask the result (\cref{todo:worker-defaults}):
+
+<<test functions>>=
+def test_edit_command_empty_clears(temp_todo_dir):
+    """Edit --command "" removes the stored command."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            command="claude",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["edit", "1", "--command", ""],
+    )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].__dict__["command"] is None
 @
 
 Editing the worktree must leave [[wd]] and [[env]] alone, and the
@@ -19551,6 +19659,7 @@ from nytid.cli.todo import (
     ParsedTodo,
     canonicalize_wd,
     normalize_worktree_name,
+    normalize_command,
     ensure_worktree,
     naive_local_datetime,
     normalize_deadline,
