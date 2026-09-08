@@ -3635,7 +3635,14 @@ def dict_or_unchanged(value):
 @
 
 The table maps a front-matter key to the attribute it writes and the
-normalizer that guards it.  Only [[estimate]] has a name of its own:
+normalizer that guards it.  [[command]] goes through
+[[normalize_command]] (defined next to [[normalize_worktree_name]],
+its worktree counterpart) rather than bare [[str]], so that a
+[[command:]] line left empty clears the field instead of storing an
+empty string that would shadow the worker default.  Like its
+neighbours it is wrapped in a lambda: the table is built at import
+time, before the helpers are defined, and the lambda defers the lookup
+to the call.  Only [[estimate]] has a name of its own:
 the key reads as a noun in the buffer while the field it feeds,
 [[estimated]], reads as a stored fact, and renaming either now would
 break every todo file and every buffer already written.
@@ -3647,7 +3654,10 @@ METADATA_FIELDS = {
         "worktree",
         lambda v: normalize_worktree_name(str(v)),
     ),
-    "command": ("command", str),
+    "command": (
+        "command",
+        lambda v: normalize_command(v),
+    ),
     "labels": (
         "labels",
         lambda v: list(v) if isinstance(v, list) else [str(v)],
@@ -3721,6 +3731,13 @@ def test_apply_metadata_applies_every_key(tmp_path):
     assert item.github["number"] == "7"
     assert item.env == {"COURSE": "DD1310"}
     assert item.description == "Standing statement."
+
+
+def test_apply_metadata_empty_command_clears():
+    """An emptied command line stores None, not an empty string."""
+    item = TodoItem(id=1, title="Task", command="claude")
+    apply_metadata(item, {"command": ""})
+    assert item.__dict__["command"] is None
 @
 
 The absent-key half of the contract needs an item that already has
@@ -6505,7 +6522,8 @@ command_opt = typer.Option(
     "--command", "-c",
     help="Default command to run on start "
          "(worker default: "
-         "todo.worker.<worker>.command)")
+         "todo.worker.<worker>.command); "
+         "on edit, an empty value clears it")
 @
 
 <<add command options>>=
@@ -7100,6 +7118,53 @@ def test_normalize_worktree_name_rejects_non_string():
     """A YAML integer is a clean error, not a TypeError."""
     with pytest.raises(typer.Exit):
         normalize_worktree_name(42)
+@
+
+The stored command needs the same treatment, but for a different
+reason.  A worktree name is validated because it becomes a path; a
+command is never validated here, since the [[track]] module's
+[[resolve_command_argv]] parses it at start time.  What the two
+share is the question of what \emph{nothing} looks like.  [[None]] is
+the only value the runtime fallback recognises: [[TodoItem]] consults
+the worker default when the stored value is [[None]]
+(\cref{todo:worker-defaults}), so an empty string stored in its place
+would silently disable [[todo.worker.<worker>.command]] while showing
+up nowhere---the editor buffer omits falsy commands, and [[start]]
+skips them.  Mapping a blank to [[None]] is what lets
+[[edit --command ""]] and an emptied [[command:]] line in the editor
+both mean \enquote{back to the default}.  The [[str]] coercion is for
+the front-matter table, whose parser types a bare number
+(\cref{sec:apply-metadata}).
+
+<<helpers>>=
+def normalize_command(command):
+    """Return the command string, or `None` when blank.
+
+    `None` and a blank string both mean no stored command,
+    so the worker default applies again at runtime.  Any
+    other value is stored as a string.
+    """
+    if command is None or not str(command).strip():
+        return None
+    return str(command)
+@
+
+<<test functions>>=
+def test_normalize_command_blank_is_none():
+    """None, the empty string and whitespace all clear."""
+    assert normalize_command(None) is None
+    assert normalize_command("") is None
+    assert normalize_command("   ") is None
+
+
+def test_normalize_command_keeps_text():
+    """A real command passes through unchanged."""
+    assert normalize_command("claude -p x") == "claude -p x"
+
+
+def test_normalize_command_coerces_to_string():
+    """A YAML integer becomes a string, as before."""
+    assert normalize_command(42) == "42"
 @
 
 With the helper in place, the resolve step simply routes the CLI
@@ -10454,6 +10519,18 @@ still checks [[todo.worker.<worker>.wd]],
 [[todo.worker.<worker>.env]], and
 [[todo.worker.<worker>.command]].
 
+An empty [[--command ""]] clears the stored command, the same way an
+empty [[--worktree]] clears the worktree.  There is no other way to
+say \enquote{stop launching this}: the pass-through form needs at
+least one word, and [[resolve_command_argv]] in the [[track]] module
+rejects an empty string for exactly that reason.  So [[edit]] answers
+the question before asking the resolver: a blank value means clear,
+anything else is parsed as before.  The cleared item falls back to
+the worker default at runtime
+(\cref{todo:worker-defaults}); to run nothing even then, use
+[[start --no-command]].  [[add]] keeps
+rejecting an empty command, since a new item has nothing to clear.
+
 Labels deserve a finer instrument than [[--label]].  [[--label]]/[[-l]]
 \emph{replaces} the whole set, so adding one label to an item that already
 has five means re-typing all six.  For incremental edits we add
@@ -10538,7 +10615,14 @@ def edit(
 
     The canonical command override form is
     ``nytid todo edit 7 -- prog args``.
+
+    An empty ``--command ""`` clears the stored command.
     """
+    clear_command = (
+        run_command is not None and not run_command.strip()
+    )
+    if clear_command:
+        run_command = None
     try:
         _, run_command = resolve_command_argv(run_command, ctx)
     except ValueError as exc:
@@ -10610,8 +10694,32 @@ else:
         item.env = dict(os.environ)
 if worktree is not None:
     item.worktree = normalize_worktree_name(worktree)
-if run_command is not None:
+if clear_command:
+    item.command = None
+elif run_command is not None:
     item.command = run_command
+@
+
+Clearing must leave the JSON with [[None]], not [[""]], and we check
+the stored value through [[__dict__]] so that a worker default cannot
+mask the result (\cref{todo:worker-defaults}):
+
+<<test functions>>=
+def test_edit_command_empty_clears(temp_todo_dir):
+    """Edit --command "" removes the stored command."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Original",
+            command="claude",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["edit", "1", "--command", ""],
+    )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].__dict__["command"] is None
 @
 
 Editing the worktree must leave [[wd]] and [[env]] alone, and the
@@ -14044,7 +14152,8 @@ command.
 
 Because [[next]] delegates its launch step to [[start]], it also passes
 through execution-mode options such as [[--headless]], [[--pane]],
-[[--window]], and [[--auto-suspend]].  This keeps the policy question 
+[[--window]], [[--auto-suspend]], and the [[--command]] and
+[[--no-command]] pair.  This keeps the policy question
 \enquote{what should start?}
 separate from the execution question \enquote{how should it run?}
 
@@ -14102,6 +14211,7 @@ def next_cmd(
                      block_opt] = None,
     run: Annotated[str | None,
                    command_opt] = None,
+    no_command: Annotated[bool, no_command_opt] = False,
     timeout: Annotated[str | None,
                        timeout_opt] = None,
     reassign_to: Annotated[str | None,
@@ -14136,6 +14246,7 @@ def next_cmd(
         window=window,
         block=block,
         run=run,
+        no_command=no_command,
         timeout=timeout,
         reassign_to=reassign_to,
         auto_suspend=auto_suspend,
@@ -14643,6 +14754,7 @@ def start(
     except typer.BadParameter as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
+    <<reject a command together with [[--no-command]]>>
     <<resolve worktree for todo start>>
     todo_id, item, next_id, todos, stack = activate_todo_state(
         todo_id, who=default_username
@@ -14968,6 +15080,42 @@ run: Annotated[str | None,
                command_opt] = None,
 @
 
+[[--no-command]] is the negative counterpart: it says \enquote{no
+command this time} without editing the item.  The typical case is
+taking over an agent's task by hand.  The item carries [[claude]]---or
+inherits it from the worker default---and the user wants the tracking
+and the working directory but not the launcher.  Substituting a shell
+with [[--command]] would work but names the wrong thing; what the user
+means is \enquote{as if no command were stored}, and that is exactly
+what the flag does: the launch decision and the command resolution
+both treat the item as command-less, so a [[wd]] still opens a tracked
+shell there while an item with only a command starts tracking and
+spawns nothing.
+
+<<argument and option definitions>>=
+no_command_opt = typer.Option(
+    "--no-command",
+    help="Start without running the stored or "
+         "worker-default command")
+@
+
+<<start command options>>=
+no_command: Annotated[bool, no_command_opt] = False,
+@
+
+A command and a request for none contradict each other, and both
+spellings of a command---the [[--command]] string and the [[--]]
+pass-through---arrive as a non-[[None]] [[run_argv]], so one check
+covers both.  We reuse the placement-flag validator; it names the two
+flags in its message, which is what the user needs to see.
+
+<<reject a command together with [[--no-command]]>>=
+reject_conflicting_flags({
+    "--no-command": no_command,
+    "--command": run_argv is not None,
+})
+@
+
 Likewise [[--worktree]] overrides the stored worktree name for this
 one start, without editing the item.  This is the one-off counterpart
 of [[todo add --worktree]]: a task normally lives in the same worktree
@@ -15164,7 +15312,9 @@ whenever the caller supplies a launch flag at invocation time
 must trigger a spawn by itself: otherwise users who configured a
 launcher such as [[claude]] on the todo would see tracking start but
 never see their command run unless they remembered to pass a launch
-flag such as [[-W]].
+flag such as [[-W]].  [[--no-command]] removes the command from that
+list of reasons, and only the command: a [[wd]], a worktree or a tmux
+flag still launches, now with a shell.
 The environment restoration starts from the stored [[env]] (if
 available) and overlays terminal-related variables ([[TERM]],
 [[DISPLAY]], [[SSH_*]]) from the current environment to ensure the
@@ -15186,7 +15336,7 @@ failure there cannot leak the file.
 <<spawn subprocess when the todo has work to launch>>=
 if (
     item.wd or worktree_dir or run or pane or window
-    or item.command
+    or (item.command and not no_command)
 ):
     <<validate tmux options>>
     <<prepare subprocess environment>>
@@ -15703,11 +15853,19 @@ apply the context to its environment here instead---mirroring
 [[track start]].  It does nothing for a non-shell launcher such as
 [[claude]] but lets an explicitly launched shell still carry the marker.
 
+[[--no-command]] is checked here rather than on the item because
+[[item.command]] is a resolved read: it answers with the worker
+default when nothing is stored (\cref{todo:worker-defaults}), and the
+flag has to silence that default as much as a stored command.  Nulling
+the attribute would not do, since a later save must not persist the
+override.  Guarding the fallback sends the launch down the shell
+branch exactly as for a command-less item.
+
 <<determine command to run>>=
 from nytid.cli.track import build_launch_shell
 
 cmd = run_argv
-if cmd is None and item.command:
+if cmd is None and item.command and not no_command:
     cmd, _ = resolve_command_argv(item.command, None)
 if cmd:
     apply_context_prompt(todo_context, proc_env)
@@ -19551,6 +19709,7 @@ from nytid.cli.todo import (
     ParsedTodo,
     canonicalize_wd,
     normalize_worktree_name,
+    normalize_command,
     ensure_worktree,
     naive_local_datetime,
     normalize_deadline,
@@ -20908,6 +21067,88 @@ def test_start_spawns_stored_command_without_wd(
         assert cmd[0] == "true"
 
 
+def test_start_no_command_skips_stored_command(temp_todo_dir):
+    """--no-command on a command-only item spawns nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            created="2026-02-20T10:00:00",
+            command="true",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-command"],
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_not_called()
+
+
+def test_start_no_command_opens_shell_in_wd(temp_todo_dir):
+    """--no-command with a wd opens a shell there instead."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+            command="true",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-command"],
+            input="n\n",
+        )
+        assert result.exit_code == 0, result.output
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] != "true"
+        assert mock_run.call_args.kwargs["cwd"] == "/tmp"
+
+
+def test_start_no_command_ignores_worker_default(temp_todo_dir):
+    """--no-command silences the worker-default command too."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Agent task",
+            who="dan-claude",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patched_worker_config({
+        "todo.worker.dan-claude.command": "true",
+    }), patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-command"],
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_not_called()
+
+
+def test_start_no_command_rejects_explicit_command(temp_todo_dir):
+    """--no-command and --command contradict each other."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["start", "1", "--no-command", "--command", "claude"],
+    )
+    assert result.exit_code == 1
+    assert "cannot be used together" in result.output
+
+
 def test_next_spawns_stored_command_without_wd(
     temp_todo_dir,
 ):
@@ -20934,6 +21175,26 @@ def test_next_spawns_stored_command_without_wd(
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "true"
+
+
+def test_next_no_command_skips_stored_command(temp_todo_dir):
+    """next forwards --no-command to start."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            status="pending",
+            created="2026-02-20T10:00:00",
+            command="true",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["next", "--no-command"],
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_not_called()
 
 
 def test_start_spawns_shell(temp_todo_dir):
