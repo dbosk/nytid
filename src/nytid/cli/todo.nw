@@ -2118,6 +2118,15 @@ transient (exists only during editor interaction) and doesn't carry
 IDs, timestamps, or status. Keeping them separate avoids polluting
 the domain model with editor concerns.
 
+[[ParsedTodo]] carries one thing the tree itself cannot: a list of
+[[warnings]].  The parser is deliberately forgiving---a buffer that
+breaks the format is still parsed as well as it can be, because the
+alternative is to throw away the editing session the user just spent
+their time on---but forgiving \emph{silently} would leave the user
+guessing why a key never took effect.  Each warning is one plain
+sentence, so the same list serves both [[add]] and [[edit]] without
+either of them having to know what can go wrong.
+
 <<editor infrastructure>>=
 @dataclass
 class ParsedItem:
@@ -2138,13 +2147,15 @@ class ParsedTodo:
     """Complete parsed result from editor content.
 
     The top-level item plus its tree of children from
-    markdown headings.
+    markdown headings, and the ``warnings`` the parser
+    raised about a buffer it could only parse in part.
     """
 
     title: str
     notes: str = ""
     metadata: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 @
 
 \subsection{Minimal YAML Parser}
@@ -2559,8 +2570,13 @@ def parse_editor_content(text):
     - ``# Heading`` = level-1 child
     - ``## Heading`` = level-2 child (of preceding #)
     - Each heading may have its own YAML block + notes
+
+    A front matter block that is never closed is kept as
+    notes and reported in ``warnings`` rather than
+    discarded.
     """
     lines = text.splitlines()
+    warnings = []
     <<parse title from first line>>
     <<parse optional yaml block>>
     <<parse notes and headings>>
@@ -2569,6 +2585,7 @@ def parse_editor_content(text):
         notes=parent_notes.strip(),
         metadata=parent_metadata,
         children=top_children,
+        warnings=warnings,
     )
 @
 
@@ -2596,24 +2613,65 @@ indented, so requiring the delimiter to start the line is what keeps
 block content from closing the front matter early.  Trailing
 whitespace is still tolerated, since editors add and strip it freely.
 
+The search for the closing delimiter stops at the end of the buffer or
+at the first column-0 line beginning with [[#]].  That second stop is
+what keeps a \emph{missing} closing delimiter from being catastrophic:
+without it, the next [[---]] in the document would close the block, and
+the next [[---]] after an unclosed parent block is the opening
+delimiter of the first sub-item's own block.  The parent's notes and
+the [[# Child]] heading between them would be handed to
+[[parse_yaml_block]] as metadata, and the sub-items would vanish.  A
+column-0 [[#]] is a safe place to stop because the renderer indents
+every literal block line by two spaces (\cref{sec:render-yaml}), so no
+line it emits inside front matter can start there; such a line can only
+be the heading that opens a sub-item.  The price is that a YAML comment
+written in column~0 inside the front matter would end the block early,
+but the renderer has never emitted one and the format has never
+promised them.
+
 <<parse optional yaml block>>=
 parent_metadata = {}
 while idx < len(lines) and not lines[idx].strip():
     idx += 1
 if idx < len(lines) and lines[idx].rstrip() == "---":
-    yaml_start = idx + 1
-    idx = yaml_start
+    opening = idx
+    idx += 1
+    closing = None
     while idx < len(lines):
         if lines[idx].rstrip() == "---":
-            yaml_text = "\n".join(
-                lines[yaml_start:idx]
-            )
-            parent_metadata = parse_yaml_block(
-                yaml_text
-            )
-            idx += 1
+            closing = idx
+            break
+        if lines[idx].startswith("#"):
             break
         idx += 1
+    if closing is None:
+        <<keep the parent block as notes>>
+    else:
+        yaml_text = "\n".join(
+            lines[opening + 1:closing]
+        )
+        parent_metadata = parse_yaml_block(yaml_text)
+        idx = closing + 1
+@
+
+When the delimiter never turns up we could report the buffer as
+malformed and exit non-zero, but that would discard the whole editing
+session---the user's only copy of the text they just typed---over one
+missing pair of dashes.  Rewinding costs nothing instead: [[idx]] goes
+back to the opening [[---]], and the loop below reads that line and
+everything after it as ordinary notes and headings.  No byte is lost,
+the sub-items are parsed as usual, and because the metadata stays empty
+[[<<update parent from parsed>>]] leaves every field of the item alone
+rather than overwriting it from a half-read block.  The stray [[---]]
+shows up in [[view]], where the user can see it and fix it on the next
+edit.
+
+<<keep the parent block as notes>>=
+idx = opening
+warnings.append(
+    "front matter opened with --- but never "
+    "closed; kept it as notes"
+)
 @
 
 The remaining content splits into parent notes (text before any
@@ -2703,15 +2761,44 @@ else:
         current_notes_lines.append(line)
 @
 
+A sub-item's block can be left open just as the parent's can, and the
+remedy mirrors the parent's for the same reason: the lines the parser
+had been setting aside as metadata are text the user typed, so they
+belong in the notes rather than in the bit bucket.  Only the detection
+differs.  The parent's block has to be scanned ahead for a delimiter
+that may not be there, whereas a sub-item's block is closed implicitly
+by the next heading or by the end of the buffer, so by the time we
+finalize the item [[in_yaml]] already answers the question.  We splice
+the [[---]] back in where it stood, after the notes collected before it
+and before the lines collected after it, so that the notes read exactly
+as they were typed.
+
 <<finalize current item>>=
 if current_item is not None:
-    if current_yaml_lines is not None:
+    if in_yaml:
+        <<keep the child block as notes>>
+    elif current_yaml_lines is not None:
         current_item.metadata = parse_yaml_block(
             "\n".join(current_yaml_lines)
         )
     current_item.notes = "\n".join(
         current_notes_lines
     ).strip()
+@
+
+The warning names the sub-item, since a document may hold many of them
+and the user needs to know which one to go and look at.
+
+<<keep the child block as notes>>=
+current_notes_lines = (
+    current_notes_lines
+    + ["---"]
+    + current_yaml_lines
+)
+warnings.append(
+    f"sub-item {current_item.title!r}: front matter "
+    "never closed; kept it as notes"
+)
 @
 
 <<finalize last item notes>>=
@@ -2832,6 +2919,90 @@ Child notes.
     assert child.metadata["description"] == "---"
     assert child.metadata["command"] == "claude"
     assert "Child notes" in child.notes
+@
+
+The unclosed cases are worth pinning down one at a time, because the
+whole point of the rewind is what it \emph{does not} do.  First, a
+parent block with no closing delimiter: nothing may be read as
+metadata, and the sub-item below it must survive.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_block():
+    """An unclosed parent block becomes notes, not metadata."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+who: dbosk
+
+Parent notes here.
+
+# Child
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.title == "Parent Task"
+    assert result.metadata == {}
+    assert "---" in result.notes
+    assert "deadline: 2026-03-01" in result.notes
+    assert "who: dbosk" in result.notes
+    assert "Parent notes here." in result.notes
+    assert len(result.children) == 1
+    assert result.children[0].title == "Child"
+    assert "Child notes." in result.children[0].notes
+    assert len(result.warnings) == 1
+@
+
+Next, the case the heading stop exists for: the parent block is
+unclosed and the next [[---]] in the buffer belongs to a sub-item.  The
+sub-item's own metadata must still be read, which it can only be if the
+parent's scan stopped at the heading instead of consuming it.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_keeps_child_block():
+    """A sub-item's --- does not close the parent's block."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+
+# Child
+---
+command: x
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.metadata == {}
+    assert "deadline: 2026-03-01" in result.notes
+    child = result.children[0]
+    assert child.metadata.get("command") == "x"
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+@
+
+Finally the mirror image, an unclosed block inside a sub-item, whose
+warning has to name the sub-item it came from.
+
+<<test functions>>=
+def test_parse_editor_unclosed_child_block():
+    """An unclosed sub-item block becomes that item's notes."""
+    text = """Parent Task
+
+# Child
+---
+command: x
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    child = result.children[0]
+    assert child.metadata == {}
+    assert "---" in child.notes
+    assert "command: x" in child.notes
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+    assert "Child" in result.warnings[0]
 @
 
 \subsection{Rendering Todo as Markdown}
@@ -3108,6 +3279,23 @@ def open_editor(initial_content=""):
             os.unlink(temp_path)
         except OSError:
             pass
+@
+
+The other half of the round trip is telling the user what the parser
+had to tolerate.  Both [[add --edit]] and [[edit --edit]] report it the
+same way, so the report is a chunk they share.  The warnings are
+advisory rather than fatal: the parse kept every line the user typed,
+so there is nothing to roll back and the save goes ahead as usual.
+They go to stderr, alongside the module's other diagnostics, so that
+they stay out of the item and sub-item lines the commands print as
+their result.
+
+The chunk reads [[parsed]], which both call sites bind immediately
+before they expand it.
+
+<<echo parse warnings>>=
+for warning in parsed.warnings:
+    typer.echo(f"Warning: {warning}", err=True)
 @
 
 \section{Binary Search Priority}
@@ -5758,6 +5946,7 @@ if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
@@ -8359,6 +8548,7 @@ if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 <<update parent from parsed>>
 <<reconcile children>>
 save_todos(next_id, todos)
@@ -8731,6 +8921,65 @@ def test_edit_interactive_removes_subtree(
   assert result.exit_code == 0, result.stdout
   _, todos = load_todos()
   assert [t.id for t in todos] == [1]
+@
+
+Deleting a heading is how the user asks for a sub-item to be removed,
+which is exactly why a buffer the parser gives up on must never come
+back looking empty.  The test below is the one that would have caught
+the loss reported in the issue: an unclosed front matter block used to
+leave the parse with no notes and no sub-items, so [[edit]] blanked the
+item and removed both children as \enquote{deleted in the editor}.  It
+now warns and saves everything.
+
+<<test functions>>=
+def test_edit_editor_unclosed_block_keeps_children(
+    temp_todo_dir,
+):
+    """An unclosed block warns instead of emptying the item."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            notes="Original notes.",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="First child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=4.0,
+        ),
+        TodoItem(
+            id=3, title="Second child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=3.0,
+        ),
+    ])
+    buffer = (
+        "Parent\n"
+        "---\n"
+        "deadline: 2026-03-01\n"
+        "\n"
+        "Original notes.\n"
+        "\n"
+        "# First child\n"
+        "\n"
+        "# Second child\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    _, todos = load_todos()
+    assert {t.id for t in todos} == {1, 2, 3}
+    parent = next(t for t in todos if t.id == 1)
+    assert "---" in parent.notes
+    assert "deadline: 2026-03-01" in parent.notes
+    assert "Original notes." in parent.notes
+    assert parent.deadline is None
 @
 
 <<test functions>>=
