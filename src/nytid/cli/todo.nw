@@ -2211,6 +2211,15 @@ transient (exists only during editor interaction) and doesn't carry
 IDs, timestamps, or status. Keeping them separate avoids polluting
 the domain model with editor concerns.
 
+[[ParsedTodo]] carries one thing the tree itself cannot: a list of
+[[warnings]].  The parser is deliberately forgiving---a buffer that
+breaks the format is still parsed as well as it can be, because the
+alternative is to throw away the editing session the user just spent
+their time on---but forgiving \emph{silently} would leave the user
+guessing why a key never took effect.  Each warning is one plain
+sentence, so the same list serves both [[add]] and [[edit]] without
+either of them having to know what can go wrong.
+
 <<editor infrastructure>>=
 @dataclass
 class ParsedItem:
@@ -2231,13 +2240,15 @@ class ParsedTodo:
     """Complete parsed result from editor content.
 
     The top-level item plus its tree of children from
-    markdown headings.
+    markdown headings, and the ``warnings`` the parser
+    raised about a buffer it could only parse in part.
     """
 
     title: str
     notes: str = ""
     metadata: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 @
 
 \subsection{Minimal YAML Parser}
@@ -2652,8 +2663,13 @@ def parse_editor_content(text):
     - ``# Heading`` = level-1 child
     - ``## Heading`` = level-2 child (of preceding #)
     - Each heading may have its own YAML block + notes
+
+    A front matter block that is never closed is kept as
+    notes and reported in ``warnings`` rather than
+    discarded.
     """
     lines = text.splitlines()
+    warnings = []
     <<parse title from first line>>
     <<parse optional yaml block>>
     <<parse notes and headings>>
@@ -2662,6 +2678,7 @@ def parse_editor_content(text):
         notes=parent_notes.strip(),
         metadata=parent_metadata,
         children=top_children,
+        warnings=warnings,
     )
 @
 
@@ -2689,24 +2706,65 @@ indented, so requiring the delimiter to start the line is what keeps
 block content from closing the front matter early.  Trailing
 whitespace is still tolerated, since editors add and strip it freely.
 
+The search for the closing delimiter stops at the end of the buffer or
+at the first column-0 line beginning with [[#]].  That second stop is
+what keeps a \emph{missing} closing delimiter from being catastrophic:
+without it, the next [[---]] in the document would close the block, and
+the next [[---]] after an unclosed parent block is the opening
+delimiter of the first sub-item's own block.  The parent's notes and
+the [[# Child]] heading between them would be handed to
+[[parse_yaml_block]] as metadata, and the sub-items would vanish.  A
+column-0 [[#]] is a safe place to stop because the renderer indents
+every literal block line by two spaces (\cref{sec:render-yaml}), so no
+line it emits inside front matter can start there; such a line can only
+be the heading that opens a sub-item.  The price is that a YAML comment
+written in column~0 inside the front matter would end the block early,
+but the renderer has never emitted one and the format has never
+promised them.
+
 <<parse optional yaml block>>=
 parent_metadata = {}
 while idx < len(lines) and not lines[idx].strip():
     idx += 1
 if idx < len(lines) and lines[idx].rstrip() == "---":
-    yaml_start = idx + 1
-    idx = yaml_start
+    opening = idx
+    idx += 1
+    closing = None
     while idx < len(lines):
         if lines[idx].rstrip() == "---":
-            yaml_text = "\n".join(
-                lines[yaml_start:idx]
-            )
-            parent_metadata = parse_yaml_block(
-                yaml_text
-            )
-            idx += 1
+            closing = idx
+            break
+        if lines[idx].startswith("#"):
             break
         idx += 1
+    if closing is None:
+        <<keep the parent block as notes>>
+    else:
+        yaml_text = "\n".join(
+            lines[opening + 1:closing]
+        )
+        parent_metadata = parse_yaml_block(yaml_text)
+        idx = closing + 1
+@
+
+When the delimiter never turns up we could report the buffer as
+malformed and exit non-zero, but that would discard the whole editing
+session---the user's only copy of the text they just typed---over one
+missing pair of dashes.  Rewinding costs nothing instead: [[idx]] goes
+back to the opening [[---]], and the loop below reads that line and
+everything after it as ordinary notes and headings.  No byte is lost,
+the sub-items are parsed as usual, and because the metadata stays empty
+[[<<update parent from parsed>>]] leaves every field of the item alone
+rather than overwriting it from a half-read block.  The stray [[---]]
+shows up in [[view]], where the user can see it and fix it on the next
+edit.
+
+<<keep the parent block as notes>>=
+idx = opening
+warnings.append(
+    "front matter opened with --- but never "
+    "closed; kept it as notes"
+)
 @
 
 The remaining content splits into parent notes (text before any
@@ -2796,15 +2854,44 @@ else:
         current_notes_lines.append(line)
 @
 
+A sub-item's block can be left open just as the parent's can, and the
+remedy mirrors the parent's for the same reason: the lines the parser
+had been setting aside as metadata are text the user typed, so they
+belong in the notes rather than in the bit bucket.  Only the detection
+differs.  The parent's block has to be scanned ahead for a delimiter
+that may not be there, whereas a sub-item's block is closed implicitly
+by the next heading or by the end of the buffer, so by the time we
+finalize the item [[in_yaml]] already answers the question.  We splice
+the [[---]] back in where it stood, after the notes collected before it
+and before the lines collected after it, so that the notes read exactly
+as they were typed.
+
 <<finalize current item>>=
 if current_item is not None:
-    if current_yaml_lines is not None:
+    if in_yaml:
+        <<keep the child block as notes>>
+    elif current_yaml_lines is not None:
         current_item.metadata = parse_yaml_block(
             "\n".join(current_yaml_lines)
         )
     current_item.notes = "\n".join(
         current_notes_lines
     ).strip()
+@
+
+The warning names the sub-item, since a document may hold many of them
+and the user needs to know which one to go and look at.
+
+<<keep the child block as notes>>=
+current_notes_lines = (
+    current_notes_lines
+    + ["---"]
+    + current_yaml_lines
+)
+warnings.append(
+    f"sub-item {current_item.title!r}: front matter "
+    "never closed; kept it as notes"
+)
 @
 
 <<finalize last item notes>>=
@@ -2925,6 +3012,90 @@ Child notes.
     assert child.metadata["description"] == "---"
     assert child.metadata["command"] == "claude"
     assert "Child notes" in child.notes
+@
+
+The unclosed cases are worth pinning down one at a time, because the
+whole point of the rewind is what it \emph{does not} do.  First, a
+parent block with no closing delimiter: nothing may be read as
+metadata, and the sub-item below it must survive.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_block():
+    """An unclosed parent block becomes notes, not metadata."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+who: dbosk
+
+Parent notes here.
+
+# Child
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.title == "Parent Task"
+    assert result.metadata == {}
+    assert "---" in result.notes
+    assert "deadline: 2026-03-01" in result.notes
+    assert "who: dbosk" in result.notes
+    assert "Parent notes here." in result.notes
+    assert len(result.children) == 1
+    assert result.children[0].title == "Child"
+    assert "Child notes." in result.children[0].notes
+    assert len(result.warnings) == 1
+@
+
+Next, the case the heading stop exists for: the parent block is
+unclosed and the next [[---]] in the buffer belongs to a sub-item.  The
+sub-item's own metadata must still be read, which it can only be if the
+parent's scan stopped at the heading instead of consuming it.
+
+<<test functions>>=
+def test_parse_editor_unclosed_parent_keeps_child_block():
+    """A sub-item's --- does not close the parent's block."""
+    text = """Parent Task
+---
+deadline: 2026-03-01
+
+# Child
+---
+command: x
+---
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    assert result.metadata == {}
+    assert "deadline: 2026-03-01" in result.notes
+    child = result.children[0]
+    assert child.metadata.get("command") == "x"
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+@
+
+Finally the mirror image, an unclosed block inside a sub-item, whose
+warning has to name the sub-item it came from.
+
+<<test functions>>=
+def test_parse_editor_unclosed_child_block():
+    """An unclosed sub-item block becomes that item's notes."""
+    text = """Parent Task
+
+# Child
+---
+command: x
+
+Child notes.
+"""
+    result = parse_editor_content(text)
+    child = result.children[0]
+    assert child.metadata == {}
+    assert "---" in child.notes
+    assert "command: x" in child.notes
+    assert "Child notes." in child.notes
+    assert len(result.warnings) == 1
+    assert "Child" in result.warnings[0]
 @
 
 \subsection{Rendering Todo as Markdown}
@@ -3144,6 +3315,256 @@ def test_github_field_roundtrip():
     assert parsed["github"]["number"] == "42"
 @
 
+\subsection{Applying Metadata to an Item}
+\label{sec:apply-metadata}
+
+[[build_item_metadata]] turns an item into front matter; this is the
+inverse direction, and until now it had no home.  Front-matter keys were
+applied by an if-chain written out five times over---for the parent and
+for the matched children of [[edit]], and for the parent and the new
+children of [[add]], the latter twice because [[add]] creates children
+in its own recursion.  Five copies of one rule drift, and these had
+drifted: [[github]] was applied for the parent but for none of the
+children, so a user who linked a sub-item to an issue in the editor
+watched the link vanish on save.  Collecting the per-key normalizers
+into a single table is what stops the next key from drifting the same
+way: adding a key becomes one edit instead of five, and forgetting a
+site stops being possible.
+
+The contract is that a key \emph{present} in [[meta]] overwrites the
+field while an \emph{absent} key leaves it alone.  Deleting
+[[deadline:]] from the buffer therefore does not clear the deadline,
+and deleting the description block does not clear the description;
+[[edit N --deadline ""]] and [[edit N --description ""]] are how a
+field is cleared.  The asymmetry is deliberate: the buffer is rendered
+from the item and shows only the keys that are set, so a user who has
+never seen a key cannot be said to have deleted it.  Keys the table
+does not know are ignored rather than rejected, which leaves the front
+matter open for a user's own annotations.
+
+Each key carries the normalizer its own site already applied: [[wd]] is
+canonicalized to an absolute path, [[worktree]] is validated as a name
+without path separators, [[deadline]] is normalized to a comparable
+string, and [[estimate]] is parsed into hours.  Gathering them here
+changes none of them; it only stops them from being written out five
+times, and makes the set of keys something a reader can take in at a
+glance.
+
+Every string-valued key coerces its value with [[str]] before storing
+it.  That is not defensive habit but a consequence of the parser: our
+minimal YAML subset (\cref{sec:parse-yaml}) types a bare number for
+\emph{every} key, so a hand-typed [[wd: 2026]] arrives here as an
+[[int]].  Coercing at this one point is what keeps the field types the
+rest of the module assumes; without it the integer surfaces far from
+the editor session that stored it, in [[canonicalize_wd]], in the
+[[subprocess]] call that [[command]] feeds, or in the Markdown renderer
+and the calendar export that read [[description]].  A list-valued key
+gets the same treatment in its own shape: [[labels: grading]] is a
+string, not a list, and wrapping it makes it the one label the user
+meant rather than the six letters [[sorted(set(...))]] would otherwise
+store.
+
+[[github]] and [[env]] are the two dictionary-valued keys, and they get
+the opposite treatment---a value that is not a dictionary is left
+alone.  There is no honest dictionary to make out of [[github: 5]], and
+storing something else in a field the [[gh]] wrappers index by [[repo]]
+and [[number]] would only move the failure to the next [[sync]].  The
+sentinel [[METADATA_UNCHANGED]] lets the table say that in the same
+shape as every other entry: a normalizer that declines to produce a
+value.
+
+<<editor infrastructure>>=
+METADATA_UNCHANGED = object()
+
+
+def dict_or_unchanged(value):
+    """Return `value` when it is a dict, else the sentinel.
+
+    The sentinel `METADATA_UNCHANGED` tells
+    `apply_metadata` to leave the field untouched.
+    """
+    if isinstance(value, dict):
+        return value
+    return METADATA_UNCHANGED
+@
+
+The table maps a front-matter key to the attribute it writes and the
+normalizer that guards it.  Only [[estimate]] has a name of its own:
+the key reads as a noun in the buffer while the field it feeds,
+[[estimated]], reads as a stored fact, and renaming either now would
+break every todo file and every buffer already written.
+
+<<editor infrastructure>>=
+METADATA_FIELDS = {
+    "wd": ("wd", lambda v: canonicalize_wd(str(v))),
+    "worktree": (
+        "worktree",
+        lambda v: normalize_worktree_name(str(v)),
+    ),
+    "command": ("command", str),
+    "labels": (
+        "labels",
+        lambda v: list(v) if isinstance(v, list) else [str(v)],
+    ),
+    "deadline": (
+        "deadline",
+        lambda v: normalize_deadline(str(v)),
+    ),
+    "estimate": (
+        "estimated",
+        lambda v: parse_hours(str(v)),
+    ),
+    "who": ("who", str),
+    "github": ("github", dict_or_unchanged),
+    "env": ("env", dict_or_unchanged),
+    "description": ("description", str),
+}
+
+
+def apply_metadata(item, meta):
+    """Apply editor front-matter keys to `item` in place.
+
+    Each key present in `meta` overwrites the matching
+    field; an absent key leaves the field alone, and an
+    unknown key is ignored.
+    """
+    for key, (attribute, normalize) in METADATA_FIELDS.items():
+        if key not in meta:
+            continue
+        value = normalize(meta[key])
+        if value is not METADATA_UNCHANGED:
+            setattr(item, attribute, value)
+@
+
+Creation sites cannot simply call the helper, because a new item also
+inherits: a child takes its parent's labels, deadline and assignee, and
+[[add]] takes whatever its command line said.  They construct the item
+with the inherited values, then call [[apply_metadata]], then---on the
+[[add]] parent, the only site with flags to consider---re-apply the
+flags.  That order is the precedence rule made executable: inherited
+default below front matter below command-line flag.
+
+Let's verify the table end to end, one key at a time:
+
+<<test functions>>=
+def test_apply_metadata_applies_every_key(tmp_path):
+    """Each known key reaches its field, normalized."""
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": str(tmp_path),
+        "worktree": "fix-42",
+        "command": "claude",
+        "labels": ["DD1310", "grading"],
+        "deadline": "2026-03-01",
+        "estimate": "90m",
+        "who": "dbosk",
+        "github": {
+            "repo": "o/r", "type": "issue", "number": "7",
+        },
+        "env": {"COURSE": "DD1310"},
+        "description": "Standing statement.",
+    })
+    assert item.wd == str(tmp_path)
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.labels == ["DD1310", "grading"]
+    assert item.deadline == "2026-03-01"
+    assert isinstance(item.estimated, float)
+    assert item.estimated == pytest.approx(1.5)
+    assert item.who == "dbosk"
+    assert item.github["number"] == "7"
+    assert item.env == {"COURSE": "DD1310"}
+    assert item.description == "Standing statement."
+@
+
+The absent-key half of the contract needs an item that already has
+something to lose, so we populate every field and then hand the helper
+a document that mentions none of them:
+
+<<test functions>>=
+def test_apply_metadata_leaves_absent_keys_alone():
+    """Absent keys keep their fields; unknown keys are ignored."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=2.0,
+        who="dbosk",
+        description="Kept.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+        env={"COURSE": "DD1310"},
+    )
+    apply_metadata(item, {"mystery": "ignored"})
+    assert item.labels == ["DD1310"]
+    assert item.deadline == "2026-03-01"
+    assert item.estimated == 2.0
+    assert item.who == "dbosk"
+    assert item.description == "Kept."
+    assert item.wd == "/tmp/project"
+    assert item.worktree == "fix-42"
+    assert item.command == "claude"
+    assert item.github == {"repo": "o/r", "number": "7"}
+    assert item.env == {"COURSE": "DD1310"}
+    assert not hasattr(item, "mystery")
+@
+
+The table is also where the round trip closes, so it is worth asserting
+that it does: every key the renderer can put in the buffer must be a key
+the applier knows, or the editor would show the user a field it then
+quietly refuses to read back.
+
+<<test functions>>=
+def test_metadata_fields_covers_rendered_keys():
+    """Every rendered front-matter key is one the table knows."""
+    item = TodoItem(
+        id=1, title="Task",
+        labels=["DD1310"],
+        deadline="2026-03-01",
+        estimated=1.5,
+        who="dbosk",
+        description="Standing statement.",
+        wd="/tmp/project",
+        worktree="fix-42",
+        command="claude",
+        github={"repo": "o/r", "number": "7"},
+    )
+    assert set(build_item_metadata(item)) <= set(
+        METADATA_FIELDS
+    )
+@
+
+Finally the coercion rule, exercised with exactly what the YAML
+subset produces for hand-typed numbers.  We change directory first
+because [[canonicalize_wd]] resolves [[2026]] as a relative path, and
+what we are checking is that it arrives there as a string at all:
+
+<<test functions>>=
+def test_apply_metadata_coerces_yaml_scalars(
+    tmp_path, monkeypatch,
+):
+    """Bare numbers become strings and a lone label a list."""
+    monkeypatch.chdir(tmp_path)
+    item = TodoItem(id=1, title="Task")
+    apply_metadata(item, {
+        "wd": 2026,
+        "command": 42,
+        "who": 7,
+        "description": 3.5,
+        "labels": "grading",
+        "github": 5,
+    })
+    assert isinstance(item.wd, str)
+    assert item.wd == str(tmp_path / "2026")
+    assert item.command == "42"
+    assert item.who == "7"
+    assert item.description == "3.5"
+    assert item.labels == ["grading"]
+    assert item.github is None
+@
+
 \subsection{Editor Invocation}
 
 Opening the user's preferred editor follows the standard UNIX
@@ -3201,6 +3622,23 @@ def open_editor(initial_content=""):
             os.unlink(temp_path)
         except OSError:
             pass
+@
+
+The other half of the round trip is telling the user what the parser
+had to tolerate.  Both [[add --edit]] and [[edit --edit]] report it the
+same way, so the report is a chunk they share.  The warnings are
+advisory rather than fatal: the parse kept every line the user typed,
+so there is nothing to roll back and the save goes ahead as usual.
+They go to stderr, alongside the module's other diagnostics, so that
+they stay out of the item and sub-item lines the commands print as
+their result.
+
+The chunk reads [[parsed]], which both call sites bind immediately
+before they expand it.
+
+<<echo parse warnings>>=
+for warning in parsed.warnings:
+    typer.echo(f"Warning: {warning}", err=True)
 @
 
 \section{Binary Search Priority}%
@@ -5585,9 +6023,6 @@ estimate_opt = typer.Option(
     "--estimate", "-e",
     help="Estimate (hours unless suffixed, "
          "e.g. 1.5, 1.5h, 90m, 1h30m)")
-description_opt = typer.Option(
-    "--description",
-    help="Body text of the item")
 @
 
 <<add command options>>=
@@ -5595,8 +6030,94 @@ deadline: Annotated[str | None,
                     deadline_opt] = None,
 estimate: Annotated[str | None,
                     estimate_opt] = None,
+@
+
+\enquote{Description} and \enquote{notes} name two fields whose
+contents are easy to confuse, and the difference decides which of them
+a piece of text belongs in.  The description is the item's standing
+statement: one line saying what the task is and why it exists, short
+enough to sit beside the title wherever the item is shown.  The notes
+are everything that accumulates afterwards---what was found while
+planning it, what [[note]] appended while working on it, what has to
+happen before it can be called done.  A description is \emph{rewritten}
+when the task changes; notes only ever \emph{grow}.
+
+The help text has to carry that distinction, because the field names
+alone do not: a user who reaches for [[--description]] to record three
+paragraphs of detail is putting a growing log into the field the
+listings expect to be one line.  It also records the one editing idiom
+that cannot be guessed, that [[edit --description ""]] clears the
+field.  Everywhere else in [[edit]] an omitted option means
+\enquote{leave this alone}, so without the sentence the empty string
+looks like the same no-op rather than the one way to erase a
+description.
+
+<<argument and option definitions>>=
+description_opt = typer.Option(
+    "--description",
+    help="One-line statement of the item (what and "
+         "why); put details in --note or the note "
+         "command. On edit, an empty string clears it.")
+@
+
+<<add command options>>=
 description: Annotated[str | None,
                        description_opt] = "",
+@
+
+Let's verify that the sentence reaches the user whole.  Typer wraps
+option help into a bordered panel, so the assertion compares against
+the output with the border characters and the line breaks flattened
+away; matching a short fragment instead would pass just as happily
+on a sentence that had lost its second half.
+
+<<test functions>>=
+def test_add_help_points_at_notes_and_clearing(temp_todo_dir):
+  """--description's help names --note and the clearing idiom."""
+  result = runner.invoke(cli, ["add", "--help"])
+  assert result.exit_code == 0
+  ascii_only = "".join(
+    c if c.isascii() else " " for c in result.output
+  )
+  helptext = " ".join(ascii_only.split())
+  assert (
+    "One-line statement of the item (what and why); "
+    "put details in --note or the note command. "
+    "On edit, an empty string clears it." in helptext
+  )
+@
+
+If the details belong in the notes, then creating an item with details
+takes two commands---[[add]], then [[note]]---and what is a minor
+annoyance once becomes the dominant cost when a script creates a
+hundred items and pays two invocations for each.  [[--note]] closes
+that gap by taking the note text at creation time.
+
+The option repeats instead of taking one long string because a note is
+a paragraph.  Each [[--note]] is one thought---a link, a constraint,
+something to check---and several short quoted arguments are far easier
+to type at a shell than one argument with embedded newlines.
+
+<<argument and option definitions>>=
+note_opt = typer.Option(
+    "--note",
+    help="Note paragraph, repeatable "
+         "(joined by blank lines)")
+@
+
+<<add command options>>=
+note: Annotated[list[str] | None,
+                note_opt] = None,
+@
+
+Those paragraphs are joined with a blank line between them, not with a
+single newline, because notes are read back as Markdown by [[view]].
+Markdown folds consecutive lines into one paragraph, so joining
+[[--note a --note b]] with a newline would render as \enquote{a b};
+the blank line is what keeps two notes two notes.
+
+<<join note paragraphs>>=
+notes_text = "\n\n".join(note) if note else ""
 @
 
 Most of the time we infer priority interactively by comparing the new
@@ -5832,8 +6353,11 @@ who: Annotated[str | None,
                who_opt] = default_username,
 @
 
-Now the implementation. We first reject contradictory flags, then
-resolve the parent ID, determine the priority, and finally save.
+Now the implementation. We first reject contradictory flags and fold
+the [[--note]] paragraphs into one string, then resolve the parent ID,
+determine the priority, and finally save.  The fold happens before the
+branch because both ways of creating an item need the result: the
+flag path stores it, and the editor path shows it.
 
 <<add command implementation>>=
 next_id, todos = load_todos()
@@ -5847,6 +6371,7 @@ except typer.BadParameter as exc:
     raise typer.Exit(1)
 
 <<validate add options>>
+<<join note paragraphs>>
 
 if edit_mode:
     <<add via editor>>
@@ -6343,6 +6868,7 @@ item = TodoItem(
     deadline=inherited_deadline,
     estimated=estimated_hours,
     description=description or "",
+    notes=notes_text,
     parent_id=resolved_parent,
     who=who,
     wd=resolved_wd,
@@ -6416,6 +6942,22 @@ def test_todo_item_without_worktree_key_loads():
     assert TodoItem.from_dict(item.to_dict()).worktree is None
 @
 
+Let's verify that repeated [[--note]] arguments reach the stored
+[[notes]] field as separate paragraphs:
+
+<<test functions>>=
+def test_add_note_flags_join_as_paragraphs(temp_todo_dir):
+  """Repeated --note becomes one blank-line-separated body."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--top-level",
+     "--prio", "1", "--note", "a", "--note", "b"],
+  )
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert todos[0].notes == "a\n\nb"
+@
+
 \subsubsection{Adding via Editor}
 \label{sec:add-via-editor}
 
@@ -6440,12 +6982,14 @@ initial = title if title else ""
 yaml_header = render_yaml_block(initial_meta)
 if yaml_header:
     initial = initial + "\n" + yaml_header
+<<prefill notes into the buffer>>
 content = open_editor(initial + "\n")
 parsed = parse_editor_content(content)
 if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
@@ -6495,67 +7039,75 @@ if description:
     initial_meta["description"] = description
 @
 
-We apply metadata from the YAML front matter to the parent item,
-with CLI flags taking precedence where provided.  The description is
-coerced to text for the reason given in \cref{sec:edit-via-editor}.
+The notes go below the front matter rather than into it, because that
+is where the body already lives (\cref{sec:editor-description}): the
+text between the front matter and the first heading is what
+[[parse_editor_content]] reads back as [[notes]].  Pre-filling it
+serves the same purpose as pre-filling the metadata keys---a flag
+whose effect were invisible in the buffer would look like the editor
+had thrown it away---and it has the same consequence: what the user
+leaves in the buffer is what gets stored, so an edited or deleted
+paragraph wins over what [[--note]] put there.
 
-The estimate needs the same [[parse_hours]] treatment on both branches,
-not just on the CLI one.  Our minimal YAML parser deliberately returns a
-plain string for anything that is not a bare number, so the
-[[1h30m]] and [[90m]] forms that [[--estimate]] advertises arrive here
-as text.  Storing that text in a field the rest of the module formats
-with [[:.1f]] would write a value that every later [[ls]], [[view]],
-and [[export]] chokes on, so the front-matter branch converts it to
-hours exactly as its sibling child and [[edit]] paths already do.
+<<prefill notes into the buffer>>=
+if notes_text:
+    initial = initial + "\n" + notes_text
+@
+
+Let's verify both halves of that: the flag's text is in the buffer
+handed to the editor, and the buffer's version is what is stored.
+
+<<test functions>>=
+def test_add_edit_note_prefills_buffer(temp_todo_dir):
+  """--note fills the editor body, and the buffer wins."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text.replace("From the flag.", "From the buffer.")
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Fetch paper", "--note", "From the flag."],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert "From the flag." in seen["text"]
+  _, todos = load_todos()
+  assert todos[0].notes == "From the buffer."
+@
+
+The parent is built in three layers, in the order that makes the
+precedence rule executable: the fields nobody else supplies, then the
+front matter through [[apply_metadata]]
+(\cref{sec:apply-metadata}), then the command-line flags on top.
+Reading the layers downwards therefore reads the precedence upwards,
+and the flags win because they are last, not because each field
+remembers to check them.
+
+Only the flags the user actually gave may overwrite, so each one is
+guarded by its own truth test.  This is also why the flags cannot
+simply be folded into the constructor: an unset flag must leave the
+front-matter value standing, and a constructor argument has no way to
+say \enquote{nothing}.
 
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
-meta = parsed.metadata
-resolved_wd = canonicalize_wd(meta.get("wd")) or (
-    os.getcwd() if here else None
-)
-resolved_env = None
-if wd_path:
-    resolved_wd = canonicalize_wd(wd_path)
-if here:
-    resolved_env = dict(os.environ)
-elif capture_env:
-    resolved_env = dict(os.environ)
 parent_item = TodoItem(
     id=next_id,
     title=parsed.title,
-    labels=(
-        list(label) if label
-        else meta.get("labels", [])
-    ),
     priority=priority,
     status="pending",
     created=now,
-    deadline=normalize_deadline(
-        deadline or meta.get("deadline")
-    ),
-    estimated=(
-        parse_hours(estimate)
-        if estimate
-        else parse_hours(str(meta["estimate"]))
-        if "estimate" in meta
-        else None
-    ),
-    description=(
-        description or str(meta.get("description", ""))
-    ),
     parent_id=resolved_parent,
-    who=who or meta.get("who"),
     notes=parsed.notes,
-    wd=resolved_wd,
-    worktree=normalize_worktree_name(
-        worktree or meta.get("worktree")
-    ),
-    env=resolved_env,
-    command=(
-        run_command or meta.get("command")
-    ),
 )
+apply_metadata(parent_item, parsed.metadata)
+<<let add flags win over the front matter>>
 todos.append(parent_item)
 parent_id_for_children = next_id
 next_id += 1
@@ -6563,6 +7115,50 @@ typer.echo(
     f"Added todo #{parent_item.id}: "
     f"{parent_item.title}"
 )
+@
+
+Two of the flags are not simple overrides.  [[--here]] is a shorthand
+for \enquote{capture both the directory and the environment}, so its
+directory yields to a [[wd:]] the user typed in the buffer: a shorthand
+should not beat something explicit.  Its environment capture is not
+conditioned the same way---a hand-written [[env:]] block loses to
+[[--here]]---which is the older rule kept as it was, from a time when
+the front matter's [[env]] was not read here at all.  Since we
+deliberately never render [[env]] into the buffer, this affects only a
+buffer someone typed the key into by hand.
+
+The [[--here]] guard reads the \emph{stored} directory out of
+[[__dict__]] rather than [[parent_item.wd]].  Attribute reads for
+[[wd]], [[env]] and [[command]]---the members of
+[[WORKER_DEFAULT_ATTRIBUTES]]---fall back to the worker's configured
+default, so a worker with a configured [[wd]]
+would make the item look as though the front matter had set one, and
+[[--here]] would then silently do nothing.  Worker defaults are runtime
+policy; what we are asking here is what this item explicitly carries.
+
+<<let add flags win over the front matter>>=
+if here and parent_item.__dict__.get("wd") is None:
+    parent_item.wd = os.getcwd()
+if wd_path:
+    parent_item.wd = canonicalize_wd(wd_path)
+if here or capture_env:
+    parent_item.env = dict(os.environ)
+if label:
+    parent_item.labels = list(label)
+if deadline:
+    parent_item.deadline = normalize_deadline(deadline)
+if estimate:
+    parent_item.estimated = parse_hours(estimate)
+if who:
+    parent_item.who = who
+if worktree:
+    parent_item.worktree = normalize_worktree_name(
+        worktree
+    )
+if run_command:
+    parent_item.command = run_command
+if description:
+    parent_item.description = description
 @
 
 Let's verify that a suffixed front-matter estimate is stored as a
@@ -6711,50 +7307,23 @@ def create_children_from_parsed(
         parsed_children
     ):
         prio = priorities[i]
-        <<resolve child metadata>>
         <<create and append child item>>
         if parsed_child.children:
             <<nested child priority range>>
-            create_children_from_parsed(
-                parsed_child.children,
-                child_id,
-                child_labels,
-                child_deadline,
-                nested_high, nested_low,
-                child_who,
-                child_env,
-            )
+            <<recurse into the grandchildren>>
 @
 
-Each child overrides its metadata (labels, deadline, working
-directory, assignee, environment, description) from the YAML block in
-the editor, falling back to the parent's values when not specified.
-A description is the one value that is never inherited: it states
-what \emph{this} item is, so a child without one simply has none.  The [[who]]
-inheritance is especially important: without it, children typed
-in the editor without an explicit [[who:]] key would be created
-unassigned, even though the user intended the whole task tree to
-belong to the same person.  Environment inheritance follows the same
-logic: changing the directory should not silently replace the stored
-environment, so [[wd]] and [[env]] are inherited independently.
-<<resolve child metadata>>=
-child_meta = parsed_child.metadata
-child_labels = child_meta.get(
-    "labels", list(parent_labels)
-)
-child_deadline = normalize_deadline(
-    child_meta.get("deadline", parent_deadline)
-)
-child_who = child_meta.get("who", parent_who)
-child_wd = canonicalize_wd(child_meta.get("wd"))
-child_worktree = normalize_worktree_name(
-    child_meta.get("worktree")
-)
-child_env = child_meta.get("env", parent_env)
-child_description = str(
-    child_meta.get("description", "")
-)
-@
+The child is built the same way the [[edit]] side builds a new one
+(\cref{sec:apply-metadata}): construct it with what it inherits, then
+let its own section override.  Labels, deadline, assignee and
+environment are what a child inherits; a description is not, because it
+states what \emph{this} item is, so a child without one simply has
+none.  The [[who]] inheritance is the one that matters most in
+practice---without it, children typed in the editor without an explicit
+[[who:]] key would be created unassigned, even though the user intended
+the whole task tree to belong to the same person.  Environment is
+inherited independently of the directory, so that pointing a child at
+another directory does not silently discard the captured environment.
 
 We append the new item to [[todos]] immediately so that recursive
 calls can see it as a parent when processing grandchildren.
@@ -6762,31 +7331,52 @@ calls can see it as a parent when processing grandchildren.
 child = TodoItem(
     id=next_id,
     title=parsed_child.title,
-    labels=child_labels,
+    labels=list(parent_labels),
     priority=prio,
     status="pending",
     created=now,
-    deadline=child_deadline,
-    estimated=(
-        parse_hours(str(child_meta["estimate"]))
-        if "estimate" in child_meta
-        else None
-    ),
+    deadline=parent_deadline,
     parent_id=parent_id,
-    who=child_who,
+    who=parent_who,
     notes=parsed_child.notes,
-    wd=child_wd,
-    worktree=child_worktree,
-    env=child_env,
-    command=child_meta.get("command"),
-    description=child_description,
+    env=parent_env,
 )
+apply_metadata(child, parsed_child.metadata)
 todos.append(child)
 child_id = next_id
 next_id += 1
 typer.echo(
     f"  Added sub-item #{child.id}: "
     f"{child.title}"
+)
+@
+
+The inherited deadline needs no [[normalize_deadline]] pass of its own.
+It comes either from the parent item, which normalized it when it was
+written, or from an ancestor child that went through
+[[apply_metadata]]---so whatever reaches a grandchild is already
+canonical, and normalizing again would only re-derive the same string.
+
+A grandchild inherits from the child, not from the child's parent, so
+the recursive call passes what the child ended up with after its own
+section was applied.  Three of those four values are plain reads, but
+[[env]] is one of [[WORKER_DEFAULT_ATTRIBUTES]]: reading
+[[child.env]] answers with the worker's configured environment when the
+child stored none, and passing \emph{that} down would write a runtime
+default into a grandchild as though the user had typed it---exactly the
+persistence [[TodoItem]] keeps [[to_dict]] free of.  Reading
+[[__dict__]] asks the question we mean: what does this child explicitly
+carry?
+
+<<recurse into the grandchildren>>=
+create_children_from_parsed(
+    parsed_child.children,
+    child_id,
+    child.labels,
+    child.deadline,
+    nested_high, nested_low,
+    child.who,
+    child.__dict__.get("env"),
 )
 @
 
@@ -7918,6 +8508,44 @@ view_format_opt = typer.Option(
          "plain otherwise), rich, plain")
 @
 
+\paragraph{Reading a whole group}
+
+A sub-item's line carries its title and, for a direct child, the first
+line of its notes.  That preview answers \enquote{what is under
+here?}, which is what a parent is usually asked.  It does not answer
+\enquote{what is this group about?}---the question put to a parent
+whose dozen children each keep their details in their own notes---and
+answering that one today costs a separate [[view]] per child.
+
+[[--notes]] prints every visible sub-item's description and notes in
+full, underneath its line.  It is a flag rather than the default
+because the two questions want opposite amounts of text: a dozen
+children with a screen of notes each would push the parent's own
+metadata off the top of the terminal every time someone only wanted to
+see what was left to do.  With the flag off the preview line is
+exactly what it was.
+
+The other half of reading a group is the finished work.  [[view]]
+hides done sub-items, and [[done]] is the \emph{only} status it
+hides---no other value is filtered---so the whole history of a group is
+one flag away.  That flag already exists as [[--done]]; [[--all]] is a
+second spelling of it rather than a second flag, because \enquote{all}
+is the word that comes to mind beside [[--notes]] when what is wanted
+is everything, and one switch under two names can never disagree with
+itself.  Widening the set is all it does: it does not imply
+[[--notes]], and the sub-item lines still carry the bracketed
+[[done]] mark (green in the rich renderer), so finished children stay
+distinguishable from the rest.
+
+<<argument and option definitions>>=
+view_notes_opt = typer.Option(
+    "--notes",
+    help="Show each sub-item's description and notes")
+view_all_opt = typer.Option(
+    "--all", "--done", "-d",
+    help="Include done sub-items")
+@
+
 Both renderers show the same things, so the command first gathers
 what there is to show---the metadata fields, the notes or GitHub
 content, the visible sub-items---and only then renders it.
@@ -7932,7 +8560,9 @@ def view(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
     include_done: Annotated[bool,
-                            done_opt] = False,
+                            view_all_opt] = False,
+    show_notes: Annotated[bool,
+                          view_notes_opt] = False,
     output_format: Annotated[ViewFormat,
                              view_format_opt] = ViewFormat.auto,
 ):
@@ -7940,7 +8570,9 @@ def view(
 
     If no ID given, shows the current active task.
     Done sub-items are
-    hidden by default; pass --done to include them.
+    hidden by default; pass --done (or --all) to include them.
+    Sub-items show a one-line note preview; pass --notes to
+    print their descriptions and notes in full instead.
     Notes are rendered as Markdown on a terminal and printed as
     written when piped; --format rich or --format plain forces
     either.
@@ -8163,7 +8795,10 @@ elif item.notes:
 
 Only children, not grandchildren, get the first line of their notes as
 a preview: at two levels down the extra line would read as a fourth
-level of nesting.
+level of nesting.  Under [[--notes]] that restraint is beside the
+point---the reader has asked for the text---so every row gets its
+blocks, and the preview steps aside rather than repeating the first
+line above them.
 
 <<print sub-items as plain text>>=
 if rows:
@@ -8173,12 +8808,35 @@ if rows:
         indent = "  " * (depth + 1)
         mark = VIEW_STATUS_MARKS.get(child.status, child.status)
         typer.echo(f"{indent}#{child.id} [{mark}] {child.title}")
-        if depth == 0 and child.notes:
+        if show_notes:
+            <<print a sub-item's blocks as plain text>>
+        elif depth == 0 and child.notes:
             typer.echo(f"{indent}  {child.notes.splitlines()[0]}")
 if hidden_done:
     typer.echo(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)"
+    )
+@
+
+The blocks are indented one level past the line they belong to, so the
+nesting on the page matches the nesting in the tree, and they go
+through [[print_markdown]] in the same verbatim form as the parent's
+own notes: an agent reading this output means to quote or extend the
+text, and a rendering would have cost it the [[#]] markers and list
+punctuation it needs.  An empty description or an empty notes field
+prints nothing at all rather than an empty heading.
+
+<<print a sub-item's blocks as plain text>>=
+if child.description:
+    print_markdown(
+        child.description, indent=len(indent) + 2,
+        terminal=False,
+    )
+if child.notes:
+    print_markdown(
+        child.notes, indent=len(indent) + 2,
+        terminal=False,
     )
 @
 
@@ -8209,7 +8867,7 @@ console.print(Text.assemble(
 ))
 <<print metadata as a grid>>
 <<print description and notes richly>>
-<<print sub-items as a table>>
+<<print sub-items richly>>
 @
 
 A two-column grid lines the values up under each other, which the
@@ -8259,7 +8917,33 @@ elif item.notes:
     print_markdown(item.notes, indent=2, terminal=True)
 @
 
-The sub-item table uses the same [[Table]] arguments as [[ls]]
+The rich renderer has two shapes for the sub-items, because a table is
+the right container for one line each and the wrong one for a screen
+each.  A table's columns are sized against every row, so a single
+child with a long note squeezes every other row's title into a narrow
+ribbon; and a cell holds a rendered Markdown block only by giving it
+that column's width, which is not the width of the terminal the reader
+is looking at.  So [[--notes]] drops the table and prints each
+sub-item as a line followed by its blocks, and without it the table
+stays exactly as it was.
+
+<<print sub-items richly>>=
+if rows:
+    console.print()
+    console.print(Text("Sub-items", style="bold"))
+    if show_notes:
+        <<print each sub-item with its blocks>>
+    else:
+        <<print sub-items as a table>>
+if hidden_done:
+    console.print(Text(
+        f"  ({hidden_done} done sub-items hidden,"
+        f" use --done to show)",
+        style="dim",
+    ))
+@
+
+The table uses the same [[Table]] arguments as [[ls]]
 (\cref{sec:todo-code-outline}), so the two commands look like parts of
 one interface.
 Depth becomes indentation of the title, the way [[ls]] indents its
@@ -8267,34 +8951,57 @@ tree, and the note preview gets a folding column so a long first line
 wraps instead of being cut off.
 
 <<print sub-items as a table>>=
-if rows:
-    console.print()
-    console.print(Text("Sub-items", style="bold"))
-    table = Table(show_header=True, header_style="bold",
-                  box=box.SIMPLE, show_edge=False,
-                  pad_edge=False)
-    table.add_column("ID", justify="right", style="cyan")
-    table.add_column("Status")
-    table.add_column("Title")
-    table.add_column("Note", overflow="fold")
-    for depth, child in rows:
-        mark = VIEW_STATUS_MARKS.get(child.status, child.status)
-        note = ""
-        if depth == 0 and child.notes:
-            note = child.notes.splitlines()[0]
-        table.add_row(
-            str(child.id),
-            Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
-            Text("  " * depth + child.title),
-            Text(note),
-        )
-    console.print(Padding(table, (0, 0, 0, 2)))
-if hidden_done:
-    console.print(Text(
-        f"  ({hidden_done} done sub-items hidden,"
-        f" use --done to show)",
-        style="dim",
+table = Table(show_header=True, header_style="bold",
+              box=box.SIMPLE, show_edge=False,
+              pad_edge=False)
+table.add_column("ID", justify="right", style="cyan")
+table.add_column("Status")
+table.add_column("Title")
+table.add_column("Note", overflow="fold")
+for depth, child in rows:
+    mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+    note = ""
+    if depth == 0 and child.notes:
+        note = child.notes.splitlines()[0]
+    table.add_row(
+        str(child.id),
+        Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
+        Text("  " * depth + child.title),
+        Text(note),
+    )
+console.print(Padding(table, (0, 0, 0, 2)))
+@
+
+Without the table the sub-item line has to carry the columns itself,
+so it is assembled in the same order and colours the header row would
+have given them.
+The blocks below it are rendered rather than printed verbatim---this
+renderer was chosen precisely for that---and both line and blocks are
+padded by depth, which is what replaces the table's indented title
+column.
+
+<<print each sub-item with its blocks>>=
+for depth, child in rows:
+    mark = VIEW_STATUS_MARKS.get(child.status, child.status)
+    console.print(Padding(
+        Text.assemble(
+            (f"#{child.id} ", "cyan"),
+            (f"[{mark}] ",
+             VIEW_STATUS_STYLES.get(child.status, "")),
+            child.title,
+        ),
+        (0, 0, 0, 2 + 2 * depth),
     ))
+    if child.description:
+        print_markdown(
+            child.description, indent=4 + 2 * depth,
+            terminal=True,
+        )
+    if child.notes:
+        print_markdown(
+            child.notes, indent=4 + 2 * depth,
+            terminal=True,
+        )
 @
 
 \subsection{Testing the [[view]] Command}
@@ -8568,6 +9275,119 @@ def test_view_shows_unset_priority_and_mixed_child_order(
         < result.stdout.index("Unranked sooner")
         < result.stdout.index("Unranked later")
     )
+@
+
+Let's verify what [[--notes]] adds and what it leaves alone.  Without
+it a child shows only the first line of its notes and nothing of its
+description; with it both children show both fields in full.
+
+<<integration tests>>=
+def test_view_notes_shows_sub_item_blocks(temp_todo_dir):
+    """--notes prints each sub-item's description and notes."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="First child", parent_id=1,
+            priority=2.0, created="2026-02-20T10:00:00",
+            description="What the first child is",
+            notes="First preview\nMore of the first note",
+        ),
+        TodoItem(
+            id=3, title="Second child", parent_id=1,
+            priority=1.0, created="2026-02-20T10:00:00",
+            description="What the second child is",
+            notes="The second note",
+        ),
+    ])
+
+    preview = runner.invoke(cli, ["view", "1"])
+    assert preview.exit_code == 0
+    assert "First preview" in preview.stdout
+    assert "More of the first note" not in preview.stdout
+    assert "What the first child is" not in preview.stdout
+
+    result = runner.invoke(cli, ["view", "1", "--notes"])
+    assert result.exit_code == 0
+    assert "What the first child is" in result.stdout
+    assert "More of the first note" in result.stdout
+    assert "What the second child is" in result.stdout
+    assert "The second note" in result.stdout
+@
+
+The rich renderer has to show the same fields, rendered rather than
+verbatim: the heading loses its marker and the list item gains a
+bullet, exactly as the parent's own notes do.
+
+<<integration tests>>=
+def test_view_notes_rich_renders_sub_item_blocks(
+    temp_todo_dir, monkeypatch,
+):
+    """--notes reaches the rich renderer's sub-items too."""
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child task", parent_id=1,
+            priority=1.0, created="2026-02-20T10:00:00",
+            description="Standing statement",
+            notes="# Heading\n\n- bullet\n",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["view", "1", "--format", "rich", "--notes"],
+    )
+    assert result.exit_code == 0
+    assert "Child task" in result.stdout
+    assert "Standing statement" in result.stdout
+    assert "# Heading" not in result.stdout
+    assert "Heading" in result.stdout
+    assert "\u2022 bullet" in result.stdout
+@
+
+And [[--all]] has to widen the set without turning the notes on by
+itself, so that the two flags compose into the whole history of a
+group:
+
+<<integration tests>>=
+def test_view_all_includes_done_sub_items(temp_todo_dir):
+    """--all shows done sub-items; --notes then shows their notes."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Done child", parent_id=1,
+            status="done", priority=1.0,
+            created="2026-02-20T10:00:00",
+            notes="Recap line\nWhat finishing it took",
+        ),
+    ])
+
+    hidden = runner.invoke(cli, ["view", "1"])
+    assert hidden.exit_code == 0
+    assert "Done child" not in hidden.stdout
+    assert "1 done sub-items hidden" in hidden.stdout
+
+    shown = runner.invoke(cli, ["view", "1", "--all"])
+    assert shown.exit_code == 0
+    assert "Done child" in shown.stdout
+    assert "[done]" in shown.stdout
+    assert "Recap line" in shown.stdout
+    assert "What finishing it took" not in shown.stdout
+
+    both = runner.invoke(cli, ["view", "1", "--all", "--notes"])
+    assert both.exit_code == 0
+    assert "Done child" in both.stdout
+    assert "What finishing it took" in both.stdout
 @
 
 \subsection{Merging Incremental Label Edits}
@@ -9330,48 +10150,27 @@ if not parsed.title:
     typer.echo("No title provided.", err=True)
     raise typer.Exit(1)
 
+<<echo parse warnings>>
 <<update parent from parsed>>
 <<reconcile children>>
 save_todos(next_id, todos)
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
 
-The description follows the rule the other keys already follow: a key
-present in the front matter is applied, an absent one leaves the field
-alone.  Deleting the block therefore does not clear the description,
-just as deleting [[deadline:]] does not clear the deadline;
-[[edit N --description ""]] remains the way to do that.  The value is
-coerced to text.  A block is always text, but a user may type
-[[description: 42]] inline, which [[parse_yaml_value]] turns into an
-integer, and that integer would reach the Markdown renderer, the
-calendar export, and the argument list of a spawned agent.
+The front matter is handed to [[apply_metadata]]
+(\cref{sec:apply-metadata}), which owns the present-versus-absent rule
+and the normalization of each key.  What stays here is what is not
+metadata.  The title and the notes come from the document body rather
+than from the front-matter block, and they are assigned
+unconditionally, which is the opposite of the metadata rule and
+deliberately so: the parser refuses a buffer with no title, and an
+emptied body really does mean an emptied [[notes]], since there is no
+key to delete or leave out.
 
 <<update parent from parsed>>=
 item.title = parsed.title
 item.notes = parsed.notes
-meta = parsed.metadata
-if "wd" in meta:
-    item.wd = canonicalize_wd(meta["wd"])
-if "worktree" in meta:
-    item.worktree = normalize_worktree_name(
-        meta["worktree"]
-    )
-if "command" in meta:
-    item.command = meta["command"]
-if "labels" in meta:
-    item.labels = meta["labels"]
-if "deadline" in meta:
-    item.deadline = normalize_deadline(
-        meta["deadline"]
-    )
-if "estimate" in meta:
-    item.estimated = parse_hours(str(meta["estimate"]))
-if "who" in meta:
-    item.who = meta["who"]
-if "github" in meta:
-    item.github = meta["github"]
-if "description" in meta:
-    item.description = str(meta["description"])
+apply_metadata(item, parsed.metadata)
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -9469,10 +10268,24 @@ priority_iter = iter(priorities)
 
 For each section in the parsed document we either update the matching
 existing child (preserving its ID and status) or create a new one.
-New children inherit [[who]] from the parent when their
-YAML block does not specify one --- the same rule as in
-[[create_children_from_parsed]] --- so that adding a sub-task in
-the editor never silently leaves it unassigned.
+Both branches end in [[apply_metadata]] (\cref{sec:apply-metadata}),
+and the difference between them is only what the item holds before it
+is called.  A matched child holds what it already had, so an absent key
+keeps the value the user saw in the buffer.  A new child holds what it
+inherits: the parent's labels, deadline and assignee, so that adding a
+sub-task in the editor never silently leaves it unassigned or
+undated---and then its own section overrides any of them.  Inheriting
+in the constructor rather than through [[child_meta.get(key, default)]]
+is what lets one helper serve both branches, and it puts the fallback
+where a reader looks for it, next to the field it fills.
+
+Routing both branches through the helper also settles a difference
+that had no reason to exist: a matched child now takes [[github]] from
+its section, which the parent has always done and no child ever did, so
+linking a sub-item to an issue in the editor is no longer silently
+discarded on save.  Both branches gain [[env]] for the same reason,
+which no site read before.
+
 Popping each match out of [[existing_by_title]] doubles as the
 seen-marker: whatever is still in the index afterwards had no section
 and was therefore deleted in the editor.
@@ -9501,60 +10314,22 @@ for parsed_child in parsed_children:
         child.title = parsed_child.title
         child.notes = parsed_child.notes
         child.priority = prio
-        child_meta = parsed_child.metadata
-        if "wd" in child_meta:
-            child.wd = canonicalize_wd(child_meta["wd"])
-        if "worktree" in child_meta:
-            child.worktree = normalize_worktree_name(
-                child_meta["worktree"]
-            )
-        if "command" in child_meta:
-            child.command = child_meta["command"]
-        if "labels" in child_meta:
-            child.labels = child_meta["labels"]
-        if "deadline" in child_meta:
-            child.deadline = normalize_deadline(
-                child_meta["deadline"]
-            )
-        if "estimate" in child_meta:
-            child.estimated = parse_hours(
-                str(child_meta["estimate"])
-            )
-        if "who" in child_meta:
-            child.who = child_meta["who"]
-        if "description" in child_meta:
-            child.description = str(
-                child_meta["description"]
-            )
+        apply_metadata(child, parsed_child.metadata)
     else:
         now = datetime.datetime.now().isoformat()
-        child_meta = parsed_child.metadata
         child = TodoItem(
             id=next_id,
             title=parsed_child.title,
-            labels=child_meta.get(
-                "labels", list(parent.labels)
-            ),
+            labels=list(parent.labels),
             priority=prio,
             status="pending",
             created=now,
-            deadline=normalize_deadline(
-                child_meta.get(
-                    "deadline", parent.deadline
-                )
-            ),
+            deadline=parent.deadline,
             parent_id=parent.id,
-            who=child_meta.get("who", parent.who),
+            who=parent.who,
             notes=parsed_child.notes,
-            wd=canonicalize_wd(child_meta.get("wd")),
-            worktree=normalize_worktree_name(
-                child_meta.get("worktree")
-            ),
-            command=child_meta.get("command"),
-            description=str(
-                child_meta.get("description", "")
-            ),
         )
+        apply_metadata(child, parsed_child.metadata)
         todos.append(child)
         next_id += 1
         typer.echo(
@@ -9585,6 +10360,47 @@ for removed in existing_by_title.values():
 
 
 \subsection{Testing Editor Reconciliation}
+
+The [[github]] key is the one that had drifted: the parent took it from
+the front matter and the children did not, so a sub-item linked to an
+issue in the editor lost the link on save.  Now that every site shares
+one helper (\cref{sec:apply-metadata}), an existing child keeps what
+its section says:
+
+<<test functions>>=
+def test_edit_editor_child_github_applied(temp_todo_dir):
+  """An existing child's github block survives the save."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent", priority=5.0,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Child", parent_id=1, priority=4.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  buffer = (
+    "Parent\n"
+    "\n"
+    "# Child\n"
+    "---\n"
+    "github: {repo: o/r, type: issue, number: 7}\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = next(t for t in todos if t.id == 2)
+  assert child.github == {
+    "repo": "o/r", "type": "issue", "number": "7",
+  }
+@
 
 Let's verify the recursion in both directions: an edit to an existing
 grandchild reaches it and preserves its identity, and a brand-new
@@ -9702,6 +10518,65 @@ def test_edit_interactive_removes_subtree(
   assert result.exit_code == 0, result.stdout
   _, todos = load_todos()
   assert [t.id for t in todos] == [1]
+@
+
+Deleting a heading is how the user asks for a sub-item to be removed,
+which is exactly why a buffer the parser gives up on must never come
+back looking empty.  The test below is the one that would have caught
+the loss reported in the issue: an unclosed front matter block used to
+leave the parse with no notes and no sub-items, so [[edit]] blanked the
+item and removed both children as \enquote{deleted in the editor}.  It
+now warns and saves everything.
+
+<<test functions>>=
+def test_edit_editor_unclosed_block_keeps_children(
+    temp_todo_dir,
+):
+    """An unclosed block warns instead of emptying the item."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            notes="Original notes.",
+            created="2026-02-20T10:00:00",
+            priority=5.0,
+        ),
+        TodoItem(
+            id=2, title="First child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=4.0,
+        ),
+        TodoItem(
+            id=3, title="Second child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            priority=3.0,
+        ),
+    ])
+    buffer = (
+        "Parent\n"
+        "---\n"
+        "deadline: 2026-03-01\n"
+        "\n"
+        "Original notes.\n"
+        "\n"
+        "# First child\n"
+        "\n"
+        "# Second child\n"
+    )
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value=buffer,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    _, todos = load_todos()
+    assert {t.id for t in todos} == {1, 2, 3}
+    parent = next(t for t in todos if t.id == 1)
+    assert "---" in parent.notes
+    assert "deadline: 2026-03-01" in parent.notes
+    assert "Original notes." in parent.notes
+    assert parent.deadline is None
 @
 
 <<test functions>>=
@@ -17175,7 +18050,9 @@ def test_sync_marks_done_from_github(
 
 The [[note]] command adds a note to a todo item. For
 GitHub-linked items, it posts a comment on the issue or PR. For
-local items, it appends to the [[notes]] field.
+local items, it records the text in the [[notes]] field: appended
+when the text arrives as a fragment, replacing the field when the
+user edited the notes as a whole.
 
 Like [[view]] and [[done]], [[note]] defaults to the currently active
 todo when no ID is given.  This keeps the common workflow short:
@@ -17201,7 +18078,12 @@ def note(
                        note_message_opt] = None,
     edit: Annotated[bool, editor_opt] = False,
 ):
-    """Add a note to a todo item."""
+    """Add a note to a todo item.
+
+    With `--edit`, a local item opens its current notes for
+    editing and the saved buffer becomes the new notes; a
+    GitHub-linked item opens an empty buffer for a new comment.
+    """
     next_id, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "add a note",
@@ -17218,10 +18100,31 @@ def note(
         raise typer.Exit(1)
 
     <<resolve note text>>
-    <<post or append note>>
+    <<record the note>>
 @
 
+The three sources differ in more than where the characters come
+from.  [[--message]] and standard input hand us a fragment: the
+user typed it without seeing what is already stored, so the only
+thing it can mean is \enquote{add this to what is there.}  The
+editor on a local item is the opposite.  It opens on the whole of
+[[item.notes]], so what comes back \emph{is} the notes as the user
+now wants them---including the lines the user rewrote or deleted.
+Appending that buffer stored every pre-filled line a second time,
+which made the pre-fill a trap rather than a convenience.
+
+GitHub-linked items keep appending even under [[--edit]], because
+there the unit of writing is a comment and not the issue body.
+The buffer starts empty, the text becomes a new comment, and
+[[item.notes]] is only a local mirror of the comment stream;
+replacing that mirror with a single comment would drop the earlier
+ones that GitHub still shows.
+
+The editor branch therefore records not only the text but whether
+it stands for the whole of the notes:
+
 <<resolve note text>>=
+replace_notes = False
 if message:
     note_text = message
 elif edit:
@@ -17232,6 +18135,7 @@ elif edit:
     if not note_text.strip():
         typer.echo("Empty note, cancelled.")
         raise typer.Exit(0)
+    replace_notes = not item.github
 else:
     note_text = sys.stdin.read()
     if not note_text.strip():
@@ -17239,7 +18143,32 @@ else:
         raise typer.Exit(0)
 @
 
-<<post or append note>>=
+An empty buffer keeps the meaning it always had: the user is
+cancelling, not clearing.  That reading costs nothing, because
+clearing is already what [[edit -E]] does when the body under the
+front matter is deleted (\cref{sec:edit-via-editor}), and it
+protects the far more common case of an editor closed by accident
+on notes that took a week to accumulate.  What we do store is
+stripped, for the same reason [[parse_editor_content]] strips the
+notes it parses: the trailing newline an editor leaves behind is
+not part of what the user wrote.
+
+<<record the note>>=
+if replace_notes:
+    item.notes = note_text.strip()
+    save_todos(next_id, todos)
+    typer.echo(f"Notes of #{todo_id} updated")
+else:
+    <<post or append the note>>
+@
+
+The appending path is unchanged.  A GitHub-linked item needs a
+working [[gh]] before we promise that the comment was posted, and
+[[append_note_to_item]] both posts it and mirrors it locally.  The
+two messages name the outcome rather than the command, so a user
+who expected one path and got the other sees it immediately.
+
+<<post or append the note>>=
 if item.github:
     require_gh()
 append_note_to_item(item, note_text, next_id, todos)
@@ -17353,6 +18282,157 @@ def test_note_without_id_requires_active_todo(
     )
 @
 
+The editor path is the one that used to bite.  Its contract is
+that the buffer the user saves is exactly what ends up stored, so
+the tests pin both halves of that: what the editor is handed, and
+what survives the save.  The first case is the one from the bug
+report---a user who appends a line below the pre-filled text:
+
+<<test functions>>=
+def test_note_edit_replaces_local_notes(temp_todo_dir):
+    """note --edit stores the buffer instead of appending."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="First\nSecond\n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Notes of #1 updated" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+
+
+def test_note_edit_prefills_existing_notes(temp_todo_dir):
+    """The editor opens on the notes already stored."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    seen = {}
+
+    def fake_editor(initial=""):
+        seen["initial"] = initial
+        return initial + "\nSecond\n"
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=fake_editor,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert seen["initial"] == "First"
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nSecond"
+@
+
+Saving the buffer untouched is the same operation with nothing
+added, so it must leave the notes exactly as they were---and an
+emptied buffer must still read as \enquote{cancel}, not
+\enquote{clear}:
+
+<<test functions>>=
+def test_note_edit_unchanged_buffer_keeps_notes(temp_todo_dir):
+    """Saving the pre-filled buffer changes nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=lambda initial="": initial,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+
+
+def test_note_edit_empty_buffer_cancels(temp_todo_dir):
+    """An empty buffer cancels and keeps the notes."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.open_editor",
+        return_value="  \n",
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Empty note, cancelled." in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First"
+@
+
+The other two paths must not have moved.  A [[--message]] note is
+still a fragment appended to what is there, and a GitHub-linked
+item still gets an empty buffer and a posted comment:
+
+<<test functions>>=
+def test_note_message_still_appends(temp_todo_dir):
+    """--message appends rather than replacing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+    result = runner.invoke(cli, ["note", "1", "-m", "X"])
+    assert result.exit_code == 0, result.stdout
+    assert "Note added to #1" in result.output
+    _, todos = load_todos()
+    assert todos[0].notes == "First\nX"
+
+
+def test_note_edit_github_still_posts_comment(temp_todo_dir):
+    """--edit on a GitHub item posts and mirrors a comment."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="GH issue",
+            created="2026-02-20T10:00:00",
+            notes="Earlier comment",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "5",
+            },
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ), patch(
+        "nytid.cli.todo.open_editor",
+        return_value="Fresh comment",
+    ) as mock_editor:
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    assert "Comment posted" in result.output
+    assert mock_editor.call_args.args[0] == ""
+    _, todos = load_todos()
+    assert "Earlier comment" in todos[0].notes
+    assert "Fresh comment" in todos[0].notes
+@
+
 \section{Tests}
 
 The test file follows the same pattern as [[track.nw]]: a fixture
@@ -17432,6 +18512,8 @@ from nytid.cli.todo import (
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
+    apply_metadata,
+    METADATA_FIELDS,
     DEFAULT_MAX_BOOST,
     gh_available,
     gh_fetch_issue,
