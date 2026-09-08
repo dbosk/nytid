@@ -220,7 +220,9 @@ def get_max_boost() -> float:
 @
 
 Worker-specific defaults need a different treatment from the global
-settings above.  A teacher may want every task for [[dan-claude]] to run
+settings above.%
+\label{todo:worker-defaults}
+A teacher may want every task for [[dan-claude]] to run
 [[opencode]] in one working directory with one captured environment,
 without baking those choices into each todo item.
 
@@ -3303,19 +3305,42 @@ We extract only non-default metadata fields so the YAML block stays
 minimal---an empty dict produces no block at all, keeping the editor
 document uncluttered for simple todos.
 
+Two of the keys are read out of [[__dict__]] rather than off the item.
+The buffer is not a report on the item, it is the item's editable
+state: whatever it shows is what [[apply_metadata]] reads back and
+stores when the user saves, so a line the user never typed is
+indistinguishable from one they did.  For [[wd]] and [[command]]---the
+two members of [[WORKER_DEFAULT_ATTRIBUTES]] this function can
+emit---an ordinary attribute read answers with the worker's configured
+default whenever the item stores nothing, and rendering \emph{that}
+would let an unrelated edit freeze runtime policy into
+[[todos.json]], which is exactly what [[to_dict]] refuses to do
+(\cref{todo:worker-defaults}).  Asking [[__dict__]] asks the question
+the buffer is actually posing: what does this item carry of its own?
+
+The remaining keys stay plain reads.  No policy stands behind them, so
+the stored value and the resolved value are the same value, and
+writing them any other way would suggest a distinction that is not
+there.
+
 <<editor infrastructure>>=
 def build_item_metadata(item):
     """Extract non-default metadata from a TodoItem.
 
+    Worker defaults are deliberately not rendered: the
+    buffer shows what the item stores, since whatever it
+    shows is stored back on save.
+
     Returns a dict suitable for YAML front matter.
     """
+    stored = item.__dict__
     meta = {}
-    if item.wd:
-        meta["wd"] = item.wd
+    if stored.get("wd"):
+        meta["wd"] = stored["wd"]
     if item.worktree:
         meta["worktree"] = item.worktree
-    if item.command:
-        meta["command"] = item.command
+    if stored.get("command"):
+        meta["command"] = stored["command"]
     if item.labels:
         meta["labels"] = item.labels
     if item.deadline:
@@ -3329,6 +3354,88 @@ def build_item_metadata(item):
     if item.description:
         meta["description"] = item.description
     return meta
+@
+
+Let's verify that the buffer really is free of policy.  With a command
+configured for the worker but nothing stored on the item, an editing
+session that changes nothing must leave the item exactly as unset as
+it found it---which it can only do if the key never appeared:
+
+<<test functions>>=
+def test_edit_buffer_hides_worker_default_command(
+  temp_todo_dir,
+):
+  """A worker-default command is neither shown nor stored."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command:" not in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] is None
+@
+
+The complement matters just as much: hiding the default must not hide
+a command the item actually carries, or the user could no longer edit
+the field at all.
+
+<<test functions>>=
+def test_edit_buffer_keeps_explicit_command(
+  temp_todo_dir,
+):
+  """An explicit command is shown and survives the trip."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent task", priority=1.0,
+      command="claude",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text
+
+  with patched_worker_config({
+    f"todo.worker.{default_username}.command":
+      "opencode",
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      side_effect=fake_editor,
+    ):
+      result = runner.invoke(
+        cli, ["edit", "1", "--edit"]
+      )
+    assert result.exit_code == 0, result.output
+
+  assert "command: claude" in seen["text"]
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  assert data["todos"][0]["command"] == "claude"
 @
 
 Children are rendered recursively, with the heading level increasing
@@ -6483,12 +6590,23 @@ who_filter_opt = typer.Option(
     autocompletion=complete_todo_workers)
 @
 
+[[add]] is the one command whose [[--who]] must default to [[None]]
+rather than to [[default_username]].  Its editor buffer carries a
+[[who:]] key (\cref{sec:add-via-editor}) and the flags are applied
+\emph{after} the front matter, so a default value would be
+indistinguishable from a typed [[-w]] and would overwrite whatever the
+user changed that key to: the one field the buffer advertises would be
+the one field the buffer could not set.  [[None]] is what makes
+\enquote{the user did not choose} expressible at all, and the price is
+that resolving it to a name moves out of the signature and into the
+three places that need one---the sibling set to compare against, the
+[[who:]] line the buffer opens with, and the item finally stored.
+
 <<add command options>>=
 parent: Annotated[int | None,
                   parent_opt] = None,
 top_level: Annotated[bool, top_level_opt] = False,
-who: Annotated[str | None,
-               who_opt] = default_username,
+who: Annotated[str | None, who_opt] = None,
 @
 
 Now the implementation. We first reject contradictory flags and fold
@@ -6713,6 +6831,13 @@ preserves the existing
 the sibling set is scoped to the target worker ([[--who]]) so that
 priorities stay meaningful within one person's task list.
 
+That scoping is why the first of the three resolutions of [[who]] sits
+here.  [[get_active_siblings]] reads a [[None]] worker as
+\enquote{every worker} rather than as \enquote{the current one}, so
+handing it the unresolved flag would silently compare the new item
+against other people's tasks whenever [[--who]] was omitted---which is
+almost always.
+
 [[--skip-priority]] is the one exception: it deliberately bypasses all
 numeric placement and stores [[None]] instead.
 
@@ -6744,7 +6869,9 @@ candidate = TodoItem(
     ),
 )
 siblings = get_active_siblings(
-    todos, candidate, who=who, ranked_only=True,
+    todos, candidate,
+    who=who or default_username,
+    ranked_only=True,
 )
 parent_ctx = (
     parent_item if resolved_parent is not None
@@ -6990,9 +7117,19 @@ if capture_env:
     resolved_env = dict(os.environ)
 @
 
+Here is the second of the three resolutions of [[who]].  The flag path
+has no front matter to wait for, so it can settle the assignee at
+once.  We bind the result under a new name instead of reassigning
+[[who]] because the two mean different things---one is what the user
+asked for, the other is who the item ends up belonging to---and only
+the second may be stored.  An item is always assigned to somebody: an
+ownerless one would be invisible to [[ls]] and [[next]], which filter
+by worker.
+
 <<create and save new todo>>=
 now = datetime.datetime.now().isoformat()
 <<resolve wd and env for new todo>>
+resolved_who = who or default_username
 estimated_hours = (
     parse_hours(estimate) if estimate else None
 )
@@ -7008,7 +7145,7 @@ item = TodoItem(
     description=description or "",
     notes=notes_text,
     parent_id=resolved_parent,
-    who=who,
+    who=resolved_who,
     wd=resolved_wd,
     worktree=normalize_worktree_name(worktree),
     env=resolved_env,
@@ -7024,8 +7161,8 @@ if inherited_deadline:
     typer.echo(f"  Deadline: {inherited_deadline}")
 if estimated_hours:
     typer.echo(f"  Estimate: {estimated_hours}h")
-if who:
-    typer.echo(f"  Assigned: {who}")
+if resolved_who:
+    typer.echo(f"  Assigned: {resolved_who}")
 if resolved_wd:
     typer.echo(f"  WD: {resolved_wd}")
 if item.worktree:
@@ -7151,6 +7288,13 @@ assign a sub-item to someone else.  Without a visible [[who:]]
 key in the parent block, a user adding children has no obvious
 cue that children can carry their own [[who]] field.
 
+\enquote{Always} is why this is the third resolution of [[who]] and
+the only one written as an unconditional assignment.  Every other key
+here is omitted when its flag was not given, and [[who]] used to
+follow that shape only because the flag could not be absent; now that
+it can, the guard would hide exactly the line the paragraph above
+argues must be shown.
+
 <<build initial editor metadata>>=
 initial_meta = {}
 if label:
@@ -7161,8 +7305,7 @@ if deadline:
     )
 if estimate:
     initial_meta["estimate"] = parse_hours(estimate)
-if who:
-    initial_meta["who"] = who
+initial_meta["who"] = who or default_username
 if wd_path:
     initial_meta["wd"] = canonicalize_wd(wd_path)
 elif here:
@@ -7233,19 +7376,33 @@ simply be folded into the constructor: an unset flag must leave the
 front-matter value standing, and a constructor argument has no way to
 say \enquote{nothing}.
 
+The bottom layer is not empty.  When [[--parent]] or auto-parenting
+resolved a parent, [[<<inherit from parent>>]] has already worked out
+the labels and deadline this item takes from it, and the constructor
+is where they belong: inheritance is precisely what the front matter
+and the flags are allowed to overrule, so a value assigned after them
+would win where it should lose.  Passing them here is also what makes
+the two halves of [[add]] agree---[[<<create and save new todo>>]] has
+always constructed with the same two values, and a user should not
+have to know whether [[--edit]] was given to predict whether a child
+of [[#42]] arrives carrying [[#42]]'s deadline.
+
 <<create parent from parsed>>=
 now = datetime.datetime.now().isoformat()
 parent_item = TodoItem(
     id=next_id,
     title=parsed.title,
+    labels=list(inherited_labels),
     priority=priority,
     status="pending",
     created=now,
+    deadline=inherited_deadline,
     parent_id=resolved_parent,
     notes=parsed.notes,
 )
 apply_metadata(parent_item, parsed.metadata)
 <<let add flags win over the front matter>>
+<<give the parent an assignee>>
 todos.append(parent_item)
 parent_id_for_children = next_id
 next_id += 1
@@ -7297,6 +7454,218 @@ if run_command:
     parent_item.command = run_command
 if description:
     parent_item.description = description
+@
+
+All three layers can still leave [[who]] unset: no [[-w]], no [[who:]]
+key---the user deleted the line the buffer opened with---and nothing
+to inherit, since a parent contributes labels and a deadline but never
+an assignee.  Only now, with every source that could name someone
+exhausted, is [[default_username]] the right answer; asking for it any
+earlier is what made a typed [[who:]] unable to survive the layer
+above it.
+
+An owner is not a nicety here.  [[ls]] and [[next]] filter by worker,
+so an item left unassigned would be invisible to the person who just
+created it.  The fallback also has to run before the children are
+built, because they take their assignee from [[parent_item.who]]
+(\cref{sec:add-via-editor}) and would otherwise inherit the hole.
+
+<<give the parent an assignee>>=
+if parent_item.who is None:
+    parent_item.who = default_username
+@
+
+Let's verify the assignee through all three layers, starting with the
+one the buffer exists to make possible.  The editor is handed the
+pre-populated line and hands back a changed one, so the same test pins
+both halves of the discovery argument above: the key is there to be
+found, and changing it has an effect.
+
+<<test functions>>=
+def test_add_edit_buffer_who_is_stored(temp_todo_dir):
+  """Editing the pre-populated who: key stores the new name."""
+  seen = {}
+
+  def fake_editor(text):
+    seen["text"] = text
+    return text.replace(
+      f"who: {default_username}", "who: alice"
+    )
+
+  with patch(
+    "nytid.cli.todo.open_editor",
+    side_effect=fake_editor,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Grade labs"],
+    )
+  assert result.exit_code == 0, result.stdout
+  assert f"who: {default_username}" in seen["text"]
+  _, todos = load_todos()
+  assert todos[0].who == "alice"
+@
+
+An explicit flag is still the top layer, so it has to beat a buffer
+that names someone else:
+
+<<test functions>>=
+def test_add_edit_who_flag_beats_buffer(temp_todo_dir):
+  """An explicit --who wins over the buffer's key."""
+  buffer = (
+    "Grade labs\n"
+    "---\n"
+    "who: alice\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "--who", "bob"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == "bob"
+@
+
+And with nothing to say who owns the item---the user deleted the
+line---the fallback still has to produce a name, on both paths through
+the command:
+
+<<test functions>>=
+def test_add_edit_without_who_falls_back(temp_todo_dir):
+  """No flag and no key leaves the default owner."""
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Grade labs\n",
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+
+
+def test_add_without_who_flag_falls_back(temp_todo_dir):
+  """The flag path assigns the default owner too."""
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Grade labs", "--top-level",
+     "--prio", "1"],
+  )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+@
+
+Let's verify the three layers where they are easiest to tell apart:
+[[labels]] and [[deadline]], the two fields a parent contributes.  One
+ranked parent carrying both serves all three cases, so we set it up
+once:
+
+<<test functions>>=
+@pytest.fixture
+def parent_with_metadata(temp_todo_dir):
+  """A ranked parent carrying labels and a deadline."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Course work", priority=5.0,
+      labels=["DD1310"],
+      deadline=normalize_deadline("2026-03-01"),
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+@
+
+A buffer that mentions neither key leaves inheritance standing, which
+is the case that used to differ between the two halves of [[add]]:
+
+<<test functions>>=
+def test_add_edit_inherits_parent_metadata(
+  parent_with_metadata,
+):
+  """A buffer naming neither key inherits both."""
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="Sub-task\n",
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["DD1310"]
+  assert child.deadline == normalize_deadline("2026-03-01")
+@
+
+The front matter is the middle layer, so what the user typed must
+replace what the parent offered rather than join it:
+
+<<test functions>>=
+def test_add_edit_buffer_beats_inherited_metadata(
+  parent_with_metadata,
+):
+  """Front matter replaces the inherited values."""
+  buffer = (
+    "Sub-task\n"
+    "---\n"
+    "labels: [grading]\n"
+    "deadline: 2026-04-01\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["grading"]
+  assert child.deadline == normalize_deadline("2026-04-01")
+@
+
+And the flags are the top layer, so they beat the buffer as well as
+the parent:
+
+<<test functions>>=
+def test_add_edit_flags_beat_buffer_metadata(
+  parent_with_metadata,
+):
+  """Command-line flags win over the front matter."""
+  buffer = (
+    "Sub-task\n"
+    "---\n"
+    "labels: [grading]\n"
+    "deadline: 2026-04-01\n"
+    "---\n"
+  )
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value=buffer,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--parent", "1", "--prio", "1",
+       "urgent", "-d", "2026-05-01"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  child = [t for t in todos if t.id == 2][0]
+  assert child.labels == ["urgent"]
+  assert child.deadline == normalize_deadline("2026-05-01")
 @
 
 Let's verify that a suffixed front-matter estimate is stored as a
@@ -7538,7 +7907,16 @@ else:
 
 The call site computes the parent's priority range from its sibling
 context and passes the parent's [[who]] so that any child lacking
-an explicit [[who:]] in its YAML block inherits the same assignee:
+an explicit [[who:]] in its YAML block inherits the same assignee.
+
+It reads the environment the same way the recursive call does, and for
+the same reason: [[env]] is the only one of these four fields that
+[[WORKER_DEFAULT_ATTRIBUTES]] covers, so [[parent_item.env]] answers
+with the worker's configured environment whenever the parent stored
+none, and every child would then be written to disk carrying a runtime
+default nobody typed.  The other three are plain reads because no
+policy stands behind them---[[labels]], [[deadline]] and [[who]] mean
+exactly what the item holds.
 
 <<create children from parsed>>=
 if parent_item.priority is None:
@@ -7555,8 +7933,47 @@ create_children_from_parsed(
     parent_item.deadline,
     prio_high, prio_low,
     parent_item.who,
-    parent_item.env,
+    parent_item.__dict__.get("env"),
 )
+@
+
+Let's verify that a configured environment stays out of the store.
+The parent has none of its own, so an attribute read would hand every
+child the worker's, and the children are the items we can check---the
+[[env]] they were given is written straight to disk:
+
+<<test functions>>=
+def test_add_edit_children_omit_worker_env(
+  temp_todo_dir,
+):
+  """A worker-default env is not written into children."""
+  buffer = (
+    "Parent task\n"
+    "\n"
+    "# Child task\n"
+  )
+  with patched_worker_config({
+    f"todo.worker.{default_username}.env": {
+      "MODE": "agent",
+    },
+  }):
+    with patch(
+      "nytid.cli.todo.open_editor",
+      return_value=buffer,
+    ):
+      result = runner.invoke(
+        cli,
+        ["add", "--edit", "--top-level", "--prio", "1"],
+      )
+    assert result.exit_code == 0, result.stdout
+
+  with open(get_todo_file()) as handle:
+    data = json.load(handle)
+  child = [
+    t for t in data["todos"] if t["id"] == 2
+  ][0]
+  assert child["title"] == "Child task"
+  assert child["env"] is None
 @
 
 \subsection{The [[ls]] Command}
