@@ -15518,6 +15518,167 @@ its chain (\cref{prompt}).
 settle_wd = worktree_launch or item.wd
 if settle_wd:
     typer.echo(f"  Working directory: {settle_wd}")
+<<adopt the current window when untracked>>
+@
+
+That replacement only holds in a window that \emph{is} tracked.
+Registration ([[start_tracking_labels]] with
+[[update_tmux_context]]) adds labels to existing pane and window
+files and creates none, so in a window the user opened themselves
+the task would be active on the stack yet invisible to every
+ID-less command run there---the failure a tracked tmux session
+turns into \enquote{No active todo} the moment any other window is
+tracked.  So when the start settles in an untracked tmux window, we
+adopt the window (\cref{todo:adopt}): the same publication, hooks
+and finalize-on-exit that [[--window]] would have installed in a
+window of its own, now installed in the one we are in.  Headless
+runs are exempt; adoption is part of the interactive workflow, and
+an agent's window is arranged by whoever launched it.
+
+One difference from [[adopt]] and [[--window]] is deliberate.
+Those publish only the task's own labels, making the window the
+task's window.  Here the window is the branch's window: in a
+tracked window, [[ensure_ancestors_active]] would already have
+registered every ancestor's labels, and the adopted window must end
+in the same state.  Otherwise [[done]] on the child would leave the
+window with no todo context, and the next [[next]] would jump to
+the top level instead of picking a sibling.  The ancestors were
+activated before the window was tracked, so we register them now,
+after adoption; the adoption's cleanup hook owns only the task's
+labels, and the ancestors leave the window file through [[done]]
+and [[stop]] just as they do in a [[--window]] window.
+
+<<adopt the current window when untracked>>=
+if (
+    not headless
+    and os.environ.get("TMUX")
+    and os.environ.get("TMUX_PANE")
+):
+    from nytid.cli.track import (
+        is_current_tmux_context_tracked,
+        register_tmux_context_labels,
+    )
+
+    settle_worker = item.who or default_username
+    if not is_current_tmux_context_tracked(settle_worker):
+        adopt_window_for_todo(
+            todo_id, item, settle_worker, auto_suspend,
+        )
+        for ancestor in get_ancestors(todos, item):
+            register_tmux_context_labels(
+                todo_track_labels(ancestor, ancestor.id),
+                settle_worker,
+            )
+        typer.echo("  Adopted this tmux window")
+@
+
+Let's verify the adoption rule: an untracked window is adopted with
+the task's labels and then receives the ancestors' labels; a tracked
+window, a window outside tmux, and a start that launches a command
+are left alone.
+
+<<test functions>>=
+def invoke_settled_start(args, tracked, env=None):
+    """Invoke start with tmux state and track adoption mocked."""
+    if env is None:
+        env = {"TMUX": "session", "TMUX_PANE": "%3"}
+    with patch.dict(os.environ, env, clear=True), patch(
+        "nytid.cli.track.is_current_tmux_context_tracked",
+        return_value=tracked,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ) as adopt_mock, patch(
+        "nytid.cli.track.register_tmux_context_labels",
+    ) as register_mock:
+        result = runner.invoke(cli, ["start"] + args)
+    return result, adopt_mock, register_mock
+
+
+def test_start_no_shell_adopts_untracked_window(temp_todo_dir):
+    """An untracked window is adopted, then given the ancestors."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            labels=["devel", "nytid"],
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, register_mock = invoke_settled_start(
+        ["2", "--no-shell"], tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Adopted this tmux window" in result.output
+    assert adopt_mock.call_args.args[0] == [
+        "devel", "nytid", "todo:2",
+    ]
+    register_mock.assert_called_once()
+    assert register_mock.call_args.args[0] == ["devel", "todo:1"]
+    assert load_active_stack() == [1, 2]
+
+
+def test_start_in_tracked_window_does_not_adopt(temp_todo_dir):
+    """A tracked window only receives the registered labels."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, register_mock = invoke_settled_start(
+        ["1", "--no-shell"], tracked=True,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+    register_mock.assert_not_called()
+
+
+def test_start_outside_tmux_does_not_adopt(temp_todo_dir):
+    """Outside tmux there is no window to adopt."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, _ = invoke_settled_start(
+        ["1", "--no-shell"], tracked=False, env={},
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+
+
+def test_start_launching_command_does_not_adopt(temp_todo_dir):
+    """A direct launch keeps today's behaviour: no adoption."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            ["true"], 0, stdout="",
+        ),
+    ):
+        result, adopt_mock, _ = invoke_settled_start(
+            ["1", "--headless", "--command", "true"],
+            tracked=False,
+        )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
 @
 
 Let's verify that the flag and the configured default keep a
@@ -20146,10 +20307,17 @@ def outside_tmux_by_default():
     Most tests exercise the non-tmux fallback path.  We patch the
     todo module's resolver to raise ``NotInTmuxError`` by default so the
     suite behaves the same whether pytest itself runs inside tmux or not.
-    Tests that need tmux-specific behavior override this fixture with
-    their own patch.
+    We also drop ``TMUX`` and ``TMUX_PANE`` from the environment: a
+    start that launches nothing adopts the window it runs in, and
+    under a developer's real tmux that would install hooks on the
+    live pane and session.  Tests that need tmux-specific behavior
+    set the variables themselves and patch the resolver again.
     """
-    with patch(
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in ("TMUX", "TMUX_PANE")
+    }
+    with patch.dict(os.environ, env, clear=True), patch(
         "nytid.cli.todo.resolve_todo_from_tmux_context",
         side_effect=NotInTmuxError,
     ):
