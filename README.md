@@ -83,13 +83,16 @@ nytid todo sync
 
 ### `prompt-nytid` — fast status for shell prompts
 
-A separate, minimal entry point that prints the active todo ids and the
-currently tracked labels as two machine-readable lines. It skips the CLI's
-import overhead so it is cheap enough to run on every shell prompt render:
+A separate, minimal entry point that prints the current todo context and the
+currently tracked labels as two machine-readable lines. In a tracked tmux
+window the context is the chain from the root task down to the window's
+current task (`353>356>359`, the task an ID-less `todo done` there would
+complete); elsewhere it is the active todo ids. It skips the CLI's import
+overhead so it is cheap enough to run on every shell prompt render:
 
 ```bash
 readarray -t _nytid < <(prompt-nytid --who "$USER")
-# ${_nytid[0]} = active todo ids, ${_nytid[1]} = tracked labels
+# ${_nytid[0]} = todo context, ${_nytid[1]} = tracked labels
 ```
 
 ### `utils` — room availability and other utilities
