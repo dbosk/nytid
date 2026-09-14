@@ -298,6 +298,64 @@ def test_get_worker_default_reads_config_once(
         defaults._reset_cache()
 @
 
+One launch decision is a preference rather than a fact about the
+task: whether starting a task that has a working directory but no
+command should open a shell there (\cref{todo:start-settle}).  A
+teacher who works in tracked tmux windows and reads the task from
+the prompt never wants that shell; an agent worker always does.  So
+the preference is resolved like auto-suspend is in [[track]]
+(\cref{track:auto-suspend}): the command-line flag wins, then the
+worker's own key, then the global default, and finally the
+historical behaviour of opening the shell.  The keys are read
+through the cached [[default]] helper for the same reason the
+worker defaults above are, and a missing key is simply the next
+fallback.  We accept the same spellings of \emph{true} that
+[[track]] does, so a user who has set [[track.auto-suspend]] can
+set this key the same way.
+
+<<constants>>=
+SHELL_CONFIG = "todo.shell"
+<<configuration>>=
+def should_spawn_shell(worker, flag):
+    """Resolve whether a wd-only start opens a shell.
+
+    Checks, in order: the `--shell/--no-shell` flag, the
+    `todo.shell.<worker>` key, the `todo.shell.default` key, and
+    finally `True`.
+    """
+    if flag is not None:
+        return flag
+    for key in (
+        f"{SHELL_CONFIG}.{worker}",
+        f"{SHELL_CONFIG}.default",
+    ):
+        value = default(key, None)
+        if value is not None:
+            return str(value).lower() in ("true", "1", "yes")
+    return True
+@
+
+Let's verify the resolution order: the flag beats the worker key,
+the worker key beats the default, and both spellings of the value
+are understood.
+
+<<test functions>>=
+def test_should_spawn_shell_resolution_order():
+    """Flag, then worker key, then default, then True."""
+    with patched_worker_config({}):
+        assert should_spawn_shell("me", None) is True
+        assert should_spawn_shell("me", False) is False
+    with patched_worker_config({"todo.shell.default": False}):
+        assert should_spawn_shell("me", None) is False
+        assert should_spawn_shell("me", True) is True
+    with patched_worker_config({
+        "todo.shell.default": "false",
+        "todo.shell.dan-claude": "yes",
+    }):
+        assert should_spawn_shell("me", None) is False
+        assert should_spawn_shell("dan-claude", None) is True
+@
+
 Let's verify that the read-only promise holds.  We give the cached
 config a [[get]] that always raises [[KeyError]], so the lookup takes
 the fallback path, and install a [[config.set]] that fails loudly if
@@ -14196,10 +14254,10 @@ command.
 
 Because [[next]] delegates its launch step to [[start]], it also passes
 through execution-mode options such as [[--headless]], [[--pane]],
-[[--window]], [[--auto-suspend]], and the [[--command]] and
-[[--no-command]] pair.  This keeps the policy question
-\enquote{what should start?}
-separate from the execution question \enquote{how should it run?}
+[[--window]], [[--auto-suspend]], the [[--command]] and
+[[--no-command]] pair, and [[--shell]]/[[--no-shell]].  This keeps
+the policy question \enquote{what should start?} separate from the
+execution question \enquote{how should it run?}
 
 The behaviour depends on whether the current context resolves to an
 active task:
@@ -14256,6 +14314,7 @@ def next_cmd(
     run: Annotated[str | None,
                    command_opt] = None,
     no_command: Annotated[bool, no_command_opt] = False,
+    shell: Annotated[bool | None, shell_opt] = None,
     timeout: Annotated[str | None,
                        timeout_opt] = None,
     reassign_to: Annotated[str | None,
@@ -14291,6 +14350,7 @@ def next_cmd(
         block=block,
         run=run,
         no_command=no_command,
+        shell=shell,
         timeout=timeout,
         reassign_to=reassign_to,
         auto_suspend=auto_suspend,
@@ -15160,6 +15220,34 @@ reject_conflicting_flags({
 })
 @
 
+[[--no-command]] silences a launcher; [[--no-shell]] silences the
+shell that a working directory alone would open.  The two answer
+different questions, which is why they are separate flags rather
+than one \enquote{launch nothing} switch: a task carrying both a
+[[wd]] and [[claude]] should still run [[claude]] under
+[[--no-shell]], and still open a shell under [[--no-command]].
+The shell is the one launch reason that is a preference---it exists
+only to carry the prompt marker and the [[cd]], both of which a
+tracked tmux window and the shell prompt (\cref{prompt}) provide
+without a nested shell---so it is the one with a configured default
+(\cref{todo:start-settle}).  The flag is tri-state for that reason:
+[[None]] means \enquote{ask the configuration}.  It governs only a
+launch in the caller's own terminal; [[--pane]] and [[--window]]
+must run \emph{something} in the pane or window they create, so a
+command-less task still gets a shell there.
+
+<<argument and option definitions>>=
+shell_opt = typer.Option(
+    "--shell/--no-shell",
+    help="Open a shell in the task's wd when it has no "
+         "command (default: todo.shell config, else yes); "
+         "--pane/--window always get a shell")
+@
+
+<<start command options>>=
+shell: Annotated[bool | None, shell_opt] = None,
+@
+
 Likewise [[--worktree]] overrides the stored worktree name for this
 one start, without editing the item.  This is the one-off counterpart
 of [[todo add --worktree]]: a task normally lives in the same worktree
@@ -15358,7 +15446,12 @@ launcher such as [[claude]] on the todo would see tracking start but
 never see their command run unless they remembered to pass a launch
 flag such as [[-W]].  [[--no-command]] removes the command from that
 list of reasons, and only the command: a [[wd]], a worktree or a tmux
-flag still launches, now with a shell.
+flag still launches, now with a shell.  The [[wd]] and worktree
+reasons are in turn subject to the shell preference
+([[should_spawn_shell]]): they only ever launch a shell, so when the
+user has asked for no shell they are no reasons at all, and the
+start settles in the current terminal instead
+(\cref{todo:start-settle}).
 The environment restoration starts from the stored [[env]] (if
 available) and overlays terminal-related variables ([[TERM]],
 [[DISPLAY]], [[SSH_*]]) from the current environment to ensure the
@@ -15378,9 +15471,13 @@ fallible auto-suspend lookup earlier keeps it outside that window so a
 failure there cannot leak the file.
 
 <<spawn subprocess when the todo has work to launch>>=
+use_shell = should_spawn_shell(
+    item.who or default_username, shell,
+)
 if (
-    item.wd or worktree_dir or run or pane or window
+    run or pane or window
     or (item.command and not no_command)
+    or ((item.wd or worktree_dir) and use_shell)
 ):
     <<validate tmux options>>
     <<prepare subprocess environment>>
@@ -15396,6 +15493,156 @@ if (
         <<run subprocess>>
         <<remove worktree after todo run>>
         <<handle subprocess exit>>
+else:
+    <<settle in the current terminal>>
+@
+
+\subsubsection{Settling in the Current Terminal}
+\label{todo:start-settle}
+
+When nothing is launched, the task is still started: it is on the
+stack and its labels are tracked.  What the shell would have
+contributed is the [[cd]] into the working directory and the
+[[todo:<id>]] marker in the prompt.  We replace the first with a
+line naming the directory---the user is in their own shell and
+changes directory themselves, and a resolved worktree is named in
+preference to [[wd]] just as the launch would have used it (it has
+already been created by [[<<resolve worktree for todo start>>]] and
+is left for the user; the post-run cleanup is a property of a run,
+and there is none).  The marker is replaced by the tmux context: in
+a tracked window the labels were just registered there, so ID-less
+[[done]] and [[next]] resolve this task and the shell prompt shows
+its chain (\cref{prompt}).
+
+<<settle in the current terminal>>=
+settle_wd = worktree_launch or item.wd
+if settle_wd:
+    typer.echo(f"  Working directory: {settle_wd}")
+@
+
+Let's verify that the flag and the configured default keep a
+[[wd]]-only task in the current terminal, that a stored command is
+unaffected, and that [[next]] forwards the flag:
+
+<<test functions>>=
+def test_start_no_shell_skips_shell_for_wd(temp_todo_dir):
+    """--no-shell with a wd starts tracking and spawns nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-shell"],
+        )
+    assert result.exit_code == 0, result.output
+    mock_sub.run.assert_not_called()
+    assert "Working directory: /tmp/project" in result.output
+    assert load_active_stack() == [1]
+
+
+def test_start_no_shell_keeps_stored_command(temp_todo_dir):
+    """--no-shell still runs a stored command in the wd."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+            command="true",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-shell"],
+            input="n\n",
+        )
+    assert result.exit_code == 0, result.output
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][0][0] == "true"
+    assert mock_run.call_args.kwargs["cwd"] == "/tmp"
+
+
+def test_start_shell_config_default(temp_todo_dir):
+    """todo.shell.default = false skips the shell; --shell wins."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patched_worker_config({
+        "todo.shell.default": "false",
+    }), patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(cli, ["start", "1"])
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_not_called()
+
+        mock_sub.run.return_value.returncode = 0
+        result = runner.invoke(
+            cli, ["start", "1", "--shell"], input="n\n",
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_called_once()
+
+
+def test_start_shell_worker_config_wins_over_default(
+    temp_todo_dir,
+):
+    """The worker's own todo.shell key beats the default."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Agent task",
+            who="dan-claude",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patched_worker_config({
+        "todo.shell.default": "false",
+        "todo.shell.dan-claude": "true",
+    }), patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        mock_sub.run.return_value.returncode = 0
+        result = runner.invoke(
+            cli, ["start", "1"], input="n\n",
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_called_once()
+
+
+def test_next_forwards_no_shell(temp_todo_dir):
+    """next forwards --no-shell to start."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            status="pending",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["next", "--no-shell"],
+        )
+    assert result.exit_code == 0, result.output
+    mock_sub.run.assert_not_called()
+    assert "Working directory: /tmp/project" in result.output
 @
 
 A worktree makes the todo launchable on its own, just as a stored
@@ -19793,6 +20040,7 @@ from nytid.cli.todo import (
     get_todo_dir,
     get_todo_file,
     get_worker_default,
+    should_spawn_shell,
     get_children,
     get_descendants,
     get_siblings,
