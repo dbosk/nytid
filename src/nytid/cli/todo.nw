@@ -15436,6 +15436,7 @@ except ImportError:
 @
 
 \subsubsection{Spawning a Subprocess}
+\label{todo:start-spawn}
 
 We spawn a subprocess whenever the todo carries enough information to
 launch something on its own (a stored [[command]] or [[wd]]) and also
@@ -15490,11 +15491,200 @@ if (
             <<remove worktree after todo run>>
             <<handle subprocess exit>>
     else:
+        <<adopt the current window for a direct launch>>
         <<run subprocess>>
         <<remove worktree after todo run>>
         <<handle subprocess exit>>
 else:
     <<settle in the current terminal>>
+@
+
+A direct launch blocks the caller's own terminal, so the task runs in
+a window the user opened---the very window that
+[[start_tracking_labels]] cannot mark as tracked, since it only adds
+labels to pane and window files that already exist.  The launched
+command is exactly the caller that suffers from that: [[claude]] or a
+shell running [[todo done]] or [[todo next]] without an ID has no way
+to name the task it is working on, and the ID-less resolution falls
+back to whichever \emph{other} window is tracked---or to
+\enquote{No active todo}.  Adopting the window first gives the child
+the same context a [[--window]] launch would have given it.  That is
+the argument the settle path already makes
+(\cref{todo:start-settle}), so the two paths call one helper,
+introduced there.
+
+We adopt without arming a finalize hook, the one difference from the
+settle path.  A pane-exit hook fires when the \emph{pane} dies, not
+when our child exits, and this pane outlives the launch: control
+returns here, [[<<handle subprocess exit>>]] stops the hierarchy and
+settles the status, and the user carries on in the same shell.  A hook
+armed now would therefore fire much later---at the end of the terminal
+session, on a task that was finished, reassigned or restarted in the
+meantime---and reset it.  The settle path has no such moment to react
+to, which is why it keeps the pane-history decision: there the shell
+the user eventually leaves is the only exit signal there is.
+
+<<adopt the current window for a direct launch>>=
+if not headless:
+    adopt_untracked_window_for_start(
+        todo_id, item, todos, auto_suspend,
+        arm_finalize=False,
+    )
+@
+
+Let's verify the four launch shapes: an interactive direct launch in
+an untracked window adopts it, hook-free and without losing the
+spawn, and carries the ancestors along; a tracked window, a tmux
+launch, and a headless run are left alone.  The pane is given
+\emph{no} exit hooks of its own here, so the hook mock would fire if
+the launch ever fell back to the pane-history decision.
+
+<<test functions>>=
+def invoke_launching_start(args, tracked, user_input=None):
+    """Invoke a launching start with the spawn mocked.
+
+    Returns the result together with the adopt, register,
+    exit-hook and subprocess mocks.
+    """
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "TMUX_PANE": "%3"},
+        clear=True,
+    ), patch(
+        "nytid.cli.track.is_current_tmux_context_tracked",
+        return_value=tracked,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=False,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ) as adopt_mock, patch(
+        "nytid.cli.track.register_tmux_context_labels",
+    ) as register_mock, patch(
+        "nytid.cli.track.install_tmux_exit_hooks",
+    ) as hooks_mock, patch(
+        "nytid.cli.todo.run_todo_tmux_command",
+        return_value=0,
+    ), patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            ["true"], 0, stdout="",
+        ),
+    ) as run_mock:
+        result = runner.invoke(
+            cli, ["start"] + args, input=user_input,
+        )
+    return (
+        result, adopt_mock, register_mock,
+        hooks_mock, run_mock,
+    )
+
+
+def test_start_direct_launch_adopts_untracked_window(
+    temp_todo_dir,
+):
+    """A direct launch adopts, without arming a finalize hook."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+    ])
+    (
+        result, adopt_mock, _, hooks_mock, run_mock,
+    ) = invoke_launching_start(
+        ["1", "--command", "true"],
+        tracked=False, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Adopted this tmux window" in result.output
+    assert adopt_mock.call_args.args[0] == ["devel", "todo:1"]
+    hooks_mock.assert_not_called()
+    assert run_mock.call_count == 1
+    assert run_mock.call_args.args[0] == ["true"]
+
+
+def test_start_direct_launch_registers_ancestors(
+    temp_todo_dir,
+):
+    """The adopted window also carries the parent's labels."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            labels=["devel", "nytid"],
+        ),
+    ])
+    (
+        result, _, register_mock, _, _,
+    ) = invoke_launching_start(
+        ["2", "--command", "true"],
+        tracked=False, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    register_mock.assert_called_once()
+    assert register_mock.call_args.args[0] == ["devel", "todo:1"]
+
+
+def test_start_direct_launch_in_tracked_window(temp_todo_dir):
+    """A tracked window is already resolvable: no adoption."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--command", "true"],
+        tracked=True, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+
+
+def test_start_window_launch_does_not_adopt(temp_todo_dir):
+    """--window makes its own tracked window to adopt instead."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--window", "--command", "true"],
+        tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+
+
+def test_start_launching_command_does_not_adopt(temp_todo_dir):
+    """A headless launch is arranged by its caller: no adoption."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--headless", "--command", "true"],
+        tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
 @
 
 \subsubsection{Settling in the Current Terminal}
@@ -15528,12 +15718,18 @@ files and creates none, so in a window the user opened themselves
 the task would be active on the stack yet invisible to every
 ID-less command run there---the failure a tracked tmux session
 turns into \enquote{No active todo} the moment any other window is
-tracked.  So when the start settles in an untracked tmux window, we
-adopt the window (\cref{todo:adopt}): the same publication, hooks
-and finalize-on-exit that [[--window]] would have installed in a
-window of its own, now installed in the one we are in.  Headless
-runs are exempt; adoption is part of the interactive workflow, and
-an agent's window is arranged by whoever launched it.
+tracked.  So when the start lands in an untracked tmux window, we
+adopt it (\cref{todo:adopt}): the publication, and the
+finalize-on-exit, that [[--window]] would have installed in a
+window of its own, installed in the one we are in.  Nothing in
+that argument is particular to settling---a blocking direct launch
+runs in the same untracked window and adopts it too
+(\cref{todo:start-spawn})---so the work is a function shared by the
+two paths rather than a chunk reused between them, and the one
+place where they differ, the finalize hook, is its parameter.
+Headless runs are exempt on both paths; adoption is part of the
+interactive workflow, and an agent's window is arranged by whoever
+launched it.
 
 One difference from [[adopt]] and [[--window]] is deliberate.
 Those publish only the task's own labels, making the window the
@@ -15548,33 +15744,68 @@ after adoption; the adoption's cleanup hook owns only the task's
 labels, and the ancestors leave the window file through [[done]]
 and [[stop]] just as they do in a [[--window]] window.
 
-<<adopt the current window when untracked>>=
-if (
-    not headless
-    and os.environ.get("TMUX")
-    and os.environ.get("TMUX_PANE")
+The two [[track]] imports stay inside the function.  Deferring them
+keeps [[todo]] usable when [[track]] is missing---the reason every
+other call into it is deferred too---and it also keeps each name
+resolved through [[nytid.cli.track]] at call time, so the tests can
+patch the helpers there rather than having to find a copy bound
+into this module at import time.
+
+<<helpers>>=
+def adopt_untracked_window_for_start(
+    todo_id, item, todos, auto_suspend,
+    *, arm_finalize=None,
 ):
+    """Adopt the current tmux window for a starting todo.
+
+    Adopts the window with the task's labels and then registers
+    every ancestor's labels on it, so ID-less todo commands run
+    there resolve the task and `next` stays inside the branch.
+    Does nothing, and returns False, outside tmux or in a window
+    that is already tracked.  `arm_finalize` is passed on to
+    `adopt_window_for_todo`.
+    """
+    if not (
+        os.environ.get("TMUX")
+        and os.environ.get("TMUX_PANE")
+    ):
+        return False
     from nytid.cli.track import (
         is_current_tmux_context_tracked,
         register_tmux_context_labels,
     )
 
-    settle_worker = item.who or default_username
-    if not is_current_tmux_context_tracked(settle_worker):
-        adopt_window_for_todo(
-            todo_id, item, settle_worker, auto_suspend,
+    worker = item.who or default_username
+    if is_current_tmux_context_tracked(worker):
+        return False
+    adopt_window_for_todo(
+        todo_id, item, worker, auto_suspend,
+        arm_finalize=arm_finalize,
+    )
+    for ancestor in get_ancestors(todos, item):
+        register_tmux_context_labels(
+            todo_track_labels(ancestor, ancestor.id),
+            worker,
         )
-        for ancestor in get_ancestors(todos, item):
-            register_tmux_context_labels(
-                todo_track_labels(ancestor, ancestor.id),
-                settle_worker,
-            )
-        typer.echo("  Adopted this tmux window")
+    typer.echo("  Adopted this tmux window")
+    return True
 @
 
-Let's verify the adoption rule: an untracked window is adopted with
-the task's labels and then receives the ancestors' labels; a tracked
-window, a window outside tmux, and a start that launches a command
+A settling start leaves the finalize decision to the helper's
+default: it launches nothing, so the only later signal that the work
+has stopped is the user's own shell exiting, and that is precisely
+what a pane-exit hook reports.
+
+<<adopt the current window when untracked>>=
+if not headless:
+    adopt_untracked_window_for_start(
+        todo_id, item, todos, auto_suspend,
+    )
+@
+
+Let's verify the settling half of the adoption rule: an untracked
+window is adopted with the task's labels and then receives the
+ancestors' labels, while a tracked window and a window outside tmux
 are left alone.
 
 <<test functions>>=
@@ -15655,28 +15886,6 @@ def test_start_outside_tmux_does_not_adopt(temp_todo_dir):
     result, adopt_mock, _ = invoke_settled_start(
         ["1", "--no-shell"], tracked=False, env={},
     )
-    assert result.exit_code == 0, result.output
-    adopt_mock.assert_not_called()
-
-
-def test_start_launching_command_does_not_adopt(temp_todo_dir):
-    """A direct launch keeps today's behaviour: no adoption."""
-    save_todos(2, [
-        TodoItem(
-            id=1, title="Task",
-            created="2026-02-20T10:00:00",
-        ),
-    ])
-    with patch(
-        "nytid.cli.todo.subprocess.run",
-        return_value=subprocess.CompletedProcess(
-            ["true"], 0, stdout="",
-        ),
-    ):
-        result, adopt_mock, _ = invoke_settled_start(
-            ["1", "--headless", "--command", "true"],
-            tracked=False,
-        )
     assert result.exit_code == 0, result.output
     adopt_mock.assert_not_called()
 @
@@ -17657,17 +17866,28 @@ result so the caller can report what was started; on a window that
 cannot be resolved it exits with the message below, which reads
 the same from both commands.
 
+[[arm_finalize]] exists because that hook is the one step a caller
+can be sure is wrong for it.  The default, [[None]], means
+\enquote{decide from the pane's history}, which is the right answer
+whenever the adopted window is where the work will end.  A blocking
+direct launch knows better: it will handle the child's exit itself
+(\cref{todo:start-spawn}), so it passes [[False]] and leaves the
+pane hook-free.
+
 <<helpers>>=
 def adopt_window_for_todo(
     todo_id, item, worker, auto_suspend, rename=False,
+    arm_finalize=None,
 ):
     """Adopt the current tmux window as work on `item`.
 
     Publishes the task's labels on the window through the track
-    module, arms the finalize hook when the pane has none, and
-    optionally renames the window `todo:<id>`.  Returns the
-    adoption result dict from `adopt_current_window`; exits with
-    status 1 when the tmux window cannot be resolved.
+    module, arms the finalize hook, and optionally renames the
+    window `todo:<id>`.  `arm_finalize` defaults to arming the
+    hook only when the pane carries none; pass False to leave the
+    pane alone when the caller handles the exit itself.  Returns
+    the adoption result dict from `adopt_current_window`; exits
+    with status 1 when the tmux window cannot be resolved.
     """
     <<decide whether to arm the finalize hook>>
     <<adopt window via track module>>
@@ -17703,7 +17923,9 @@ the user here (it lives in the pane and its hooks, not in nytid's
 state files), so re-arming would make finalize run twice---the
 fresh hook cannot share the launch-time guard.  A manually created
 window, by contrast, has no pane-exit hooks at all.  So the pane's
-exit hooks are the discriminator.
+exit hooks are the discriminator---unless the caller has already
+answered the question, in which case we take its answer and do not
+even ask tmux.
 
 <<helpers>>=
 def pane_has_exit_hooks(pane_id):
@@ -17721,9 +17943,10 @@ def pane_has_exit_hooks(pane_id):
         or "pane-died" in result.stdout
     )
 <<decide whether to arm the finalize hook>>=
-arm_finalize = not pane_has_exit_hooks(
-    os.environ["TMUX_PANE"]
-)
+if arm_finalize is None:
+    arm_finalize = not pane_has_exit_hooks(
+        os.environ["TMUX_PANE"]
+    )
 @
 
 Activation precedes publication, mirroring [[todo start]]: the
