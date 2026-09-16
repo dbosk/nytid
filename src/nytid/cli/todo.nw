@@ -40,11 +40,11 @@ siblings, and can be started/stopped independently via the track
 system. When all children of a parent are done, the parent is
 automatically marked done.
 
-Both listings keep sub-items out of the way by default: [[todo ls]]
-shows top-level items, [[todo view]] the item alone.  [[ls --all]]
-adds one level, and [[--recursive]] lists every depth in either
-command; [[todo.ls.recursive]] and [[todo.view.recursive]] make that
-the default.
+Both listings stop at one level by default: [[todo ls]] shows
+top-level items, and [[ls --all]] or [[todo view]] add the direct
+children.  [[--recursive]] lists every depth in either command, and
+[[-r N]] the next [[N]] levels; [[todo.ls.recursive]] and
+[[todo.view.recursive]] make either the default.
 
 Starting a child automatically activates the entire ancestor chain:
 if you [[todo start 7]] and item~7 is a sub-item of~5, which in turn
@@ -84,6 +84,7 @@ import sys
 import tempfile
 import typer
 import typerconf as config
+from typer.core import TyperCommand
 from nytid.cli.utils.defaults import default, config_hint
 from nytid.cli.utils.labels import apply_label_edits
 from nytid.cli.utils.output import print_markdown, print_rows
@@ -8290,29 +8291,151 @@ ls_output_opt = typer.Option(
     help="Write CSV output to file")
 @
 
-\paragraph{Every depth}
+\paragraph{Every depth, or some}%
+\label{sec:todo-depth-flag}
 
 [[--all]] stops at one level because that is what keeps a listing of
 a dozen projects scannable: the reader sees what each one is made of
 without the tree under every part.  Sometimes the tree is the
 question---which branch of a sprint is furthest behind---and for that
-[[--recursive]] lists every depth.  It implies [[--all]], since a
-tree cut below its roots' children has no deeper level to show.
+[[--recursive]] lists every depth.  Sometimes it is only the next
+level or two, so the flag takes an optional number: [[-r 1]] is one
+level below the top, the same listing as [[--all]], [[-r 2]] adds
+the grandchildren, and a bare [[-r]] means all of them.  A number
+never hides what [[--all]] shows, so the two flags compose as the
+larger of the two depths.
 
 Whether one wants the whole tree is a habit rather than a fact about
 the data, so the default is read from configuration like the other
-listing defaults.  The option is a pair, [[--recursive]] and
-[[--no-recursive]], so that a configured default can still be
-overridden for one invocation.
+listing defaults.  The key takes the spellings of the flag, a number
+of levels or [[true]] for every level, and [[-r 0]] on the command
+line is how a configured default is switched off for one invocation.
+
+Both the flag and the key are parsed by one function, which returns
+the number of levels, or [[None]] when there is no limit---[[None]]
+rather than a large number because the walkers below already read
+[[None]] as \enquote{no cap}, and because a limit that is a number
+should mean that number.  The same function serves as the [[cast]]
+of [[default]] (\cref{cli.utils.defaults}), whose contract, that a
+value it cannot parse falls back, is what keeps a mistyped key from
+breaking every listing.
 
 <<configuration>>=
+def parse_depth(value):
+    """Return `value` as a number of levels below, or None for all.
+
+    Accepts an int, a bool (True is every level), or a string:
+    digits, `all`, or the spellings of true and false the boolean
+    keys accept.  Anything else raises `ValueError`.
+    """
+    if value is None or isinstance(value, bool):
+        return None if value else 0
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"negative depth: {value}")
+        return value
+    text = str(value).strip().lower()
+    if text in ("all", "true", "yes", "on"):
+        return None
+    if text in ("", "false", "no", "off"):
+        return 0
+    if text.isdigit():
+        return int(text)
+    raise ValueError(f"not a number of levels: {value!r}")
+
+
 TODO_LS_RECURSIVE_CONFIG = "todo.ls.recursive"
 DEFAULT_LS_RECURSIVE = default(
-    TODO_LS_RECURSIVE_CONFIG, False, bool)
+    TODO_LS_RECURSIVE_CONFIG, 0, parse_depth)
+@
+
+Let's verify the spellings, and that a bad value raises so that
+[[default]] can fall back:
+
+<<test functions>>=
+def test_parse_depth():
+    """Numbers are levels, true and all are unlimited, else 0."""
+    assert parse_depth(2) == 2
+    assert parse_depth("2") == 2
+    assert parse_depth(True) is None
+    assert parse_depth("all") is None
+    assert parse_depth(False) == 0
+    assert parse_depth("no") == 0
+    with pytest.raises(ValueError):
+        parse_depth("deep")
+    with pytest.raises(ValueError):
+        parse_depth(-1)
+@
+
+An option that may be given with or without a value is something
+Typer does not offer: its parser takes a value or a flag, never one
+that is sometimes the other.  What it does offer is the class of the
+command, so the two commands that carry [[-r]] use one that looks at
+the arguments before parsing and gives a bare [[-r]] the value
+[[all]].  \enquote{Bare} means not followed by a number: a following
+option, a following word, or the end of the line.  A following number
+is taken as the depth, which also means that [[todo view -r 5]] reads
+[[5]] as levels rather than as the id; the id goes first,
+[[todo view 5 -r]].  Anything after [[--]] is left alone, as the
+shell convention requires.
+
+The rewrite is a function of the argument list, so it can be tested
+without building a command, and the class is the thin adapter that
+hands it Typer's arguments.
+
+<<helpers>>=
+def rewrite_depth_flags(args, flags=("-r", "--recursive")):
+    """Return `args` with every bare depth flag given the value `all`.
+
+    A flag is bare when it is last or not followed by a number.
+    Arguments after `--` are left untouched.
+    """
+    rewritten = []
+    for i, arg in enumerate(args):
+        rewritten.append(arg)
+        if arg == "--":
+            rewritten.extend(args[i + 1:])
+            break
+        if arg not in flags:
+            continue
+        following = args[i + 1] if i + 1 < len(args) else ""
+        if not following.isdigit():
+            rewritten.append("all")
+    return rewritten
+
+
+class RecursiveDepthCommand(TyperCommand):
+    """A command whose `-r` may be given with or without a depth."""
+
+    def parse_args(self, ctx, args):
+        return super().parse_args(ctx, rewrite_depth_flags(args))
+@
+
+Let's verify the three shapes a bare flag can take, that a number
+is left to be the value, and that [[--]] ends the rewriting:
+
+<<test functions>>=
+def test_rewrite_depth_flags():
+    """A bare -r gets `all`; a number after it is its value."""
+    assert rewrite_depth_flags(["-r"]) == ["-r", "all"]
+    assert rewrite_depth_flags(["-r", "--flat"]) == [
+        "-r", "all", "--flat",
+    ]
+    assert rewrite_depth_flags(["1", "-r", "rich"]) == [
+        "1", "-r", "all", "rich",
+    ]
+    assert rewrite_depth_flags(["--recursive", "2", "x"]) == [
+        "--recursive", "2", "x",
+    ]
+    assert rewrite_depth_flags(["--", "-r"]) == ["--", "-r"]
+@
+
 <<argument and option definitions>>=
 ls_recursive_opt = typer.Option(
-    "--recursive/--no-recursive", "-r",
-    help="Show sub-items at every depth (implies --all). "
+    "--recursive", "-r",
+    metavar="[LEVELS]", parser=parse_depth,
+    help="Show sub-items this many levels below the top; "
+         "bare -r shows every level. "
          + config_hint("todo.ls.recursive"))
 @
 
@@ -8346,14 +8469,14 @@ def test_ls_help_advertises_config_key():
 @
 
 <<list command>>=
-@cli.command(name="ls")
+@cli.command(name="ls", cls=RecursiveDepthCommand)
 def ls(
     label_filter: Annotated[list[str] | None,
                             label_filter_arg] = None,
     include_done: Annotated[bool,
                             done_opt] = False,
     show_tree: Annotated[bool, ls_all_opt] = False,
-    recursive: Annotated[bool,
+    recursive: Annotated[int | None,
                          ls_recursive_opt] = DEFAULT_LS_RECURSIVE,
     count: Annotated[int | None,
                      ls_count_opt] = DEFAULT_LS_COUNT,
@@ -8373,8 +8496,9 @@ def ls(
     Ranked items are shown first by effective priority; unranked
     items follow in deadline order. By default shows only top-level
     items assigned to the current user. Pass `--all` to see each
-    item's direct sub-items, `--recursive` to see every depth, or
-    `-n N` to cap the output at N items; `-n 0` lifts the cap.
+    item's direct sub-items, `-r` to see every depth or `-r N` the
+    top N levels, and `-n N` to cap the output at N items; `-n 0`
+    lifts the cap.
 
     `--who` defaults to $USER; pass an empty string
     (`--who ''`) to show all assignees.
@@ -8613,8 +8737,9 @@ The depth of the listing is decided here, once, before the format
 branch.  Without [[--all]] we restrict [[filtered]] to its visible
 roots: sub-items of a visible parent are subordinate detail the user
 can reveal on demand.  With [[--all]] we keep those roots and their
-direct children---one level, in every format.  With [[--recursive]]
-nothing is cut, and every format lists every depth.
+direct children---one level, in every format.  [[-r]] names the
+number of levels, or lifts the limit, and every format lists the
+same ones.
 
 That last clause is a change.  [[--all]] used to leave [[filtered]]
 untouched, so a JSON or CSV listing carried every depth while the
@@ -8624,16 +8749,18 @@ for the script that switches formats, so the restriction now applies
 before the renderer is chosen, and JSON, CSV, the flat table and the
 tree all agree on what one level is.
 
+The tree walker below (\cref{sec:todo-ls-walk}) already knows every
+item's depth, so the restriction is a slice of its rows rather than
+a second notion of depth.  The walker sorts, but so does every
+renderer afterwards, so the order it leaves behind is harmless.
+
 <<restrict [[filtered]] to the requested depth>>=
-if not recursive:
-    roots = get_visible_roots(filtered)
-    if show_tree:
-        root_ids = {t.id for t in roots}
-        filtered = roots + [
-            t for t in filtered if t.parent_id in root_ids
-        ]
-    else:
-        filtered = roots
+depth_limit = recursive
+if show_tree and depth_limit is not None:
+    depth_limit = max(depth_limit, 1)
+if depth_limit is not None:
+    rows, _ = get_tree_rows(filtered)
+    filtered = [t for depth, t in rows if depth <= depth_limit]
 @
 
 To show tracked time, we load track data and sum durations for
@@ -8833,6 +8960,19 @@ def test_ls_recursive_shows_every_depth(temp_todo_dir):
     assert sorted(titles) == [
         "Child task", "Grandchild task", "Parent task",
     ]
+
+    one_level = runner.invoke(
+        cli, ["ls", "-r", "1", "--format", "json", "--who", ""]
+    )
+    assert one_level.exit_code == 0
+    titles = [t["title"] for t in json.loads(one_level.stdout)]
+    assert sorted(titles) == ["Child task", "Parent task"]
+
+    two_levels = runner.invoke(
+        cli, ["ls", "-r", "2", "--format", "json", "--who", ""]
+    )
+    assert two_levels.exit_code == 0
+    assert len(json.loads(two_levels.stdout)) == 3
 
 
 def test_ls_recursive_flat_lists_every_depth(temp_todo_dir):
@@ -9390,7 +9530,8 @@ for item in sorted_items:
     <<add item row to rich table>>
 @
 
-\paragraph{Walking the tree}
+\paragraph{Walking the tree}%
+\label{sec:todo-ls-walk}
 
 The tree is a depth-first walk that starts at the visible roots and
 descends only into children that are themselves in [[filtered]].
@@ -10040,33 +10181,30 @@ view_all_opt = typer.Option(
 
 \paragraph{Listing what is underneath}
 
-The sub-items are not listed unless asked for.  The item is the
-subject of [[view]]; what is under it is context, and context that
-grows with the item's importance, so that the parent of a term's
-work opened for its own notes gets a screen of children first and
-the notes somewhere below.  [[--recursive]] asks for the list, at
-every depth, and the reader who wants the list every time sets
-[[todo.view.recursive]] and gets it by default; the option is a
-pair so that the configured default still yields to
-[[--no-recursive]] for one invocation.
-
-The two flags above describe the list, not the item: [[--notes]]
-asks for text under every listed sub-item, and [[--done]] asks for
-finished sub-items among them.  Asking for either is asking for the
-list, so both imply [[--recursive]]---the alternative is two flags
-that silently do nothing until a third is added.
+The item is the subject of [[view]], and its direct children are
+what it is made of, so they are listed with it.  Below them the tree
+is context rather than composition, and context that grows with the
+item's importance: the parent of a term's work, opened for its own
+notes, would otherwise show every level first and the notes
+somewhere below.  [[--recursive]] lists every depth, and [[-r 1]]
+one more level---the grandchildren---on the terms [[ls]] set
+(\cref{sec:todo-depth-flag}): an optional number of levels, all of
+them when it is left out, parsed by [[parse_depth]] and put in place
+by [[RecursiveDepthCommand]].  The reader who wants the whole tree
+every time sets [[todo.view.recursive]], and [[-r 0]] switches a
+configured default off for one invocation.
 
 <<configuration>>=
 TODO_VIEW_RECURSIVE_CONFIG = "todo.view.recursive"
 DEFAULT_VIEW_RECURSIVE = default(
-    TODO_VIEW_RECURSIVE_CONFIG, False, bool)
+    TODO_VIEW_RECURSIVE_CONFIG, 0, parse_depth)
 <<argument and option definitions>>=
 view_recursive_opt = typer.Option(
-    "--recursive/--no-recursive", "-r",
-    help="List the sub-items under the todo, at every depth. "
+    "--recursive", "-r",
+    metavar="[LEVELS]", parser=parse_depth,
+    help="List sub-items this many levels below the children; "
+         "bare -r lists every level. "
          + config_hint("todo.view.recursive"))
-<<let the sub-item flags imply [[recursive]]>>=
-recursive = recursive or show_notes or include_done
 @
 
 Let's verify that the key is advertised:
@@ -10147,7 +10285,7 @@ renderers is what keeps them from drifting apart: a field added to
 renderer can show something the other lacks.
 
 <<view command>>=
-@cli.command()
+@cli.command(cls=RecursiveDepthCommand)
 def view(
     todo_id: Annotated[int | None,
                        todo_id_arg] = None,
@@ -10157,7 +10295,7 @@ def view(
                           view_notes_opt] = False,
     count: Annotated[int | None,
                      view_count_opt] = DEFAULT_VIEW_SUBITEMS,
-    recursive: Annotated[bool,
+    recursive: Annotated[int | None,
                          view_recursive_opt] = DEFAULT_VIEW_RECURSIVE,
     output_format: Annotated[ViewFormat,
                              view_format_opt] = ViewFormat.auto,
@@ -10165,10 +10303,11 @@ def view(
     """View a todo item with full details.
 
     If no ID given, shows the current active task.
-    Sub-items are listed only with --recursive; --notes and --done
-    imply it.  Done sub-items are hidden; pass --done (or --all) to
-    include them.  At most N sub-items are shown under each parent,
-    at every depth; `-n N` changes that bound and `-n 0` lifts it.
+    The item's children are listed; `-r` adds every level below
+    them and `-r N` the next N.  Done sub-items are hidden; pass
+    --done (or --all) to
+    include them.  At most N sub-items are shown under each parent;
+    `-n N` changes that bound and `-n 0` lifts it.
     Sub-items show a one-line note preview; pass --notes to
     print their descriptions and notes in full instead.
     Notes are rendered as Markdown on a terminal and printed as
@@ -10196,7 +10335,6 @@ def view(
     <<collect metadata fields>>
     <<fetch GitHub content>>
     <<treat [[-n 0]] as unlimited>>
-    <<let the sub-item flags imply [[recursive]]>>
     <<collect visible sub-items>>
     if use_rich:
         <<render view with rich>>
@@ -10360,18 +10498,27 @@ past [[count]], because [[count]] is [[None]] under [[-n 0]]---and
 slicing from [[count]] would report every child as hidden at exactly
 the moment nothing is.
 
+The depth limit is the same rule as the cap, applied to levels
+rather than siblings, and the two compose the same way: a level the
+listing does not descend into is not charged to the cap either,
+since [[-n 0]] would not show it.  What a cut child is charged is
+therefore its subtree \emph{down to the limit}---the same walk
+again, with the remaining depth.
+
 <<sub-item helpers>>=
 def get_visible_sub_item_rows(
     todos: list[TodoItem], parent_id: int,
-    include_done: bool, count: int | None, depth: int = 0,
+    include_done: bool, count: int | None,
+    max_depth: int | None = None, depth: int = 0,
 ) -> tuple[list[tuple[int, TodoItem]], int, int]:
     """Return the shown subtree of `parent_id` as (depth, item) rows.
 
     Under each parent the first `count` visible children are kept
     (all of them when `count` is None), each followed by its own
-    kept subtree one level deeper.  The two integers count the done
-    items dropped and the items the cap left out, the latter
-    including everything under a cut child that `-n 0` would show.
+    kept subtree one level deeper, down to `max_depth` (every
+    level when None).  The two integers count the done items
+    dropped and the items the cap left out, the latter including
+    everything under a cut child that `-n 0` would show.
     """
     rows = []
     hidden_by_cap = 0
@@ -10379,19 +10526,25 @@ def get_visible_sub_item_rows(
         todos, parent_id, include_done
     )
     shown = children[:count]
+    descend = max_depth is None or depth < max_depth
     for child in shown:
         rows.append((depth, child))
-        branch, dropped, cut = get_visible_sub_item_rows(
-            todos, child.id, include_done, count, depth + 1
-        )
-        rows.extend(branch)
-        hidden_done += dropped
-        hidden_by_cap += cut
+        if descend:
+            branch, dropped, cut = get_visible_sub_item_rows(
+                todos, child.id, include_done, count,
+                max_depth, depth + 1,
+            )
+            rows.extend(branch)
+            hidden_done += dropped
+            hidden_by_cap += cut
     for child in children[len(shown):]:
-        branch, _, _ = get_visible_sub_item_rows(
-            todos, child.id, include_done, None
-        )
-        hidden_by_cap += 1 + len(branch)
+        hidden_by_cap += 1
+        if descend:
+            branch, _, _ = get_visible_sub_item_rows(
+                todos, child.id, include_done, None,
+                max_depth, depth + 1,
+            )
+            hidden_by_cap += len(branch)
     return rows, hidden_done, hidden_by_cap
 @
 
@@ -10446,23 +10599,36 @@ def test_get_visible_sub_item_rows_uncapped_skips_done_branch():
     ]
     assert hidden_done == 1
     assert hidden_by_cap == 0
+
+
+def test_get_visible_sub_item_rows_depth_limit():
+    """With `max_depth` 0 only children are listed, and a cut child
+    is charged alone, since the level below is not shown anyway."""
+    rows, hidden_done, hidden_by_cap = get_visible_sub_item_rows(
+        three_generation_items(), 1, False, 2, max_depth=0
+    )
+    assert [(d, t.id) for d, t in rows] == [(0, 2), (0, 3)]
+    assert hidden_done == 0
+    assert hidden_by_cap == 1
 @
 
-Without [[--recursive]] the same walk runs uncapped, and its length
-is the number the hint below owes the reader: exactly the rows that
-[[-r]] would print plus whatever its own cap hint would then report,
-so the two can be checked against each other on screen.  The done
-count survives the reset for the same reason---the hint that names
-[[--done]] stays true, and [[--done]] now brings the listing with it.
+With a depth limit the walk stops there, and the hint below owes the
+reader the number of rows a bare [[-r]] would add: the same walk
+with the limit lifted, under the same cap and the same done filter,
+less what is already on the screen.  That second walk's cap count is
+not used, because the cap hint must describe the listing that was
+printed, not the one that was not.
 
 <<collect visible sub-items>>=
 rows, hidden_done, hidden_by_cap = get_visible_sub_item_rows(
-    todos, item.id, include_done, count if recursive else None
+    todos, item.id, include_done, count, recursive,
 )
-hidden_by_flag = 0
-if not recursive:
-    hidden_by_flag = len(rows)
-    rows, hidden_by_cap = [], 0
+hidden_below = 0
+if recursive is not None:
+    deeper, _, _ = get_visible_sub_item_rows(
+        todos, item.id, include_done, count
+    )
+    hidden_below = len(deeper) - len(rows)
 @
 
 Sub-items show their status as a short word rather than the stored
@@ -10557,12 +10723,7 @@ if rows:
             <<print a sub-item's blocks as plain text>>
         elif depth == 0 and child.notes:
             typer.echo(f"{indent}  {child.notes.splitlines()[0]}")
-if hidden_by_flag:
-    typer.echo(
-        f"  ({hidden_by_flag} sub-items hidden,"
-        f" use --recursive to list)"
-    )
-elif hidden_done:
+if hidden_done:
     typer.echo(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)"
@@ -10572,6 +10733,11 @@ if hidden_by_cap:
         f"  ({hidden_by_cap} more sub-items hidden,"
         f" use -n 0 to show all)"
     )
+if hidden_below:
+    typer.echo(
+        f"  ({hidden_below} deeper sub-items hidden,"
+        f" use --recursive to list)"
+    )
 @
 
 Each rule that hid something says so, in the order the rules ran:
@@ -10580,21 +10746,21 @@ Read the other way round the second number would not be checkable
 against anything on the screen, because the cap's count already
 speaks only about items the done filter had passed.
 
-Without [[--recursive]] there is one rule and one line, naming the
-flag that lifts it.  The exception is the parent whose every child
-is done: the recursive walk found nothing to list, and printing
-nothing would make the parent read as a leaf, so the [[--done]] line
-takes the place of the other---and [[--done]] does lift it, since it
-brings the listing along.
+The depth limit is the third rule and its line comes last, for the
+reason the cap's comes after the done filter's: its number is the
+rows [[-r]] would add to the listing as it stands, cap and done
+filter included, so a reader can check it by adding the flag and
+counting.
 
-Let's verify the default: the sub-items are counted rather than
-listed, in both renderers, the count is what [[-r]] then prints, a
-leaf says nothing, and an explicit [[--no-recursive]] beats [[-r]].
+Let's verify the default: the children are listed and the deeper
+levels counted, in both renderers, the count is what [[-r]] then
+adds, a parent of leaves says nothing, and [[-r 0]] is the default
+depth again.
 
 <<test functions>>=
-def test_view_default_hides_sub_items_with_hint(temp_todo_dir):
-    """Without -r the sub-items are counted, not listed."""
-    save_todos(4, [
+def test_view_default_lists_children_only(temp_todo_dir):
+    """Without -r the children are listed; deeper levels counted."""
+    save_todos(5, [
         TodoItem(
             id=1, title="Parent task",
             created="2026-02-20T10:00:00",
@@ -10607,88 +10773,71 @@ def test_view_default_hides_sub_items_with_hint(temp_todo_dir):
             id=3, title="Grandchild task", parent_id=2,
             created="2026-02-20T10:00:00",
         ),
+        TodoItem(
+            id=4, title="Leaf child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
     ])
-    hint = "(2 sub-items hidden, use --recursive to list)"
+    hint = "(1 deeper sub-items hidden, use --recursive to list)"
 
     plain = runner.invoke(cli, ["view", "1"])
     assert plain.exit_code == 0
-    assert "Child task" not in plain.stdout
-    assert "Sub-items" not in plain.stdout
+    assert "Child task" in plain.stdout
+    assert "Leaf child" in plain.stdout
+    assert "Grandchild task" not in plain.stdout
     assert hint in plain.stdout
 
     rich = runner.invoke(cli, ["view", "1", "--format", "rich"])
     assert rich.exit_code == 0
-    assert "Child task" not in rich.stdout
+    assert "Child task" in rich.stdout
+    assert "Grandchild task" not in rich.stdout
     assert hint in rich.stdout
 
     listed = runner.invoke(cli, ["view", "1", "-r"])
     assert listed.exit_code == 0
-    assert "Child task" in listed.stdout
     assert "Grandchild task" in listed.stdout
     assert "hidden" not in listed.stdout
 
-    explicit = runner.invoke(
-        cli, ["view", "1", "-r", "--no-recursive"]
-    )
-    assert "Child task" not in explicit.stdout
+    explicit = runner.invoke(cli, ["view", "1", "-r", "0"])
+    assert "Child task" in explicit.stdout
+    assert "Grandchild task" not in explicit.stdout
 
-    leaf = runner.invoke(cli, ["view", "3"])
-    assert leaf.exit_code == 0
-    assert "hidden" not in leaf.stdout
+    leaves = runner.invoke(cli, ["view", "2"])
+    assert leaves.exit_code == 0
+    assert "Grandchild task" in leaves.stdout
+    assert "hidden" not in leaves.stdout
 
 
-def test_view_all_done_children_still_hint_without_recursive(
-    temp_todo_dir,
-):
-    """A parent of only done children names --done, not -r."""
-    save_todos(3, [
+def test_view_depth_hint_respects_the_cap(temp_todo_dir):
+    """The deeper count is what -r adds under the same -n."""
+    save_todos(5, [
         TodoItem(
             id=1, title="Parent task",
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Done child", parent_id=1, status="done",
+            id=2, title="Child task", parent_id=1, priority=2.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Grandchild task", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=4, title="Cut child", parent_id=1, priority=1.0,
             created="2026-02-20T10:00:00",
         ),
     ])
-    result = runner.invoke(cli, ["view", "1"])
+    result = runner.invoke(cli, ["view", "1", "-n", "1"])
     assert result.exit_code == 0
-    assert "(1 done sub-items hidden, use --done to show)" in (
+    assert "Child task" in result.stdout
+    assert "Cut child" not in result.stdout
+    assert "(1 more sub-items hidden, use -n 0 to show all)" in (
         result.stdout
     )
-    assert "--recursive" not in result.stdout
-@
-
-Let's verify that the two flags about the list bring the list with
-them:
-
-<<test functions>>=
-def test_view_notes_and_done_imply_recursive(temp_todo_dir):
-    """--notes and --done each list the sub-items without -r."""
-    save_todos(4, [
-        TodoItem(
-            id=1, title="Parent task",
-            created="2026-02-20T10:00:00",
-        ),
-        TodoItem(
-            id=2, title="Pending child", parent_id=1,
-            notes="Child note",
-            created="2026-02-20T10:00:00",
-        ),
-        TodoItem(
-            id=3, title="Done child", parent_id=1, status="done",
-            created="2026-02-20T10:00:00",
-        ),
-    ])
-    notes = runner.invoke(cli, ["view", "1", "--notes"])
-    assert notes.exit_code == 0
-    assert "Pending child" in notes.stdout
-    assert "Child note" in notes.stdout
-
-    done = runner.invoke(cli, ["view", "1", "--done"])
-    assert done.exit_code == 0
-    assert "Pending child" in done.stdout
-    assert "Done child" in done.stdout
+    assert "(1 deeper sub-items hidden, use --recursive to list)" in (
+        result.stdout
+    )
 @
 
 Let's verify the depth: a great-grandchild is indented one level past
@@ -10727,6 +10876,14 @@ def test_view_recursive_reaches_great_grandchildren(temp_todo_dir):
     assert "Great 6" not in result.stdout
     assert "(1 more sub-items hidden, use -n 0 to show all)" in (
         result.stdout
+    )
+
+    one_more = runner.invoke(cli, ["view", "1", "-r", "1"])
+    assert one_more.exit_code == 0
+    assert "Grandchild task" in one_more.stdout
+    assert "Great 4" not in one_more.stdout
+    assert "(3 deeper sub-items hidden, use --recursive to list)" in (
+        one_more.stdout
     )
 @
 
@@ -10852,13 +11009,7 @@ if rows:
         <<print each sub-item with its blocks>>
     else:
         <<print sub-items as a table>>
-if hidden_by_flag:
-    console.print(Text(
-        f"  ({hidden_by_flag} sub-items hidden,"
-        f" use --recursive to list)",
-        style="dim",
-    ))
-elif hidden_done:
+if hidden_done:
     console.print(Text(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)",
@@ -10868,6 +11019,12 @@ if hidden_by_cap:
     console.print(Text(
         f"  ({hidden_by_cap} more sub-items hidden,"
         f" use -n 0 to show all)",
+        style="dim",
+    ))
+if hidden_below:
+    console.print(Text(
+        f"  ({hidden_below} deeper sub-items hidden,"
+        f" use --recursive to list)",
         style="dim",
     ))
 @
@@ -11018,7 +11175,7 @@ def test_view_command(temp_todo_dir):
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r"])
+    result = runner.invoke(cli, ["view", "1"])
     assert result.exit_code == 0
     assert "Parent task" in result.stdout
     assert "/tmp/project" in result.stdout
@@ -11060,7 +11217,7 @@ def test_view_format_rich_renders_markdown(temp_todo_dir, monkeypatch):
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r", "--format", "rich"])
+    result = runner.invoke(cli, ["view", "1", "--format", "rich"])
     assert result.exit_code == 0
     assert "Parent task" in result.stdout
     assert "/tmp/project" in result.stdout
@@ -11260,7 +11417,7 @@ def test_view_shows_unset_priority_and_mixed_child_order(
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r"])
+    result = runner.invoke(cli, ["view", "1"])
 
     assert result.exit_code == 0
     assert "Priority: unset" in result.stdout
@@ -11297,13 +11454,13 @@ def test_view_notes_shows_sub_item_blocks(temp_todo_dir):
         ),
     ])
 
-    preview = runner.invoke(cli, ["view", "1", "-r"])
+    preview = runner.invoke(cli, ["view", "1"])
     assert preview.exit_code == 0
     assert "First preview" in preview.stdout
     assert "More of the first note" not in preview.stdout
     assert "What the first child is" not in preview.stdout
 
-    result = runner.invoke(cli, ["view", "1", "-r", "--notes"])
+    result = runner.invoke(cli, ["view", "1", "--notes"])
     assert result.exit_code == 0
     assert "What the first child is" in result.stdout
     assert "More of the first note" in result.stdout
@@ -11336,7 +11493,7 @@ def test_view_notes_rich_renders_sub_item_blocks(
     ])
 
     result = runner.invoke(
-        cli, ["view", "1", "-r", "--format", "rich", "--notes"],
+        cli, ["view", "1", "--format", "rich", "--notes"],
     )
     assert result.exit_code == 0
     assert "Child task" in result.stdout
@@ -11366,19 +11523,19 @@ def test_view_all_includes_done_sub_items(temp_todo_dir):
         ),
     ])
 
-    hidden = runner.invoke(cli, ["view", "1", "-r"])
+    hidden = runner.invoke(cli, ["view", "1"])
     assert hidden.exit_code == 0
     assert "Done child" not in hidden.stdout
     assert "1 done sub-items hidden" in hidden.stdout
 
-    shown = runner.invoke(cli, ["view", "1", "-r", "--all"])
+    shown = runner.invoke(cli, ["view", "1", "--all"])
     assert shown.exit_code == 0
     assert "Done child" in shown.stdout
     assert "[done]" in shown.stdout
     assert "Recap line" in shown.stdout
     assert "What finishing it took" not in shown.stdout
 
-    both = runner.invoke(cli, ["view", "1", "-r", "--all", "--notes"])
+    both = runner.invoke(cli, ["view", "1", "--all", "--notes"])
     assert both.exit_code == 0
     assert "Done child" in both.stdout
     assert "What finishing it took" in both.stdout
@@ -11414,7 +11571,7 @@ def test_view_caps_sub_items_at_the_default(temp_todo_dir):
         for n in range(2, 9)
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r"])
+    result = runner.invoke(cli, ["view", "1"])
 
     assert result.exit_code == 0
     assert "Child 2" in result.stdout
@@ -11501,7 +11658,7 @@ def test_view_n_zero_shows_all_sub_items(temp_todo_dir):
         for n in range(2, 9)
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r", "-n", "0"])
+    result = runner.invoke(cli, ["view", "1", "-n", "0"])
 
     assert result.exit_code == 0
     assert "Child 8" in result.stdout
@@ -11532,7 +11689,7 @@ def test_view_cap_applies_after_the_done_filter(temp_todo_dir):
         for n in range(2, 8)
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r", "-n", "2"])
+    result = runner.invoke(cli, ["view", "1", "-n", "2"])
 
     assert result.exit_code == 0
     out = result.stdout
@@ -11572,7 +11729,7 @@ def test_view_notes_respects_the_cap(temp_todo_dir):
     ])
 
     result = runner.invoke(
-        cli, ["view", "1", "-r", "-n", "1", "--notes"]
+        cli, ["view", "1", "-n", "1", "--notes"]
     )
 
     assert result.exit_code == 0
@@ -11600,7 +11757,7 @@ def test_view_rich_respects_the_cap(temp_todo_dir, monkeypatch):
     ])
 
     result = runner.invoke(
-        cli, ["view", "1", "-r", "-n", "1", "--format", "rich"]
+        cli, ["view", "1", "-n", "1", "--format", "rich"]
     )
 
     assert result.exit_code == 0
@@ -11629,7 +11786,7 @@ def test_view_says_nothing_when_under_the_cap(temp_todo_dir):
         for n in range(2, 5)
     ])
 
-    result = runner.invoke(cli, ["view", "1", "-r"])
+    result = runner.invoke(cli, ["view", "1"])
 
     assert result.exit_code == 0
     assert "Child 4" in result.stdout
@@ -21486,6 +21643,8 @@ from nytid.cli.todo import (
     get_tree_rows,
     get_subtree_rows,
     get_visible_sub_item_rows,
+    parse_depth,
+    rewrite_depth_flags,
     get_siblings,
     get_active_siblings,
     check_parent_completion,
