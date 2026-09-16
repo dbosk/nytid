@@ -8150,8 +8150,8 @@ The list command shows ranked todos first, ordered by effective
 priority, and then any unranked todos in deadline order. By default it
 shows only top-level items (those without a parent), keeping the list
 scannable without drowning the user in sub-tasks. The [[--all]] option
-enables the full tree view: top-level items with their children
-indented below. The [[--flat]] option shows a flat list in that same
+adds one level: each top-level item with its direct children indented
+below. The [[--flat]] option shows a flat list in that same
 display order instead of the indented tree.
 
 We query tracked time by looking for entries with [[todo:<id>]] labels
@@ -8342,7 +8342,7 @@ def ls(
 
     <<treat [[-n 0]] as unlimited>>
     <<filter todos>>
-    <<restrict to top-level when not [[show_tree]]>>
+    <<restrict [[filtered]] to the requested depth>>
     <<query tracked time>>
 
     <<determine effective format>>
@@ -8563,20 +8563,30 @@ def get_visible_roots(
     ]
 @
 
-When [[--all]] is not given, we restrict [[filtered]] to its
-visible roots.  This keeps the list scannable by default: subitems
-of a visible parent are subordinate detail the user can reveal on
-demand with [[--all]].  Applying the restriction before the
-format-selection branch keeps JSON, CSV, and rich table output
-consistent.
+The depth of the listing is decided here, once, before the format
+branch.  Without [[--all]] we restrict [[filtered]] to its visible
+roots: sub-items of a visible parent are subordinate detail the user
+can reveal on demand.  With [[--all]] we keep those roots and their
+direct children---one level, in every format.
 
-<<restrict to top-level when not [[show_tree]]>>=
-if not show_tree:
-    filtered = get_visible_roots(filtered)
+That last clause is a change.  [[--all]] used to leave [[filtered]]
+untouched, so a JSON or CSV listing carried every depth while the
+rich table, which walked one level by hand, showed grandchildren to
+nobody.  A flag whose meaning depends on the output format is a trap
+for the script that switches formats, so the restriction now applies
+before the renderer is chosen, and JSON, CSV, the flat table and the
+tree all agree on what one level is.
+
+<<restrict [[filtered]] to the requested depth>>=
+roots = get_visible_roots(filtered)
+if show_tree:
+    root_ids = {t.id for t in roots}
+    filtered = roots + [
+        t for t in filtered if t.parent_id in root_ids
+    ]
+else:
+    filtered = roots
 @
-
-When [[--all]] is given the tree renderer already handles building
-the top-level list itself, so we leave [[filtered]] untouched.
 
 To show tracked time, we load track data and sum durations for
 entries matching [[todo:<id>]] labels. This avoids duplicating the
@@ -8688,6 +8698,48 @@ def test_ls_all_shows_children(temp_todo_dir):
     )
     assert "Parent task" in result.output
     assert "Child task" in result.output
+
+
+def test_ls_all_stops_at_children(temp_todo_dir):
+    """--all shows one level in every format; grandchildren wait.
+
+    The child that has children of its own gets a progress row, so
+    the level below the listing is visible even though its rows are
+    not.
+    """
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=1,
+        ),
+        TodoItem(
+            id=3, title="Grandchild task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=2,
+        ),
+    ])
+    rich = runner.invoke(
+        cli, ["ls", "--all", "--format", "rich", "--who", ""]
+    )
+    assert rich.exit_code == 0
+    assert "Child task" in rich.output
+    assert "Grandchild task" not in rich.output
+    assert rich.output.count("[0/1 done]") == 2
+
+    as_json = runner.invoke(
+        cli, ["ls", "--all", "--format", "json", "--who", ""]
+    )
+    assert as_json.exit_code == 0
+    titles = [t["title"] for t in json.loads(as_json.stdout)]
+    assert titles == ["Parent task", "Child task"]
 
 
 def test_ls_who_promotes_orphaned_child(temp_todo_dir):
@@ -9030,9 +9082,9 @@ print(json_mod.dumps(
 
 For rich table output we use [[rich.table.Table]] so the
 terminal gets nicely aligned, coloured columns. The tree layout
-is preserved: children are indented with a \texttt{└─} prefix
-in the Title column, and a dimmed progress summary follows each
-parent that has children.
+is preserved: sub-items are indented under their parent with a
+[[└─]] marker in the Title column, and a dimmed progress summary
+follows each parent that has children.
 
 That progress summary must also land in the Title column when the
 optional priority column is hidden. A fixed [[table.add_row("", "",
@@ -9056,6 +9108,7 @@ priority visible instead of pretending it is zero.
 <<output rich table>>=
 from rich.console import Console
 from rich import box
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
@@ -9112,9 +9165,10 @@ def truncation_hint(hidden):
 Whichever chunk above did the slicing left [[hidden]] behind for us,
 and the two chunks compute it differently on purpose: the flat listing
 caps items, while the tree listing caps \emph{top-level} items and
-lets each one bring its children along.  Reporting the difference the
-renderer actually made is the only way the count matches what the
-reader sees.
+lets each one bring its whole subtree along.  Reporting the difference
+the renderer actually made is the only way the count matches what the
+reader sees---which also means a tree of busy items can print many
+rows and still, truthfully, report a small number.
 
 The line is dimmed, the same treatment the progress summaries get: it
 is commentary on the listing rather than a row of it, and dimming says
@@ -9171,47 +9225,147 @@ table.add_column("Tracked", justify="right")
 table.add_column("Status")
 @
 
+The row chunk below indents its title by [[depth]], and a flat
+listing has no depth, so the variable is set once before the loop
+rather than threaded through a chunk that has no other reason to know
+about trees.
+
 <<populate flat rows into rich table>>=
 ranked = sort_todos_for_display(filtered, now)
 sorted_items = ranked[:count]
 hidden = len(ranked) - len(sorted_items)
+depth = 0
 for item in sorted_items:
     <<add item row to rich table>>
 @
 
-<<populate tree rows into rich table>>=
-roots = sort_todos_for_display(
-    get_visible_roots(filtered), now
-)
-top_level = roots[:count]
-hidden = len(roots) - len(top_level)
-for item in top_level:
-    <<add item row to rich table>>
+\paragraph{Walking the tree}
+
+The tree is a depth-first walk that starts at the visible roots and
+descends only into children that are themselves in [[filtered]].
+Membership in the filtered list, not [[parent_id]] alone, decides
+both where the walk starts and where it goes next, so the promotion
+that [[get_visible_roots]] performs for a child whose parent a filter
+removed holds at every depth: an orphaned grandchild is a root, not a
+missing row.  It is also what lets one walker serve every depth.
+[[<<restrict [[filtered]] to the requested depth>>]] has already cut
+the list to one level under [[--all]], so the walk stops there on its
+own; hand it the whole tree and it lists the whole tree.
+
+The cap applies to roots, and each root brings its subtree along
+uncut---the flat listing caps rows, the tree caps top-level items, as
+[[truncation_hint]] explains.  Rows come back as (depth, item) pairs
+so the renderer is one loop with an indentation rule, the same shape
+the [[view]] command uses for its sub-items.  No cycle guard is
+needed here, unlike in [[get_ancestors]]: a root is an item whose
+parent is absent, and a [[parent_id]] cycle contains no such item, so
+the walk never enters one.
+
+<<sub-item helpers>>=
+def get_tree_rows(
+    items: list[TodoItem], now=None, count=None,
+) -> tuple[list[tuple[int, TodoItem]], int]:
+    """Return the tree of `items` as (depth, item) rows.
+
+    Visible roots come in display order, capped at `count` (None
+    for no cap), each followed depth-first by its children that are
+    present in `items`.  The second value is the number of roots the
+    cap left out.
+    """
+    roots = sort_todos_for_display(get_visible_roots(items), now)
+    top_level = roots[:count]
+    rows = []
+    for root in top_level:
+        rows.extend(get_subtree_rows(items, root, now))
+    return rows, len(roots) - len(top_level)
+
+
+def get_subtree_rows(items, item, now=None, depth=0):
+    """Return `item` and its descendants in `items` as (depth, item)."""
+    rows = [(depth, item)]
     children = sort_todos_for_display(
-        [
-            t for t in filtered
-            if t.parent_id == item.id
-        ],
-        now,
+        [t for t in items if t.parent_id == item.id], now
     )
-    all_children = get_children(todos, item.id)
-    if all_children:
-        done_count = sum(
-            1 for c in all_children
-            if c.status == "done"
-        )
-        total = len(all_children)
-        progress = Text(
-            f"[{done_count}/{total} done]",
-            style="dim",
-        )
-        progress_row = [""]
-        if show_prio:
-            progress_row.append("")
-        progress_row.append(progress)
-        table.add_row(*progress_row)
     for child in children:
-        <<add child row to rich table>>
+        rows.extend(get_subtree_rows(items, child, now, depth + 1))
+    return rows
+@
+
+Let's verify the walk: children nest under their parent at increasing
+depth, an item whose parent is absent is a root, and the cap counts
+roots while the subtree of a kept root comes along whole.
+
+<<test functions>>=
+def test_get_tree_rows_walks_filtered_subtree():
+    """Rows descend into children present in the list; roots capped."""
+    items = [
+        TodoItem(
+            id=1, title="Root A", priority=9.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Grandchild", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=4, title="Root B", priority=1.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=5, title="Orphan", parent_id=99,
+            created="2026-02-20T10:00:00",
+        ),
+    ]
+    now = datetime.datetime.now()
+
+    rows, hidden = get_tree_rows(items, now)
+    assert [(d, t.id) for d, t in rows] == [
+        (0, 1), (1, 2), (2, 3), (0, 4), (0, 5),
+    ]
+    assert hidden == 0
+
+    rows, hidden = get_tree_rows(items, now, count=1)
+    assert [(d, t.id) for d, t in rows] == [(0, 1), (1, 2), (2, 3)]
+    assert hidden == 2
+@
+
+<<populate tree rows into rich table>>=
+rows, hidden = get_tree_rows(filtered, now, count)
+for depth, item in rows:
+    <<add item row to rich table>>
+    <<add a progress row under a parent>>
+@
+
+Every parent gets a progress summary, not only the top-level ones.
+Under [[--all]] a child with children of its own is the only sign
+that a level exists below the listing, and in a deeper tree the
+summary says how far along each branch is.  The count comes from
+[[todos]], not [[filtered]], so it reports the whole family whatever
+the filters removed.  The summary sits in the Title column, indented
+like the title above it, and the leading empty cells depend on
+whether the priority column is shown, as explained above.
+
+<<add a progress row under a parent>>=
+all_children = get_children(todos, item.id)
+if all_children:
+    done_count = sum(
+        1 for c in all_children
+        if c.status == "done"
+    )
+    total = len(all_children)
+    progress = Padding(
+        Text(f"[{done_count}/{total} done]", style="dim"),
+        (0, 0, 0, 2 * depth),
+    )
+    progress_row = [""]
+    if show_prio:
+        progress_row.append("")
+    progress_row.append(progress)
+    table.add_row(*progress_row)
 @
 
 We share a small helper to format the deadline and estimate
@@ -9226,6 +9380,15 @@ cells are ids, numbers, dates and status words we generate---so they
 are the only cells that need the literal treatment.
 The [[view]] command's renderer and [[print_rows]]
 (\cref{cli.utils.output}) make the same move.
+
+Depth becomes indentation of the title, as a [[Padding]] around the
+cell rather than spaces in front of it.  Titles routinely outrun
+their column, and when [[rich]] wraps a cell it keeps leading spaces
+only on the first line, so a nested title that wraps shows its
+continuation lines flush with its parent---the nesting vanishes
+exactly when the tree is deep enough to need it.  A padding indents
+every wrapped line; [[view]] indents its sub-items the same way for
+the same reason.
 
 <<add item row to rich table>>=
 ep = effective_priority(item, now)
@@ -9252,46 +9415,15 @@ table.add_row(
     *([
         "" if ep is None else f"{ep:.1f}"
     ] if show_prio else []),
-    Text(item.title),
+    Padding(
+        Text(("\u2514\u2500 " if depth else "") + item.title),
+        (0, 0, 0, 2 * depth),
+    ),
     item.who or "",
     dl_str,
     est_str,
     tracked_str,
     item.status,
-)
-@
-
-<<add child row to rich table>>=
-ep = effective_priority(child, now)
-dl_str = ""
-if child.deadline:
-    try:
-        dl = datetime.datetime.fromisoformat(
-            child.deadline
-        )
-        dl_str = dl.strftime("%b %d")
-    except ValueError:
-        dl_str = child.deadline[:10]
-est_str = (
-    f"{child.estimated:.1f}h"
-    if child.estimated
-    else ""
-)
-tracked = tracked_times.get(child.id, 0)
-tracked_str = (
-    f"{tracked:.1f}h" if tracked > 0 else ""
-)
-table.add_row(
-    str(child.id),
-    *([
-        "" if ep is None else f"{ep:.1f}"
-    ] if show_prio else []),
-    Text(f"  \u2514\u2500 {child.title}"),
-    child.who or "",
-    dl_str,
-    est_str,
-    tracked_str,
-    child.status,
 )
 @
 
@@ -20921,6 +21053,8 @@ from nytid.cli.todo import (
     should_spawn_shell,
     get_children,
     get_descendants,
+    get_tree_rows,
+    get_subtree_rows,
     get_siblings,
     get_active_siblings,
     check_parent_completion,
