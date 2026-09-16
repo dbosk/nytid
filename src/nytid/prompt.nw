@@ -1,8 +1,8 @@
 \chapter{Fast status for shell prompts}%
 \label{prompt}
 
-A shell prompt that shows the active todos and the currently tracked
-labels must run on \emph{every} prompt render.
+A shell prompt that shows the current todo context and the
+currently tracked labels must run on \emph{every} prompt render.
 The obvious implementation runs [[nytid todo status]] and
 [[nytid track status --who $USER]], which together take about
 1.2~seconds---long enough that pressing return feels sluggish.
@@ -46,11 +46,14 @@ we need to locate the configuration file the same way
 <<[[prompt.py]]>>=
 """Machine-readable nytid status for shell prompts.
 
-Prints two lines: the space-separated ids of the active
-(in-progress) todos, and the space-separated labels currently
-tracked by `nytid track`.  Designed to be cheap enough to run on
-every shell prompt render; it deliberately avoids importing
-`nytid.cli`, which would pull in the whole CLI dependency tree.
+Prints two lines.  The first is the todo context: in a tracked
+tmux pane or window, the chain of todo ids from the root down to
+that window's current task (`353>356>359`); elsewhere, the
+space-separated ids of all active (in-progress) todos.  The second
+is the space-separated labels currently tracked by `nytid track`.
+Designed to be cheap enough to run on every shell prompt render;
+it deliberately avoids importing `nytid.cli`, which would pull in
+the whole CLI dependency tree.
 
 Installed as the script `prompt-nytid`.
 """
@@ -68,10 +71,14 @@ The [[__main__]] guard lets us run the module as
 experiments and for the cheapness test below.
 
 <<imports>>=
+import hashlib
 import json
 import os
 import pathlib
+import socket
+import subprocess
 import sys
+import tempfile
 
 import platformdirs
 @
@@ -244,42 +251,61 @@ order, drop ids missing from the todos, ids whose status is
 [[done]], and duplicates.
 We replicate exactly that filter; anything less and the prompt
 would show todos the CLI no longer considers active.
+The reader returns the parent map alongside the stack because the
+window chain (\cref{prompt:chain}) needs both, and one parse of
+[[todos.json]] per prompt is the whole budget for that file.
 
 <<functions>>=
-def active_todo_ids():
-    """Return the ids of the active todos, in stack order.
+def todo_state():
+    """Return the todo tree's parents and the active stack.
 
-    Replicates the semantics of `load_todo_state` and
-    `normalize_active_stack` in `nytid.cli.todo`: stack order is
-    kept; ids missing from `todos.json`, ids whose status is
-    `done`, and duplicates are dropped.  Missing or corrupt
-    files yield an empty list.
+    Returns `(parent_by_id, active_ids)`: the parent id (or
+    `None`) of every todo in `todos.json`, and the ids of the
+    active todos in stack order, normalized like
+    `load_todo_state` and `normalize_active_stack` in
+    `nytid.cli.todo`: stack order is kept; ids missing from
+    `todos.json`, ids whose status is `done`, and duplicates
+    are dropped.  Missing or corrupt files yield empty results.
     """
     directory = todo_dir()
     <<read the todo statuses>>
     <<read and normalize the raw stack>>
-    return normalized
+    return parent_by_id, normalized
+
+
+def active_todo_ids():
+    """Return the ids of the active todos, in stack order.
+
+    See `todo_state` for the normalization rule.
+    """
+    _, active = todo_state()
+    return active
 @
 
-We only need each todo's status, so we index status by id rather
-than deserializing full todo items.
+We only need each todo's status and parent, so we index those by
+id rather than deserializing full todo items.
 The error handling matches the real reader's granularity: on any
 problem with [[todos.json]], [[load_todos_raw]] discards the whole
 file and returns no todos, whereupon normalization drops every
 stack id.
-An empty status map achieves the same.
+Empty maps achieve the same.
 
 <<read the todo statuses>>=
 status_by_id = {}
+parent_by_id = {}
 try:
     with open(directory / TODO_FILE) as todo_file:
         data = json.load(todo_file)
     for item in data.get("todos", []):
-        status_by_id[int(item["id"])] = item.get(
-            "status", "pending"
+        todo_id = int(item["id"])
+        status_by_id[todo_id] = item.get("status", "pending")
+        parent = item.get("parent_id")
+        parent_by_id[todo_id] = (
+            None if parent is None else int(parent)
         )
 except (OSError, ValueError, KeyError, TypeError):
     status_by_id = {}
+    parent_by_id = {}
 <<constants>>=
 TODO_FILE = "todos.json"
 @
@@ -329,6 +355,10 @@ def prompt_dirs(tmp_path, monkeypatch):
     """Point both the real modules and `nytid.prompt` at
     temporary todo and tracking directories.
 
+    The tmux state directory is the tracking directory, as in
+    the CLI suites, and the tmux variables are removed so a
+    developer's own tmux cannot leak in.
+
     Yields the pair (todo directory, tracking directory).
     """
     todo_path = tmp_path / "todos"
@@ -352,6 +382,14 @@ def prompt_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         nytid.prompt, "tracking_dir", lambda: tracking_path
     )
+    monkeypatch.setattr(
+        real_track, "get_tmux_state_dir", lambda: tracking_path
+    )
+    monkeypatch.setattr(
+        nytid.prompt, "tmux_state_dir", lambda: tracking_path
+    )
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     yield todo_path, tracking_path
 @
 
@@ -394,6 +432,502 @@ def test_active_todo_ids_corrupt_files(prompt_dirs):
     (todo_path / "todos.json").write_text("{not json")
     (todo_path / "active_stack.json").write_text("[1, 2")
     assert nytid.prompt.active_todo_ids() == []
+@
+
+
+\section{The current window's todo chain}%
+\label{prompt:chain}
+
+Inside tmux the CLI does not act on the global stack top.  An
+ID-less [[todo done]] or [[todo next]] resolves its task from the
+[[todo:<id>]] labels that the [[track]] module keeps per tmux pane
+and window ([[resolve_todo_from_tmux_context]] in \cref{cli.todo},
+the label files in \cref{track:window-auto-suspend}), so that
+parallel task windows do not steal each other's context.  A prompt
+that showed the global stack would therefore name todos that
+[[done]] in this window would never touch.  Instead the first line
+shows the chain from the root task down to the window's current
+task, [[353>356>359]]: the same task the CLI would act on, with its
+ancestors for orientation.  Outside tmux, or in a pane and window
+that nytid does not track, the CLI falls back to the global stack,
+and so does the prompt (\cref{prompt:cli}).
+
+Replicating the resolver means replicating how the state files are
+found.  They live in a tmux-scoped directory
+(\cref{track:tmux-state-dir}), configurable like the data
+directories; unlike the real helper we neither create the directory
+nor check its owner, because a prompt must never create state and a
+missing directory simply means nothing is tracked.
+
+<<functions>>=
+def tmux_state_dir():
+    """Return the directory holding tmux-scoped state files.
+
+    Mirrors `get_tmux_state_dir` in `nytid.cli.track` without
+    creating the directory or checking its owner.
+    """
+    configured = config_value(TMUX_STATE_DIR_CONFIG, None)
+    if configured is None:
+        return (
+            pathlib.Path(tempfile.gettempdir())
+            / f"nytid-{os.getuid()}"
+        )
+    return pathlib.Path(configured)
+<<constants>>=
+TMUX_STATE_DIR_CONFIG = "track.tmux_state_dir"
+@
+
+Each file name embeds a \emph{server key}
+(\cref{track:server-key}): a hash of the host name and the socket
+path taken from [[$TMUX]], followed by the server's generation, its
+PID and start time.  The hash we can compute for free; we split
+[[$TMUX]] from the right because the socket path may itself contain
+commas, exactly as [[parse_tmux_socket_path]] does.
+
+<<functions>>=
+def tmux_sockethash(tmux_env):
+    """Return the address part of the tmux server key, or `None`.
+
+    Mirrors `parse_tmux_socket_path` and `build_tmux_sockethash`
+    in `nytid.cli.track`.
+    """
+    if not tmux_env:
+        return None
+    try:
+        socket_path, _pid, _session = tmux_env.rsplit(",", 2)
+    except ValueError:
+        socket_path = tmux_env
+    if not socket_path:
+        return None
+    digest = hashlib.sha256(
+        f"{socket.gethostname()}\0{socket_path}".encode()
+    ).hexdigest()
+    return digest[:16]
+@
+
+The generation, by contrast, only the server knows, and the window
+containing our pane likewise---[[TMUX_PANE]] is the one identifier
+the environment reliably carries.  Both come from a single
+[[tmux display-message]] query, the one subprocess this module
+allows itself: it costs a few milliseconds, well inside the budget,
+but only when there is tracked state to read (the guard in
+[[context_todo_id]] below).  Any failure means \enquote{no
+context}, never a traceback.
+
+<<functions>>=
+def tmux_pane_context(pane_id):
+    """Return `(generation, window id)` for `pane_id`, or `None`.
+
+    One `tmux display-message` query yields both the server's
+    `pid-start_time` generation, which completes the server key,
+    and the id of the window containing the pane.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "display-message", "-p", "-t", pane_id,
+                "#{pid}-#{start_time} #{window_id}",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    parts = result.stdout.split()
+    if len(parts) != 2 or not parts[0].strip("-"):
+        return None
+    return parts[0], parts[1]
+@
+
+Let's pin the address computation to the real one, including the
+comma-in-path case and the degenerate values.
+
+<<test functions>>=
+def test_tmux_sockethash_matches_track():
+    """Drift guard: same sockethash as `nytid.cli.track`."""
+    host = socket.gethostname()
+    for tmux_env, path in (
+        ("/tmp/tmux.sock,123,0", "/tmp/tmux.sock"),
+        ("/tmp/a,b.sock,123,0", "/tmp/a,b.sock"),
+    ):
+        assert nytid.prompt.tmux_sockethash(tmux_env) \
+            == real_track.build_tmux_sockethash(
+                host, real_track.parse_tmux_socket_path(tmux_env),
+            )
+    assert nytid.prompt.tmux_sockethash(None) is None
+    assert nytid.prompt.tmux_sockethash("") is None
+    assert nytid.prompt.tmux_sockethash(",1,0") is None
+
+
+def test_tmux_state_dir_matches_track(tmp_path, monkeypatch):
+    """Drift guard: same directory rule as `get_tmux_state_dir`."""
+    conf = tmp_path / "config.json"
+    monkeypatch.setattr(nytid.prompt, "config_file", lambda: conf)
+    configured = str(tmp_path / "state")
+    for value in (None, configured):
+        conf.write_text(json.dumps(
+            {"track": {"tmux_state_dir": value}} if value else {}
+        ))
+        with cli_config(
+            {"track.tmux_state_dir": value} if value else {}
+        ):
+            assert nytid.prompt.tmux_state_dir() \
+                == real_track.get_tmux_state_dir()
+@
+
+With the files located, the resolution rule is the CLI's: the
+pane's file is consulted first, then the file of the window that
+contains the pane; from each we take the [[todo:<id>]] labels that
+are on the active stack and pick the one latest in stack order,
+which---because the stack only ever grows by pushing children after
+their parents---is the deepest task in that context.  Two details
+of the real reader matter here.  First, the window file holds a
+mapping from label to a reference count and batch id, while the
+pane file holds a plain list (\cref{track:window-auto-suspend});
+legacy window files were plain lists too, and the real reader
+accepts both shapes, so we do.  Second, a file that exists but
+yields no todo is not the same as no file: inside tmux the CLI
+treats a tracked pane or window without a todo label as
+\enquote{no active todo}, whereas an untracked one makes it fall
+back to the global stack.  The reader therefore returns
+[[(tracked, todo_id)]] rather than a bare id.
+
+The early guard mirrors [[get_current_tmux_server_key]]: when no
+file at all carries this socket's hash, nothing is tracked on this
+server and we return before ever running [[tmux]], so an untracked
+prompt stays subprocess-free.  The key is spelled into the file
+names verbatim; it consists of hex digits and hyphens only, which
+[[sanitize_tmux_id]] passes through unchanged.
+
+<<functions>>=
+def read_label_file(path):
+    """Return the labels in a pane or window file, or `None`.
+
+    A pane file is a JSON list; a window file maps each label to
+    its entry.  Missing or corrupt files yield `None`.
+    """
+    try:
+        with open(path) as label_file:
+            data = json.load(label_file)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, list):
+        return [str(label) for label in data]
+    if isinstance(data, dict):
+        return [str(label) for label in data]
+    return None
+
+
+def latest_todo_on_stack(labels, stack):
+    """Return the `todo:<id>` in `labels` latest on `stack`."""
+    candidates = []
+    for label in labels:
+        if not label.startswith("todo:"):
+            continue
+        try:
+            todo_id = int(label[5:])
+        except ValueError:
+            continue
+        if todo_id in stack:
+            candidates.append(todo_id)
+    if not candidates:
+        return None
+    return max(candidates, key=stack.index)
+
+
+def context_todo_id(who, stack):
+    """Return `(tracked, todo id)` for the current pane or window.
+
+    Replicates `resolve_todo_from_tmux_context` in
+    `nytid.cli.todo`: the pane's labels first, then the tracked
+    window's, taking the `todo:<id>` latest on `stack`.
+    `tracked` is whether either file exists; outside tmux, or
+    without any state for this server, it is `False`.
+    """
+    <<locate the tmux server state>>
+    <<read the pane's todo id>>
+    <<read the window's todo id>>
+    return tracked, None
+@
+
+<<locate the tmux server state>>=
+pane_id = os.environ.get("TMUX_PANE")
+sockethash = tmux_sockethash(os.environ.get("TMUX"))
+if not pane_id or sockethash is None:
+    return False, None
+state_dir = tmux_state_dir()
+if not any(state_dir.glob(f"*_{sockethash}-*")):
+    return False, None
+context = tmux_pane_context(pane_id)
+if context is None:
+    return False, None
+generation, window_id = context
+server_key = f"{sockethash}-{generation}"
+suffix = f"_{sanitize_who(who)}.json"
+tracked = False
+@
+
+<<read the pane's todo id>>=
+labels = read_label_file(state_dir / (
+    f"pane_labels_{server_key}"
+    f"_{pane_id.replace('%', 'pane_')}{suffix}"
+))
+if labels is not None:
+    tracked = True
+    todo_id = latest_todo_on_stack(labels, stack)
+    if todo_id is not None:
+        return True, todo_id
+@
+
+<<read the window's todo id>>=
+labels = read_label_file(state_dir / (
+    f"window_labels_{server_key}"
+    f"_{window_id.replace('@', 'window_')}{suffix}"
+))
+if labels is not None:
+    tracked = True
+    todo_id = latest_todo_on_stack(labels, stack)
+    if todo_id is not None:
+        return True, todo_id
+@
+
+The chain is the task's ancestors, root first, then the task; the
+walk is [[get_ancestors]] from \cref{cli.todo} on the parent map,
+stopping at a missing parent and at a repeated id.  The three
+outcomes are kept apart for the caller: [[None]] when untracked,
+the empty string when tracked but idle, the chain otherwise.
+
+<<functions>>=
+def context_todo_chain(who):
+    """Return the current window's todo chain.
+
+    `None` when the pane and window are untracked (or outside
+    tmux), `""` when tracked but holding no active todo, and
+    otherwise the ids from the root task down to the window's
+    current task joined by `>`, e.g. `353>356>359`.
+    """
+    parent_by_id, stack = todo_state()
+    tracked, todo_id = context_todo_id(who, stack)
+    if not tracked:
+        return None
+    if todo_id is None:
+        return ""
+    chain = [todo_id]
+    seen = {todo_id}
+    parent = parent_by_id.get(todo_id)
+    while (
+        parent is not None
+        and parent in parent_by_id
+        and parent not in seen
+    ):
+        seen.add(parent)
+        chain.append(parent)
+        parent = parent_by_id[parent]
+    chain.reverse()
+    return ">".join(str(todo_id) for todo_id in chain)
+@
+
+The drift guards put both readers in the same fake tmux: the
+environment names a pane, the server generation and the pane's
+window are pinned on both sides, and the state files are written
+through the real [[track]] writers.  The real resolver must then
+agree with ours on every outcome---the leaf in a window, the pane
+file winning over the window file, a tracked window without a
+todo, and no state at all---and the chain must match
+[[get_ancestors]].
+
+The CLI reads its configuration through the cached, write-free
+[[default]] helper, so a guard that compares against the CLI has to
+feed that cache rather than a file; this mirrors the
+[[patched_worker_config]] helper of the todo test suite.
+
+<<test fixtures>>=
+@contextlib.contextmanager
+def cli_config(values):
+    """Serve `values` from the CLI's cached config for one block."""
+    def config_get(path):
+        if path in values:
+            return values[path]
+        raise KeyError(path)
+
+    fake = MagicMock()
+    fake.get.side_effect = config_get
+    defaults._reset_cache()
+    try:
+        with patch.object(
+            defaults.typerconf, "Config", lambda: fake
+        ):
+            yield
+    finally:
+        defaults._reset_cache()
+@
+
+<<test fixtures>>=
+TMUX_ENV = "/tmp/tmux.sock,123,0"
+GENERATION = "123-1700000000"
+
+
+def enter_tracked_tmux(monkeypatch, window_id="@42"):
+    """Pretend to sit in pane %7 of `window_id` on a pinned server.
+
+    Returns the server key both readers will use.
+    """
+    monkeypatch.setenv("TMUX", TMUX_ENV)
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(
+        real_track, "get_tmux_server_generation",
+        lambda: GENERATION,
+    )
+    monkeypatch.setattr(
+        real_track, "get_tmux_window_id_for_pane",
+        lambda pane: window_id,
+    )
+    monkeypatch.setattr(
+        nytid.prompt, "tmux_pane_context",
+        lambda pane: (GENERATION, window_id),
+    )
+    return real_track.build_tmux_server_key(
+        socket.gethostname(), "/tmp/tmux.sock", GENERATION,
+    )
+
+
+def save_chain(todo_path):
+    """Save the chain 353 > 356 > 359 plus an unrelated 400."""
+    todos = [
+        real_todo.TodoItem(
+            id=353, title="Root",
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=356, title="Mid", parent_id=353,
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=359, title="Leaf", parent_id=356,
+            created="2026-08-25T10:00:00",
+        ),
+        real_todo.TodoItem(
+            id=400, title="Other",
+            created="2026-08-25T10:00:00",
+        ),
+    ]
+    real_todo.save_todo_state_unlocked(
+        401, todos, [400, 353, 356, 359],
+    )
+    return todos
+@
+
+<<test functions>>=
+def test_context_todo_matches_real_resolver(
+    prompt_dirs, monkeypatch,
+):
+    """Drift guard: same leaf and chain as the CLI in a window."""
+    todo_path, _ = prompt_dirs
+    key = enter_tracked_tmux(monkeypatch)
+    todos = save_chain(todo_path)
+    real_track.write_window_labels(
+        "@42", "alice", key,
+        ["devel", "todo:353", "todo:356", "todo:359", "todo:400"],
+    )
+    stack = nytid.prompt.active_todo_ids()
+
+    tracked, leaf = nytid.prompt.context_todo_id("alice", stack)
+    assert tracked
+    assert leaf == real_todo.resolve_todo_from_tmux_context(
+        "alice", stack,
+    )
+    assert leaf == 359
+    chain = nytid.prompt.context_todo_chain("alice")
+    assert chain == ">".join(
+        str(t.id)
+        for t in real_todo.get_ancestors(todos, todos[2])
+    ) + ">359"
+    assert chain == "353>356>359"
+
+
+def test_context_pane_file_wins_over_window(
+    prompt_dirs, monkeypatch,
+):
+    """Drift guard: the pane's labels are consulted first."""
+    todo_path, _ = prompt_dirs
+    key = enter_tracked_tmux(monkeypatch)
+    save_chain(todo_path)
+    real_track.write_window_labels(
+        "@42", "alice", key, ["todo:359"],
+    )
+    real_track.write_pane_labels(
+        "%7", "alice", key, ["todo:356"],
+    )
+    stack = nytid.prompt.active_todo_ids()
+
+    assert nytid.prompt.context_todo_id("alice", stack) \
+        == (True, 356)
+    assert real_todo.resolve_todo_from_tmux_context(
+        "alice", stack,
+    ) == 356
+    assert nytid.prompt.context_todo_chain("alice") == "353>356"
+
+
+def test_context_tracked_window_without_todo(
+    prompt_dirs, monkeypatch,
+):
+    """Drift guard: tracked but idle is not the same as untracked."""
+    todo_path, _ = prompt_dirs
+    key = enter_tracked_tmux(monkeypatch)
+    save_chain(todo_path)
+    real_track.write_window_labels(
+        "@42", "alice", key, ["devel", "todo:999"],
+    )
+    stack = nytid.prompt.active_todo_ids()
+
+    assert nytid.prompt.context_todo_id("alice", stack) \
+        == (True, None)
+    assert real_todo.resolve_todo_from_tmux_context(
+        "alice", stack,
+    ) is None
+    assert nytid.prompt.context_todo_chain("alice") == ""
+
+
+def test_context_untracked(prompt_dirs, monkeypatch):
+    """Drift guard: no state means untracked, in or out of tmux."""
+    todo_path, _ = prompt_dirs
+    save_chain(todo_path)
+    stack = nytid.prompt.active_todo_ids()
+    assert nytid.prompt.context_todo_id("alice", stack) \
+        == (False, None)
+    assert nytid.prompt.context_todo_chain("alice") is None
+
+    enter_tracked_tmux(monkeypatch)
+    assert nytid.prompt.context_todo_id("alice", stack) \
+        == (False, None)
+    with pytest.raises(real_todo.NotInTmuxError):
+        real_todo.resolve_todo_from_tmux_context("alice", stack)
+
+
+def test_context_stays_subprocess_free_without_state(
+    prompt_dirs, monkeypatch,
+):
+    """Without tracked state, tmux is never queried."""
+    monkeypatch.setenv("TMUX", TMUX_ENV)
+    monkeypatch.setenv("TMUX_PANE", "%7")
+
+    def boom(pane):
+        raise AssertionError("tmux queried")
+
+    monkeypatch.setattr(nytid.prompt, "tmux_pane_context", boom)
+    assert nytid.prompt.context_todo_id("alice", []) \
+        == (False, None)
+
+
+def test_latest_todo_on_stack_picks_deepest():
+    """The label latest in stack order wins; others are ignored."""
+    stack = [353, 356, 359]
+    assert nytid.prompt.latest_todo_on_stack(
+        ["todo:359", "devel", "todo:353", "todo:x", "todo:999"],
+        stack,
+    ) == 359
+    assert nytid.prompt.latest_todo_on_stack(
+        ["devel"], stack,
+    ) is None
 @
 
 
@@ -577,15 +1111,21 @@ def test_active_labels_missing_or_corrupt(prompt_dirs):
 @
 
 
-\section{The command line}
+\section{The command line}%
+\label{prompt:cli}
 
-The entry point prints, by default, two lines: the active todo ids
-and the active labels, each space-separated, an empty line when
-there is nothing.
+The entry point prints, by default, two lines: the todo context and
+the active labels, an empty line when there is nothing.
+The todo context is the window chain of \cref{prompt:chain} when
+the pane or window is tracked---empty when it is tracked but idle,
+which is what the CLI would tell an ID-less command there---and the
+space-separated active todo ids otherwise, so a prompt outside tmux
+keeps showing what is active.
 Two lines with a fixed meaning make the shell side trivial:
 \begin{minted}{bash}
 readarray -t _nytid < <(prompt-nytid --who "$USER")
-# ${_nytid[0]} = active todo ids
+# ${_nytid[0]} = todo context: 353>356>359 in a tracked window,
+#                else the active todo ids
 # ${_nytid[1]} = tracked labels
 \end{minted}
 
@@ -612,7 +1152,9 @@ exhibit.
 def main():
     """Print machine-readable status lines for a prompt.
 
-    Line 1: space-separated active todo ids.
+    Line 1: the todo chain of the current tmux window
+    (`353>356>359`), or the space-separated active todo ids
+    when the pane and window are untracked.
     Line 2: space-separated tracked labels for `--who WHO`
     (default: the `USER` environment variable, or `me`).
     `--todos` or `--labels` restricts output to that one line.
@@ -645,9 +1187,12 @@ while i < len(args):
 
 <<print the requested lines>>=
 if only != "labels":
-    print(" ".join(
-        str(todo_id) for todo_id in active_todo_ids()
-    ))
+    context = context_todo_chain(who)
+    if context is None:
+        context = " ".join(
+            str(todo_id) for todo_id in active_todo_ids()
+        )
+    print(context)
 if only != "todos":
     print(" ".join(active_labels(who)))
 @
@@ -665,8 +1210,8 @@ for _ in range(1 if restricted else 2):
 @
 
 Let's verify the output contract: the default two lines, the
-restricted single lines, and that broken state files still
-produce empty, zero-exit output.
+restricted single lines, the three shapes of the first line, and
+that broken state files still produce empty, zero-exit output.
 
 <<test functions>>=
 def run_main(monkeypatch, capsys, argv):
@@ -702,6 +1247,32 @@ def test_main_default_two_lines(
 
     out = run_main(monkeypatch, capsys, ["--who", "alice"])
     assert out == "2 1\nDD1310 grading\n"
+
+
+def test_main_first_line_is_window_chain(
+    prompt_dirs, monkeypatch, capsys
+):
+    """In a tracked window the first line is the chain."""
+    todo_path, _ = prompt_dirs
+    monkeypatch.setenv("USER", "alice")
+    key = enter_tracked_tmux(monkeypatch)
+    save_chain(todo_path)
+    real_track.write_window_labels(
+        "@42", "alice", key, ["todo:353", "todo:356"],
+    )
+    assert run_main(
+        monkeypatch, capsys, ["--todos", "--who", "alice"]
+    ) == "353>356\n"
+
+    real_track.write_window_labels("@42", "alice", key, [])
+    assert run_main(
+        monkeypatch, capsys, ["--todos", "--who", "alice"]
+    ) == "\n"
+
+    monkeypatch.delenv("TMUX")
+    assert run_main(
+        monkeypatch, capsys, ["--todos", "--who", "alice"]
+    ) == "400 353 356 359\n"
 
 
 def test_main_restricted_lines(
@@ -788,12 +1359,15 @@ the drift guards; the fixtures live in
 [[<<test fixtures>>]] above.
 
 <<test [[prompt.py]]>>=
+import contextlib
 import datetime
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
+from unittest.mock import MagicMock, patch
 
 import platformdirs
 import pytest
@@ -803,6 +1377,7 @@ sys.path.insert(0, "../src")
 import nytid.prompt
 from nytid.cli import todo as real_todo
 from nytid.cli import track as real_track
+from nytid.cli.utils import defaults
 
 <<test fixtures>>
 <<test functions>>

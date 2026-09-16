@@ -40,6 +40,12 @@ siblings, and can be started/stopped independently via the track
 system. When all children of a parent are done, the parent is
 automatically marked done.
 
+Both listings keep sub-items out of the way by default: [[todo ls]]
+shows top-level items, [[todo view]] the item alone.  [[ls --all]]
+adds one level, and [[--recursive]] lists every depth in either
+command; [[todo.ls.recursive]] and [[todo.view.recursive]] make that
+the default.
+
 Starting a child automatically activates the entire ancestor chain:
 if you [[todo start 7]] and item~7 is a sub-item of~5, which in turn
 is a sub-item of~3, both~3 and~5 are pushed onto the active stack and
@@ -78,7 +84,7 @@ import sys
 import tempfile
 import typer
 import typerconf as config
-from nytid.cli.utils.defaults import default
+from nytid.cli.utils.defaults import default, config_hint
 from nytid.cli.utils.labels import apply_label_edits
 from nytid.cli.utils.output import print_markdown, print_rows
 from typing import Annotated
@@ -296,6 +302,64 @@ def test_get_worker_default_reads_config_once(
         assert fake.read_config.call_count == 1
     finally:
         defaults._reset_cache()
+@
+
+One launch decision is a preference rather than a fact about the
+task: whether starting a task that has a working directory but no
+command should open a shell there (\cref{todo:start-settle}).  A
+teacher who works in tracked tmux windows and reads the task from
+the prompt never wants that shell; an agent worker always does.  So
+the preference is resolved like auto-suspend is in [[track]]
+(\cref{track:auto-suspend}): the command-line flag wins, then the
+worker's own key, then the global default, and finally the
+historical behaviour of opening the shell.  The keys are read
+through the cached [[default]] helper for the same reason the
+worker defaults above are, and a missing key is simply the next
+fallback.  We accept the same spellings of \emph{true} that
+[[track]] does, so a user who has set [[track.auto-suspend]] can
+set this key the same way.
+
+<<constants>>=
+SHELL_CONFIG = "todo.shell"
+<<configuration>>=
+def should_spawn_shell(worker, flag):
+    """Resolve whether a wd-only start opens a shell.
+
+    Checks, in order: the `--shell/--no-shell` flag, the
+    `todo.shell.<worker>` key, the `todo.shell.default` key, and
+    finally `True`.
+    """
+    if flag is not None:
+        return flag
+    for key in (
+        f"{SHELL_CONFIG}.{worker}",
+        f"{SHELL_CONFIG}.default",
+    ):
+        value = default(key, None)
+        if value is not None:
+            return str(value).lower() in ("true", "1", "yes")
+    return True
+@
+
+Let's verify the resolution order: the flag beats the worker key,
+the worker key beats the default, and both spellings of the value
+are understood.
+
+<<test functions>>=
+def test_should_spawn_shell_resolution_order():
+    """Flag, then worker key, then default, then True."""
+    with patched_worker_config({}):
+        assert should_spawn_shell("me", None) is True
+        assert should_spawn_shell("me", False) is False
+    with patched_worker_config({"todo.shell.default": False}):
+        assert should_spawn_shell("me", None) is False
+        assert should_spawn_shell("me", True) is True
+    with patched_worker_config({
+        "todo.shell.default": "false",
+        "todo.shell.dan-claude": "yes",
+    }):
+        assert should_spawn_shell("me", None) is False
+        assert should_spawn_shell("dan-claude", None) is True
 @
 
 Let's verify that the read-only promise holds.  We give the cached
@@ -1835,16 +1899,31 @@ def filter_ids_by_worker(
         if i in by_id
         and (by_id[i].who or default_username) == who
     ]
+@
 
+Several callers need the whole line of ancestors above an item rather
+than one parent: [[ensure_ancestors_active]] activates all of them,
+the shell prompt (\cref{prompt}) prints the chain from the root down
+to the current task, and the depth of an item is simply the length
+of that line.  We return the ancestors root first, because that is
+the reading order of a path ([[353 > 356 > 359]]) and the activation
+order a parent-before-child stack needs.  The walk stops at a
+missing parent---an orphan is placed against the top level, as
+[[get_parent]] decides---and at a repeated id, so a cycle written by
+a broken editor session cannot hang the caller.
 
-def todo_depth(
+<<sub-item helpers>>=
+def get_ancestors(
     todos: list[TodoItem],
     item: TodoItem,
-) -> int:
-    """Return the depth of ``item`` in the todo tree."""
+) -> list[TodoItem]:
+    """Return the ancestors of ``item``, root first.
+
+    Stops at a missing parent or a cycle.
+    """
     by_id = {t.id: t for t in todos}
-    depth = 0
-    seen = set()
+    ancestors = []
+    seen = {item.id}
     parent_id = item.parent_id
     while (
         parent_id is not None
@@ -1852,11 +1931,19 @@ def todo_depth(
         and parent_id not in seen
     ):
         seen.add(parent_id)
-        depth += 1
+        ancestors.append(by_id[parent_id])
         parent_id = by_id[parent_id].parent_id
-    return depth
+    ancestors.reverse()
+    return ancestors
 
 
+def todo_depth(
+    todos: list[TodoItem],
+    item: TodoItem,
+) -> int:
+    """Return the depth of ``item`` in the todo tree."""
+    return len(get_ancestors(todos, item))
+<<sub-item helpers>>=
 def check_parent_completion(
     todos: list[TodoItem], parent_id: int
 ) -> bool:
@@ -2014,6 +2101,34 @@ def test_check_parent_completion():
     assert not check_parent_completion(todos, 1)
     todos[2].status = "done"
     assert check_parent_completion(todos, 1)
+
+
+def test_get_ancestors_root_first():
+    """The chain is returned from the root down."""
+    todos = [
+        TodoItem(id=353, title="Root"),
+        TodoItem(id=356, title="Mid", parent_id=353),
+        TodoItem(id=359, title="Leaf", parent_id=356),
+    ]
+    chain = get_ancestors(todos, todos[2])
+    assert [t.id for t in chain] == [353, 356]
+    assert get_ancestors(todos, todos[0]) == []
+    assert todo_depth(todos, todos[2]) == 2
+
+
+def test_get_ancestors_stops_at_orphan_and_cycle():
+    """A missing parent ends the chain; a cycle cannot hang it."""
+    orphan = [
+        TodoItem(id=2, title="Orphan", parent_id=99),
+    ]
+    assert get_ancestors(orphan, orphan[0]) == []
+    cycle = [
+        TodoItem(id=1, title="A", parent_id=2),
+        TodoItem(id=2, title="B", parent_id=1),
+    ]
+    assert [
+        t.id for t in get_ancestors(cycle, cycle[0])
+    ] == [2]
 @
 
 \subsection{Context-Aware Child Priorities}%
@@ -5705,21 +5820,14 @@ def ensure_ancestors_active(
     Returns the list of ancestor items that were
     newly activated (outermost first).
     """
-    by_id = {t.id: t for t in todos}
-    missing = []
-    current = item
-    while current.parent_id is not None:
-        parent = by_id.get(current.parent_id)
-        if parent is None:
-            break
-        if parent.id not in stack:
-            missing.append(parent)
-        current = parent
+    missing = [
+        ancestor
+        for ancestor in get_ancestors(todos, item)
+        if ancestor.id not in stack
+    ]
 
     if not missing:
         return []
-
-    missing.reverse()
 
     def push_ancestors(next_id, todos, stack):
         for ancestor in missing:
@@ -8048,9 +8156,10 @@ The list command shows ranked todos first, ordered by effective
 priority, and then any unranked todos in deadline order. By default it
 shows only top-level items (those without a parent), keeping the list
 scannable without drowning the user in sub-tasks. The [[--all]] option
-enables the full tree view: top-level items with their children
-indented below. The [[--flat]] option shows a flat list in that same
-display order instead of the indented tree.
+adds one level: each top-level item with its direct children indented
+below. The [[--recursive]] option lists every depth. The [[--flat]]
+option shows a flat list in that same display order instead of the
+indented tree.
 
 We query tracked time by looking for entries with [[todo:<id>]] labels
 in the track data, connecting the todo system to actual time spent.
@@ -8147,17 +8256,17 @@ done_opt = typer.Option(
     help="Include done items")
 ls_all_opt = typer.Option(
     "--all", "-a",
-    help="Show full tree including subtasks")
+    help="Show direct sub-items under each item")
 ls_count_opt = typer.Option(
     "-n",
     help="Limit output to top N items; "
          "0 shows all. "
-         "[config: todo.ls.count]")
+         + config_hint("todo.ls.count"))
 ls_who_opt = typer.Option(
     "--who", "-w",
     help="Filter by assignee regex "
          "(default: $USER, use '' for all). "
-         "[config: todo.ls.who]",
+         + config_hint("todo.ls.who"),
     autocompletion=complete_todo_workers)
 ls_flat_opt = typer.Option(
     "--flat",
@@ -8167,7 +8276,7 @@ ls_format_opt = typer.Option(
     help="Output format: table (rich on a TTY, "
          "headerless TSV in a pipe), rich, "
          "csv (header row and commas), json. "
-         "[config: todo.ls.format]")
+         + config_hint("todo.ls.format"))
 ls_status_opt = typer.Option(
     "--status", "-s",
     help="Filter by status: "
@@ -8181,6 +8290,61 @@ ls_output_opt = typer.Option(
     help="Write CSV output to file")
 @
 
+\paragraph{Every depth}
+
+[[--all]] stops at one level because that is what keeps a listing of
+a dozen projects scannable: the reader sees what each one is made of
+without the tree under every part.  Sometimes the tree is the
+question---which branch of a sprint is furthest behind---and for that
+[[--recursive]] lists every depth.  It implies [[--all]], since a
+tree cut below its roots' children has no deeper level to show.
+
+Whether one wants the whole tree is a habit rather than a fact about
+the data, so the default is read from configuration like the other
+listing defaults.  The option is a pair, [[--recursive]] and
+[[--no-recursive]], so that a configured default can still be
+overridden for one invocation.
+
+<<configuration>>=
+TODO_LS_RECURSIVE_CONFIG = "todo.ls.recursive"
+DEFAULT_LS_RECURSIVE = default(
+    TODO_LS_RECURSIVE_CONFIG, False, bool)
+<<argument and option definitions>>=
+ls_recursive_opt = typer.Option(
+    "--recursive/--no-recursive", "-r",
+    help="Show sub-items at every depth (implies --all). "
+         + config_hint("todo.ls.recursive"))
+@
+
+Let's verify that the key is advertised the way the others are:
+
+<<test functions>>=
+def test_ls_help_advertises_recursive_key():
+    """--help shows the todo.ls.recursive key."""
+    result = runner.invoke(cli, ["ls", "--help"])
+    assert result.exit_code == 0
+    rendered = re.sub(r"[\s\u2502]", "", result.output)
+    assert "[config:todo.ls.recursive]" in rendered
+@
+
+The suffix goes through [[config_hint]]
+(\cref{cli.utils.defaults.hint}) because Typer's rich help
+rendering would otherwise swallow the brackets.  Let's verify on the
+rendered help itself---the only place the escape can be seen to
+work.  Rich wraps the help column at whatever width it decides on,
+and may break the suffix across lines with box-drawing characters in
+between, so the comparison drops whitespace and the box border
+first:
+
+<<test functions>>=
+def test_ls_help_advertises_config_key():
+    """--help shows the config key despite rich markup."""
+    result = runner.invoke(cli, ["ls", "--help"])
+    assert result.exit_code == 0
+    rendered = re.sub(r"[\s\u2502]", "", result.output)
+    assert "[config:todo.ls.count]" in rendered
+@
+
 <<list command>>=
 @cli.command(name="ls")
 def ls(
@@ -8189,6 +8353,8 @@ def ls(
     include_done: Annotated[bool,
                             done_opt] = False,
     show_tree: Annotated[bool, ls_all_opt] = False,
+    recursive: Annotated[bool,
+                         ls_recursive_opt] = DEFAULT_LS_RECURSIVE,
     count: Annotated[int | None,
                      ls_count_opt] = DEFAULT_LS_COUNT,
     who_filter: Annotated[str | None,
@@ -8206,9 +8372,9 @@ def ls(
 
     Ranked items are shown first by effective priority; unranked
     items follow in deadline order. By default shows only top-level
-    items assigned to the current user. Pass `--all` to see the
-    full tree including subtasks, or `-n N` to cap the output at
-    N items; `-n 0` lifts the cap.
+    items assigned to the current user. Pass `--all` to see each
+    item's direct sub-items, `--recursive` to see every depth, or
+    `-n N` to cap the output at N items; `-n 0` lifts the cap.
 
     `--who` defaults to $USER; pass an empty string
     (`--who ''`) to show all assignees.
@@ -8222,7 +8388,7 @@ def ls(
 
     <<treat [[-n 0]] as unlimited>>
     <<filter todos>>
-    <<restrict to top-level when not [[show_tree]]>>
+    <<restrict [[filtered]] to the requested depth>>
     <<query tracked time>>
 
     <<determine effective format>>
@@ -8443,20 +8609,32 @@ def get_visible_roots(
     ]
 @
 
-When [[--all]] is not given, we restrict [[filtered]] to its
-visible roots.  This keeps the list scannable by default: subitems
-of a visible parent are subordinate detail the user can reveal on
-demand with [[--all]].  Applying the restriction before the
-format-selection branch keeps JSON, CSV, and rich table output
-consistent.
+The depth of the listing is decided here, once, before the format
+branch.  Without [[--all]] we restrict [[filtered]] to its visible
+roots: sub-items of a visible parent are subordinate detail the user
+can reveal on demand.  With [[--all]] we keep those roots and their
+direct children---one level, in every format.  With [[--recursive]]
+nothing is cut, and every format lists every depth.
 
-<<restrict to top-level when not [[show_tree]]>>=
-if not show_tree:
-    filtered = get_visible_roots(filtered)
+That last clause is a change.  [[--all]] used to leave [[filtered]]
+untouched, so a JSON or CSV listing carried every depth while the
+rich table, which walked one level by hand, showed grandchildren to
+nobody.  A flag whose meaning depends on the output format is a trap
+for the script that switches formats, so the restriction now applies
+before the renderer is chosen, and JSON, CSV, the flat table and the
+tree all agree on what one level is.
+
+<<restrict [[filtered]] to the requested depth>>=
+if not recursive:
+    roots = get_visible_roots(filtered)
+    if show_tree:
+        root_ids = {t.id for t in roots}
+        filtered = roots + [
+            t for t in filtered if t.parent_id in root_ids
+        ]
+    else:
+        filtered = roots
 @
-
-When [[--all]] is given the tree renderer already handles building
-the top-level list itself, so we leave [[filtered]] untouched.
 
 To show tracked time, we load track data and sum durations for
 entries matching [[todo:<id>]] labels. This avoids duplicating the
@@ -8568,6 +8746,151 @@ def test_ls_all_shows_children(temp_todo_dir):
     )
     assert "Parent task" in result.output
     assert "Child task" in result.output
+
+
+def test_ls_all_stops_at_children(temp_todo_dir):
+    """--all shows one level in every format; grandchildren wait.
+
+    The child that has children of its own gets a progress row, so
+    the level below the listing is visible even though its rows are
+    not.
+    """
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=1,
+        ),
+        TodoItem(
+            id=3, title="Grandchild task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=2,
+        ),
+    ])
+    rich = runner.invoke(
+        cli, ["ls", "--all", "--format", "rich", "--who", ""]
+    )
+    assert rich.exit_code == 0
+    assert "Child task" in rich.output
+    assert "Grandchild task" not in rich.output
+    assert rich.output.count("[0/1 done]") == 2
+
+    as_json = runner.invoke(
+        cli, ["ls", "--all", "--format", "json", "--who", ""]
+    )
+    assert as_json.exit_code == 0
+    titles = [t["title"] for t in json.loads(as_json.stdout)]
+    assert titles == ["Parent task", "Child task"]
+
+
+def save_three_generations():
+    """Store a parent, its child and that child's child, all pending."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="Child task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=1,
+        ),
+        TodoItem(
+            id=3, title="Grandchild task",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+            parent_id=2,
+        ),
+    ])
+
+
+def test_ls_recursive_shows_every_depth(temp_todo_dir):
+    """--recursive lists grandchildren, nested one level deeper."""
+    save_three_generations()
+    rich = runner.invoke(
+        cli, ["ls", "--recursive", "--format", "rich", "--who", ""]
+    )
+    assert rich.exit_code == 0
+    lines = rich.output.splitlines()
+    child = next(l for l in lines if "Child task" in l)
+    grandchild = next(l for l in lines if "Grandchild task" in l)
+    assert child.index("\u2514") < grandchild.index("\u2514")
+
+    as_json = runner.invoke(
+        cli, ["ls", "-r", "--format", "json", "--who", ""]
+    )
+    assert as_json.exit_code == 0
+    titles = [t["title"] for t in json.loads(as_json.stdout)]
+    assert sorted(titles) == [
+        "Child task", "Grandchild task", "Parent task",
+    ]
+
+
+def test_ls_recursive_flat_lists_every_depth(temp_todo_dir):
+    """--recursive --flat lists every depth without a tree."""
+    save_three_generations()
+    result = runner.invoke(
+        cli, ["ls", "-r", "--flat", "--format", "rich", "--who", ""]
+    )
+    assert result.exit_code == 0
+    assert "Grandchild task" in result.output
+    assert "\u2514" not in result.output
+
+
+def test_ls_rich_grandchild_indent_survives_wrapping(temp_todo_dir):
+    """Wrapped nested titles stay indented under their parent."""
+    long_title = " ".join(["word"] * 30)
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=2, title="child " + long_title, parent_id=1,
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+        TodoItem(
+            id=3, title="grandchild " + long_title, parent_id=2,
+            created="2026-02-20T10:00:00",
+            status="pending", who="me",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["ls", "-r", "--format", "rich", "--who", ""],
+        terminal_width=60,
+    )
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    child_start = next(
+        i for i, l in enumerate(lines) if "child word" in l
+    )
+    gc_start = next(
+        i for i, l in enumerate(lines) if "grandchild word" in l
+    )
+    child_lines = [
+        l for l in lines[child_start + 1:gc_start]
+        if l.strip() and "done]" not in l
+    ]
+    gc_lines = [l for l in lines[gc_start + 1:] if l.strip()]
+    assert len(child_lines) > 1 and len(gc_lines) > 1
+
+    def title_indent(line):
+        return len(line) - len(line.lstrip())
+
+    child_indent = min(title_indent(l) for l in child_lines)
+    for line in gc_lines:
+        assert title_indent(line) > child_indent, line
 
 
 def test_ls_who_promotes_orphaned_child(temp_todo_dir):
@@ -8910,9 +9233,9 @@ print(json_mod.dumps(
 
 For rich table output we use [[rich.table.Table]] so the
 terminal gets nicely aligned, coloured columns. The tree layout
-is preserved: children are indented with a \texttt{└─} prefix
-in the Title column, and a dimmed progress summary follows each
-parent that has children.
+is preserved: sub-items are indented under their parent with a
+[[└─]] marker in the Title column, and a dimmed progress summary
+follows each parent that has children.
 
 That progress summary must also land in the Title column when the
 optional priority column is hidden. A fixed [[table.add_row("", "",
@@ -8936,6 +9259,7 @@ priority visible instead of pretending it is zero.
 <<output rich table>>=
 from rich.console import Console
 from rich import box
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
@@ -8992,9 +9316,10 @@ def truncation_hint(hidden):
 Whichever chunk above did the slicing left [[hidden]] behind for us,
 and the two chunks compute it differently on purpose: the flat listing
 caps items, while the tree listing caps \emph{top-level} items and
-lets each one bring its children along.  Reporting the difference the
-renderer actually made is the only way the count matches what the
-reader sees.
+lets each one bring its whole subtree along.  Reporting the difference
+the renderer actually made is the only way the count matches what the
+reader sees---which also means a tree of busy items can print many
+rows and still, truthfully, report a small number.
 
 The line is dimmed, the same treatment the progress summaries get: it
 is commentary on the listing rather than a row of it, and dimming says
@@ -9051,47 +9376,147 @@ table.add_column("Tracked", justify="right")
 table.add_column("Status")
 @
 
+The row chunk below indents its title by [[depth]], and a flat
+listing has no depth, so the variable is set once before the loop
+rather than threaded through a chunk that has no other reason to know
+about trees.
+
 <<populate flat rows into rich table>>=
 ranked = sort_todos_for_display(filtered, now)
 sorted_items = ranked[:count]
 hidden = len(ranked) - len(sorted_items)
+depth = 0
 for item in sorted_items:
     <<add item row to rich table>>
 @
 
-<<populate tree rows into rich table>>=
-roots = sort_todos_for_display(
-    get_visible_roots(filtered), now
-)
-top_level = roots[:count]
-hidden = len(roots) - len(top_level)
-for item in top_level:
-    <<add item row to rich table>>
+\paragraph{Walking the tree}
+
+The tree is a depth-first walk that starts at the visible roots and
+descends only into children that are themselves in [[filtered]].
+Membership in the filtered list, not [[parent_id]] alone, decides
+both where the walk starts and where it goes next, so the promotion
+that [[get_visible_roots]] performs for a child whose parent a filter
+removed holds at every depth: an orphaned grandchild is a root, not a
+missing row.  It is also what lets one walker serve every depth.
+[[<<restrict [[filtered]] to the requested depth>>]] has already cut
+the list to one level under [[--all]], so the walk stops there on its
+own; hand it the whole tree and it lists the whole tree.
+
+The cap applies to roots, and each root brings its subtree along
+uncut---the flat listing caps rows, the tree caps top-level items, as
+[[truncation_hint]] explains.  Rows come back as (depth, item) pairs
+so the renderer is one loop with an indentation rule, the same shape
+the [[view]] command uses for its sub-items.  No cycle guard is
+needed here, unlike in [[get_ancestors]]: a root is an item whose
+parent is absent, and a [[parent_id]] cycle contains no such item, so
+the walk never enters one.
+
+<<sub-item helpers>>=
+def get_tree_rows(
+    items: list[TodoItem], now=None, count=None,
+) -> tuple[list[tuple[int, TodoItem]], int]:
+    """Return the tree of `items` as (depth, item) rows.
+
+    Visible roots come in display order, capped at `count` (None
+    for no cap), each followed depth-first by its children that are
+    present in `items`.  The second value is the number of roots the
+    cap left out.
+    """
+    roots = sort_todos_for_display(get_visible_roots(items), now)
+    top_level = roots[:count]
+    rows = []
+    for root in top_level:
+        rows.extend(get_subtree_rows(items, root, now))
+    return rows, len(roots) - len(top_level)
+
+
+def get_subtree_rows(items, item, now=None, depth=0):
+    """Return `item` and its descendants in `items` as (depth, item)."""
+    rows = [(depth, item)]
     children = sort_todos_for_display(
-        [
-            t for t in filtered
-            if t.parent_id == item.id
-        ],
-        now,
+        [t for t in items if t.parent_id == item.id], now
     )
-    all_children = get_children(todos, item.id)
-    if all_children:
-        done_count = sum(
-            1 for c in all_children
-            if c.status == "done"
-        )
-        total = len(all_children)
-        progress = Text(
-            f"[{done_count}/{total} done]",
-            style="dim",
-        )
-        progress_row = [""]
-        if show_prio:
-            progress_row.append("")
-        progress_row.append(progress)
-        table.add_row(*progress_row)
     for child in children:
-        <<add child row to rich table>>
+        rows.extend(get_subtree_rows(items, child, now, depth + 1))
+    return rows
+@
+
+Let's verify the walk: children nest under their parent at increasing
+depth, an item whose parent is absent is a root, and the cap counts
+roots while the subtree of a kept root comes along whole.
+
+<<test functions>>=
+def test_get_tree_rows_walks_filtered_subtree():
+    """Rows descend into children present in the list; roots capped."""
+    items = [
+        TodoItem(
+            id=1, title="Root A", priority=9.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Grandchild", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=4, title="Root B", priority=1.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=5, title="Orphan", parent_id=99,
+            created="2026-02-20T10:00:00",
+        ),
+    ]
+    now = datetime.datetime.now()
+
+    rows, hidden = get_tree_rows(items, now)
+    assert [(d, t.id) for d, t in rows] == [
+        (0, 1), (1, 2), (2, 3), (0, 4), (0, 5),
+    ]
+    assert hidden == 0
+
+    rows, hidden = get_tree_rows(items, now, count=1)
+    assert [(d, t.id) for d, t in rows] == [(0, 1), (1, 2), (2, 3)]
+    assert hidden == 2
+@
+
+<<populate tree rows into rich table>>=
+rows, hidden = get_tree_rows(filtered, now, count)
+for depth, item in rows:
+    <<add item row to rich table>>
+    <<add a progress row under a parent>>
+@
+
+Every parent gets a progress summary, not only the top-level ones.
+Under [[--all]] a child with children of its own is the only sign
+that a level exists below the listing, and in a deeper tree the
+summary says how far along each branch is.  The count comes from
+[[todos]], not [[filtered]], so it reports the whole family whatever
+the filters removed.  The summary sits in the Title column, indented
+like the title above it, and the leading empty cells depend on
+whether the priority column is shown, as explained above.
+
+<<add a progress row under a parent>>=
+all_children = get_children(todos, item.id)
+if all_children:
+    done_count = sum(
+        1 for c in all_children
+        if c.status == "done"
+    )
+    total = len(all_children)
+    progress = Padding(
+        Text(f"[{done_count}/{total} done]", style="dim"),
+        (0, 0, 0, 2 * depth),
+    )
+    progress_row = [""]
+    if show_prio:
+        progress_row.append("")
+    progress_row.append(progress)
+    table.add_row(*progress_row)
 @
 
 We share a small helper to format the deadline and estimate
@@ -9106,6 +9531,15 @@ cells are ids, numbers, dates and status words we generate---so they
 are the only cells that need the literal treatment.
 The [[view]] command's renderer and [[print_rows]]
 (\cref{cli.utils.output}) make the same move.
+
+Depth becomes indentation of the title, as a [[Padding]] around the
+cell rather than spaces in front of it.  Titles routinely outrun
+their column, and when [[rich]] wraps a cell it keeps leading spaces
+only on the first line, so a nested title that wraps shows its
+continuation lines flush with its parent---the nesting vanishes
+exactly when the tree is deep enough to need it.  A padding indents
+every wrapped line; [[view]] indents its sub-items the same way for
+the same reason.
 
 <<add item row to rich table>>=
 ep = effective_priority(item, now)
@@ -9132,46 +9566,15 @@ table.add_row(
     *([
         "" if ep is None else f"{ep:.1f}"
     ] if show_prio else []),
-    Text(item.title),
+    Padding(
+        Text(("\u2514\u2500 " if depth else "") + item.title),
+        (0, 0, 0, 2 * depth),
+    ),
     item.who or "",
     dl_str,
     est_str,
     tracked_str,
     item.status,
-)
-@
-
-<<add child row to rich table>>=
-ep = effective_priority(child, now)
-dl_str = ""
-if child.deadline:
-    try:
-        dl = datetime.datetime.fromisoformat(
-            child.deadline
-        )
-        dl_str = dl.strftime("%b %d")
-    except ValueError:
-        dl_str = child.deadline[:10]
-est_str = (
-    f"{child.estimated:.1f}h"
-    if child.estimated
-    else ""
-)
-tracked = tracked_times.get(child.id, 0)
-tracked_str = (
-    f"{tracked:.1f}h" if tracked > 0 else ""
-)
-table.add_row(
-    str(child.id),
-    *([
-        "" if ep is None else f"{ep:.1f}"
-    ] if show_prio else []),
-    Text(f"  \u2514\u2500 {child.title}"),
-    child.who or "",
-    dl_str,
-    est_str,
-    tracked_str,
-    child.status,
 )
 @
 
@@ -9635,6 +10038,106 @@ view_all_opt = typer.Option(
     help="Include done sub-items")
 @
 
+\paragraph{Listing what is underneath}
+
+The sub-items are not listed unless asked for.  The item is the
+subject of [[view]]; what is under it is context, and context that
+grows with the item's importance, so that the parent of a term's
+work opened for its own notes gets a screen of children first and
+the notes somewhere below.  [[--recursive]] asks for the list, at
+every depth, and the reader who wants the list every time sets
+[[todo.view.recursive]] and gets it by default; the option is a
+pair so that the configured default still yields to
+[[--no-recursive]] for one invocation.
+
+The two flags above describe the list, not the item: [[--notes]]
+asks for text under every listed sub-item, and [[--done]] asks for
+finished sub-items among them.  Asking for either is asking for the
+list, so both imply [[--recursive]]---the alternative is two flags
+that silently do nothing until a third is added.
+
+<<configuration>>=
+TODO_VIEW_RECURSIVE_CONFIG = "todo.view.recursive"
+DEFAULT_VIEW_RECURSIVE = default(
+    TODO_VIEW_RECURSIVE_CONFIG, False, bool)
+<<argument and option definitions>>=
+view_recursive_opt = typer.Option(
+    "--recursive/--no-recursive", "-r",
+    help="List the sub-items under the todo, at every depth. "
+         + config_hint("todo.view.recursive"))
+<<let the sub-item flags imply [[recursive]]>>=
+recursive = recursive or show_notes or include_done
+@
+
+Let's verify that the key is advertised:
+
+<<test functions>>=
+def test_view_help_advertises_recursive_key():
+    """--help shows the todo.view.recursive key."""
+    result = runner.invoke(cli, ["view", "--help"])
+    assert result.exit_code == 0
+    rendered = re.sub(r"[\s\u2502]", "", result.output)
+    assert "[config:todo.view.recursive]" in rendered
+@
+
+\paragraph{Bounding a busy group}
+
+The flags above widen what [[view]] prints; nothing yet narrows it.
+A parent that collects a sprint's worth of work has dozens of
+children, and display order already puts the ones that matter first,
+so printing the whole set spends the top of the terminal---where the
+parent's own metadata was---on a tail nobody asked about.
+
+[[-n]] caps the sub-items, and it caps them \emph{per parent} rather
+than capping the flat list of rows the renderers walk.  A row cap
+would spend its budget on whichever branch comes first: one child
+with fifteen grandchildren would fill the listing on its own and its
+siblings would never appear, which is the opposite of what someone
+scanning a group wants.  Capping each level separately bounds the
+listing without changing its shape---the first [[N]] children, and
+under each of them the first [[N]] of its own children, at every
+level---so what the reader gets is a sample of the whole group rather
+than all of one corner of it.
+
+<<argument and option definitions>>=
+view_count_opt = typer.Option(
+    "-n",
+    help="Limit sub-items to the top N per parent; "
+         "0 shows all. "
+         + config_hint("todo.view.subitems"))
+@
+
+Five is a smaller default than [[ls]]'s ten because these lines are
+already nested under an item the reader chose to open: [[view]] is
+the detail of one todo, and five children still leave that detail on
+the screen beside them.
+
+The number is configurable for the reason every listing default is:
+it is a property of the reader's terminal and habits, not of the
+data.  Resolving it through [[default]]
+(\cref{cli.utils.defaults.cache}) at import time---once per process,
+from a cache that cannot write back---is also what puts the number in
+[[--help]], since Typer reads the parameter's default when it builds
+the help text and a value computed inside the command body would
+leave the reader nothing to read.
+
+<<configuration>>=
+TODO_VIEW_SUBITEMS_CONFIG = "todo.view.subitems"
+DEFAULT_VIEW_SUBITEMS = default(
+    TODO_VIEW_SUBITEMS_CONFIG, 5, int)
+@
+
+\paragraph{[[-n 0]] means all of them here too}
+
+The command line has no spelling for [[None]], so the integer a
+reader reaches for to lift a cap is [[0]]---the one value slicing
+reads as the exact opposite.  [[ls]] met that trap first and maps a
+non-positive count onto [[None]] before any slicing happens; what
+[[view]] uses below is that same chunk rather than a copy of it,
+which works because both commands call the parameter [[count]].
+Sharing it is what keeps [[todo ls -n 0]] and [[todo view -n 0]] from
+ever drifting into meaning different things.
+
 Both renderers show the same things, so the command first gathers
 what there is to show---the metadata fields, the notes or GitHub
 content, the visible sub-items---and only then renders it.
@@ -9652,14 +10155,20 @@ def view(
                             view_all_opt] = False,
     show_notes: Annotated[bool,
                           view_notes_opt] = False,
+    count: Annotated[int | None,
+                     view_count_opt] = DEFAULT_VIEW_SUBITEMS,
+    recursive: Annotated[bool,
+                         view_recursive_opt] = DEFAULT_VIEW_RECURSIVE,
     output_format: Annotated[ViewFormat,
                              view_format_opt] = ViewFormat.auto,
 ):
     """View a todo item with full details.
 
     If no ID given, shows the current active task.
-    Done sub-items are
-    hidden by default; pass --done (or --all) to include them.
+    Sub-items are listed only with --recursive; --notes and --done
+    imply it.  Done sub-items are hidden; pass --done (or --all) to
+    include them.  At most N sub-items are shown under each parent,
+    at every depth; `-n N` changes that bound and `-n 0` lifts it.
     Sub-items show a one-line note preview; pass --notes to
     print their descriptions and notes in full instead.
     Notes are rendered as Markdown on a terminal and printed as
@@ -9686,6 +10195,8 @@ def view(
     <<decide whether to render richly>>
     <<collect metadata fields>>
     <<fetch GitHub content>>
+    <<treat [[-n 0]] as unlimited>>
+    <<let the sub-item flags imply [[recursive]]>>
     <<collect visible sub-items>>
     if use_rich:
         <<render view with rich>>
@@ -9785,28 +10296,173 @@ items are hidden we count them so the renderers can print a short
 hint; without it a parent could appear childless even though it has
 completed sub-items.
 
-The result is a flat list of (depth, item) rows, children at depth
-zero and grandchildren at depth one, in the order they are to appear.
-Flattening here means each renderer is a single loop with an
-indentation rule, instead of two nested loops that would each have to
-repeat the done-filtering.
-A hidden child takes its grandchildren with it uncounted, exactly as
-the nested loops did: they belong to a branch the user chose not to
-see.
+Ordering one parent's children and dropping the done ones is asked
+for at every level of the walk below, and again for the branch under
+a child the cap cut, so it becomes a helper instead of being written
+out at each place.  It hands back the count of what it dropped alongside the
+list, because the caller is the only one that knows whether those
+drops belong in a hint the reader will see.
 
-<<collect visible sub-items>>=
-rows = []
-hidden_done = 0
-for child in sort_todos_for_display(get_children(todos, item.id)):
-    if child.status == "done" and not include_done:
-        hidden_done += 1
-        continue
-    rows.append((0, child))
-    for gc in sort_todos_for_display(get_children(todos, child.id)):
-        if gc.status == "done" and not include_done:
+<<sub-item helpers>>=
+def get_visible_sub_items(
+    todos: list[TodoItem], parent_id: int,
+    include_done: bool,
+) -> tuple[list[TodoItem], int]:
+    """Return one parent's shown children and its done count.
+
+    The list holds the children of `parent_id` in display order,
+    with done ones dropped unless `include_done`; the integer
+    counts the ones that were dropped.
+    """
+    shown = []
+    hidden_done = 0
+    for child in sort_todos_for_display(
+        get_children(todos, parent_id)
+    ):
+        if child.status == "done" and not include_done:
             hidden_done += 1
             continue
-        rows.append((1, gc))
+        shown.append(child)
+    return shown, hidden_done
+@
+
+The result is a flat list of (depth, item) rows, children at depth
+zero, grandchildren at depth one, and so on down, in the order they
+are to appear.  Flattening here means each renderer is a single loop
+with an indentation rule, instead of nested loops that would each
+have to repeat the done-filtering---and the cap.
+
+The two rules compose in one direction only: the done filter runs
+first and the cap applies to what survives it.  Capping first would
+let finished work spend the budget and push pending siblings out of a
+listing whose whole purpose is to show what is left.
+A done child still takes its subtree with it uncounted: it belongs to
+a branch the user chose not to see, and [[--done]] is what asks for
+it back.
+
+Applying the cap again under each child that got through is what
+makes [[-n]] a bound on the listing's shape rather than on its
+length, and applying it at every level is what a recursion gives for
+free: the walk under a child is the same walk, one level down.
+
+A child the cap cut is worth more than one line to the reader:
+[[-n 0]] would bring it back together with everything under it, so
+the count charges the child and its whole visible subtree.  Charging
+only the child would understate what the flag reveals; charging its
+done descendants too would overstate it, since [[-n 0]] alone still
+does not show those.  The size of that subtree is the same walk with
+the cap lifted---one traversal, defined once, rather than a second
+counting routine that could drift from it.
+
+The complement is taken as the slice past [[len(shown)]] rather than
+past [[count]], because [[count]] is [[None]] under [[-n 0]]---and
+[[None]] means \emph{the whole list} on both sides of the colon, so
+slicing from [[count]] would report every child as hidden at exactly
+the moment nothing is.
+
+<<sub-item helpers>>=
+def get_visible_sub_item_rows(
+    todos: list[TodoItem], parent_id: int,
+    include_done: bool, count: int | None, depth: int = 0,
+) -> tuple[list[tuple[int, TodoItem]], int, int]:
+    """Return the shown subtree of `parent_id` as (depth, item) rows.
+
+    Under each parent the first `count` visible children are kept
+    (all of them when `count` is None), each followed by its own
+    kept subtree one level deeper.  The two integers count the done
+    items dropped and the items the cap left out, the latter
+    including everything under a cut child that `-n 0` would show.
+    """
+    rows = []
+    hidden_by_cap = 0
+    children, hidden_done = get_visible_sub_items(
+        todos, parent_id, include_done
+    )
+    shown = children[:count]
+    for child in shown:
+        rows.append((depth, child))
+        branch, dropped, cut = get_visible_sub_item_rows(
+            todos, child.id, include_done, count, depth + 1
+        )
+        rows.extend(branch)
+        hidden_done += dropped
+        hidden_by_cap += cut
+    for child in children[len(shown):]:
+        branch, _, _ = get_visible_sub_item_rows(
+            todos, child.id, include_done, None
+        )
+        hidden_by_cap += 1 + len(branch)
+    return rows, hidden_done, hidden_by_cap
+@
+
+Let's verify the walk on three generations: the cap applies under
+every parent, a cut child is charged with its whole subtree, and
+with the cap lifted a done child still takes its branch with it.
+
+<<test functions>>=
+def three_generation_items():
+    """A root with three children, each with three children."""
+    items = [
+        TodoItem(id=1, title="Root", created="2026-02-20T10:00:00"),
+    ]
+    for c in (2, 3, 4):
+        items.append(TodoItem(
+            id=c, title=f"Child {c}", parent_id=1,
+            priority=float(5 - c), created="2026-02-20T10:00:00",
+        ))
+        for g in range(3):
+            items.append(TodoItem(
+                id=10 * c + g, title=f"Grandchild {c}.{g}",
+                parent_id=c, priority=float(3 - g),
+                created="2026-02-20T10:00:00",
+            ))
+    return items
+
+
+def test_get_visible_sub_item_rows_caps_every_level():
+    """The per-parent cap applies at each depth; the cut is charged."""
+    rows, hidden_done, hidden_by_cap = get_visible_sub_item_rows(
+        three_generation_items(), 1, False, 2
+    )
+    assert [(d, t.id) for d, t in rows] == [
+        (0, 2), (1, 20), (1, 21),
+        (0, 3), (1, 30), (1, 31),
+    ]
+    assert hidden_done == 0
+    assert hidden_by_cap == 1 + 1 + (1 + 3)
+
+
+def test_get_visible_sub_item_rows_uncapped_skips_done_branch():
+    """Without a cap every visible row comes back; a done child
+    takes its children with it and is counted once."""
+    items = three_generation_items()
+    next(t for t in items if t.id == 3).status = "done"
+    rows, hidden_done, hidden_by_cap = get_visible_sub_item_rows(
+        items, 1, False, None
+    )
+    assert [(d, t.id) for d, t in rows] == [
+        (0, 2), (1, 20), (1, 21), (1, 22),
+        (0, 4), (1, 40), (1, 41), (1, 42),
+    ]
+    assert hidden_done == 1
+    assert hidden_by_cap == 0
+@
+
+Without [[--recursive]] the same walk runs uncapped, and its length
+is the number the hint below owes the reader: exactly the rows that
+[[-r]] would print plus whatever its own cap hint would then report,
+so the two can be checked against each other on screen.  The done
+count survives the reset for the same reason---the hint that names
+[[--done]] stays true, and [[--done]] now brings the listing with it.
+
+<<collect visible sub-items>>=
+rows, hidden_done, hidden_by_cap = get_visible_sub_item_rows(
+    todos, item.id, include_done, count if recursive else None
+)
+hidden_by_flag = 0
+if not recursive:
+    hidden_by_flag = len(rows)
+    rows, hidden_by_cap = [], 0
 @
 
 Sub-items show their status as a short word rather than the stored
@@ -9901,12 +10557,184 @@ if rows:
             <<print a sub-item's blocks as plain text>>
         elif depth == 0 and child.notes:
             typer.echo(f"{indent}  {child.notes.splitlines()[0]}")
-if hidden_done:
+if hidden_by_flag:
+    typer.echo(
+        f"  ({hidden_by_flag} sub-items hidden,"
+        f" use --recursive to list)"
+    )
+elif hidden_done:
     typer.echo(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)"
     )
+if hidden_by_cap:
+    typer.echo(
+        f"  ({hidden_by_cap} more sub-items hidden,"
+        f" use -n 0 to show all)"
+    )
 @
+
+Each rule that hid something says so, in the order the rules ran:
+the done filter first, then the cap that was applied to what it left.
+Read the other way round the second number would not be checkable
+against anything on the screen, because the cap's count already
+speaks only about items the done filter had passed.
+
+Without [[--recursive]] there is one rule and one line, naming the
+flag that lifts it.  The exception is the parent whose every child
+is done: the recursive walk found nothing to list, and printing
+nothing would make the parent read as a leaf, so the [[--done]] line
+takes the place of the other---and [[--done]] does lift it, since it
+brings the listing along.
+
+Let's verify the default: the sub-items are counted rather than
+listed, in both renderers, the count is what [[-r]] then prints, a
+leaf says nothing, and an explicit [[--no-recursive]] beats [[-r]].
+
+<<test functions>>=
+def test_view_default_hides_sub_items_with_hint(temp_todo_dir):
+    """Without -r the sub-items are counted, not listed."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child task", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Grandchild task", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    hint = "(2 sub-items hidden, use --recursive to list)"
+
+    plain = runner.invoke(cli, ["view", "1"])
+    assert plain.exit_code == 0
+    assert "Child task" not in plain.stdout
+    assert "Sub-items" not in plain.stdout
+    assert hint in plain.stdout
+
+    rich = runner.invoke(cli, ["view", "1", "--format", "rich"])
+    assert rich.exit_code == 0
+    assert "Child task" not in rich.stdout
+    assert hint in rich.stdout
+
+    listed = runner.invoke(cli, ["view", "1", "-r"])
+    assert listed.exit_code == 0
+    assert "Child task" in listed.stdout
+    assert "Grandchild task" in listed.stdout
+    assert "hidden" not in listed.stdout
+
+    explicit = runner.invoke(
+        cli, ["view", "1", "-r", "--no-recursive"]
+    )
+    assert "Child task" not in explicit.stdout
+
+    leaf = runner.invoke(cli, ["view", "3"])
+    assert leaf.exit_code == 0
+    assert "hidden" not in leaf.stdout
+
+
+def test_view_all_done_children_still_hint_without_recursive(
+    temp_todo_dir,
+):
+    """A parent of only done children names --done, not -r."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Done child", parent_id=1, status="done",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(cli, ["view", "1"])
+    assert result.exit_code == 0
+    assert "(1 done sub-items hidden, use --done to show)" in (
+        result.stdout
+    )
+    assert "--recursive" not in result.stdout
+@
+
+Let's verify that the two flags about the list bring the list with
+them:
+
+<<test functions>>=
+def test_view_notes_and_done_imply_recursive(temp_todo_dir):
+    """--notes and --done each list the sub-items without -r."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Pending child", parent_id=1,
+            notes="Child note",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Done child", parent_id=1, status="done",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    notes = runner.invoke(cli, ["view", "1", "--notes"])
+    assert notes.exit_code == 0
+    assert "Pending child" in notes.stdout
+    assert "Child note" in notes.stdout
+
+    done = runner.invoke(cli, ["view", "1", "--done"])
+    assert done.exit_code == 0
+    assert "Pending child" in done.stdout
+    assert "Done child" in done.stdout
+@
+
+Let's verify the depth: a great-grandchild is indented one level past
+its parent, and the cap applies down there too.
+
+<<test functions>>=
+def test_view_recursive_reaches_great_grandchildren(temp_todo_dir):
+    """Every depth is listed and capped per parent."""
+    save_todos(7, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child task", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="Grandchild task", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Great {n}", parent_id=3,
+            priority=float(10 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in (4, 5, 6)
+    ])
+    result = runner.invoke(cli, ["view", "1", "-r", "-n", "2"])
+    assert result.exit_code == 0
+    assert "\n  #2 [pending] Child task" in result.stdout
+    assert "\n    #3 [pending] Grandchild task" in result.stdout
+    assert "\n      #4 [pending] Great 4" in result.stdout
+    assert "\n      #5 [pending] Great 5" in result.stdout
+    assert "Great 6" not in result.stdout
+    assert "(1 more sub-items hidden, use -n 0 to show all)" in (
+        result.stdout
+    )
+@
+
+Each line also names the flag that lifts its own rule and no other,
+which is the property that makes two hints better than one combined
+total: a reader who wants the finished work back and a reader who
+wants the rest of a busy group back need different flags, and a
+single \enquote{$n$ sub-items hidden} could not tell them which.
 
 The blocks are indented one level past the line they belong to, so the
 nesting on the page matches the nesting in the tree, and they go
@@ -10024,13 +10852,33 @@ if rows:
         <<print each sub-item with its blocks>>
     else:
         <<print sub-items as a table>>
-if hidden_done:
+if hidden_by_flag:
+    console.print(Text(
+        f"  ({hidden_by_flag} sub-items hidden,"
+        f" use --recursive to list)",
+        style="dim",
+    ))
+elif hidden_done:
     console.print(Text(
         f"  ({hidden_done} done sub-items hidden,"
         f" use --done to show)",
         style="dim",
     ))
+if hidden_by_cap:
+    console.print(Text(
+        f"  ({hidden_by_cap} more sub-items hidden,"
+        f" use -n 0 to show all)",
+        style="dim",
+    ))
 @
+
+The pair is repeated here rather than shared with the plain renderer
+because the two hints differ in more than their text: both are dimmed
+and wrapped in [[Text]], the treatment this renderer gives every
+piece of commentary and every string that a user could have written a
+bracket into.  What must not differ is the wording and the order,
+which is why the two hints were added to both renderers in the same
+change and are written in the same shape in both.
 
 The table uses the same [[Table]] arguments as [[ls]]
 (\cref{sec:todo-code-outline}), so the two commands look like parts of
@@ -10038,6 +10886,15 @@ one interface.
 Depth becomes indentation of the title, the way [[ls]] indents its
 tree, and the note preview gets a folding column so a long first line
 wraps instead of being cut off.
+The indentation is a [[Padding]] around the cell rather than spaces
+in front of the title.  Titles routinely outrun the column, and when
+[[rich]] wraps a cell it keeps leading spaces only on the first line;
+a grandchild whose title wraps to four lines then shows three of them
+flush with its parent, and once every title wraps the nesting
+disappears from the table altogether---which is exactly how a capped
+view of a busy item read at first.  A padding indents every wrapped
+line, so the structure survives any terminal width; the [[--notes]]
+renderer below indents the same way for the same reason.
 
 <<print sub-items as a table>>=
 table = Table(show_header=True, header_style="bold",
@@ -10055,10 +10912,58 @@ for depth, child in rows:
     table.add_row(
         str(child.id),
         Text(mark, style=VIEW_STATUS_STYLES.get(child.status, "")),
-        Text("  " * depth + child.title),
+        Padding(Text(child.title), (0, 0, 0, 2 * depth)),
         Text(note),
     )
 console.print(Padding(table, (0, 0, 0, 2)))
+@
+
+Let's verify that the nesting survives wrapping: at a width where a
+long grandchild title breaks across lines, every one of its lines is
+indented past the lines of its parent's own wrapped title.
+
+<<test functions>>=
+def test_view_rich_grandchild_indent_survives_wrapping(
+    temp_todo_dir,
+):
+    """Wrapped grandchild titles stay indented under the parent."""
+    long_title = " ".join(["word"] * 30)
+    save_todos(4, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="child " + long_title, parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="grandchild " + long_title, parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    result = runner.invoke(
+        cli, ["view", "1", "-r", "--format", "rich"],
+        terminal_width=60,
+    )
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    child_start = next(
+        i for i, l in enumerate(lines) if "child word" in l
+    )
+    gc_start = next(
+        i for i, l in enumerate(lines) if "grandchild word" in l
+    )
+    child_lines = lines[child_start + 1:gc_start]
+    gc_lines = [l for l in lines[gc_start + 1:] if l.strip()]
+    assert len(child_lines) > 1 and len(gc_lines) > 1
+
+    def title_indent(line):
+        return len(line) - len(line.lstrip())
+
+    child_indent = min(title_indent(l) for l in child_lines)
+    for line in gc_lines:
+        assert title_indent(line) > child_indent, line
 @
 
 Without the table the sub-item line has to carry the columns itself,
@@ -10113,7 +11018,7 @@ def test_view_command(temp_todo_dir):
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1"])
+    result = runner.invoke(cli, ["view", "1", "-r"])
     assert result.exit_code == 0
     assert "Parent task" in result.stdout
     assert "/tmp/project" in result.stdout
@@ -10155,7 +11060,7 @@ def test_view_format_rich_renders_markdown(temp_todo_dir, monkeypatch):
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1", "--format", "rich"])
+    result = runner.invoke(cli, ["view", "1", "-r", "--format", "rich"])
     assert result.exit_code == 0
     assert "Parent task" in result.stdout
     assert "/tmp/project" in result.stdout
@@ -10223,7 +11128,7 @@ def test_view_rich_children_keep_order_and_hint(
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1", "--format", "rich"])
+    result = runner.invoke(cli, ["view", "1", "-r", "--format", "rich"])
     assert result.exit_code == 0
     out = result.stdout
     assert out.index("Ranked child") < out.index("Grandchild")
@@ -10232,7 +11137,7 @@ def test_view_rich_children_keep_order_and_hint(
     assert "1 done sub-items hidden" in out
 
     result = runner.invoke(
-        cli, ["view", "1", "--format", "rich", "--done"]
+        cli, ["view", "1", "-r", "--format", "rich", "--done"]
     )
     assert result.exit_code == 0
     assert "Done child" in result.stdout
@@ -10306,7 +11211,7 @@ def test_view_hides_done_children(temp_todo_dir):
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1"])
+    result = runner.invoke(cli, ["view", "1", "-r"])
     assert result.exit_code == 0
     assert "Pending child" in result.stdout
     assert "Done child" not in result.stdout
@@ -10314,7 +11219,7 @@ def test_view_hides_done_children(temp_todo_dir):
     assert "2 done sub-items hidden" in result.stdout
 
     result = runner.invoke(
-        cli, ["view", "--done", "1"]
+        cli, ["view", "--done", "1", "-r"]
     )
     assert result.exit_code == 0
     assert "Pending child" in result.stdout
@@ -10355,7 +11260,7 @@ def test_view_shows_unset_priority_and_mixed_child_order(
         ),
     ])
 
-    result = runner.invoke(cli, ["view", "1"])
+    result = runner.invoke(cli, ["view", "1", "-r"])
 
     assert result.exit_code == 0
     assert "Priority: unset" in result.stdout
@@ -10392,13 +11297,13 @@ def test_view_notes_shows_sub_item_blocks(temp_todo_dir):
         ),
     ])
 
-    preview = runner.invoke(cli, ["view", "1"])
+    preview = runner.invoke(cli, ["view", "1", "-r"])
     assert preview.exit_code == 0
     assert "First preview" in preview.stdout
     assert "More of the first note" not in preview.stdout
     assert "What the first child is" not in preview.stdout
 
-    result = runner.invoke(cli, ["view", "1", "--notes"])
+    result = runner.invoke(cli, ["view", "1", "-r", "--notes"])
     assert result.exit_code == 0
     assert "What the first child is" in result.stdout
     assert "More of the first note" in result.stdout
@@ -10431,7 +11336,7 @@ def test_view_notes_rich_renders_sub_item_blocks(
     ])
 
     result = runner.invoke(
-        cli, ["view", "1", "--format", "rich", "--notes"],
+        cli, ["view", "1", "-r", "--format", "rich", "--notes"],
     )
     assert result.exit_code == 0
     assert "Child task" in result.stdout
@@ -10461,22 +11366,274 @@ def test_view_all_includes_done_sub_items(temp_todo_dir):
         ),
     ])
 
-    hidden = runner.invoke(cli, ["view", "1"])
+    hidden = runner.invoke(cli, ["view", "1", "-r"])
     assert hidden.exit_code == 0
     assert "Done child" not in hidden.stdout
     assert "1 done sub-items hidden" in hidden.stdout
 
-    shown = runner.invoke(cli, ["view", "1", "--all"])
+    shown = runner.invoke(cli, ["view", "1", "-r", "--all"])
     assert shown.exit_code == 0
     assert "Done child" in shown.stdout
     assert "[done]" in shown.stdout
     assert "Recap line" in shown.stdout
     assert "What finishing it took" not in shown.stdout
 
-    both = runner.invoke(cli, ["view", "1", "--all", "--notes"])
+    both = runner.invoke(cli, ["view", "1", "-r", "--all", "--notes"])
     assert both.exit_code == 0
     assert "Done child" in both.stdout
     assert "What finishing it took" in both.stdout
+@
+
+\paragraph{Testing the sub-item cap}
+
+The cap has two visible effects---rows that are missing and a line
+that says how many---and the second is the one worth pinning down,
+because a wrong count is worse than no hint at all: it tells the
+reader there is nothing more to see when there is.  So every test
+below asserts the number, not just the presence of the line.
+
+A parent with seven children is the smallest case that shows the
+default doing something.  The same invocation is also where we check
+that [[--help]] advertises the number, since a configurable default
+the user cannot read is one they have to guess at.
+
+<<integration tests>>=
+def test_view_caps_sub_items_at_the_default(temp_todo_dir):
+    """Five children are shown by default, and the rest counted."""
+    save_todos(9, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            priority=float(10 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in range(2, 9)
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "-r"])
+
+    assert result.exit_code == 0
+    assert "Child 2" in result.stdout
+    assert "Child 6" in result.stdout
+    assert "Child 7" not in result.stdout
+    assert "Child 8" not in result.stdout
+    assert "2 more sub-items hidden" in result.stdout
+
+    usage = runner.invoke(cli, ["view", "--help"])
+    assert usage.exit_code == 0
+    assert "[default: 5]" in " ".join(usage.stdout.split())
+@
+
+Three children with three grandchildren each, under [[-n 2]], is the
+case that separates a per-parent cap from a cap on the flat row list:
+a row cap of two would stop inside the first child's grandchildren
+and never reach a second child.  The count it has to report adds up
+from three different sources---the grandchildren each shown child
+lost, plus the cut child together with everything under it---so
+getting it right is evidence that all three are accounted for.
+
+<<integration tests>>=
+def test_view_n_caps_children_and_grandchildren(temp_todo_dir):
+    """-n bounds each level, and the hint counts every branch."""
+    children = [
+        TodoItem(
+            id=n, title=f"Child {letter}", parent_id=1,
+            priority=float(4 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n, letter in ((2, "A"), (3, "B"), (4, "C"))
+    ]
+    grandchildren = [
+        TodoItem(
+            id=5 + 3 * offset + index,
+            title=f"GC {letter}{index + 1}",
+            parent_id=parent,
+            priority=float(3 - index),
+            created="2026-02-20T10:00:00",
+        )
+        for offset, (parent, letter) in enumerate(
+            ((2, "A"), (3, "B"), (4, "C"))
+        )
+        for index in range(3)
+    ]
+    save_todos(14, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + children + grandchildren)
+
+    result = runner.invoke(cli, ["view", "1", "-r", "-n", "2"])
+
+    assert result.exit_code == 0
+    out = result.stdout
+    assert "Child A" in out and "Child B" in out
+    assert "Child C" not in out
+    assert "GC A1" in out and "GC A2" in out
+    assert "GC A3" not in out
+    assert "GC B1" in out and "GC B2" in out
+    assert "GC B3" not in out
+    assert "GC C1" not in out
+    assert "6 more sub-items hidden" in out
+@
+
+[[-n 0]] has to undo all of that, and the absence of the hint is half
+of what it means: a listing that hides nothing must not claim to.
+
+<<integration tests>>=
+def test_view_n_zero_shows_all_sub_items(temp_todo_dir):
+    """-n 0 lifts the cap and says nothing about hidden items."""
+    save_todos(9, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            priority=float(10 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in range(2, 9)
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "-r", "-n", "0"])
+
+    assert result.exit_code == 0
+    assert "Child 8" in result.stdout
+    assert "more sub-items hidden" not in result.stdout
+@
+
+The order the two rules run in is observable, and it has to be:
+the done children here carry the highest priorities, so a cap applied
+first would have spent its whole budget on finished work.  Both hints
+appear, and the done one comes first because that is the order the
+listing was built in.
+
+<<integration tests>>=
+def test_view_cap_applies_after_the_done_filter(temp_todo_dir):
+    """Done children go first, then the cap takes what is left."""
+    save_todos(8, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            status="done" if n < 4 else "pending",
+            priority=float(8 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in range(2, 8)
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "-r", "-n", "2"])
+
+    assert result.exit_code == 0
+    out = result.stdout
+    assert "Child 2" not in out and "Child 3" not in out
+    assert "Child 4" in out and "Child 5" in out
+    assert "Child 6" not in out and "Child 7" not in out
+    assert "2 done sub-items hidden" in out
+    assert "2 more sub-items hidden" in out
+    assert (
+        out.index("done sub-items hidden")
+        < out.index("more sub-items hidden")
+    )
+@
+
+The cap is computed before either renderer runs, so the remaining
+question is only whether every output path prints the hint.
+[[--notes]] takes the plain renderer down its other branch, and
+[[--format rich]] leaves the plain renderer entirely; one test each
+covers both.
+
+<<integration tests>>=
+def test_view_notes_respects_the_cap(temp_todo_dir):
+    """--notes prints the capped set and reports the rest."""
+    save_todos(5, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            priority=float(5 - n),
+            created="2026-02-20T10:00:00",
+            notes=f"Note for {n}",
+        )
+        for n in range(2, 5)
+    ])
+
+    result = runner.invoke(
+        cli, ["view", "1", "-r", "-n", "1", "--notes"]
+    )
+
+    assert result.exit_code == 0
+    assert "Note for 2" in result.stdout
+    assert "Note for 3" not in result.stdout
+    assert "2 more sub-items hidden" in result.stdout
+
+
+def test_view_rich_respects_the_cap(temp_todo_dir, monkeypatch):
+    """The rich renderer caps the table and dims the same hint."""
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    save_todos(5, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            priority=float(5 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in range(2, 5)
+    ])
+
+    result = runner.invoke(
+        cli, ["view", "1", "-r", "-n", "1", "--format", "rich"]
+    )
+
+    assert result.exit_code == 0
+    assert "Child 2" in result.stdout
+    assert "Child 3" not in result.stdout
+    assert "2 more sub-items hidden" in result.stdout
+@
+
+Finally, a parent the cap never reaches must look exactly as it did
+before [[-n]] existed---no line, no count, nothing to explain:
+
+<<integration tests>>=
+def test_view_says_nothing_when_under_the_cap(temp_todo_dir):
+    """A parent with fewer children than N gets no cap hint."""
+    save_todos(5, [
+        TodoItem(
+            id=1, title="Parent task",
+            created="2026-02-20T10:00:00",
+        ),
+    ] + [
+        TodoItem(
+            id=n, title=f"Child {n}", parent_id=1,
+            priority=float(5 - n),
+            created="2026-02-20T10:00:00",
+        )
+        for n in range(2, 5)
+    ])
+
+    result = runner.invoke(cli, ["view", "1", "-r"])
+
+    assert result.exit_code == 0
+    assert "Child 4" in result.stdout
+    assert "more sub-items hidden" not in result.stdout
 @
 
 \subsection{Merging Incremental Label Edits}
@@ -14152,10 +15309,10 @@ command.
 
 Because [[next]] delegates its launch step to [[start]], it also passes
 through execution-mode options such as [[--headless]], [[--pane]],
-[[--window]], [[--auto-suspend]], and the [[--command]] and
-[[--no-command]] pair.  This keeps the policy question
-\enquote{what should start?}
-separate from the execution question \enquote{how should it run?}
+[[--window]], [[--auto-suspend]], the [[--command]] and
+[[--no-command]] pair, and [[--shell]]/[[--no-shell]].  This keeps
+the policy question \enquote{what should start?} separate from the
+execution question \enquote{how should it run?}
 
 The behaviour depends on whether the current context resolves to an
 active task:
@@ -14212,6 +15369,7 @@ def next_cmd(
     run: Annotated[str | None,
                    command_opt] = None,
     no_command: Annotated[bool, no_command_opt] = False,
+    shell: Annotated[bool | None, shell_opt] = None,
     timeout: Annotated[str | None,
                        timeout_opt] = None,
     reassign_to: Annotated[str | None,
@@ -14247,6 +15405,7 @@ def next_cmd(
         block=block,
         run=run,
         no_command=no_command,
+        shell=shell,
         timeout=timeout,
         reassign_to=reassign_to,
         auto_suspend=auto_suspend,
@@ -15116,6 +16275,34 @@ reject_conflicting_flags({
 })
 @
 
+[[--no-command]] silences a launcher; [[--no-shell]] silences the
+shell that a working directory alone would open.  The two answer
+different questions, which is why they are separate flags rather
+than one \enquote{launch nothing} switch: a task carrying both a
+[[wd]] and [[claude]] should still run [[claude]] under
+[[--no-shell]], and still open a shell under [[--no-command]].
+The shell is the one launch reason that is a preference---it exists
+only to carry the prompt marker and the [[cd]], both of which a
+tracked tmux window and the shell prompt (\cref{prompt}) provide
+without a nested shell---so it is the one with a configured default
+(\cref{todo:start-settle}).  The flag is tri-state for that reason:
+[[None]] means \enquote{ask the configuration}.  It governs only a
+launch in the caller's own terminal; [[--pane]] and [[--window]]
+must run \emph{something} in the pane or window they create, so a
+command-less task still gets a shell there.
+
+<<argument and option definitions>>=
+shell_opt = typer.Option(
+    "--shell/--no-shell",
+    help="Open a shell in the task's wd when it has no "
+         "command (default: todo.shell config, else yes); "
+         "--pane/--window always get a shell")
+@
+
+<<start command options>>=
+shell: Annotated[bool | None, shell_opt] = None,
+@
+
 Likewise [[--worktree]] overrides the stored worktree name for this
 one start, without editing the item.  This is the one-off counterpart
 of [[todo add --worktree]]: a task normally lives in the same worktree
@@ -15304,6 +16491,7 @@ except ImportError:
 @
 
 \subsubsection{Spawning a Subprocess}
+\label{todo:start-spawn}
 
 We spawn a subprocess whenever the todo carries enough information to
 launch something on its own (a stored [[command]] or [[wd]]) and also
@@ -15314,7 +16502,12 @@ launcher such as [[claude]] on the todo would see tracking start but
 never see their command run unless they remembered to pass a launch
 flag such as [[-W]].  [[--no-command]] removes the command from that
 list of reasons, and only the command: a [[wd]], a worktree or a tmux
-flag still launches, now with a shell.
+flag still launches, now with a shell.  The [[wd]] and worktree
+reasons are in turn subject to the shell preference
+([[should_spawn_shell]]): they only ever launch a shell, so when the
+user has asked for no shell they are no reasons at all, and the
+start settles in the current terminal instead
+(\cref{todo:start-settle}).
 The environment restoration starts from the stored [[env]] (if
 available) and overlays terminal-related variables ([[TERM]],
 [[DISPLAY]], [[SSH_*]]) from the current environment to ensure the
@@ -15334,9 +16527,13 @@ fallible auto-suspend lookup earlier keeps it outside that window so a
 failure there cannot leak the file.
 
 <<spawn subprocess when the todo has work to launch>>=
+use_shell = should_spawn_shell(
+    item.who or default_username, shell,
+)
 if (
-    item.wd or worktree_dir or run or pane or window
+    run or pane or window
     or (item.command and not no_command)
+    or ((item.wd or worktree_dir) and use_shell)
 ):
     <<validate tmux options>>
     <<prepare subprocess environment>>
@@ -15349,9 +16546,528 @@ if (
             <<remove worktree after todo run>>
             <<handle subprocess exit>>
     else:
+        <<adopt the current window for a direct launch>>
         <<run subprocess>>
         <<remove worktree after todo run>>
         <<handle subprocess exit>>
+else:
+    <<settle in the current terminal>>
+@
+
+A direct launch blocks the caller's own terminal, so the task runs in
+a window the user opened---the very window that
+[[start_tracking_labels]] cannot mark as tracked, since it only adds
+labels to pane and window files that already exist.  The launched
+command is exactly the caller that suffers from that: [[claude]] or a
+shell running [[todo done]] or [[todo next]] without an ID has no way
+to name the task it is working on, and the ID-less resolution falls
+back to whichever \emph{other} window is tracked---or to
+\enquote{No active todo}.  Adopting the window first gives the child
+the same context a [[--window]] launch would have given it.  That is
+the argument the settle path already makes
+(\cref{todo:start-settle}), so the two paths call one helper,
+introduced there.
+
+We adopt without arming a finalize hook, the one difference from the
+settle path.  A pane-exit hook fires when the \emph{pane} dies, not
+when our child exits, and this pane outlives the launch: control
+returns here, [[<<handle subprocess exit>>]] stops the hierarchy and
+settles the status, and the user carries on in the same shell.  A hook
+armed now would therefore fire much later---at the end of the terminal
+session, on a task that was finished, reassigned or restarted in the
+meantime---and reset it.  The settle path has no such moment to react
+to, which is why it keeps the pane-history decision: there the shell
+the user eventually leaves is the only exit signal there is.
+
+<<adopt the current window for a direct launch>>=
+if not headless:
+    adopt_untracked_window_for_start(
+        todo_id, item, todos, auto_suspend,
+        arm_finalize=False,
+    )
+@
+
+Let's verify the four launch shapes: an interactive direct launch in
+an untracked window adopts it, hook-free and without losing the
+spawn, and carries the ancestors along; a tracked window, a tmux
+launch, and a headless run are left alone.  The pane is given
+\emph{no} exit hooks of its own here, so the hook mock would fire if
+the launch ever fell back to the pane-history decision.
+
+<<test functions>>=
+def invoke_launching_start(args, tracked, user_input=None):
+    """Invoke a launching start with the spawn mocked.
+
+    Returns the result together with the adopt, register,
+    exit-hook and subprocess mocks.
+    """
+    with patch.dict(
+        os.environ,
+        {"TMUX": "session", "TMUX_PANE": "%3"},
+        clear=True,
+    ), patch(
+        "nytid.cli.track.is_current_tmux_context_tracked",
+        return_value=tracked,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=False,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ) as adopt_mock, patch(
+        "nytid.cli.track.register_tmux_context_labels",
+    ) as register_mock, patch(
+        "nytid.cli.track.install_tmux_exit_hooks",
+    ) as hooks_mock, patch(
+        "nytid.cli.todo.run_todo_tmux_command",
+        return_value=0,
+    ), patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            ["true"], 0, stdout="",
+        ),
+    ) as run_mock:
+        result = runner.invoke(
+            cli, ["start"] + args, input=user_input,
+        )
+    return (
+        result, adopt_mock, register_mock,
+        hooks_mock, run_mock,
+    )
+
+
+def test_start_direct_launch_adopts_untracked_window(
+    temp_todo_dir,
+):
+    """A direct launch adopts, without arming a finalize hook."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+    ])
+    (
+        result, adopt_mock, _, hooks_mock, run_mock,
+    ) = invoke_launching_start(
+        ["1", "--command", "true"],
+        tracked=False, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Adopted this tmux window" in result.output
+    assert adopt_mock.call_args.args[0] == ["devel", "todo:1"]
+    hooks_mock.assert_not_called()
+    assert run_mock.call_count == 1
+    assert run_mock.call_args.args[0] == ["true"]
+
+
+def test_start_direct_launch_registers_ancestors(
+    temp_todo_dir,
+):
+    """The adopted window also carries the parent's labels."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            labels=["devel", "nytid"],
+        ),
+    ])
+    (
+        result, _, register_mock, _, _,
+    ) = invoke_launching_start(
+        ["2", "--command", "true"],
+        tracked=False, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    register_mock.assert_called_once()
+    assert register_mock.call_args.args[0] == ["devel", "todo:1"]
+
+
+def test_start_direct_launch_in_tracked_window(temp_todo_dir):
+    """A tracked window is already resolvable: no adoption."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--command", "true"],
+        tracked=True, user_input="n\n",
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+
+
+def test_start_window_launch_does_not_adopt(temp_todo_dir):
+    """--window makes its own tracked window to adopt instead."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--window", "--command", "true"],
+        tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+
+
+def test_start_launching_command_does_not_adopt(temp_todo_dir):
+    """A headless launch is arranged by its caller: no adoption."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    (
+        result, adopt_mock, _, _, _,
+    ) = invoke_launching_start(
+        ["1", "--headless", "--command", "true"],
+        tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+@
+
+\subsubsection{Settling in the Current Terminal}
+\label{todo:start-settle}
+
+When nothing is launched, the task is still started: it is on the
+stack and its labels are tracked.  What the shell would have
+contributed is the [[cd]] into the working directory and the
+[[todo:<id>]] marker in the prompt.  We replace the first with a
+line naming the directory---the user is in their own shell and
+changes directory themselves, and a resolved worktree is named in
+preference to [[wd]] just as the launch would have used it (it has
+already been created by [[<<resolve worktree for todo start>>]] and
+is left for the user; the post-run cleanup is a property of a run,
+and there is none).  The marker is replaced by the tmux context: in
+a tracked window the labels were just registered there, so ID-less
+[[done]] and [[next]] resolve this task and the shell prompt shows
+its chain (\cref{prompt}).
+
+<<settle in the current terminal>>=
+settle_wd = worktree_launch or item.wd
+if settle_wd:
+    typer.echo(f"  Working directory: {settle_wd}")
+<<adopt the current window when untracked>>
+@
+
+That replacement only holds in a window that \emph{is} tracked.
+Registration ([[start_tracking_labels]] with
+[[update_tmux_context]]) adds labels to existing pane and window
+files and creates none, so in a window the user opened themselves
+the task would be active on the stack yet invisible to every
+ID-less command run there---the failure a tracked tmux session
+turns into \enquote{No active todo} the moment any other window is
+tracked.  So when the start lands in an untracked tmux window, we
+adopt it (\cref{todo:adopt}): the publication, and the
+finalize-on-exit, that [[--window]] would have installed in a
+window of its own, installed in the one we are in.  Nothing in
+that argument is particular to settling---a blocking direct launch
+runs in the same untracked window and adopts it too
+(\cref{todo:start-spawn})---so the work is a function shared by the
+two paths rather than a chunk reused between them, and the one
+place where they differ, the finalize hook, is its parameter.
+Headless runs are exempt on both paths; adoption is part of the
+interactive workflow, and an agent's window is arranged by whoever
+launched it.
+
+One difference from [[adopt]] and [[--window]] is deliberate.
+Those publish only the task's own labels, making the window the
+task's window.  Here the window is the branch's window: in a
+tracked window, [[ensure_ancestors_active]] would already have
+registered every ancestor's labels, and the adopted window must end
+in the same state.  Otherwise [[done]] on the child would leave the
+window with no todo context, and the next [[next]] would jump to
+the top level instead of picking a sibling.  The ancestors were
+activated before the window was tracked, so we register them now,
+after adoption; the adoption's cleanup hook owns only the task's
+labels, and the ancestors leave the window file through [[done]]
+and [[stop]] just as they do in a [[--window]] window.
+
+The two [[track]] imports stay inside the function.  Deferring them
+keeps [[todo]] usable when [[track]] is missing---the reason every
+other call into it is deferred too---and it also keeps each name
+resolved through [[nytid.cli.track]] at call time, so the tests can
+patch the helpers there rather than having to find a copy bound
+into this module at import time.
+
+<<helpers>>=
+def adopt_untracked_window_for_start(
+    todo_id, item, todos, auto_suspend,
+    *, arm_finalize=None,
+):
+    """Adopt the current tmux window for a starting todo.
+
+    Adopts the window with the task's labels and then registers
+    every ancestor's labels on it, so ID-less todo commands run
+    there resolve the task and `next` stays inside the branch.
+    Does nothing, and returns False, outside tmux or in a window
+    that is already tracked.  `arm_finalize` is passed on to
+    `adopt_window_for_todo`.
+    """
+    if not (
+        os.environ.get("TMUX")
+        and os.environ.get("TMUX_PANE")
+    ):
+        return False
+    from nytid.cli.track import (
+        is_current_tmux_context_tracked,
+        register_tmux_context_labels,
+    )
+
+    worker = item.who or default_username
+    if is_current_tmux_context_tracked(worker):
+        return False
+    adopt_window_for_todo(
+        todo_id, item, worker, auto_suspend,
+        arm_finalize=arm_finalize,
+    )
+    for ancestor in get_ancestors(todos, item):
+        register_tmux_context_labels(
+            todo_track_labels(ancestor, ancestor.id),
+            worker,
+        )
+    typer.echo("  Adopted this tmux window")
+    return True
+@
+
+A settling start leaves the finalize decision to the helper's
+default: it launches nothing, so the only later signal that the work
+has stopped is the user's own shell exiting, and that is precisely
+what a pane-exit hook reports.
+
+<<adopt the current window when untracked>>=
+if not headless:
+    adopt_untracked_window_for_start(
+        todo_id, item, todos, auto_suspend,
+    )
+@
+
+Let's verify the settling half of the adoption rule: an untracked
+window is adopted with the task's labels and then receives the
+ancestors' labels, while a tracked window and a window outside tmux
+are left alone.
+
+<<test functions>>=
+def invoke_settled_start(args, tracked, env=None):
+    """Invoke start with tmux state and track adoption mocked."""
+    if env is None:
+        env = {"TMUX": "session", "TMUX_PANE": "%3"}
+    with patch.dict(os.environ, env, clear=True), patch(
+        "nytid.cli.track.is_current_tmux_context_tracked",
+        return_value=tracked,
+    ), patch(
+        "nytid.cli.todo.pane_has_exit_hooks",
+        return_value=True,
+    ), patch(
+        "nytid.cli.track.adopt_current_window",
+        return_value=dict(ADOPTED_WINDOW),
+    ) as adopt_mock, patch(
+        "nytid.cli.track.register_tmux_context_labels",
+    ) as register_mock:
+        result = runner.invoke(cli, ["start"] + args)
+    return result, adopt_mock, register_mock
+
+
+def test_start_no_shell_adopts_untracked_window(temp_todo_dir):
+    """An untracked window is adopted, then given the ancestors."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+            labels=["devel"],
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+            labels=["devel", "nytid"],
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, register_mock = invoke_settled_start(
+        ["2", "--no-shell"], tracked=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Adopted this tmux window" in result.output
+    assert adopt_mock.call_args.args[0] == [
+        "devel", "nytid", "todo:2",
+    ]
+    register_mock.assert_called_once()
+    assert register_mock.call_args.args[0] == ["devel", "todo:1"]
+    assert load_active_stack() == [1, 2]
+
+
+def test_start_in_tracked_window_does_not_adopt(temp_todo_dir):
+    """A tracked window only receives the registered labels."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, register_mock = invoke_settled_start(
+        ["1", "--no-shell"], tracked=True,
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+    register_mock.assert_not_called()
+
+
+def test_start_outside_tmux_does_not_adopt(temp_todo_dir):
+    """Outside tmux there is no window to adopt."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    result, adopt_mock, _ = invoke_settled_start(
+        ["1", "--no-shell"], tracked=False, env={},
+    )
+    assert result.exit_code == 0, result.output
+    adopt_mock.assert_not_called()
+@
+
+Let's verify that the flag and the configured default keep a
+[[wd]]-only task in the current terminal, that a stored command is
+unaffected, and that [[next]] forwards the flag:
+
+<<test functions>>=
+def test_start_no_shell_skips_shell_for_wd(temp_todo_dir):
+    """--no-shell with a wd starts tracking and spawns nothing."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-shell"],
+        )
+    assert result.exit_code == 0, result.output
+    mock_sub.run.assert_not_called()
+    assert "Working directory: /tmp/project" in result.output
+    assert load_active_stack() == [1]
+
+
+def test_start_no_shell_keeps_stored_command(temp_todo_dir):
+    """--no-shell still runs a stored command in the wd."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Launcher task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp",
+            command="true",
+        ),
+    ])
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli, ["start", "1", "--no-shell"],
+            input="n\n",
+        )
+    assert result.exit_code == 0, result.output
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][0][0] == "true"
+    assert mock_run.call_args.kwargs["cwd"] == "/tmp"
+
+
+def test_start_shell_config_default(temp_todo_dir):
+    """todo.shell.default = false skips the shell; --shell wins."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patched_worker_config({
+        "todo.shell.default": "false",
+    }), patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(cli, ["start", "1"])
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_not_called()
+
+        mock_sub.run.return_value.returncode = 0
+        result = runner.invoke(
+            cli, ["start", "1", "--shell"], input="n\n",
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_called_once()
+
+
+def test_start_shell_worker_config_wins_over_default(
+    temp_todo_dir,
+):
+    """The worker's own todo.shell key beats the default."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Agent task",
+            who="dan-claude",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patched_worker_config({
+        "todo.shell.default": "false",
+        "todo.shell.dan-claude": "true",
+    }), patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        mock_sub.run.return_value.returncode = 0
+        result = runner.invoke(
+            cli, ["start", "1"], input="n\n",
+        )
+        assert result.exit_code == 0, result.output
+        mock_sub.run.assert_called_once()
+
+
+def test_next_forwards_no_shell(temp_todo_dir):
+    """next forwards --no-shell to start."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Shell task",
+            status="pending",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project",
+        ),
+    ])
+    with patch(
+        "nytid.cli.todo.subprocess"
+    ) as mock_sub:
+        result = runner.invoke(
+            cli, ["next", "--no-shell"],
+        )
+    assert result.exit_code == 0, result.output
+    mock_sub.run.assert_not_called()
+    assert "Working directory: /tmp/project" in result.output
 @
 
 A worktree makes the todo launchable on its own, just as a stored
@@ -17185,13 +18901,53 @@ def adopt(
     tracked status.
     """
     <<fail adopt early outside tmux>>
-    <<decide whether to arm the finalize hook>>
     <<activate adopted todo and ancestors>>
-    <<adopt window via track module>>
-    <<arm todo finalize hook for adopted window>>
+    adopt_window_for_todo(
+        todo_id, item, worker, auto_suspend, rename=rename,
+    )
     typer.echo(
         f"Adopted window for: #{todo_id} {item.title}"
     )
+@
+
+The window half of the command is a function of its own, for the
+same reason [[track]] splits [[adopt_current_window]] from its
+[[adopt]] command: [[start]] adopts the window it runs in when it
+launches nothing there (\cref{todo:start-settle}), and it needs
+precisely these steps---the finalize decision, the call into
+[[track]], and the hook---minus the activation, which it has
+already done in its own order.  The helper returns [[track]]'s
+result so the caller can report what was started; on a window that
+cannot be resolved it exits with the message below, which reads
+the same from both commands.
+
+[[arm_finalize]] exists because that hook is the one step a caller
+can be sure is wrong for it.  The default, [[None]], means
+\enquote{decide from the pane's history}, which is the right answer
+whenever the adopted window is where the work will end.  A blocking
+direct launch knows better: it will handle the child's exit itself
+(\cref{todo:start-spawn}), so it passes [[False]] and leaves the
+pane hook-free.
+
+<<helpers>>=
+def adopt_window_for_todo(
+    todo_id, item, worker, auto_suspend, rename=False,
+    arm_finalize=None,
+):
+    """Adopt the current tmux window as work on `item`.
+
+    Publishes the task's labels on the window through the track
+    module, arms the finalize hook, and optionally renames the
+    window `todo:<id>`.  `arm_finalize` defaults to arming the
+    hook only when the pane carries none; pass False to leave the
+    pane alone when the caller handles the exit itself.  Returns
+    the adoption result dict from `adopt_current_window`; exits
+    with status 1 when the tmux window cannot be resolved.
+    """
+    <<decide whether to arm the finalize hook>>
+    <<adopt window via track module>>
+    <<arm todo finalize hook for adopted window>>
+    return adopted
 @
 
 The tmux check comes before any state change: adoption of the
@@ -17222,7 +18978,9 @@ the user here (it lives in the pane and its hooks, not in nytid's
 state files), so re-arming would make finalize run twice---the
 fresh hook cannot share the launch-time guard.  A manually created
 window, by contrast, has no pane-exit hooks at all.  So the pane's
-exit hooks are the discriminator.
+exit hooks are the discriminator---unless the caller has already
+answered the question, in which case we take its answer and do not
+even ask tmux.
 
 <<helpers>>=
 def pane_has_exit_hooks(pane_id):
@@ -17240,9 +18998,10 @@ def pane_has_exit_hooks(pane_id):
         or "pane-died" in result.stdout
     )
 <<decide whether to arm the finalize hook>>=
-arm_finalize = not pane_has_exit_hooks(
-    os.environ["TMUX_PANE"]
-)
+if arm_finalize is None:
+    arm_finalize = not pane_has_exit_hooks(
+        os.environ["TMUX_PANE"]
+    )
 @
 
 Activation precedes publication, mirroring [[todo start]]: the
@@ -19682,6 +21441,7 @@ directory.
 
 <<test [[clitodo.py]]>>=
 import contextlib
+import re
 import csv
 import datetime
 import io
@@ -19720,12 +21480,18 @@ from nytid.cli.todo import (
     get_todo_dir,
     get_todo_file,
     get_worker_default,
+    should_spawn_shell,
     get_children,
     get_descendants,
+    get_tree_rows,
+    get_subtree_rows,
+    get_visible_sub_item_rows,
     get_siblings,
     get_active_siblings,
     check_parent_completion,
     get_parent,
+    get_ancestors,
+    todo_depth,
     assign_priority_at_position,
     binary_search_priority,
     compute_child_priority_range,
@@ -19823,10 +21589,17 @@ def outside_tmux_by_default():
     Most tests exercise the non-tmux fallback path.  We patch the
     todo module's resolver to raise ``NotInTmuxError`` by default so the
     suite behaves the same whether pytest itself runs inside tmux or not.
-    Tests that need tmux-specific behavior override this fixture with
-    their own patch.
+    We also drop ``TMUX`` and ``TMUX_PANE`` from the environment: a
+    start that launches nothing adopts the window it runs in, and
+    under a developer's real tmux that would install hooks on the
+    live pane and session.  Tests that need tmux-specific behavior
+    set the variables themselves and patch the resolver again.
     """
-    with patch(
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in ("TMUX", "TMUX_PANE")
+    }
+    with patch.dict(os.environ, env, clear=True), patch(
         "nytid.cli.todo.resolve_todo_from_tmux_context",
         side_effect=NotInTmuxError,
     ):
