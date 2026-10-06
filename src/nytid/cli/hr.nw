@@ -774,24 +774,196 @@ raise ValueError(f"Can't find {username} in Canvas, but the following users "
                  f"don't have a login ID: {users_without_login_id_str}")
 @
 
-It's very straightforward to get a LADOK student object once we have the Canvas
-user object.
-We don't need to cache this function since LADOK already caches the results and
-is very fast.
+Once we have the Canvas user object, the LADOK student is one call away:
+Canvas stores the student's LADOK UID as the user's [[integration_id]],
+and [[get_student]] accepts exactly that.
+We don't need to cache this function since LADOK already caches the
+results and is very fast.
+
+What [[get_student]] returns, though, is a promise rather than a record.
+[[ladok3]]'s [[Student]] is lazy: constructing it sends nothing to LADOK,
+and the first read of an attribute such as [[personnummer]] is what
+fetches the data.
+So a student LADOK doesn't know does not fail here, it fails wherever the
+object is first printed.
+In [[nytid hr users --detailed]] that is the [[str(user_obj)]] that
+renders the row, outside the [[try]] that turns a failed lookup into a
+warning, and so one unknown TA used to abort the listing of everyone.
+An [[except KeyError]] here once looked like it handled lookup failures,
+but nothing in the constructor can raise one, and LADOK reports an
+unknown student with its own [[LadokError]]s rather than a
+[[KeyError]].
+
+We therefore make the lookup happen here, inside [[get_ladok_user]],
+where the callers already catch failures.
 <<helper functions>>=
 def get_ladok_user(canvas_user):
   """
   Takes a Canvas user object and returns a LADOK student object.
+
+  The student's personal data is fetched before returning, so a student
+  LADOK doesn't know raises here rather than when the object is printed.
   """
-  try:
-    ladok_session = get_ladok_session()
-    if ladok_session is None:
-      raise RuntimeError("LADOK session not available, run `ladok login`")
-    return ladok_session.get_student(canvas_user.integration_id)
-  except KeyError as err:
-    raise KeyError(f"can't look up {canvas_user} in LADOK: {err}")
-  except RuntimeError:
-    raise
+  ladok_session = get_ladok_session()
+  if ladok_session is None:
+    raise RuntimeError("LADOK session not available, run `ladok login`")
+
+  <<let [[ladok_id]] be [[canvas_user]]'s LADOK ID>>
+  student = ladok_session.get_student(ladok_id)
+  <<fetch [[student]]'s personal data now>>
+  return student
+@
+
+Not every Canvas user has an [[integration_id]].
+A teacher who has never studied at the university, for instance, has no
+LADOK record for Canvas to point to.
+Passed on as [[None]], it made [[ladok3]] fail deep in its personnummer
+parsing with \enquote{expected string or bytes-like object, got
+'NoneType'}, which says nothing about the actual problem.
+We name the actual problem instead.
+<<let [[ladok_id]] be [[canvas_user]]'s LADOK ID>>=
+ladok_id = getattr(canvas_user, "integration_id", None)
+if not ladok_id:
+  raise ValueError(f"{canvas_user} has no LADOK ID "
+                   "(integration_id) in Canvas")
+@
+
+Any attribute of the personal record would force the fetch, and we read
+[[personnummer]] because the callers need it anyway: it is the first
+thing [[str]] prints and what the time sheets are made out to.
+Since [[student]] was created from a LADOK UID, it doesn't know its
+personnummer yet, so reading it is guaranteed to go to LADOK.
+The same request brings the first and last names, so nothing the callers
+read later goes to LADOK again.
+[[Student.pull]] would also force the fetch, but it additionally fetches
+every course registration of the student, which we never use.
+<<fetch [[student]]'s personal data now>>=
+student.personnummer
+@
+
+Both failures are checked with a stand-in for [[ladok3]]'s [[Student]]
+that is lazy in the same way: it records whether anything has been
+fetched and fails only on the first attribute read.
+A stub session that raises from [[get_student]] would not do, since it
+would pass with or without the fix:
+<<test setup>>=
+class LazyStudent:
+  """Mimics ladok3.Student: the record is only fetched on attribute access."""
+  def __init__(self, ladok_id, error=None):
+    self.ladok_id = ladok_id
+    self.error = error
+    self.fetched = False
+
+  @property
+  def personnummer(self):
+    self.fetched = True
+    if self.error:
+      raise self.error
+    return "190001019999"
+
+
+class LazyLadokSession:
+  """A LADOK session handing out LazyStudent objects."""
+  def __init__(self, error=None):
+    self.error = error
+    self.requested = []
+
+  def get_student(self, ladok_id):
+    self.requested.append(ladok_id)
+    return LazyStudent(ladok_id, self.error)
+@
+
+A successful lookup returns a student whose record has already been
+fetched:
+<<test functions>>=
+def test_ladok_user_is_fetched_before_returning(monkeypatch):
+  """The LADOK record is loaded inside get_ladok_user."""
+  import types
+  from nytid.cli import hr as hrcli
+
+  session = LazyLadokSession()
+  monkeypatch.setattr(hrcli, "get_ladok_session", lambda: session)
+
+  student = hrcli.get_ladok_user(
+    types.SimpleNamespace(integration_id="uid-1"))
+
+  assert session.requested == ["uid-1"]
+  assert student.fetched
+@
+
+An unknown student must fail inside [[get_ladok_user]], where the
+callers catch it, and not later when the row is printed:
+<<test functions>>=
+def test_ladok_user_unknown_student_fails_here(monkeypatch):
+  """LADOK's error surfaces from get_ladok_user itself."""
+  import types
+  from nytid.cli import hr as hrcli
+
+  class LadokAPIError(Exception):
+    pass
+
+  session = LazyLadokSession(LadokAPIError("GET request failed"))
+  monkeypatch.setattr(hrcli, "get_ladok_session", lambda: session)
+
+  with pytest.raises(LadokAPIError):
+    hrcli.get_ladok_user(types.SimpleNamespace(integration_id="uid-1"))
+@
+
+A Canvas user without an [[integration_id]] gets an error that names
+it, and LADOK isn't asked at all:
+<<test functions>>=
+def test_ladok_user_without_integration_id(monkeypatch):
+  """A missing integration_id is reported as such."""
+  import types
+  from nytid.cli import hr as hrcli
+
+  session = LazyLadokSession()
+  monkeypatch.setattr(hrcli, "get_ladok_session", lambda: session)
+
+  with pytest.raises(ValueError, match="integration_id"):
+    hrcli.get_ladok_user(types.SimpleNamespace(integration_id=None))
+
+  assert session.requested == []
+@
+
+Finally, the listing as a whole has to survive the unknown student.
+The caller already turns a failure in [[get_ladok_user]] into a warning
+and keeps the Canvas user.
+This test checks that the failure now actually happens there, so the
+row is still printed:
+<<test functions>>=
+def test_users_detailed_survives_unknown_ladok_student(monkeypatch,
+                                                       capsys, caplog):
+  """One unknown student is a warning, not an aborted listing."""
+  import typerconf
+  from nytid.cli import hr as hrcli
+
+  class LadokAPIError(Exception):
+    pass
+
+  class CanvasUser:
+    integration_id = "uid-1"
+    email = "alice@kth.se"
+    def __str__(self):
+      return "Alice Anteater"
+
+  session = LazyLadokSession(LadokAPIError("GET request failed"))
+  monkeypatch.setattr(hrcli, "get_ladok_session", lambda: session)
+  monkeypatch.setattr(hrcli, "get_canvas_user",
+                      lambda *args, **kwargs: CanvasUser())
+  monkeypatch.setattr(
+    hrcli.coursescli, "get_courses_configs",
+    lambda *args, **kwargs: {
+      ("DD1310", "reg"): typerconf.Config({})})
+  monkeypatch.setattr(
+    nytid.signup.hr, "hours_per_TA",
+    lambda booked: {"alice": 10})
+
+  with caplog.at_level(logging.WARNING):
+    hrcli.users("DD1310", "reg", True)
+
+  assert "Alice Anteater <alice@kth.se>" in capsys.readouterr().out
+  assert "in LADOK" in caplog.text
 @
 
 
