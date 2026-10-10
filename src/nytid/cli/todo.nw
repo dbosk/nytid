@@ -17572,10 +17572,12 @@ def stop_todo_hierarchy(todo_id, who=None, launched_by=None):
     resolved_id, item, _, todos, _ = stop_todo_state(
         todo_id, who=who, launched_by=launched_by,
     )
-    resolved_who = who
+    resolved_who = who or launched_by
     if resolved_who is None and item is not None:
         resolved_who = session_worker(item)
-    stop_todo_tracking(resolved_id, item, todos)
+    stop_todo_tracking(
+        resolved_id, item, todos, worker=launched_by,
+    )
     stopped_ids = stop_active_descendants(
         resolved_id, todos, who=resolved_who
     )
@@ -19358,20 +19360,83 @@ all was stopped or completed by someone, which is not a takeover and
 is handled as before.  Runs started before this check existed carry
 no launcher, and [[None]] keeps their old behaviour.
 
+Unlike the claim check, this comparison reads [[claimed_by]] itself
+and not [[session_worker]], whose fallback to the assignee is meant
+for items activated before claims were recorded.  A run's ending
+needs evidence of a takeover before it holds back, and an empty
+[[claimed_by]] on an active item is no such evidence: a takeover
+always writes the new claimant.  The field is empty when an older
+version of nytid saved the store meanwhile and dropped the unknown
+key, or when a command was interrupted between its writes.  Falling
+back to the assignee there would mistake the run's own item for
+somebody else's whenever an agent ran a task from the user's queue,
+and leave it on the stack with nobody's clock running.  For the same
+reason a run's stop closes the session of the worker that launched it
+by name, as [[stop_todo_hierarchy]] does when given [[launched_by]],
+rather than the session it would derive from the item.
+
 <<helpers>>=
 def run_taken_over_by(item, stack, launched_by):
     """Return the worker who took `item` from a run.
 
     `launched_by` is the acting worker that launched the
     run.  Returns the claimant if `item` is active on
-    `stack` and claimed by someone else, otherwise `None`
-    (also when `launched_by` is `None`: an older run
-    that did not record its launcher).
+    `stack` and claimed by someone else, otherwise `None`:
+    also when nobody is recorded as its claimant, and when
+    `launched_by` is `None` (an older run that did not
+    record its launcher).
     """
     if launched_by is None or item.id not in stack:
         return None
-    holder = session_worker(item)
-    return holder if holder != launched_by else None
+    holder = item.claimed_by
+    if holder is None or holder == launched_by:
+        return None
+    return holder
+@
+
+Let's verify that case: an agent runs a task from the user's queue,
+and while it runs an older version of nytid saves the store without
+[[claimed_by]].  The run must end as its own, stopping the item and
+handing it on, not report a takeover:
+
+<<test functions>>=
+def test_run_ending_ignores_stripped_claim(temp_todo_dir):
+  """A missing claimant is not taken for a takeover."""
+  from nytid.cli.track import load_active_session
+  save_todos(2, [
+    TodoItem(
+      id=1, title="User task",
+      created="2026-02-20T10:00:00",
+      command="claude -p",
+    ),
+  ])
+  store = temp_todo_dir / "todos.json"
+
+  def old_version_saves_meanwhile(cmd, *args, **kwargs):
+    data = json.loads(store.read_text())
+    for record in data["todos"]:
+      record.pop("claimed_by", None)
+    store.write_text(json.dumps(data))
+    return subprocess.CompletedProcess(cmd, 1, stdout="fail")
+
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=old_version_saves_meanwhile,
+  ), patch("nytid.cli.todo.post_note_comment"):
+    result = runner.invoke(
+      cli,
+      ["start", "1", "--who", "dan-claude", "--headless",
+       "--reassign-to", "bob"],
+    )
+
+  assert result.exit_code == 0, result.output
+  assert "taken over" not in result.output
+  assert load_active_stack() == []
+  _, todos = load_todos()
+  assert todos[0].who == "bob"
+  assert load_active_session(
+    "dan-claude"
+  ).get_active_labels() == []
 @
 
 The comparison is made twice, both times under the lock, because the
