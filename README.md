@@ -72,8 +72,8 @@ nytid track stats weekly
 Priority-based task list with working-directory capture, notes, and GitHub issue
 sync. Tasks can be started interactively or handed off to AI agents in headless
 mode. Tasks can wait for other tasks: `todo ready` and `todo next` offer only
-the tasks that nothing blocks, and the schedule view automatically slots those
-into free time.
+the tasks that nothing blocks, and the schedule view automatically slots those,
+and the tasks already in progress, into free time.
 
 ```bash
 nytid todo add "Grade assignment 3" --prio 2
