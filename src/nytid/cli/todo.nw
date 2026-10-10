@@ -44,7 +44,9 @@ Both listings stop at one level by default: [[todo ls]] shows
 top-level items, and [[ls --all]] or [[todo view]] add the direct
 children.  [[--recursive]] lists every depth in either command, and
 [[-r N]] the next [[N]] levels; [[todo.ls.recursive]] and
-[[todo.view.recursive]] make either the default.
+[[todo.view.recursive]] make either the default.  [[todo ready]]
+(\cref{sec:todo-ready}) cuts across the tree instead: one flat,
+ranked list of the items that can be started now, at any depth.
 
 Starting a child automatically activates the entire ancestor chain:
 if you [[todo start 7]] and item~7 is a sub-item of~5, which in turn
@@ -110,6 +112,8 @@ cli = typer.Typer(
         "task\n"
         "  nytid todo ls                           # list by "
         "priority\n"
+        "  nytid todo ready                        # what can "
+        "I start now?\n"
         "  nytid todo next                         # start "
         "highest-priority\n"
         "  nytid todo edit -E                      # edit active"
@@ -6608,6 +6612,7 @@ exporting to calendars.
 <<item management commands>>=
 <<add command>>
 <<list command>>
+<<ready command>>
 <<view command>>
 <<edit command>>
 <<reprioritize command>>
@@ -8973,8 +8978,9 @@ or a [[--who]] value selects is not: any other listing that accepts
 the same positional labels and the same [[--who]] should select the
 same items, or a user who narrows two listings with the same words
 gets two different answers.  We therefore keep those two filters in a
-function rather than in the chunk above, so that a second listing
-reuses them by calling it instead of by copying its lines.
+function rather than in the chunk above, so that the [[ready]] listing
+(\cref{sec:todo-ready}) reuses them by calling it instead of by
+copying its lines.
 
 The labels form a union, as the introduction to this command said,
 and the assignee is a regular expression searched in [[who]].  Each
@@ -10131,7 +10137,10 @@ dictionary of repository, type and number, rendered as [[repo#number]]:
 the spelling [[gh]] itself accepts and the one a reader would write in
 a commit message.  Flattening it drops the issue-versus-pull-request
 distinction, which is the price of a single cell; a consumer that needs
-that distinction reads JSON.
+that distinction reads JSON.  The ancestor path that [[ready]] adds to
+its records (\cref{sec:todo-ready}) is a list of id and title pairs;
+its cell is the line of titles the [[ready]] table shows, and a
+consumer that needs the ids reads JSON for the same reason.
 
 That leaves [[env]], a dictionary of arbitrary environment variables
 with no one-line spelling at all.  Encoding it would mean inventing a
@@ -10148,11 +10157,14 @@ def csv_cell(name, value):
     """Return `value` rendered as the CSV cell of column `name`.
 
     Labels are joined with semicolons, a GitHub link becomes
-    `repo#number`, and `None` becomes the empty string.  Every other
-    value is rendered with `str`, matching what JSON would show.
+    `repo#number`, a path becomes its titles, and `None` becomes the
+    empty string.  Every other value is rendered with `str`,
+    matching what JSON would show.
     """
     if name == "labels":
         return ";".join(value or [])
+    if name == "path":
+        return format_todo_path(value)
     if name == "github":
         if not value:
             return ""
@@ -10474,6 +10486,575 @@ def test_ls_csv_blank_cells_for_unset_fields(temp_todo_dir):
     assert rows[0]["github"] == ""
     assert rows[0]["deadline"] == ""
     assert "env" not in rows[0]
+@
+
+\subsection{The [[ready]] Command}%
+\label{sec:todo-ready}
+
+[[ls]] answers how the work is organised: projects at the top, each
+one's parts below it.  That is the wrong shape for the question one
+asks most often, \enquote{what can I do now?}  The answer to that is
+usually a sub-item a level or two down, under a parent that ranks
+high, and the tree hides it behind [[--all]] or [[-r]], in among
+parents that cannot be worked on as such and items that someone is
+already working on.  [[ready]] answers the question directly: one
+flat list, ranked the way [[ls]] ranks, of the items that could be
+started now.
+
+The two listings differ in what they show and agree on how they
+filter, rank and render:
+\begin{description}
+\item[What differs] [[ls]] lists a tree, top-level items by default,
+  in every status but done.  [[ready]] lists every depth, flat, and
+  only the items that are ready (defined below); each row carries the
+  path of its ancestors, since a flat row has no tree around it to
+  say where it belongs.
+\item[What is shared] The positional labels, [[--who]] and its
+  default, the display order, [[-n]] with [[-n 0]] for all, the four
+  formats with their defaults and dialects, [[--prio]] and
+  [[--output]].  These are [[ls]]'s own code, called rather than
+  copied, so a filter that changes in [[ls]] changes here too.
+\end{description}
+
+[[ready]] does not walk the tree the way [[next]] does.  [[next]]
+starts from the current context and descends one level at a time, so
+it finishes the project it is in before moving on; [[ready]] ranks the
+ready items of every project against each other, which is the view
+one wants when choosing what to switch to.
+
+\paragraph{What ready means}
+
+An item is ready when it is pending and none of its children is
+still open.  The status condition is plain: a done item needs no work
+and an in-progress item already has a worker.  The condition on
+children is what makes the list a list of things one can actually
+do.  A parent is marked done by rollup when its last child is done,
+so working on a parent \emph{means} working on one of its children,
+and listing the parent as well would offer the same work twice.  The
+children counted are all of them, whoever they are assigned to: a
+parent whose remaining child belongs to an agent is not ready for its
+owner either, because it completes when the agent finishes.
+
+Readiness is decided in one function, [[is_ready]], rather than in
+the command.  [[ready]] is the first caller, but not the only
+candidate: [[next]] and the schedule both pick pending items to work
+on, and a condition added to readiness---for instance an item that
+waits for another---has to reach every caller at once, which it does
+only if there is one definition to add it to.
+
+[[--all]] widens the listing without changing the definition: it also
+lists pending items whose children are open, for the user who wants
+to see the projects that are waiting.  The flag is a parameter of
+[[is_ready]] rather than a second test in the command, so that
+whatever else readiness comes to require still applies to those rows.
+
+<<sub-item helpers>>=
+def is_ready(todos, item, allow_open_children=False):
+    """Return whether `item` is ready to be worked on.
+
+    An item is ready when it is pending and none of its children in
+    `todos` is open (not done).  With `allow_open_children`, a
+    pending item with open children counts as well.  This is the
+    single definition of readiness; callers should not test the
+    conditions themselves.
+    """
+    if item.status != "pending":
+        return False
+    if allow_open_children:
+        return True
+    return all(
+        child.status == "done"
+        for child in get_children(todos, item.id)
+    )
+@
+
+Let's verify the cases: a pending leaf is ready, a parent with an open
+child is not unless asked, neither an in-progress nor a done item is
+ever ready, and a child counts whoever it is assigned to.
+
+<<test functions>>=
+def test_is_ready_leaves_only_by_default():
+  """Pending leaves are ready; open parents only when allowed."""
+  todos = [
+    TodoItem(id=1, title="Parent"),
+    TodoItem(id=2, title="Open child", parent_id=1),
+    TodoItem(id=3, title="Done child", parent_id=1, status="done"),
+    TodoItem(id=4, title="Active", status="in-progress"),
+    TodoItem(id=5, title="Done", status="done"),
+  ]
+  by_id = {t.id: t for t in todos}
+
+  assert is_ready(todos, by_id[2])
+  assert not is_ready(todos, by_id[1])
+  assert is_ready(todos, by_id[1], allow_open_children=True)
+  assert not is_ready(todos, by_id[4], allow_open_children=True)
+  assert not is_ready(todos, by_id[5], allow_open_children=True)
+
+
+def test_is_ready_counts_children_of_every_worker():
+  """A child assigned to someone else still keeps its parent open."""
+  todos = [
+    TodoItem(id=1, title="Parent", who="me"),
+    TodoItem(id=2, title="Child", parent_id=1, who="dan-claude"),
+  ]
+  assert not is_ready(todos, todos[0])
+@
+
+\paragraph{Where a row belongs}
+
+The path is the line of ancestors that [[get_ancestors]] returns, root
+first, which is the order one reads a path in.  Two encodings of it
+are needed.  A person reads titles, so the table shows them joined by
+[[>]], the separator the shell prompt already uses for the same chain
+of ids (\cref{prompt}); it is ASCII, so it reads the same in every
+terminal and every CSV consumer.  A script wants to act on an
+ancestor, and a title can itself contain the separator, so the record
+carries the path as a list of id and title pairs, from which the line
+of titles is derived.
+
+<<constants>>=
+TODO_PATH_SEPARATOR = " > "
+<<helpers>>=
+def todo_path(todos, item):
+    """Return the ancestors of `item` as `{id, title}` dicts.
+
+    The root comes first; a top-level item has an empty path.
+    """
+    return [
+        {"id": ancestor.id, "title": ancestor.title}
+        for ancestor in get_ancestors(todos, item)
+    ]
+
+
+def format_todo_path(path):
+    """Return the titles of `path` as one line, root first."""
+    return TODO_PATH_SEPARATOR.join(
+        step["title"] for step in path or []
+    )
+@
+
+Let's verify both encodings on a three-level chain:
+
+<<test functions>>=
+def test_todo_path_lists_ancestors_root_first():
+  """The path names the ancestors, root first, and none at the top."""
+  todos = [
+    TodoItem(id=1, title="Course X"),
+    TodoItem(id=2, title="Lab 2", parent_id=1),
+    TodoItem(id=3, title="Grade", parent_id=2),
+  ]
+  path = todo_path(todos, todos[2])
+  assert path == [
+    {"id": 1, "title": "Course X"},
+    {"id": 2, "title": "Lab 2"},
+  ]
+  assert format_todo_path(path) == "Course X > Lab 2"
+  assert todo_path(todos, todos[0]) == []
+@
+
+The record [[ready]] serializes is [[ls]]'s record
+(\cref{sec:todo-ls-record}) with two derived values appended, for the
+reason [[ls_record]] appends its own: derived values stay at the end
+of every record and of the CSV header.  The [[ready]] field is
+[[is_ready]]'s verdict on the row.  Without [[--all]] it is always
+true, which looks redundant until one notices what it buys: under
+[[--all]] it is how a script tells the parents that the flag let in
+from the items it can start.
+
+<<helpers>>=
+def ready_record(todos, item, now, tracked_times, show_prio):
+    """Return the dictionary `todo ready` serializes for `item`.
+
+    This is the `todo ls` record followed by `path`, the item's
+    ancestors as `{id, title}` dicts, and `ready`, whether the item
+    is ready by `is_ready`.
+    """
+    record = ls_record(item, now, tracked_times, show_prio)
+    record["path"] = todo_path(todos, item)
+    record["ready"] = is_ready(todos, item)
+    return record
+@
+
+\paragraph{The options}
+
+All but two options are [[ls]]'s option objects, so the flags, their
+help and their configuration keys are the same.  The row cap is one
+exception and gets a key of its own: a list of things to start is
+read differently from an overview, and one may well want the overview
+long and the choice short.  Its fallback is [[ls]]'s cap rather than a
+number of our own, so someone who configured [[todo.ls.count]] and
+never heard of [[ready]] gets the cap they chose.  [[--all]] is the
+other, because its meaning differs from [[ls]]'s.  What [[ls]] has and
+[[ready]] lacks is the tree and status options---[[--recursive]],
+[[--flat]], [[--status]] and [[--done]]---since a ready list is flat,
+and readiness decides the status.
+
+<<configuration>>=
+TODO_READY_COUNT_CONFIG = "todo.ready.count"
+DEFAULT_READY_COUNT = default(
+    TODO_READY_COUNT_CONFIG, DEFAULT_LS_COUNT, int)
+<<argument and option definitions>>=
+ready_all_opt = typer.Option(
+    "--all", "-a",
+    help="Also list pending items whose sub-items are still open")
+ready_count_opt = typer.Option(
+    "-n",
+    help="Limit output to top N items; 0 shows all; "
+         "defaults to todo.ls.count. "
+         + config_hint("todo.ready.count"))
+@
+
+\paragraph{The command}
+
+The body has [[ls]]'s shape and reuses its chunks where the variables
+mean the same thing: [[-n 0]] is lifted to no cap, the tracked time is
+queried for the rows in [[filtered]], and the format is resolved from
+the terminal.  What differs is the selection, and that every format
+sorts and caps the same list, since there is no tree to cap by roots.
+
+<<ready command>>=
+@cli.command(name="ready")
+def ready(
+    label_filter: Annotated[list[str] | None,
+                            label_filter_arg] = None,
+    include_parents: Annotated[bool, ready_all_opt] = False,
+    count: Annotated[int | None,
+                     ready_count_opt] = DEFAULT_READY_COUNT,
+    who_filter: Annotated[str | None,
+                          ls_who_opt] = DEFAULT_LS_WHO,
+    output_format: Annotated[LsFormat,
+                             ls_format_opt] = DEFAULT_LS_FORMAT,
+    show_prio: Annotated[bool, ls_prio_opt] = False,
+    output: Annotated[str | None,
+                      ls_output_opt] = None,
+):
+    """List the items that are ready to work on, by priority.
+
+    An item is ready when it is pending and has no open sub-items.
+    Every depth is listed flat, in the order `todo ls` uses, with
+    the path of each item's ancestors.  Pass `--all` to also list
+    pending items whose sub-items are open.
+
+    Labels, `--who` (default $USER, `''` for all), `-n` (`0` for
+    all), `--format`, `--prio` and `--output` work as in `todo ls`.
+    """
+    _, todos = load_todos()
+
+    <<treat [[-n 0]] as unlimited>>
+    <<select the ready items>>
+    <<query tracked time>>
+
+    <<determine effective format>>
+
+    now = datetime.datetime.now()
+    ranked = sort_todos_for_display(filtered, now)
+    shown = ranked[:count]
+    if effective_format == "json":
+        <<output the ready json>>
+    elif effective_format == "rich":
+        <<output the ready rich table>>
+    else:
+        <<output the ready csv>>
+@
+
+The selection is readiness first, then [[ls]]'s filters.  The order
+matters for correctness and not only for speed: readiness looks at
+\emph{all} of an item's children, so it has to be asked of the whole
+list, while the filters only decide which of the ready items to show.
+
+<<select the ready items>>=
+filtered = filter_by_labels_and_who(
+    [
+        t for t in todos
+        if is_ready(todos, t, allow_open_children=include_parents)
+    ],
+    label_filter,
+    who_filter,
+)
+@
+
+The three renderers follow [[ls]]'s.  JSON and the delimited formats
+encode the record, the latter through [[ls]]'s CSV chunks, so the path
+reaches a CSV cell as its line of titles (\cref{sec:todo-ls-csv}).
+An empty listing prints an empty JSON array and nothing as CSV, as [[ls]]
+does.
+
+<<output the ready json>>=
+print(json.dumps(
+    [
+        ready_record(todos, t, now, tracked_times, show_prio)
+        for t in shown
+    ],
+    indent=2,
+))
+<<output the ready csv>>=
+if not shown:
+    return
+records = [
+    ready_record(todos, item, now, tracked_times, show_prio)
+    for item in shown
+]
+<<choose the csv dialect>>
+<<write the records as csv>>
+<<deliver the csv text>>
+@
+
+The table is [[ls]]'s table with a Path column appended.  Appending,
+rather than placing it beside the title, keeps every column where a
+reader of [[ls]] expects it, and matches the record, where the path
+also comes last.  The path is user-authored text like the title, so
+it is wrapped in [[Text]] for the same reason.  An empty table says
+so, and a capped one says how much it hid, both as [[ls]] does.
+
+<<output the ready rich table>>=
+from rich.console import Console
+from rich import box
+from rich.table import Table
+from rich.text import Text
+
+if not shown:
+    typer.echo("No ready todos found.")
+    return
+
+console = Console()
+<<create the rich table with [[ls]]'s columns>>
+table.add_column("Path")
+for item in shown:
+    table.add_row(
+        *ls_row_cells(item, now, tracked_times, show_prio),
+        Text(format_todo_path(todo_path(todos, item))),
+    )
+console.print(table)
+hidden = len(ranked) - len(shown)
+<<show the truncation hint below the table>>
+@
+
+\paragraph{Testing the command}
+
+The tests share one small project: a course with a lab that has two
+sub-items, one of them done, a research item, an item of another
+worker, and two items that are not ready, one done and one in
+progress.  The latter is on the active stack, because the stack, not
+the stored status, is what makes an item in progress when the list is
+loaded.
+
+<<test functions>>=
+def save_ready_fixture():
+  """Store a small tree with ready and unready items."""
+  save_todos(9, [
+    TodoItem(
+      id=1, title="Course X", priority=9.0,
+      created="2026-02-20T10:00:00", who="me",
+      labels=["course"],
+    ),
+    TodoItem(
+      id=2, title="Lab 2", parent_id=1, priority=8.0,
+      created="2026-02-20T10:00:00", who="me",
+      labels=["course"],
+    ),
+    TodoItem(
+      id=3, title="Grade", parent_id=2, priority=7.5,
+      created="2026-02-20T10:00:00", who="me",
+      labels=["course", "grading"],
+    ),
+    TodoItem(
+      id=4, title="Old grading", parent_id=2, priority=7.0,
+      created="2026-02-20T10:00:00", who="me",
+      status="done", labels=["grading"],
+    ),
+    TodoItem(
+      id=5, title="Write paper", priority=5.0,
+      created="2026-02-20T10:00:00", who="me",
+      labels=["research"],
+    ),
+    TodoItem(
+      id=6, title="Fix bug", priority=4.0,
+      created="2026-02-20T10:00:00", who="dan-claude",
+      labels=["grading"],
+    ),
+    TodoItem(
+      id=7, title="In flight", priority=6.0,
+      created="2026-02-20T10:00:00", who="me",
+      status="in-progress",
+    ),
+    TodoItem(
+      id=8, title="Finished", priority=6.5,
+      created="2026-02-20T10:00:00", who="me",
+      status="done",
+    ),
+  ])
+  save_active_stack([7])
+
+
+def ready_ids(*args):
+  """Return the ids `todo ready -f json` lists for `args`."""
+  result = runner.invoke(
+    cli, ["ready", "--format", "json", *args]
+  )
+  assert result.exit_code == 0, result.output
+  return [record["id"] for record in json.loads(result.stdout)]
+@
+
+By default only the leaves are listed, and neither the in-progress nor
+the done item; [[--all]] adds the two parents, in their places in the
+ranking:
+
+<<test functions>>=
+def test_ready_lists_leaves_by_default(temp_todo_dir):
+  """Parents with open children, active and done items are left out."""
+  save_ready_fixture()
+  assert ready_ids("--who", "") == [3, 5, 6]
+  assert ready_ids("--who", "", "--all") == [1, 2, 3, 5, 6]
+@
+
+The filters are [[ls]]'s, so the test compares with [[ls]] itself
+rather than with a list of ids written down here.  For every label
+combination and [[--who]] value below, [[ready]] must select from the
+ready items exactly what [[ls -r]] selects from all of them:
+
+<<test functions>>=
+def test_ready_filters_like_ls(temp_todo_dir):
+  """Labels and --who select from the ready items what ls selects."""
+  save_ready_fixture()
+  ready_set = set(ready_ids("--who", ""))
+  for args in (
+    ["grading"],
+    ["course", "research"],
+    ["nosuchlabel"],
+    ["--who", "dan"],
+    ["--who", "^me$", "grading"],
+  ):
+    if "--who" not in args:
+      args = [*args, "--who", ""]
+    listed = runner.invoke(
+      cli, ["ls", "-r", "-n", "0", "--format", "json", *args]
+    )
+    assert listed.exit_code == 0
+    by_ls = {r["id"] for r in json.loads(listed.stdout)}
+    assert set(ready_ids("-n", "0", *args)) == by_ls & ready_set, args
+@
+
+The order is [[ls]]'s display order, including the deadline boost
+that lets a lower-ranked item with a passed deadline overtake a
+higher-ranked one, and the unranked tail sorted by deadline.  The cap
+takes the top of that order, and [[-n 0]] lifts it:
+
+<<test functions>>=
+def test_ready_ranks_like_ls_and_caps(temp_todo_dir):
+  """Effective priority first, unranked by deadline, capped by -n."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="High", priority=5.0,
+      created="2026-01-01T00:00:00", who="me",
+    ),
+    TodoItem(
+      id=2, title="Overdue", priority=4.0,
+      created="2026-01-01T00:00:00", who="me",
+      deadline="2026-01-02T00:00:00",
+    ),
+    TodoItem(
+      id=3, title="Unranked late", who="me",
+      created="2026-01-01T00:00:00", deadline="2030-02-01",
+    ),
+    TodoItem(
+      id=4, title="Unranked soon", who="me",
+      created="2026-01-01T00:00:00", deadline="2030-01-01",
+    ),
+  ])
+  assert ready_ids("--who", "") == [2, 1, 4, 3]
+  listed = runner.invoke(
+    cli, ["ls", "--format", "json", "--who", ""]
+  )
+  assert [r["id"] for r in json.loads(listed.stdout)] == [2, 1, 4, 3]
+  assert ready_ids("--who", "", "-n", "2") == [2, 1]
+  assert ready_ids("--who", "", "-n", "0") == [2, 1, 4, 3]
+@
+
+The JSON record is [[ls]]'s with the path and the verdict appended;
+under [[--all]] the verdict is what tells a parent from a leaf:
+
+<<test functions>>=
+def test_ready_json_carries_path_and_ready(temp_todo_dir):
+  """JSON rows end with the ancestor path and the ready flag."""
+  save_ready_fixture()
+  result = runner.invoke(
+    cli, ["ready", "--format", "json", "--who", "", "--all"]
+  )
+  assert result.exit_code == 0
+  rows = {r["id"]: r for r in json.loads(result.stdout)}
+  assert list(rows[3])[-3:] == ["tracked_hours", "path", "ready"]
+  assert rows[3]["path"] == [
+    {"id": 1, "title": "Course X"},
+    {"id": 2, "title": "Lab 2"},
+  ]
+  assert rows[3]["ready"] is True
+  assert rows[5]["path"] == []
+  assert rows[2]["ready"] is False
+@
+
+The table and the CSV show the path as titles, and the table keeps
+[[ls]]'s columns in front of it:
+
+<<test functions>>=
+def test_ready_table_and_csv_show_path(temp_todo_dir):
+  """The rich table ends with Path; the CSV path cell is titles."""
+  save_ready_fixture()
+  table = runner.invoke(
+    cli, ["ready", "--format", "rich", "--who", ""],
+    env={"COLUMNS": "200"},
+  )
+  assert table.exit_code == 0
+  header = next(l for l in table.output.splitlines() if "Path" in l)
+  assert header.index("Title") < header.index("Status") \
+    < header.index("Path")
+  assert "Course X > Lab 2" in table.output
+
+  as_csv = runner.invoke(
+    cli, ["ready", "--format", "csv", "--who", ""]
+  )
+  assert as_csv.exit_code == 0
+  rows = list(csv.DictReader(io.StringIO(as_csv.stdout)))
+  assert rows[0]["title"] == "Grade"
+  assert rows[0]["path"] == "Course X > Lab 2"
+  assert rows[0]["ready"] == "True"
+@
+
+When nothing is ready, the table says so and the data formats stay
+data, and the command succeeds either way, because an empty answer is
+still an answer:
+
+<<test functions>>=
+def test_ready_empty(temp_todo_dir):
+  """No ready items: a line for people, empty data for scripts."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Busy", status="in-progress",
+      created="2026-02-20T10:00:00", who="me",
+    ),
+  ])
+  save_active_stack([1])
+  table = runner.invoke(
+    cli, ["ready", "--format", "rich", "--who", ""]
+  )
+  assert table.exit_code == 0
+  assert "No ready todos found." in table.output
+  assert ready_ids("--who", "") == []
+  as_csv = runner.invoke(
+    cli, ["ready", "--format", "csv", "--who", ""]
+  )
+  assert as_csv.exit_code == 0
+  assert as_csv.output == ""
+@
+
+Finally, the cap's own key is advertised the way [[ls]]'s is:
+
+<<test functions>>=
+def test_ready_help_advertises_count_key(temp_todo_dir):
+  """--help shows the todo.ready.count key."""
+  result = runner.invoke(cli, ["ready", "--help"])
+  assert result.exit_code == 0
+  rendered = re.sub(r"[\s│]", "", result.output)
+  assert "[config:todo.ready.count]" in rendered
 @
 
 \subsection{The [[view]] Command}
@@ -23064,6 +23645,9 @@ from nytid.cli.todo import (
     get_parent,
     get_ancestors,
     todo_depth,
+    is_ready,
+    todo_path,
+    format_todo_path,
     assign_priority_at_position,
     binary_search_priority,
     compute_child_priority_range,
