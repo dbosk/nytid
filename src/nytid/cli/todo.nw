@@ -15424,7 +15424,10 @@ We package that policy into [[stop_todo_hierarchy]] so manual
 all share one implementation.  The helper stops at the hierarchy
 boundary; callers remain free to apply their own post-stop status policy
 such as prompting for completion or resetting unfinished work to
-[[pending]].
+[[pending]].  The state it returns is a snapshot to base that decision
+on, read after the stop; the decision itself is stored by
+[[record_run_outcome]] (\cref{sec:todo-run-outcome}), never by writing
+this snapshot back, since a prompt may stand between the two.
 
 <<helpers>>=
 def stop_todo_hierarchy(todo_id, who=None):
@@ -16784,6 +16787,81 @@ The note says \enquote{no output} because a detached pane writes to the
 terminal, not to a pipe we can capture; the wording matches the blocking
 path so both kinds of run leave notes in one format.
 
+\paragraph{Storing the outcome of a run}%
+\label{sec:todo-run-outcome}
+Both kinds of run end the same way: stop the hierarchy, decide what
+the run amounted to, and store that decision.  The deciding is where
+the time goes.  The blocking path may ask the user whether the task is
+done, and the answer can take as long as the user likes; meanwhile the
+agent's own session, or anyone else, may have added a note or
+completed the item.  The old way of storing the decision---writing
+back the snapshot that [[stop_todo_hierarchy]] returned---erased all of
+that.
+
+[[record_run_outcome]] therefore takes the decision as data and applies
+it inside one locked callback (\cref{sec:todo-read-modify-write}).  The
+decision has three parts: notes to append, whether the item is done,
+and whom to hand an unfinished item to.  The callback re-checks the
+one assumption the decision rests on, that the item is not done yet.
+If it was completed in the meantime, a \enquote{not done} answer must
+not reopen it, because that answer was about the run, not about the
+completion somebody else recorded.  An item that was removed
+meanwhile is reported and left removed.  Descendants that the stop
+deactivated go back to [[pending]] unless they are done, as before.
+
+Posting a note to GitHub is network I/O and stays outside the lock:
+callers post with [[post_note_comment]] first and pass the same text
+here to be mirrored locally.
+
+<<helpers>>=
+def record_run_outcome(
+    todo_id, descendant_ids, *,
+    notes=(), done=False, reassign_to=None,
+):
+    """Store how a run of `todo_id` ended.
+
+    Appends `notes` locally.  Unless the item is already
+    done, marks it done if `done`, otherwise resets it to
+    pending and assigns it to `reassign_to` if given.
+    Descendants in `descendant_ids` that are not done
+    are reset to pending.  Returns the stored item (or
+    `None` if it no longer exists) and the stored todos.
+    """
+    def update(next_id, todos, stack):
+        item = next(
+            (t for t in todos if t.id == todo_id), None
+        )
+        if item is None:
+            typer.echo(
+                f"Warning: todo #{todo_id} no longer exists; "
+                "the outcome of its run was not stored",
+                err=True,
+            )
+            return next_id, todos, stack, None
+        for note_text in notes:
+            append_note_to_item(item, note_text)
+        if item.status != "done":
+            if done:
+                item.status = "done"
+            else:
+                if reassign_to:
+                    item.who = reassign_to
+                item.status = "pending"
+        for child in todos:
+            if (
+                child.id in descendant_ids
+                and child.status != "done"
+            ):
+                child.status = "pending"
+        return next_id, todos, stack, item
+
+    _, todos, _, item = mutate_todo_state(update)
+    return item, todos
+@
+
+The detached helper uses it directly: it has no prompt, only the exit
+code, so its decision is made at once from that.
+
 <<helpers>>=
 def finalize_detached_todo(
     todo_id, exit_code=1, exit_code_file=None,
@@ -16797,9 +16875,9 @@ def finalize_detached_todo(
     (
         todo_id,
         item,
-        next_id,
-        todos,
-        stack,
+        _,
+        _,
+        _,
         descendants,
     ) = stop_todo_hierarchy(
         todo_id
@@ -16809,17 +16887,14 @@ def finalize_detached_todo(
 
     exit_note = f"Exit code: {exit_code} (no output)"
     post_note_comment(item, exit_note)
-    append_note_to_item(item, exit_note)
-
-    if item.status != "done":
-        if exit_code != 0 and reassign_to:
-            item.who = reassign_to
-        item.status = "pending"
-    for child in descendants:
-        if child.status != "done":
-            child.status = "pending"
-
-    save_todos(next_id, todos)
+    record_run_outcome(
+        todo_id,
+        {child.id for child in descendants},
+        notes=[exit_note],
+        reassign_to=(
+            reassign_to if exit_code != 0 else None
+        ),
+    )
 
 
 def run_todo_tmux_command(*args, **kwargs):
@@ -19341,13 +19416,17 @@ handler apply the reassignment on the far side of the stop, which is
 exactly what the non-timeout failure path in
 [[<<handle headless exit status>>]] already does.
 
+The note is posted to GitHub before the lock is taken and stored
+inside a callback on the item as it is now
+(\cref{sec:todo-read-modify-write}); the agent was running until a
+moment ago and may well have added notes of its own.
+
 <<handle subprocess timeout>>=
 timed_out = True
 partial = (
     exc.stdout if exc.stdout else ""
 )
-# Reload and post timeout note
-next_id, todos = load_todos()
+_, todos = load_todos()
 item = next(
     (t for t in todos if t.id == todo_id),
     None,
@@ -19362,9 +19441,18 @@ if item is not None:
             f"```\n{partial.strip()}\n```"
         )
     post_note_comment(item, note)
-    append_note_to_item(item, note)
-    item.status = "pending"
-    save_todos(next_id, todos)
+
+    def record_timeout(next_id, todos, stack):
+        timed = next(
+            (t for t in todos if t.id == todo_id),
+            None,
+        )
+        if timed is not None:
+            append_note_to_item(timed, note)
+            timed.status = "pending"
+        return next_id, todos, stack
+
+    mutate_todo_state(record_timeout)
 typer.echo(
     f"  Timed out after {timeout}",
     err=True,
@@ -19373,7 +19461,11 @@ typer.echo(
 
 After the subprocess exits, we stop the todo through the same shared
 hierarchy helper used by manual [[todo stop]] and detached tmux cleanup,
-then prompt the user about completion status.  In headless mode we skip
+then prompt the user about completion status.  The prompt is the
+reason this handler only \emph{decides} on the snapshot and leaves the
+storing to [[record_run_outcome]] (\cref{sec:todo-run-outcome}): the
+question can stay open for hours, and a note the agent's session adds
+in that time must not be erased by the answer.  In headless mode we skip
 the prompt: if the subprocess already marked the todo done (via
 [[todo done]]), we respect that; otherwise we reset the todo and any
 auto-stopped descendants to pending for retry.
@@ -19387,17 +19479,20 @@ failed or was reset.
 (
     todo_id,
     item,
-    next_id,
-    todos,
-    stack,
+    _,
+    _,
+    _,
     descendants,
 ) = stop_todo_hierarchy(
     todo_id
 )
 if item is None:
     return
+run_notes = []
 <<post headless output as note>>
 
+mark_done = False
+hand_to = None
 if item.status == "done":
     pass
 elif timed_out:
@@ -19407,16 +19502,16 @@ elif headless:
 elif typer.confirm(
     f"Mark todo #{todo_id} as done?"
 ):
-    item.status = "done"
-else:
-    item.status = "pending"
+    mark_done = True
 
-for child in descendants:
-    if child.status != "done":
-        child.status = "pending"
-
-save_todos(next_id, todos)
-if item.status == "done":
+item, todos = record_run_outcome(
+    todo_id,
+    {child.id for child in descendants},
+    notes=run_notes,
+    done=mark_done,
+    reassign_to=hand_to,
+)
+if item is not None and item.status == "done":
     auto_complete_parent(item, todos)
 @
 
@@ -19436,7 +19531,7 @@ if headless and result is not None:
     else:
         note = f"Exit code: {code} (no output)"
     post_note_comment(item, note)
-    append_note_to_item(item, note)
+    run_notes.append(note)
 @
 
 This is the deferred half of the timeout handling: tracking has now
@@ -19448,12 +19543,12 @@ interactive prompt because a killed process never reported an outcome.
 Asking \enquote{mark todo as done?} about work we ourselves cut short
 invites the user to record a completion that did not happen, so a
 timed-out task always goes back to pending regardless of how it was
-launched.
+launched.  Leaving [[mark_done]] unset is all that takes, since
+[[record_run_outcome]] resets an unfinished item to pending; the
+branch only has to say who receives it.
 
 <<handle timeout exit status>>=
-if reassign_to:
-    item.who = reassign_to
-item.status = "pending"
+hand_to = reassign_to
 @
 
 In headless mode, a non-zero exit code indicates failure.
@@ -19461,16 +19556,90 @@ If [[--reassign-to]] is set, we hand the task back to a human
 so they can investigate.  A zero exit
 code where the subprocess did not mark the task done means the
 agent finished without completing the task---we reset to
-pending for the next retry.
+pending for the next retry.  As in the timeout branch, the reset is
+[[record_run_outcome]]'s default, so only the reassignment is spelled
+out here.
 
 <<handle headless exit status>>=
 if (
     result is not None
     and result.returncode != 0
-    and reassign_to
 ):
-    item.who = reassign_to
-item.status = "pending"
+    hand_to = reassign_to
+@
+
+Let's verify the two promises [[record_run_outcome]] makes to the
+blocking path, using the prompt as the window in which other work
+happens.  A note added while the question is open survives a
+\enquote{yes}, and a completion recorded meanwhile survives a
+\enquote{no}.
+
+<<test functions>>=
+@pytest.fixture
+def blocked_window_run(temp_todo_dir):
+  """Run `start 1 --window --block` with `confirm` faked."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Review PR",
+      created="2026-02-20T10:00:00",
+      wd="/tmp/project",
+      command="python -m pytest",
+    ),
+  ])
+
+  def run(confirm):
+    with patch.dict(
+      os.environ, {"TMUX": "session"}, clear=True,
+    ), patch(
+      "nytid.cli.todo.run_todo_tmux_command",
+      return_value=0,
+    ), patch(
+      "nytid.cli.todo.typer.confirm",
+      side_effect=confirm,
+    ):
+      return runner.invoke(
+        cli, [
+          "start", "1", "--window", "--block",
+          "--no-auto-suspend",
+        ],
+      )
+
+  return run
+
+
+def test_start_confirm_keeps_note_added_meanwhile(
+  blocked_window_run,
+):
+  """A note stored while 'Mark done?' waits is kept."""
+  from nytid.cli.todo import note
+
+  def answer_yes(message):
+    note(1, message="Agent", edit=False)
+    return True
+
+  result = blocked_window_run(answer_yes)
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+  assert todos[0].notes == "Agent"
+
+
+def test_start_no_keeps_completion_made_meanwhile(
+  blocked_window_run,
+):
+  """Answering no does not reopen an item done meanwhile."""
+  from nytid.cli.todo import complete_todo_state
+
+  def answer_no(message):
+    complete_todo_state(1)
+    return False
+
+  result = blocked_window_run(answer_no)
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].status == "done"
 @
 
 Let's verify that [[append_note_to_item]] changes the item it is
