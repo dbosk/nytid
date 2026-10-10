@@ -16984,12 +16984,21 @@ session.  An item removed meanwhile is the one thing it cannot store,
 and after a long series of questions it skips that item with a warning
 rather than discarding every other answer.
 
+Each number is stored through [[set_priority_with_subtree]]
+(\cref{sec:subtree-follows-parent}).  The batch only visits unranked
+items, which have no child range to move from, so usually nothing else
+changes; but an item that another process ranked during the session
+is a re-ranked parent by the time we store it, and its subtree must
+follow the number we store just like on the single-item path.
+
 <<store the chosen priorities under the lock>>=
 def store_priorities(next_id, todos, stack):
     by_id = {t.id: t for t in todos}
     for chosen_id, priority in chosen.items():
         if chosen_id in by_id:
-            by_id[chosen_id].priority = priority
+            set_priority_with_subtree(
+                todos, by_id[chosen_id], priority
+            )
         else:
             typer.echo(
                 f"Warning: #{chosen_id} no longer exists; "
@@ -17004,12 +17013,22 @@ mutate_todo_state(store_priorities)
 
 The single-item path has only one answer to lose, so a vanished item
 is an error here, reported through [[require_todo]] like in the other
-commands, and nothing is written.  Only [[priority]] is set; any other
-change made to the item during the search stays as it was stored.
+commands, and nothing is written.  Only [[priority]] is set on the
+item; any other change made to it during the search stays as it was
+stored.
+
+The item's descendants move with it into its new child range
+(\cref{sec:subtree-follows-parent}).  Both ranges are read here, from
+the state about to be saved, not from the snapshot the search ran on:
+a child added under the item, or a sibling moved, while the user was
+answering questions is part of the subtree and the ranges we map
+between.
 
 <<store the new priority under the lock>>=
 def store_priority(next_id, todos, stack):
-    require_todo(todos, todo_id).priority = new_priority
+    set_priority_with_subtree(
+        todos, require_todo(todos, todo_id), new_priority
+    )
     return next_id, todos, stack
 
 
@@ -17048,6 +17067,128 @@ def test_reprioritize_batch_keeps_concurrent_note(
   _, todos = load_todos()
   assert todos[0].priority == 3.0
   assert without_note_headers(todos[0].notes) == "Agent"
+@
+
+A re-ranked parent takes its subtree along whichever flag placed it.
+With [[--below]] the parent [[First]] drops from [[6.0]] to [[1.0]],
+from the range $(4.0, 6.0)$ to $(0.0, 1.0)$, and its children are
+squeezed into the new range in their old order.  With [[--above]]
+[[Mover]] climbs from the bottom, where its range ended at the default
+floor, into the gap between [[First]] and [[Second]].
+
+<<test functions>>=
+def ranked_child(todo_id, parent_id, priority):
+  """A ranked child of `parent_id` for the current worker."""
+  return TodoItem(
+    id=todo_id, title=f"Child {todo_id}",
+    parent_id=parent_id, priority=priority,
+    created="2026-02-20T10:00:00",
+    who=default_username,
+  )
+
+
+def test_reprioritize_below_moves_subtree(ranked_siblings):
+  """--below carries the children into the new range."""
+  _, todos = load_todos()
+  save_todos(7, todos + [
+    ranked_child(5, 1, 5.5),
+    ranked_child(6, 1, 5.0),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "1", "--below", "3"]
+  )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(1) == 1.0
+  assert stored_priority(5) == 0.75
+  assert stored_priority(6) == 0.5
+
+
+def test_reprioritize_above_moves_subtree(ranked_siblings):
+  """--above lifts the children from the default floor."""
+  _, todos = load_todos()
+  save_todos(6, todos + [ranked_child(5, 4, -5.0)])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(4) == 5.0
+  assert stored_priority(5) == pytest.approx(4.5)
+@
+
+The subtree is the one stored when the number is written, not the one
+the search started from: a child added under [[First]] while the
+placement was being decided moves with the others.
+
+<<test functions>>=
+def test_reprioritize_moves_child_added_meanwhile(
+  ranked_siblings,
+):
+  """A child stored during the search follows too."""
+  from nytid.cli.todo import place_existing_item as place
+  _, todos = load_todos()
+  save_todos(6, todos + [ranked_child(5, 1, 5.5)])
+
+  def place_meanwhile(*args, **kwargs):
+    next_id, todos = load_todos()
+    save_todos(
+      next_id + 1, todos + [ranked_child(next_id, 1, 4.5)]
+    )
+    return place(*args, **kwargs)
+
+  with patch(
+    "nytid.cli.todo.place_existing_item",
+    side_effect=place_meanwhile,
+  ):
+    result = runner.invoke(
+      cli, ["reprioritize", "1", "--below", "3"]
+    )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(5) == 0.75
+  assert stored_priority(6) == 0.25
+@
+
+The batch path meets a ranked parent only when another process ranked
+it during the session.  Its children then follow the number the batch
+stores, as they would on the single-item path.
+
+<<test functions>>=
+def test_reprioritize_batch_moves_subtree_ranked_meanwhile(
+  temp_todo_dir,
+):
+  """An item ranked meanwhile takes its children along."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Ranked", priority=3.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  def rank_meanwhile(*args, **kwargs):
+    _, todos = load_todos()
+    todos[0].priority = 5.0
+    save_todos(4, todos + [ranked_child(3, 1, 4.0)])
+    return 1.0
+
+  with patch(
+    "nytid.cli.todo.binary_search_priority",
+    side_effect=rank_meanwhile,
+  ):
+    result = runner.invoke(cli, ["reprioritize"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(1) == 1.0
+  assert stored_priority(3) == -4.0
 @
 
 
