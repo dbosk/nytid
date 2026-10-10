@@ -16719,8 +16719,11 @@ def reconcile_children(parent, parsed_children):
     nonlocal next_id, todos
     <<build existing children index>>
     <<distribute child priorities>>
+    <<record the children's ranges before they move>>
     <<update or create each parsed child>>
     <<remove deleted children>>
+    <<carry each child's subtree to its new range>>
+    <<reconcile each child against its own sections>>
 @
 
 We normalize titles to lowercase with stripped whitespace so that
@@ -16813,13 +16816,11 @@ Popping each match out of [[existing_by_title]] doubles as the
 seen-marker: whatever is still in the index afterwards had no section
 and was therefore deleted in the editor.
 
-Each child is reconciled against its own sections immediately after it
-is settled, so a freshly created child can already receive
-grandchildren in the same save.  A newly appended child is on
-[[todos]] by then, which is what lets [[get_children]] find its own
-level on the recursive call.
+Each settled child is collected with its section, and its own
+sections are reconciled only once the whole level is settled (below).
 
 <<update or create each parsed child>>=
+settled = []
 for parsed_child in parsed_children:
     norm_title = parsed_child.title.strip().lower()
     existing_child = existing_by_title.get(norm_title)
@@ -16857,7 +16858,7 @@ for parsed_child in parsed_children:
             f"  Added sub-item #{child.id}: "
             f"{child.title}"
         )
-    reconcile_children(child, parsed_child.children)
+    settled.append((child, parsed_child))
 @
 
 A matched child is updated the way the parent is: the section is
@@ -16912,7 +16913,118 @@ for removed in existing_by_title.values():
 @
 
 
+A child's own range is bounded by its siblings' numbers
+(\cref{sec:child-priority-helpers}), so the level below can only be
+placed once every child at this level has its final number.
+Reconciling each child as soon as it was settled computed its range
+against siblings still carrying their old numbers: a first child
+moved from~4.9 to~4.5 next to a sibling about to go from~3.2 to~4.0
+saw the range $(3.2, 4.5)$ and spread its children below where that
+sibling would land.  We therefore settle the whole level and remove
+what was deleted first, and only then descend.
+
+The new numbers are also new child ranges.  The recursive call
+redistributes the grandchildren the buffer shows, but not one another
+process added under a child during the session, so before descending
+we carry each existing child's subtree from its old range to its new
+one (\cref{sec:subtree-follows-parent}); the old ranges are recorded
+before any number changes.  A newly created child has no subtree yet
+and no old range.
+
+<<record the children's ranges before they move>>=
+old_ranges = {
+    c.id: child_priority_range_or_none(todos, c)
+    for c in children
+}
+<<carry each child's subtree to its new range>>=
+for child, _ in settled:
+    move_subtree_priorities(
+        todos, child, old_ranges.get(child.id),
+        child_priority_range_or_none(todos, child),
+    )
+@
+
+A newly appended child is on [[todos]] by the time we descend, which
+is what lets [[get_children]] find its own level on the recursive call,
+so a freshly created child can already receive grandchildren in the
+same save.
+
+<<reconcile each child against its own sections>>=
+for child, parsed_child in settled:
+    reconcile_children(child, parsed_child.children)
+@
+
 \subsection{Testing Editor Reconciliation}
+
+Let's verify the order of settling: saving the buffer unchanged spreads
+A's children evenly and puts the first child's own child between it
+and the second, not below the second.
+
+<<test functions>>=
+def test_edit_editor_grandchild_uses_settled_siblings(
+  temp_todo_dir,
+):
+  """Grandchildren are placed against the new numbers."""
+  save_todos(7, [
+    TodoItem(
+      id=n, title=t, priority=p, parent_id=parent,
+      created="2026-02-20T10:00:00",
+    )
+    for n, t, p, parent in [
+      (1, "A", 5.0, None), (2, "B", 3.0, None),
+      (3, "c1", 4.9, 1), (4, "c2", 3.2, 1),
+      (5, "c3", 3.1, 1), (6, "g1", 4.0, 3),
+    ]
+  ])
+
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=lambda text: text,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+  assert result.exit_code == 0, result.output
+  assert [stored_priority(i) for i in (3, 4, 5)] == [
+    4.5, 4.0, 3.5
+  ]
+  assert 4.0 < stored_priority(6) < 4.5
+@
+
+A grandchild the buffer never showed, stored under the first child by
+another process during the session, follows its parent too:
+
+<<test functions>>=
+def test_edit_editor_carries_unshown_grandchild(
+  temp_todo_dir,
+):
+  """A grandchild added meanwhile moves with its parent."""
+  save_todos(6, [
+    TodoItem(
+      id=n, title=t, priority=p, parent_id=parent,
+      created="2026-02-20T10:00:00",
+    )
+    for n, t, p, parent in [
+      (1, "A", 5.0, None), (2, "B", 3.0, None),
+      (3, "c1", 4.9, 1), (4, "c2", 3.2, 1),
+      (5, "c3", 3.1, 1),
+    ]
+  ])
+
+  def add_meanwhile(text):
+    next_id, todos = load_todos()
+    save_todos(next_id + 1, todos + [TodoItem(
+      id=next_id, title="Meanwhile", priority=4.8,
+      parent_id=3, created="2026-02-20T10:00:00",
+    )])
+    return text
+
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=add_meanwhile,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+  assert result.exit_code == 0, result.output
+  assert 4.0 < stored_priority(6) < 4.5
+@
 
 The [[github]] key is the one that had drifted: the parent took it from
 the front matter and the children did not, so a sub-item linked to an
