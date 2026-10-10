@@ -8226,8 +8226,8 @@ if current_item is not None:
         current_item.metadata = parse_yaml_block(
             "\n".join(current_yaml_lines)
         )
-    current_item.notes = "\n".join(
-        current_notes_lines
+    current_item.notes = unescape_note_lines(
+        "\n".join(current_notes_lines)
     ).strip()
 @
 
@@ -8249,7 +8249,7 @@ warnings.append(
 <<finalize last item notes>>=
 if current_item is not None:
     <<finalize current item>>
-parent_notes = "\n".join(parent_notes_lines)
+parent_notes = unescape_note_lines("\n".join(parent_notes_lines))
 @
 
 \subsection{Testing the Editor Parser}
@@ -8450,6 +8450,62 @@ Child notes.
     assert "Child" in result.warnings[0]
 @
 
+\subsection{Notes That Look Like Headings}
+\label{sec:note-escaping}
+
+Notes are free text, and a line of them may begin with [[#]]: a
+Markdown heading pasted from somewhere, an issue number, a shell
+comment.  In the buffer that line would be a heading, and on save it
+would become a sub-item, or worse, with a marker such as [[{#2}]] in
+it, take over an existing sub-item, renaming it and emptying its notes;
+a marker naming an item outside the buffer made [[edit]] fail on an
+unchanged save.  The renderer therefore escapes such a line the way
+Markdown does, with a backslash, [[\# not a heading]], and the parser
+takes the backslash off again, so the stored notes keep the line as it
+was written.  A line that already begins with backslashes before its
+[[#]] gets one more, which the parser removes, so that it too comes
+back as it was.  The escape is in the buffer only; [[view]] and every
+other reader see the notes unchanged.
+
+<<editor infrastructure>>=
+def escape_note_lines(text):
+    """Return `text` with every line that would read as a
+    heading, one starting with `#` after any backslashes,
+    behind one more backslash."""
+    return "\n".join(
+        "\\" + line if NOTE_HEADING_PATTERN.match(line) else line
+        for line in text.split("\n")
+    )
+
+
+def unescape_note_lines(text):
+    """Undo `escape_note_lines`: drop one backslash from
+    every line that starts with backslashes and a `#`."""
+    return "\n".join(
+        line[1:] if ESCAPED_HEADING_PATTERN.match(line) else line
+        for line in text.split("\n")
+    )
+<<constants>>=
+NOTE_HEADING_PATTERN = re.compile(r"\\*#")
+ESCAPED_HEADING_PATTERN = re.compile(r"\\+#")
+@
+
+Let's verify the round trip on lines with and without backslashes, and
+that the escaped notes parse as notes, not as sub-items:
+
+<<test functions>>=
+def test_note_lines_round_trip():
+  """Heading-like note lines survive the buffer."""
+  notes = "# Other {#3}\n\\# kept\n\\\\# two\nplain # not first"
+  escaped = escape_note_lines(notes)
+  assert escaped.split("\n")[:3] == [
+    "\\# Other {#3}", "\\\\# kept", "\\\\\\# two",
+  ]
+  assert unescape_note_lines(escaped) == notes
+  parsed = parse_editor_content(f"Title\n\n{escaped}\n")
+  assert (parsed.notes, parsed.children) == (notes, [])
+@
+
 \subsection{Naming Items in Headings}
 \label{sec:heading-ids}
 
@@ -8618,7 +8674,7 @@ def render_todo_markdown(
         lines.append(yaml_block)
     lines.append("")
     if item.notes:
-        lines.append(item.notes)
+        lines.append(escape_note_lines(item.notes))
         lines.append("")
     children = sort_todos_for_display(
         children_of(todos, item.id)
@@ -8826,7 +8882,7 @@ def render_child_markdown(
         lines.append(yaml_block)
     lines.append("")
     if item.notes:
-        lines.append(item.notes)
+        lines.append(escape_note_lines(item.notes))
         lines.append("")
     grandchildren = sort_todos_for_display(
         children_of(todos, item.id)
@@ -15361,7 +15417,7 @@ paragraph wins over what [[--note]] put there.
 
 <<prefill notes into the buffer>>=
 if notes_text:
-    initial = initial + "\n" + notes_text
+    initial = initial + "\n" + escape_note_lines(notes_text)
 @
 
 Let's verify both halves of that: the flag's text is in the buffer
@@ -15389,6 +15445,26 @@ def test_add_edit_note_prefills_buffer(temp_todo_dir):
   assert "From the flag." in seen["text"]
   _, todos = load_todos()
   assert todos[0].notes == "From the buffer."
+@
+
+A note line that looks like a heading is escaped in the buffer
+(\cref{sec:note-escaping}), so it stays a note rather than becoming a
+sub-item:
+
+<<test functions>>=
+def test_add_edit_note_heading_line_stays_a_note(temp_todo_dir):
+  """--note '# x' is a note line, not a sub-item."""
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=lambda text: text,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Fetch paper", "--note", "# Section 3"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert [t.notes for t in todos] == ["# Section 3"]
 @
 
 The parent is built in three layers, in the order that makes the
@@ -23948,9 +24024,9 @@ shown it there.
 
 <<edit via editor>>=
 md = render_todo_markdown(item, todos)
-shown = buffer_baseline(
-    item, todos, parse_editor_content(md)
-)
+rendered = parse_editor_content(md)
+shown = buffer_baseline(item, todos, rendered)
+<<refuse a buffer that would not read back>>
 shown_children = {
     t.id: [c.id for c in children_of(todos, t.id)]
     for t in [item, *descendants_of(todos, item.id)]
@@ -23972,6 +24048,45 @@ refused_places = []
 <<commit the buffer under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 <<fail when the buffer asked for refused places>>
+@
+
+Everything above rests on the buffer reading back as it was rendered:
+every heading the renderer wrote parsed as that heading, with its
+marker, and nothing else parsed as one.  Escaping the notes
+(\cref{sec:note-escaping}) is what makes that so for the notes, but a
+title may hold a line break, written to the file by some other
+program, and the next line of it would be a heading of its own.
+Rather than trust that every such way has been thought of, we parse the
+rendered buffer, which we do anyway for the baseline, and check it: the
+headings must name exactly the items below the edited one, and every
+heading must name one.  If not, [[-E]] is refused before the editor
+opens, when nothing has been typed that could be lost, and the flags
+are named instead.
+
+<<refuse a buffer that would not read back>>=
+below = {d.id for d in descendants_of(todos, item.id)}
+if (
+    section_ids(rendered.children) != below
+    or set(shown) != below | {item.id}
+    or not all_sections_named(rendered.children)
+):
+    typer.echo(
+        f"Error: the buffer of #{item.id} would not read back as "
+        "it is written, since a title or a note in it reads as a "
+        "heading; edit the items with flags such as --title "
+        "instead",
+        err=True,
+    )
+    raise typer.Exit(1)
+<<helpers>>=
+def all_sections_named(sections):
+    """Tell whether every heading in `sections`, at any depth,
+    names an item."""
+    return all(
+        section.id is not None
+        and all_sections_named(section.children)
+        for section in sections
+    )
 @
 
 \paragraph{What a buffer says.}
@@ -25347,6 +25462,46 @@ def test_edit_editor_warns_about_a_lost_marker(temp_todo_dir):
   )
   assert result.exit_code == 0, result.output
   assert "#6 'O' left #2 and 'O again' came in new" in result.output
+@
+
+Notes with lines that look like headings, naming items inside the
+buffer and outside it, come back from an unchanged buffer as they
+were, and neither rename a sub-item nor make the save fail
+(\cref{sec:note-escaping}).  A title with a line break in it cannot be
+escaped that way, and the editor is refused before it opens.
+
+<<test functions>>=
+def test_edit_editor_keeps_heading_like_notes(temp_todo_dir):
+  """Notes starting with # stay notes."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[0].notes = f"# Other {{#{next_id}}}\n\\# escaped already"
+  todos[1].notes = "# not a heading {#6}"
+  save_todos(next_id + 1, todos + [TodoItem(
+    id=next_id, title="Outside", created="2026-02-20T10:00:00",
+  )])
+  _, before = load_todos()
+  result, _ = edit_buffer(1, lambda text: text)
+  assert result.exit_code == 0, result.output
+  _, after = load_todos()
+  assert [(t.id, t.title, t.notes, t.parents) for t in after] == [
+    (t.id, t.title, t.notes, t.parents) for t in before
+  ]
+
+
+def test_edit_editor_refuses_a_buffer_that_misreads(
+  temp_todo_dir,
+):
+  """A title with a line break refuses -E before editing."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].title = "O\n# looks like a heading"
+  save_todos(next_id, todos)
+  with patch("nytid.cli.todo.open_editor") as editor:
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+  assert result.exit_code == 1
+  assert "would not read back" in result.output
+  editor.assert_not_called()
 @
 
 Finally the session itself, with the overlap of
@@ -37842,6 +37997,8 @@ from nytid.cli.todo import (
     render_todo_markdown,
     split_heading_id,
     heading_id_marker,
+    escape_note_lines,
+    unescape_note_lines,
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
