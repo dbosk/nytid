@@ -156,6 +156,7 @@ cli = typer.Typer(
 <<placement helpers>>
 <<autocompletion functions>>
 <<helpers>>
+<<registrations with other modules>>
 <<argument and option definitions>>
 <<subcommands>>
 @
@@ -6097,7 +6098,9 @@ sub-tasks too takes them over one by one.
 A takeover also has to survive the displaced claimant's run, if one is
 still going: when that process exits, its ending must not stop or
 reset an item that is no longer its own.  The run's ending checks
-for that itself (\cref{sec:todo-run-taken-over}).
+for that itself (\cref{sec:todo-run-taken-over}).  Nor may the
+displaced claimant's tmux pane or window bring the item's labels back
+when it regains focus; \cref{sec:todo-resume-claim} covers that.
 
 One gap remains.  Two sessions acting as the \emph{same} worker, two
 agent runs as [[dan-claude]] for instance, can still both start one
@@ -6105,6 +6108,137 @@ item: the claim tells workers apart, not sessions, and for the
 acting worker an active item of its own is simply a restart.
 Closing that needs an identity per session, which the store does not
 have, and is left for follow-up work.
+
+\paragraph{Resuming a claim that moved}%
+\label{sec:todo-resume-claim}
+Auto-suspend (\cref{track:auto-suspend}) stops a worker's labels when
+the worker's tmux pane or window loses focus and starts them again
+when it regains it.  If the item was taken over in between, starting
+them again would put the displaced claimant back on the task, with
+nothing to stop it until the next takeover.  We could clear the
+suspended labels at takeover time, but they live in several kinds of
+file---a pane's suspend file, a window's label file---on any tmux
+server that shares the state directory, and only [[track]] knows the
+formats.  Instead [[track]] asks before it resumes
+(\cref{track:resume-filters}), and we answer: a [[todo:<id>]] label
+whose item is active and claimed by somebody else does not come back,
+nor do that item's other labels, unless one of the worker's own
+active items still carries them.  The answer uses the claims as they
+are when the worker returns, so it is right however the claim moved
+and however long ago.
+
+<<helpers>>=
+def drop_taken_over_todo_labels(who, labels):
+    """Return `labels` without those of todos taken from `who`.
+
+    A todo is taken when it is active and claimed by a
+    worker other than `who`.  Its labels are dropped too,
+    unless one of `who`'s own active todos carries them.
+    """
+    todo_ids = set()
+    for label in labels:
+        if label.startswith("todo:"):
+            try:
+                todo_ids.add(int(label[len("todo:"):]))
+            except ValueError:
+                continue
+    if not todo_ids:
+        return labels
+    _, todos, stack = load_todo_state()
+    by_id = {t.id: t for t in todos}
+    taken = [
+        by_id[tid] for tid in todo_ids
+        if tid in by_id
+        and claim_holder(by_id[tid], stack, who) is not None
+    ]
+    if not taken:
+        return labels
+    still_needed = set()
+    for sid in stack:
+        own = by_id.get(sid)
+        if own is not None and session_worker(own) == who:
+            still_needed.update(todo_track_labels(own, sid))
+    dropped = set()
+    for item in taken:
+        dropped.update(
+            label
+            for label in todo_track_labels(item, item.id)
+            if label not in still_needed
+        )
+    return [label for label in labels if label not in dropped]
+@
+
+The filter is registered when this module is imported.  [[track]] is
+optional here as everywhere else in this module, so a missing
+[[track]] simply means there is nothing to resume.
+
+<<registrations with other modules>>=
+try:
+    from nytid.cli.track import register_resume_label_filter
+    register_resume_label_filter(drop_taken_over_todo_labels)
+except ImportError:
+    pass
+@
+
+Let's verify both resume paths after a takeover.  Alice has the item
+active with its labels suspended in her pane and in her window; the
+user takes the item over; when Alice's pane or window regains focus,
+neither the item's [[todo:]] label nor its course label comes back,
+while a label of her own other active item does.
+
+<<test functions>>=
+def test_resume_skips_labels_of_taken_over_todo(
+  temp_todo_dir,
+):
+  """Auto-suspend resume does not restart a taken todo."""
+  from nytid.cli.track import (
+    load_active_session,
+    resume_tracking_labels,
+    restart_window_batches,
+    stop_tracking_labels_if_active,
+    suspend_state_path,
+    write_suspend_state,
+  )
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Alice's task",
+      created="2026-02-20T10:00:00",
+      who="alice", labels=["DD1310"],
+    ),
+    TodoItem(
+      id=2, title="Alice's other task",
+      created="2026-02-20T10:00:00",
+      who="alice", labels=["review"],
+    ),
+  ])
+  runner.invoke(cli, ["start", "2", "--who", "alice"])
+  runner.invoke(cli, ["start", "1", "--who", "alice"])
+  taken = runner.invoke(cli, ["start", "1", "--force"])
+  assert taken.exit_code == 0, taken.output
+
+  stop_tracking_labels_if_active(
+    who="alice", labels=["review"],
+  )
+  write_suspend_state(
+    suspend_state_path("%3", "alice", "server0"),
+    ["todo:1", "DD1310", "review"],
+  )
+  resume_tracking_labels("alice", "%3", "server0")
+  restart_window_batches(
+    who="alice", window_id="@1",
+    tmux_server_key="server0",
+    label_batches={"todo:1": 7, "DD1310": 7},
+  )
+
+  alice = load_active_session("alice").get_active_labels()
+  assert "todo:1" not in alice
+  assert "DD1310" not in alice
+  assert "review" in alice
+  mine = load_active_session(
+    default_username
+  ).get_active_labels()
+  assert "todo:1" in mine
+@
 
 Let's verify the rule and the three cases it leaves alone, starting
 with the refusal itself.  The item stays the previous owner's, and
