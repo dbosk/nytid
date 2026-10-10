@@ -718,23 +718,30 @@ empty on every item that is not done.
 
 Becoming done stamps the current time; any other status clears it, so a
 reopened item does not carry the time of a completion that no longer
-holds.  An item that is already done keeps its stamp.  Running
+holds.  A caller that knows better when the work was finished passes
+that time instead, as [[sync]] and [[import]] do with the time GitHub
+closed the issue (\cref{sec:todo-github-closed}).
+
+An item that is already done keeps its stamp.  Running
 [[todo done]] twice, or a [[sync]] that meets a closed issue long after
 the item was completed locally, says nothing new about when the work
 finished.
 
 <<data model>>=
-def set_status(item, status):
+def set_status(item, status, closed_at=None):
     """Set `item.status` and keep `item.closed` in step.
 
-    Becoming `done` stamps `closed` with the current local
-    time, unless the item was done already; any other
+    Becoming `done` stamps `closed` with `closed_at`, a
+    local ISO time, or the current local time if that is
+    `None`, unless the item was done already; any other
     status clears it.
     """
     if status != "done":
         item.closed = None
     elif item.status != "done":
-        item.closed = datetime.datetime.now().isoformat()
+        item.closed = (
+            closed_at or datetime.datetime.now().isoformat()
+        )
     item.status = status
 @
 
@@ -5331,21 +5338,24 @@ def require_gh():
 @
 
 Fetching a single issue or pull request returns the full JSON
-object including comments, which we use for the [[view]] command:
+object including comments, which we use for the [[view]] command.
+It also asks for [[closedAt]], the time GitHub closed the item, which
+[[sync]] and [[import]] store as the item's closing time
+(\cref{sec:todo-github-closed}):
 
 <<helpers>>=
 def gh_fetch_issue(repo, number):
     """Fetch a GitHub issue with comments.
 
     Returns parsed JSON with title, body, state,
-    comments, and labels.
+    comments, labels, and closedAt.
     """
     result = subprocess.run(
         [
             "gh", "issue", "view",
             str(number), "-R", repo,
             "--json",
-            "title,body,state,comments,labels",
+            "title,body,state,comments,labels,closedAt",
         ],
         capture_output=True,
         text=True,
@@ -5366,14 +5376,14 @@ def gh_fetch_pr(repo, number):
     """Fetch a GitHub pull request with comments.
 
     Returns parsed JSON with title, body, state,
-    comments, and labels.
+    comments, labels, and closedAt.
     """
     result = subprocess.run(
         [
             "gh", "pr", "view",
             str(number), "-R", repo,
             "--json",
-            "title,body,state,comments,labels",
+            "title,body,state,comments,labels,closedAt",
         ],
         capture_output=True,
         text=True,
@@ -5384,6 +5394,62 @@ def gh_fetch_pr(repo, number):
             f"{result.stderr.strip()}"
         )
     return json.loads(result.stdout)
+@
+
+\paragraph{When GitHub closed an item}%
+\label{sec:todo-github-closed}
+An item that is done because its issue or pull request was closed on
+GitHub was finished when GitHub closed it, not when [[sync]] or
+[[import]] happened to notice.  Those can be days apart, so we take
+the closing time (\cref{sec:todo-closed}) from GitHub's [[closedAt]].
+Pull requests use [[closedAt]] too, not [[mergedAt]]: a merge closes a
+pull request, and GitHub then sets [[closedAt]] to the moment of the
+merge, while a pull request closed without merging has only
+[[closedAt]].  The one field therefore covers both ways a pull request
+ends.
+
+GitHub gives the time in UTC with a [[Z]] suffix, whereas [[created]]
+and every other stamp we write is local time without an offset.  We
+convert with [[naive_local_datetime]], so that the stored values
+compare and display alike.  The [[Z]] is replaced first because
+[[datetime.fromisoformat]] accepts it only from Python~3.11, and nytid
+also runs on~3.10; the age heuristic of [[import]] does the same with
+[[createdAt]].  A missing or unreadable value gives [[None]], and
+[[set_status]] then stamps the current time, which is what the item
+would have had without GitHub's help.
+
+<<helpers>>=
+def github_closed_time(data):
+    """Return GitHub's `closedAt` in `data` as local ISO time.
+
+    Returns `None` when the field is missing or unreadable.
+    """
+    closed_at = data.get("closedAt")
+    if not closed_at:
+        return None
+    parsed = naive_local_datetime(
+        str(closed_at).replace("Z", "+00:00")
+    )
+    if parsed is None:
+        return None
+    return parsed.isoformat()
+@
+
+Let's verify the conversion against the same instant computed
+directly, and the two ways of having no usable value:
+
+<<test functions>>=
+def test_github_closed_time_is_local_iso():
+  """`closedAt` in UTC becomes a naive local ISO string."""
+  expected = datetime.datetime(
+    2026, 10, 8, 12, 3, 59, tzinfo=datetime.timezone.utc,
+  ).astimezone().replace(tzinfo=None).isoformat()
+  assert github_closed_time(
+    {"closedAt": "2026-10-08T12:03:59Z"}
+  ) == expected
+  assert github_closed_time({"closedAt": None}) is None
+  assert github_closed_time({"closedAt": "soon"}) is None
+  assert github_closed_time({}) is None
 @
 
 Closing requires separate functions for issues and PRs because
@@ -6479,14 +6545,18 @@ def test_start_child_skips_already_active_parent(
 
 Listing issues and PRs returns summaries for bulk import. We
 include [[createdAt]] because the age-based priority heuristic
-in the [[import]] command needs timestamps to rank items:
+in the [[import]] command needs timestamps to rank items.  We also
+include [[closedAt]], although the lists return only open items unless
+asked otherwise, so that the import loop sees the same fields whichever
+fetch produced an item and reads the closing time in one way
+(\cref{sec:todo-github-closed}):
 
 <<helpers>>=
 def gh_list_issues(repo):
     """List open issues from a GitHub repository.
 
     Returns a list of dicts with number, title, body,
-    state, labels, and createdAt fields.
+    state, labels, createdAt, and closedAt fields.
     """
     result = subprocess.run(
         [
@@ -6494,7 +6564,7 @@ def gh_list_issues(repo):
             "-R", repo,
             "--json",
             "number,title,body,state,"
-            "labels,createdAt",
+            "labels,createdAt,closedAt",
             "--limit", "100",
         ],
         capture_output=True,
@@ -6516,7 +6586,7 @@ def gh_list_prs(repo):
     """List open pull requests from a repository.
 
     Returns a list of dicts with number, title, body,
-    state, labels, and createdAt fields.
+    state, labels, createdAt, and closedAt fields.
     """
     result = subprocess.run(
         [
@@ -6524,7 +6594,7 @@ def gh_list_prs(repo):
             "-R", repo,
             "--json",
             "number,title,body,state,"
-            "labels,createdAt",
+            "labels,createdAt,closedAt",
             "--limit", "100",
         ],
         capture_output=True,
@@ -22230,12 +22300,10 @@ the command line are appended last.
 
 An issue that is already closed on GitHub is imported as done, and it
 gets its status through [[set_status]] like any other completion
-(\cref{sec:todo-closed}).  Its [[closed]] stamp is therefore the time
-of the import, not the time GitHub closed the issue: neither
-[[gh_list_issues]] nor the single-item fetches ask [[gh]] for
-[[closedAt]].  The stamp still answers the question it answers
-everywhere else, when the item became done in this list, and that is
-also what [[sync]] records when it finds an issue closed later.
+(\cref{sec:todo-closed}).  Its closing time is the one GitHub reports
+(\cref{sec:todo-github-closed}), so an issue closed last month does
+not look as if it had been finished today; only when GitHub gives no
+time does the import stamp its own.
 
 <<create todos from github items>>=
 if skip_priority and new_items:
@@ -22316,7 +22384,10 @@ for gh_item in new_items:
             "number": str(gh_item["number"]),
         },
     )
-    set_status(item, status)
+    set_status(
+        item, status,
+        closed_at=github_closed_time(gh_item),
+    )
     todos.append(item)
     next_id += 1
     imported.append(item)
@@ -22768,12 +22839,45 @@ def test_import_single_issue(temp_todo_dir):
         assert len(view_calls) >= 1
 @
 
-An issue that is already closed comes in done, and its closing time is
-the time of the import:
+An issue that is already closed comes in done.  Its closing time is
+GitHub's when GitHub reports one, and the time of the import when it
+does not:
 
 <<test functions>>=
+def test_import_closed_issue_keeps_github_time(temp_todo_dir):
+    """A closed issue is imported with GitHub's closing time."""
+    save_todos(1, [])
+    mock_result = MagicMock(returncode=0)
+    mock_result.stdout = json.dumps({
+        "title": "Fixed bug", "body": "",
+        "state": "CLOSED", "comments": [], "labels": [],
+        "closedAt": "2026-10-08T12:03:59Z",
+    })
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ) as mock_run:
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--number", "7",
+                "--type", "issue",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].status == "done"
+    assert todos[0].closed == github_closed_time(
+        {"closedAt": "2026-10-08T12:03:59Z"}
+    )
+    view_args = mock_run.call_args_list[-1].args[0]
+    fields = view_args[view_args.index("--json") + 1]
+    assert "closedAt" in fields.split(",")
+
+
 def test_import_closed_issue_is_stamped(temp_todo_dir):
-    """A closed issue is imported done, with `closed` set."""
+    """Without `closedAt`, a closed issue gets the import time."""
     save_todos(1, [])
     mock_result = MagicMock(returncode=0)
     mock_result.stdout = json.dumps({
@@ -23542,14 +23646,18 @@ GitHub is the authoritative source for issue state: a
 collaborator may have closed the issue, or a linked pull request
 may have been merged and triggered an auto-close. If GitHub
 shows the item as closed but our local copy is still open, we
-mark it done locally and stop any active time-tracking session:
+mark it done locally, with the time GitHub closed it
+(\cref{sec:todo-github-closed}), and stop any active time-tracking
+session:
 
 <<sync state from github>>=
 if (
     gh_state in ("CLOSED", "MERGED")
     and item.status != "done"
 ):
-    set_status(item, "done")
+    set_status(
+        item, "done", closed_at=github_closed_time(data),
+    )
     changes += 1
     typer.echo(
         f"  #{item.id} marked done "
@@ -23629,6 +23737,7 @@ def test_sync_marks_done_from_github(
         "title": "Old issue",
         "body": "",
         "state": "CLOSED",
+        "closedAt": "2026-10-08T12:03:59Z",
         "comments": [],
         "labels": [],
     })
@@ -23649,7 +23758,9 @@ def test_sync_marks_done_from_github(
         assert "marked done" in result.output
         _, todos = load_todos()
         assert todos[0].status == "done"
-        assert todos[0].closed is not None
+        assert todos[0].closed == github_closed_time(
+            {"closedAt": "2026-10-08T12:03:59Z"}
+        )
 @
 
 \subsection{The [[note]] Command}
@@ -24306,6 +24417,7 @@ from nytid.cli.todo import (
     gh_close_pr,
     gh_list_issues,
     gh_list_prs,
+    github_closed_time,
     gh_add_comment,
     require_gh,
     load_active_stack,
