@@ -725,20 +725,59 @@ top level just as it did for [[parent_id]], can pass [[[parent] ]]
 without a case of its own; and a single id where a list should be, as a
 hand edit may leave it, is read as that one parent.
 
+Anything else is refused.  An id is a non-negative integer, and a
+value that merely looks like one---the string [[12]], the float
+[[12.0]], a list [[[12] ]] nested in the list---is not, however
+plausible the guess: [[1.5]] or [[true]] has no plausible guess at all,
+and a rule that repairs some values and not others is one more thing a
+person editing the file would have to know.  A boolean is excluded
+explicitly, since Python counts [[True]] as the integer one.  The
+refusal is its own exception, [[InvalidParentsError]], rather than a
+[[ValueError]], because the file reader turns a [[ValueError]] into an
+empty list and the next save would then wipe the file; the reader
+instead stops with an error that names the file and the item
+(\cref{sec:todo-refused-files}).
+
 <<helpers>>=
+class InvalidParentsError(Exception):
+    """A parents value that is neither a todo id nor a list of
+    them."""
+
+
+def is_parent_id(value):
+    """Tell whether `value` can be a parent id: a non-negative
+    integer that is not a boolean."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
 def normalize_parents(parents):
     """Return `parents` as a list of parent ids in order.
 
     Repeated ids keep their first place, `None` entries are
     dropped, a single id counts as a list of one, and an
-    empty result means the top level, `[ROOT_ID]`.
+    empty result means the top level, `[ROOT_ID]`.  Raises
+    `InvalidParentsError` for anything that is not an id.
     """
-    if isinstance(parents, int):
+    if parents is None or is_parent_id(parents):
         parents = [parents]
+    if not isinstance(parents, (list, tuple)):
+        raise InvalidParentsError(
+            f"parents {parents!r}, which is not a list of ids"
+        )
     normalized = []
-    for parent_id in parents or []:
-        if parent_id is not None and parent_id not in normalized:
-            normalized.append(parent_id)
+    for parent_id in parents:
+        if parent_id is None:
+            continue
+        if not is_parent_id(parent_id):
+            raise InvalidParentsError(
+                f"parent {parent_id!r}, which is not a todo id"
+            )
+        if parent_id not in normalized:
+            normalized.append(int(parent_id))
     return normalized or [ROOT_ID]
 <<normalize [[parents]] on assignment>>=
 if name == "parents":
@@ -759,6 +798,20 @@ def test_parents_are_normalized():
   assert item.parents == [ROOT_ID]
   item.parents = 7
   assert item.parents == [7]
+@
+
+Values that only resemble ids are refused, each of them:
+
+<<test functions>>=
+@pytest.mark.parametrize("parents", [
+  "12", [[1]], 1.5, ["1"], [1.0], [True], [-2], {"id": 1},
+])
+def test_parents_refuse_what_is_not_an_id(parents):
+  """Strings, nested lists, floats, booleans are not ids."""
+  with pytest.raises(InvalidParentsError):
+    TodoItem(id=1, title="T", parents=parents)
+  with pytest.raises(InvalidParentsError):
+    TodoItem.from_dict({"id": 1, "title": "T", "parents": parents})
 @
 
 Files written before [[parents]] existed store a single [[parent_id]]
@@ -1938,10 +1991,9 @@ def load_todos_raw() -> tuple:
     try:
         with open(todo_file, "r") as f:
             data = json.load(f)
-            todos = [
-                TodoItem.from_dict(t)
-                for t in data.get("todos", [])
-            ]
+            todos = []
+            for record in data.get("todos", []):
+                <<read one stored todo or refuse the file>>
             <<refuse a todo whose id is the root's>>
             return data.get("next_id", 1), todos
     except (
@@ -1987,6 +2039,9 @@ def load_todo_state() -> tuple:
     return next_id, todos, stack
 @
 
+\paragraph{Files we refuse to read}%
+\label{sec:todo-refused-files}
+
 One stored id cannot be read at all: zero.  It is [[ROOT_ID]], the id
 the top level has among parent ids (\cref{sec:todo-parents}), and the
 commands never hand it out, since ids start at one.  A file edited by
@@ -2008,14 +2063,49 @@ inside a [[mutate_todo_state]] callback abandons the write instead
 
 <<refuse a todo whose id is the root's>>=
 if any(t.id == ROOT_ID for t in todos):
+    refuse_todo_file(
+        todo_file,
+        f"holds a todo with id {ROOT_ID}, which stands for the "
+        "top level; give it another id, and its children their "
+        "new parent",
+    )
+@
+
+A [[parents]] value that is not a list of ids
+(\cref{sec:todo-parents-field}) is refused the same way, and for the
+same reasons: only the person who wrote it knows what it should have
+been, and the alternative to stopping, an empty list, would cost the
+whole file at the next save.  The error names the item, since the file
+may hold hundreds.
+
+<<read one stored todo or refuse the file>>=
+try:
+    todos.append(TodoItem.from_dict(record))
+except InvalidParentsError as error:
+    refuse_todo_file(
+        todo_file,
+        f"holds todo #{record.get('id')} with {error}",
+    )
+@
+
+Both refusals share one helper, so that they look alike and both end
+in [[typer.Exit]], whose meaning inside a callback is what keeps the
+file safe.
+
+<<active stack helpers>>=
+def refuse_todo_file(todo_file, problem):
+    """Exit with an error naming `todo_file` and `problem`.
+
+    Inside a `mutate_todo_state` callback the exit also
+    abandons the write, so the file stays as it is.
+    """
     typer.echo(
-        f"Error: {todo_file} holds a todo with id {ROOT_ID}, "
-        "which stands for the top level; give it another "
-        "id, and its children their new parent, by hand",
+        f"Error: {todo_file} {problem}; fix it by hand",
         err=True,
     )
     raise typer.Exit(1)
 @
+
 
 Let's verify that a file with such a todo is refused by a reading
 command and by a writing one, and that neither changes it:
@@ -2039,6 +2129,30 @@ def test_todo_with_root_id_is_refused(temp_todo_dir):
     assert "holds a todo with id 0" in result.output
     assert get_todo_file().read_text() == stored
 @
+
+A parents value that is not a list of ids stops the commands the same
+way, naming the item:
+
+<<test functions>>=
+def test_todo_with_bad_parents_is_refused(temp_todo_dir):
+  """A string parent stops every command; the file stays."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "One", "parents": [0]},
+      {"id": 2, "title": "Two", "parents": ["1"]},
+    ],
+  }))
+  stored = get_todo_file().read_text()
+
+  for args in (["ls", "--who", ""], ["add", "-t", "New", "--prio", "1"]):
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 1
+    assert "holds todo #2 with parent '1'" in result.output
+    assert get_todo_file().read_text() == stored
+@
+
 
 
 Once we have a coherent in-memory state, writes should either fully
@@ -30003,6 +30117,7 @@ from nytid.cli.todo import (
     ROOT_ID,
     push_active,
     normalize_parents,
+    InvalidParentsError,
     parents_of,
     real_parents_of,
     children_of,
