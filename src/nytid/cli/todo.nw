@@ -1219,7 +1219,18 @@ That makes storage updates more subtle than a plain JSON overwrite.
 Commands often need to update both files together, and a crash or
 concurrent command between those writes would leave the task model in an
 impossible state.  We therefore factor persistence into three layers:
-raw loaders, synchronizers, and a locked mutation helper.
+raw loaders, synchronizers, and a locked mutation helper.  Every command
+that changes the state goes through the third layer; how commands that
+must first ask the user something keep to that rule is the subject of
+\cref{sec:todo-read-modify-write}.
+
+The two helpers below are the convenient entry points for whole-state
+reads and writes.  [[load_todos]] is the snapshot read that commands
+start from.  [[save_todos]] \emph{replaces} the stored todos with the
+list it is given; it is right for setting up a known state, as the tests
+do, but it is not a way to save a modification: the list it writes was
+loaded before the lock was taken, so anything another process wrote in
+between would be erased.
 
 <<storage functions>>=
 def ensure_todo_dir():
@@ -1244,7 +1255,12 @@ def load_todos() -> tuple:
 
 
 def save_todos(next_id: int, todos: list[TodoItem]):
-    """Save todos to persistent storage."""
+    """Replace the stored todos with `todos`.
+
+    Not for read-modify-write: a list loaded earlier
+    would overwrite concurrent changes.  Change the state
+    inside a `mutate_todo_state` callback instead.
+    """
     def update(_next_id, _todos, stack):
         return next_id, todos, stack
 
@@ -1708,6 +1724,172 @@ def test_active_stack_discards_unknown_ids(temp_todo_dir):
     """Stack normalization drops IDs missing from todos."""
     save_active_stack([5, 7, 3])
     assert load_active_stack() == []
+@
+
+\subsection{Every Read-Modify-Write Goes Through the Lock}%
+\label{sec:todo-read-modify-write}
+
+[[mutate_todo_state]] protects exactly what happens inside its
+callback, and nothing else.  A command that loads the todos with
+[[load_todos]], changes its copy and hands the copy to [[save_todos]]
+still races, even though [[save_todos]] takes the lock: the lock covers
+the write, but the data being written was read before it.  Two
+commands that overlap show what that costs.  [[todo add]] and
+[[todo note]] start at the same moment and both read the file; [[note]]
+stores its note; [[add]] then writes its copy plus the new item, and
+the note is gone.  Two overlapping [[add]] commands are worse: both
+read the same [[next_id]], so the later one replaces the earlier
+item with a new one under the same ID.  These overlaps are not
+exotic here, since agents run [[note]] and [[done]] from their own
+sessions while the user works in the same list.
+
+The rule every command follows is therefore:
+\begin{description}
+\item[Snapshot] A command may read the state without the lock to decide
+  what to do: resolve which item is meant, ask the user to confirm or to
+  compare priorities, open an editor, or talk to GitHub.
+\item[Commit] The change itself is made inside one [[mutate_todo_state]]
+  callback, on the state that callback receives.  The callback looks
+  the items up again by ID, checks that what the decision assumed still
+  holds, and takes any new IDs from the [[next_id]] it was given.
+\end{description}
+
+Prompts and network calls stay out of the callback because they take
+unbounded time.  Holding the lock across a [[typer.confirm]] would
+block every other [[nytid todo]] command, the agents' included, for as
+long as the user takes to answer.
+
+A check in the commit step can fail.  The commonest case is an item
+that was removed while the command was waiting, and the answer is
+then to stop with an error rather than to write the snapshot's copy
+back, which would bring a deleted item back from the dead.  Raising
+inside the callback is what makes this safe: [[mutate_todo_state]]
+writes only after the callback returns, so an exception leaves the
+files untouched.  Values the command worked out from the snapshot are,
+by contrast, applied as they are.  A priority chosen by binary search
+answers questions about the siblings the user was shown; if a sibling
+changed meanwhile, the number is still where the user put the item,
+and asking again would cost more than a slightly stale rank.
+
+Most callbacks begin with the same look-up, so we give the
+\enquote{no longer exists} error one home.
+
+<<active stack helpers>>=
+def require_todo(todos, todo_id):
+    """Return the item with `todo_id` from a fresh state.
+
+    Exits with an error if it is gone, which inside a
+    `mutate_todo_state` callback also abandons the write.
+    """
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} no longer exists",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return item
+@
+
+Testing the rule needs the dangerous interleaving on demand rather than
+by luck.  We get it by holding each thread at its first state read, the
+unlocked snapshot, until every thread has taken one.  After that
+barrier both commands are working from the same old state, which is
+precisely the situation in which an unlocked save loses data.  The
+barrier must not stop a later read: the reads inside
+[[mutate_todo_state]] happen with the lock held, and a thread waiting
+there for a partner that is itself waiting for the lock would never
+wake up.
+
+Each thread runs a real command and so takes the real lock.  That
+matters because [[flock]] locks belong to an open file description:
+[[mutate_todo_state]] opens the lock file afresh on every call, so two
+threads exclude each other just as two processes would, and a mocked
+lock would prove nothing.
+
+<<test functions>>=
+def run_with_shared_snapshot(*commands):
+    """Run each command in its own thread from one old state.
+
+    Every thread is held after its first todo-state read
+    until all threads have made one.  Returns the results
+    and re-raises the first exception from any thread.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from nytid.cli import todo as todo_module
+
+    real_load = todo_module.load_todo_state
+    barrier = threading.Barrier(len(commands), timeout=10)
+    held = set()
+
+    def load_then_wait():
+        state = real_load()
+        me = threading.get_ident()
+        if me not in held:
+            held.add(me)
+            barrier.wait()
+        return state
+
+    with patch(
+        "nytid.cli.todo.load_todo_state",
+        side_effect=load_then_wait,
+    ):
+        with ThreadPoolExecutor(len(commands)) as pool:
+            futures = [pool.submit(c) for c in commands]
+            return [f.result() for f in futures]
+@
+
+With that harness, the two overlaps from the start of this section
+become tests.  We call the command functions directly rather than
+through [[CliRunner]], which redirects the process-wide standard
+streams and so cannot run two invocations at once.  [[--prio]] and
+[[--top-level]] keep [[add]] from prompting or looking for a tmux
+parent.
+
+<<test functions>>=
+def add_ranked(title):
+    """Return a call of `todo add` that needs no prompts."""
+    from nytid.cli.todo import add
+    return lambda: add(
+        None, title=title,
+        top_level=True, explicit_priority=1.0,
+    )
+
+
+def test_overlapping_adds_get_distinct_ids(temp_todo_dir):
+    """Two adds from one snapshot both survive, with own IDs."""
+    run_with_shared_snapshot(
+        add_ranked("First"), add_ranked("Second"),
+    )
+
+    next_id, todos = load_todos()
+    assert sorted(t.title for t in todos) == ["First", "Second"]
+    assert sorted(t.id for t in todos) == [1, 2]
+    assert next_id == 3
+
+
+def test_overlapping_add_keeps_a_note(temp_todo_dir):
+    """A note stored while an add is pending is not lost."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Existing",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    run_with_shared_snapshot(
+        add_ranked("New"),
+        lambda: note(1, message="Progress", edit=False),
+    )
+
+    _, todos = load_todos()
+    by_title = {t.title: t for t in todos}
+    assert by_title["Existing"].notes == "Progress"
+    assert by_title["New"].id == 2
 @
 
 \section{Sub-item Helpers}%
@@ -6765,13 +6947,15 @@ who: Annotated[str | None, who_opt] = None,
 @
 
 Now the implementation. We first reject contradictory flags and fold
-the [[--note]] paragraphs into one string, then resolve the parent ID,
-determine the priority, and finally save.  The fold happens before the
+the [[--note]] paragraphs into one string, then resolve the parent ID
+and determine the priority, both on the snapshot loaded here, and
+finally create the item under the lock
+(\cref{sec:todo-read-modify-write}).  The fold happens before the
 branch because both ways of creating an item need the result: the
 flag path stores it, and the editor path shows it.
 
 <<add command implementation>>=
-next_id, todos = load_todos()
+_, todos = load_todos()
 try:
     _, run_command = resolve_command_argv(run_command, ctx)
 except ValueError as exc:
@@ -7335,26 +7519,7 @@ resolved_who = who or default_username
 estimated_hours = (
     parse_hours(estimate) if estimate else None
 )
-item = TodoItem(
-    id=next_id,
-    title=title,
-    labels=inherited_labels,
-    priority=priority,
-    status="pending",
-    created=now,
-    deadline=inherited_deadline,
-    estimated=estimated_hours,
-    description=description or "",
-    notes=notes_text,
-    parent_id=resolved_parent,
-    who=resolved_who,
-    wd=resolved_wd,
-    worktree=normalize_worktree_name(worktree),
-    env=resolved_env,
-    command=run_command,
-)
-todos.append(item)
-save_todos(next_id + 1, todos)
+<<append the new todo under the lock>>
 
 typer.echo(f"Added todo #{item.id}: {item.title}")
 if inherited_labels:
@@ -7371,6 +7536,45 @@ if item.worktree:
     typer.echo(f"  Worktree: {item.worktree}")
 if run_command:
     typer.echo(f"  Command: {run_command}")
+@
+
+Everything so far worked on the snapshot read at the start of the
+command, including the binary search, which may have kept the user
+answering questions for a while.  The item itself is created inside a
+locked callback (\cref{sec:todo-read-modify-write}).  Its ID has to
+come from the [[next_id]] that is current when the item is written:
+taking it from the snapshot is what let two overlapping [[add]]s
+hand out the same ID.  The parent chosen at the start is looked up
+again for the same reason, since it may have been removed in the
+meantime, and a child of a removed item would be promoted to the top
+level by [[get_visible_roots]] instead of being refused.
+
+<<append the new todo under the lock>>=
+def append_new_todo(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    item = TodoItem(
+        id=next_id,
+        title=title,
+        labels=inherited_labels,
+        priority=priority,
+        status="pending",
+        created=now,
+        deadline=inherited_deadline,
+        estimated=estimated_hours,
+        description=description or "",
+        notes=notes_text,
+        parent_id=resolved_parent,
+        who=resolved_who,
+        wd=resolved_wd,
+        worktree=normalize_worktree_name(worktree),
+        env=resolved_env,
+        command=run_command,
+    )
+    todos.append(item)
+    return next_id + 1, todos, stack, item
+
+*_, item = mutate_todo_state(append_new_todo)
 @
 
 Let us verify that [[--worktree]] is persisted next to [[wd]], that
@@ -7453,6 +7657,16 @@ environment is often large, noisy, and not something the user wants to
 edit as front matter.  The flag still applies when saving, just without
 dumping the whole environment into the buffer.
 
+The editor session and the priority search both wait for the user, so
+they run on the snapshot, and the items are created afterwards inside
+one locked callback (\cref{sec:todo-read-modify-write}).  That callback
+re-checks the parent and draws every ID---the parent's and all its
+children's---from the current [[next_id]], exactly as the flag path
+does.  The creation chunks below assign to [[next_id]] and [[todos]] as
+they go; inside the callback those names are its parameters, the fresh
+state, so the recursive [[create_children_from_parsed]] picks them up
+through [[nonlocal]] without knowing that a lock is involved.
+
 <<add via editor>>=
 <<build initial editor metadata>>
 initial = title if title else ""
@@ -7471,9 +7685,17 @@ priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
 <<resolve priority for new todo>>
-<<create parent from parsed>>
-<<create children from parsed>>
-save_todos(next_id, todos)
+
+
+def append_parsed_todos(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    <<create parent from parsed>>
+    <<create children from parsed>>
+    return next_id, todos, stack
+
+
+mutate_todo_state(append_parsed_todos)
 @
 
 We build a metadata dictionary from CLI flags so the editor opens
@@ -21250,7 +21472,7 @@ def note(
     editing and the saved buffer becomes the new notes; a
     GitHub-linked item opens an empty buffer for a new comment.
     """
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "add a note",
         who=default_username, todos=todos,
@@ -21319,19 +21541,36 @@ stripped, for the same reason [[parse_editor_content]] strips the
 notes it parses: the trailing newline an editor leaves behind is
 not part of what the user wrote.
 
+Both paths store the note inside a locked callback on the item as it
+is \emph{now} (\cref{sec:todo-read-modify-write}); [[item]] is the
+snapshot the command started from, and an editor session can last long
+enough for an agent to add a note of its own.  For the replacing path
+that raises a question: whose notes win?  We let the buffer win only if
+the user changed it.  A buffer saved as it was opened says nothing
+about the notes, so storing it would erase whatever arrived meanwhile
+for no reason; a changed buffer is the user's version and replaces the
+stored one, as it always has.
+
 <<record the note>>=
 if replace_notes:
-    item.notes = note_text.strip()
-    save_todos(next_id, todos)
+    edited_notes = note_text.strip()
+
+    def replace_the_notes(next_id, todos, stack):
+        fresh = require_todo(todos, todo_id)
+        if edited_notes != item.notes:
+            fresh.notes = edited_notes
+        return next_id, todos, stack
+
+    mutate_todo_state(replace_the_notes)
     typer.echo(f"Notes of #{todo_id} updated")
 else:
     <<post or append the note>>
 @
 
-The appending path is unchanged.  A GitHub-linked item needs a
+The appending path keeps its two halves.  A GitHub-linked item needs a
 working [[gh]] before we promise that the comment was posted;
-[[post_note_comment]] posts it and [[append_note_to_item]] mirrors it
-locally.  The
+[[post_note_comment]] posts it, before the lock is taken, and
+[[append_note_to_item]] mirrors it locally inside the callback.  The
 two messages name the outcome rather than the command, so a user
 who expected one path and got the other sees it immediately.
 
@@ -21339,8 +21578,16 @@ who expected one path and got the other sees it immediately.
 if item.github:
     require_gh()
 post_note_comment(item, note_text)
-append_note_to_item(item, note_text)
-save_todos(next_id, todos)
+
+
+def append_the_note(next_id, todos, stack):
+    append_note_to_item(
+        require_todo(todos, todo_id), note_text
+    )
+    return next_id, todos, stack
+
+
+mutate_todo_state(append_the_note)
 if item.github:
     gh = item.github
     typer.echo(
@@ -21600,6 +21847,46 @@ def test_note_edit_github_still_posts_comment(temp_todo_dir):
     _, todos = load_todos()
     assert "Earlier comment" in todos[0].notes
     assert "Fresh comment" in todos[0].notes
+@
+
+Finally, the editor session is where another process is most likely
+to write meanwhile.  We let a second [[note]] land while the editor is
+open: an untouched buffer must keep it, and an edited buffer is the
+user's version and replaces it.
+
+<<test functions>>=
+@pytest.mark.parametrize(
+    "edit_buffer,expected",
+    [
+        (lambda initial: initial, "First\nAgent"),
+        (lambda initial: "Rewritten", "Rewritten"),
+    ],
+)
+def test_note_edit_while_another_note_lands(
+    temp_todo_dir, edit_buffer, expected,
+):
+    """Only a changed buffer overwrites a concurrent note."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+
+    def editor_meanwhile(initial=""):
+        note(1, message="Agent", edit=False)
+        return edit_buffer(initial)
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=editor_meanwhile,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == expected
 @
 
 \section{Tests}
