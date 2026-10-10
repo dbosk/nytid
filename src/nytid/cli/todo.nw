@@ -8586,6 +8586,7 @@ def render_todo_markdown(
     """
     lines = [item.title]
     meta = build_item_metadata(item)
+    <<show the edited item's places>>
     yaml_block = render_yaml_block(meta)
     if yaml_block:
         lines.append(yaml_block)
@@ -8604,6 +8605,23 @@ def render_todo_markdown(
             )
         )
     return "\n".join(lines)
+@
+
+A sub-item's places are its headings, but the edited item has no
+heading: the buffer is its section.  Its parents go in its front
+matter instead, as \texttt{parents: [0, 12]}, with~0 for the top level
+(\cref{sec:todo-parents}), and [[edit]] reads them back
+(\cref{sec:edit-buffer-parents}).  The key is shown only for an item
+with several parents.  An item with one parent is the common case, and
+the line would cost every buffer the space the description argument
+below weighs; a user who wants to give such an item a second place can
+still type the key, or use [[edit --add-parent]].  [[build_item_metadata]]
+does not emit the key, since it also renders the sub-items, whose
+places the headings already give.
+
+<<show the edited item's places>>=
+if len(parents_of(item)) > 1:
+    meta = {"parents": list(parents_of(item)), **meta}
 @
 
 We extract only non-default metadata fields so the YAML block stays
@@ -23921,6 +23939,7 @@ if not parsed.title:
 
 <<echo parse warnings>>
 <<update parent from parsed>>
+<<read the edited item's places from the buffer>>
 <<commit the buffer under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
 @
@@ -24058,11 +24077,126 @@ def commit_the_buffer(next_id, todos, stack):
     replay_item_edits(
         edited, shown[todo_id], item, as_read[todo_id]
     )
+    <<move the edited item to the places the buffer names>>
     <<reconcile the buffer with the stored items>>
     return next_id, todos, stack
 
 
 mutate_todo_state(commit_the_buffer)
+@
+
+\paragraph{The edited item's own places.}
+\label{sec:edit-buffer-parents}
+The edited item's parents are in its front matter, as [[parents:]],
+when it has several (\cref{sec:heading-ids}), and the user may type the
+key when it has one.  The key follows the rule of every other key: an
+absent key leaves the parents alone.  A value that is not a list of
+IDs is reported and ignored rather than refused, since refusing would
+throw away the rest of the buffer; an ID may be written with its
+[[#]], as the IDs are written everywhere else.
+
+<<read the edited item's places from the buffer>>=
+buffer_parents = None
+if "parents" in parsed.metadata:
+    try:
+        buffer_parents = parse_parents_key(
+            parsed.metadata["parents"]
+        )
+    except InvalidParentsError as exc:
+        typer.echo(
+            f"Warning: parents: {exc}; kept the places "
+            f"#{todo_id} has",
+            err=True,
+        )
+<<helpers>>=
+def parse_parents_key(value):
+    """Return the parent IDs a `parents:` front-matter key
+    lists, normalized.
+
+    `value` is what the YAML subset made of the key: a list
+    of strings or a single value.  Raises
+    `InvalidParentsError` for anything that is not an ID.
+    """
+    values = value if isinstance(value, list) else [value]
+    ids = []
+    for entry in values:
+        try:
+            ids.append(int(str(entry).strip().lstrip("#")))
+        except ValueError:
+            raise InvalidParentsError(
+                f"{entry!r} is not a todo id"
+            )
+    return normalize_parents(ids)
+@
+
+What the user changed is what the key now says compared with what the
+buffer showed, and it is applied to the parents as they are stored
+now, as [[--add-parent]] and [[--remove-parent]] are
+(\cref{sec:todo-edit-places}), so that a place another process gave the
+item during the session survives.  Each added parent must exist and
+must not lie below the item; one that fails is refused with a warning
+and the rest applied, for the reason places in headings are
+(\cref{sec:edit-via-editor}).
+
+The number follows the rule of [[--remove-parent]]: losing the place
+the number came from, the item's ranking context, puts it at the bottom
+of its best remaining place, as [[rm]] does, since the editor has no
+one to ask where.  An added place cannot lower the number; when it
+ranks above the item, the item is lifted to the bottom of it, which is
+the least presumptuous place there and what [[settle_placement]] does
+for any item below one of its places (\cref{sec:ranking-context}).
+[[edit --add-parent]] ranks it by asking instead.  The item is settled
+before its sub-items are reconciled, so that their families are laid
+out in the range it has now.
+
+<<move the edited item to the places the buffer names>>=
+if buffer_parents is not None:
+    shown_parents = shown[todo_id]["parents"]
+    add = []
+    for parent_id in buffer_parents:
+        if parent_id in shown_parents:
+            continue
+        if parent_id != ROOT_ID and not any(
+            t.id == parent_id for t in todos
+        ):
+            typer.echo(
+                f"Warning: parent #{parent_id} not found",
+                err=True,
+            )
+        elif would_make_a_cycle(todos, edited, parent_id):
+            typer.echo(
+                f"Warning: #{todo_id} cannot go under "
+                f"#{parent_id}, which is #{todo_id} itself or "
+                "below it",
+                err=True,
+            )
+        else:
+            add.append(parent_id)
+    new_parents, _ = apply_parent_edits(
+        edited.parents, add,
+        [p for p in shown_parents if p not in buffer_parents],
+    )
+    if new_parents != edited.parents:
+        <<move the edited item and settle it>>
+<<move the edited item and settle it>>=
+old_range = child_priority_range_or_none(todos, edited)
+old_place = (edited.priority, list(edited.parents))
+old_context = ranking_context(todos, edited)
+left = [p for p in edited.parents if p not in new_parents]
+joined = [p for p in new_parents if p not in edited.parents]
+edited.parents = new_parents
+if old_context not in new_parents and edited.priority is not None:
+    edited.priority = place_existing_item(
+        todos, edited, PLACE_BOTTOM
+    )
+    old_place = None
+settle_placement(todos, edited, old_range, old_place)
+if left:
+    typer.echo(f"#{todo_id} is no longer {describe_places(left)}")
+if joined:
+    typer.echo(
+        f"#{todo_id} is now also {describe_places(joined)}"
+    )
 @
 
 Reconciliation runs in phases, each over the whole buffer, because
@@ -24238,6 +24372,22 @@ elif (
     typer.echo(
         f"Warning: #{child.id} {child.title!r}: ignored the "
         "text under a heading that does not show it in full",
+        err=True,
+    )
+@
+
+A sub-item's places are its headings, so a [[parents:]] key in its
+front matter, which only the edited item has
+(\cref{sec:edit-buffer-parents}), would contradict them.  The key is
+ignored, as unknown keys are, but with a warning, since a user who
+typed it expected it to do something.
+
+<<apply the section to its item>>=
+if "parents" in section.metadata:
+    typer.echo(
+        f"Warning: sub-item {section.title!r}: ignored "
+        "parents: in its front matter; its headings are its "
+        "places",
         err=True,
     )
 @
@@ -24637,7 +24787,8 @@ settle_placement(
 \subsection{Testing Editor Reconciliation}
 
 An item with several parents can be edited in the editor, and keeps its
-places, which its own buffer does not show.
+places as long as its [[parents:]] line is left alone
+(\cref{sec:edit-buffer-parents}).
 
 <<test functions>>=
 def test_edit_editor_keeps_the_places_of_a_shared_item(
@@ -25047,6 +25198,95 @@ def test_edit_editor_carries_a_shared_item_once(temp_todo_dir):
   by_id = stored_by_id()
   p, q = by_id[2].priority, by_id[3].priority
   assert by_id[7].priority == pytest.approx(q + 0.1 * (p - q))
+@
+
+The edited item's own places are in its front matter
+(\cref{sec:edit-buffer-parents}).  S's buffer shows both, P's buffer
+none, and editing the key moves the item: S taken from P, the place its
+number came from, goes to the bottom of Q, below Q's own child R; S
+made top-level as well keeps its number.  A parent below the item, or
+one that does not exist, is refused with a warning and the rest is
+saved, and so is a value that is not a list of IDs.
+
+<<test functions>>=
+def test_edit_editor_shows_parents_of_a_shared_item(
+  temp_todo_dir,
+):
+  """Only an item with several parents shows them."""
+  save_diamond()
+  _, text = edit_buffer(4, lambda text: text)
+  assert "parents: [2, 3]" in text
+  _, text = edit_buffer(2, lambda text: text)
+  assert "parents:" not in text
+
+
+@pytest.mark.parametrize("value,parents", [
+  ("[3]", [3]), ("[2, 3, 0]", [2, 3, ROOT_ID]),
+  ("[#3, #2]", [2, 3]),
+])
+def test_edit_editor_front_matter_parents(
+  temp_todo_dir, value, parents,
+):
+  """Editing parents: moves the edited item."""
+  save_diamond()
+  next_id, todos = load_todos()
+  save_todos(next_id + 1, todos + [TodoItem(
+    id=next_id, title="R", parents=[3], priority=3.5,
+    created="2026-02-20T10:00:00", who=default_username,
+  )])
+  result, _ = edit_buffer(
+    4, lambda text: text.replace("[2, 3]", value),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == parents
+  todos = list(by_id.values())
+  assert ranking_is_consistent(todos)
+  if 2 not in parents:
+    assert "#4 is no longer under #2" in result.output
+    assert ranking_context(todos, by_id[4]) == 3
+    assert by_id[4].priority < by_id[7].priority
+  else:
+    assert by_id[4].priority == 4.25
+
+
+@pytest.mark.parametrize("value,message", [
+  ("[1, 4]", "#2 cannot go under #4"),
+  ("[1, 9]", "parent #9 not found"),
+  ("[1, x]", "'x' is not a todo id"),
+])
+def test_edit_editor_front_matter_parents_refused(
+  temp_todo_dir, value, message,
+):
+  """A bad parent is refused; the rest is saved."""
+  save_diamond()
+  result, _ = edit_buffer(
+    2,
+    lambda text: text.replace(
+      "---\n", f"---\nparents: {value}\n", 1,
+    ).replace("P\n", "Pa\n", 1),
+  )
+  assert result.exit_code == 0, result.output
+  assert message in result.output
+  by_id = stored_by_id()
+  assert by_id[2].parents == [1]
+  assert by_id[2].title == "Pa"
+
+
+def test_edit_editor_sub_item_parents_key_ignored(
+  temp_todo_dir,
+):
+  """A sub-item's parents: key warns and changes nothing."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: text.replace(
+      "## O {#6}\n---\n", "## O {#6}\n---\nparents: [3]\n",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "ignored parents:" in result.output
+  assert stored_by_id()[6].parents == [2]
 @
 
 Let's verify the order of settling: saving the buffer unchanged spreads
