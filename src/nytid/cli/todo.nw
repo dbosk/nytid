@@ -456,6 +456,18 @@ a URL string because the [[gh]] CLI needs these components
 individually---parsing them back from a URL would be fragile and
 redundant.
 
+The [[claimed_by]] field is runtime state rather than task data: it
+names the worker whose session is working on the item while it is
+on the active stack, and is empty otherwise.  It is separate from
+[[who]] because the two answer different questions.  [[who]] is the
+assignee, whose queue the item is in; [[claimed_by]] is the
+claimant, who started it.  An agent picking up a task from the
+user's queue claims it without becoming its assignee, and changing
+the assignee of a running task does not change who is running it
+(\cref{sec:todo-claim}).  The field comes last, and [[ls]] lists it
+after its computed columns as well, so that the columns of the
+headerless listing format keep their positions.
+
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
 track, which manages mutable state with batch semantics.
@@ -512,6 +524,7 @@ class TodoItem:
     command: str | None = None
     github: dict[str, str] | None = None
     closed: str | None = None
+    claimed_by: str | None = None
 
     def to_dict(self) -> dict:
         """Convert explicit values to a JSON-serializable dict."""
@@ -1648,6 +1661,37 @@ def test_pending_item_loses_stray_closed(temp_todo_dir):
   assert todos[0].closed is None
 @
 
+The claim (\cref{sec:todo-claim}) is tied to the stack in the same
+way: an item that is not active has no claimant.  Rather than
+clearing [[claimed_by]] at every place that takes an item off the
+stack---[[stop]], [[done]], [[rm]], the run finalizers, and the
+normalization that drops done items---we clear it where the state is
+read and written, so no path can forget.  Loading releases the claims
+of inactive items, which also repairs a file written by an interrupted
+command.  Saving writes them released but leaves the objects in memory
+alone, unlike the status cache.  That difference is deliberate: the
+command that has just taken an item off the stack still holds those
+objects, and it needs to know whose tracking to stop next.
+
+<<active stack helpers>>=
+def release_inactive_claims(
+    todos: list[TodoItem], stack: list[int]
+):
+    """Clear `claimed_by` on items not on the stack."""
+    active_ids = set(stack)
+    for item in todos:
+        if item.id not in active_ids:
+            item.claimed_by = None
+
+
+def stored_todo_record(item, active_ids):
+    """Return `item` as stored, unclaimed unless active."""
+    record = item.to_dict()
+    if item.id not in active_ids:
+        record["claimed_by"] = None
+    return record
+@
+
 <<active stack helpers>>=
 def load_todos_raw() -> tuple:
     """Load todos without synchronizing derived state."""
@@ -1702,6 +1746,7 @@ def load_todo_state() -> tuple:
         todos, load_active_stack_raw()
     )
     synchronize_todo_statuses(todos, stack)
+    release_inactive_claims(todos, stack)
     return next_id, todos, stack
 @
 
@@ -1745,11 +1790,15 @@ def save_todo_state_unlocked(
     """Persist todos and active stack after synchronization."""
     normalized_stack = normalize_active_stack(todos, stack)
     synchronize_todo_statuses(todos, normalized_stack)
+    active_ids = set(normalized_stack)
     write_json_atomically(
         get_todo_file(),
         {
             "next_id": next_id,
-            "todos": [t.to_dict() for t in todos],
+            "todos": [
+                stored_todo_record(t, active_ids)
+                for t in todos
+            ],
         },
         indent=2,
     )
@@ -2294,27 +2343,46 @@ push and pop on the same list.  Stack-based commands like [[stop]]
 and [[done]] need to ignore entries that belong to other workers,
 otherwise one worker's implicit resolution would land on another
 worker's item.  [[filter_ids_by_worker]] performs that narrowing.
-Items created before the [[who]] field existed have
-[[who=None]]; we treat those as belonging to
+
+An entry on the stack belongs to the worker whose session is working
+on it: its claimant (\cref{sec:todo-claim}), not its assignee.  An
+agent that started a task from the user's queue must find it with
+its own [[todo stop --who]], and the user's [[todo stop]] must not.
+[[session_worker]] answers that question for every place that asks
+whose session an item belongs to---resolving ID-less commands,
+deciding whose tracking to stop, and checking a claim.  For an item
+that is not active it falls back to the assignee, which is also what
+it does for an item that an older version put on the stack before
+claims were recorded.  Items created before the [[who]] field
+existed have [[who=None]]; we treat those as belonging to
 [[default_username]] so they remain reachable.
 
 <<sub-item helpers>>=
+def session_worker(item):
+    """Return the worker whose session works on `item`.
+
+    That is the claimant while the item is active; for an
+    inactive item, or one activated before claims were
+    recorded, the assignee or the default user.
+    """
+    return item.claimed_by or item.who or default_username
+
+
 def filter_ids_by_worker(
     todos: list[TodoItem],
     ids: list[int],
     who: str,
 ) -> list[int]:
-    """Keep only todo IDs belonging to ``who``.
+    """Keep only todo IDs whose session is ``who``'s.
 
-    Treats items with ``who=None`` as belonging to
-    ``default_username``.
+    See `session_worker` for whose an item is.
     """
     by_id = {t.id: t for t in todos}
     return [
         i
         for i in ids
         if i in by_id
-        and (by_id[i].who or default_username) == who
+        and session_worker(by_id[i]) == who
     ]
 @
 
@@ -5852,19 +5920,19 @@ state that follows from it. This keeps the command bodies declarative:
 Activation resolves the ID (falling back to the current worker/tmux
 context when [[who]] is given), verifies the item exists, claims it
 for the acting worker (\cref{sec:todo-claim}), and pushes it onto the
-shared stack.  Besides the usual state it returns the item as it was
-before a forced takeover, or [[None]] when nothing was taken over;
-the caller needs that copy to stop the previous owner's tracking.
+shared stack.  Besides the usual state it returns the worker it took
+the item from, or [[None]] when nothing was taken over; the caller
+needs that name to stop the displaced claimant's tracking.
 
 <<helpers>>=
 def activate_todo_state(todo_id, who=None, force=False):
     """Push ``todo_id`` onto the authoritative active stack.
 
-    Refuses an item that is active for a worker other
-    than ``who``; with ``force`` the item is handed to
-    ``who`` instead.  Returns the resolved ID, the item,
-    the new state, and a copy of the item as it was
-    before a takeover (``None`` if there was none).
+    Records ``who`` as the item's claimant.  Refuses an
+    item that another worker has claimed, unless
+    ``force``, which takes the claim over.  Returns the
+    resolved ID, the item, the new state, and the worker
+    whose claim was taken over (``None`` if none was).
     """
 
     def update(next_id, todos, stack):
@@ -5899,19 +5967,33 @@ def activate_todo_state(todo_id, who=None, force=False):
 
 \paragraph{Claiming an item}%
 \label{sec:todo-claim}
-An item on the active stack is being worked on, and the worker doing
-it is its owner, [[item.who]] (the default user when unset).  The
-stack is shared, though, and by itself it does not keep a second
-worker from starting an item that another worker already has active.  Both
-would then track time on it, and each one's [[stop]] or [[done]]
-would cut the other's work short.  With agents taking work from the
-same list as the user, that is not an exotic accident.
+An item on the active stack is being worked on in some worker's
+session.  The stack is shared, though, and by itself it does not keep
+a second worker from starting an item that another worker already
+has active.  Both would then track time on it, and each one's
+[[stop]] or [[done]] would cut the other's work short.  With agents
+taking work from the same list as the user, that is not an exotic
+accident.
 
-Starting an item is therefore also a claim on it, and the first claim
-wins.  Activation refuses an item that is active for a worker other
-than the acting one (\cref{sec:todo-acting-worker}) and says whose it
-is, with the two ways forward: act as that worker with [[--who]], or
-take the item over with [[start --force]].
+Starting an item is therefore also a claim on it, recorded in
+[[claimed_by]], and the first claim wins.  Activation records the
+acting worker (\cref{sec:todo-acting-worker}) as the claimant, and
+refuses an item that another worker has claimed.  The refusal says
+whose it is, with the two ways forward: act as that worker with
+[[--who]], or take the item over with [[start --force]].
+
+The claimant is deliberately not the assignee.  An earlier version of
+this rule used [[who]] for both, and each meaning got in the other's
+way.  When the user started a task from an agent's queue, the item
+stayed the agent's, so the user's own restart was refused and the
+user's [[todo stop]] could not find it.  And since the assignee can be
+edited at any time, [[edit --who]] on a running task looked exactly
+like a takeover to the run that was still working on it.  With a
+separate claimant, the assignee says whose queue an item is in and
+changes only when someone reassigns it; the claimant says whose
+session is working on it and changes only when an item is started.
+Everything that asks whose session an active item belongs to goes
+through [[session_worker]].
 
 The check runs inside the locked callback, on the stack as it is when
 the item is pushed (\cref{sec:todo-read-modify-write}).  A check on a
@@ -5926,14 +6008,17 @@ Three cases look similar but are deliberately left alone.
   item active while an agent works through its children.  Starting
   a child must not be refused because its parent is somebody else's,
   and the parent is not taken from them either, since an ancestor
-  that is already active is left exactly as it is.
+  that is already active is left exactly as it is.  An ancestor that
+  is \emph{not} active yet is claimed by the acting worker, though,
+  since it is activated as context for that worker's session and its
+  labels are tracked there.
 \item[Another worker's pending item] An item that is assigned to
-  another worker but not active can still be started by explicit ID,
-  as before.  Assignment says whose queue an item is in, not who is
+  another worker but not active can be started by explicit ID, as
+  before.  Assignment says whose queue an item is in, not who is
   working on it, and picking a task from a colleague's queue is the
-  ordinary way to help out.  Such a start does not change [[who]]
-  either: only a forced takeover rewrites the owner.
-\item[A restart] An item that is already active for the acting worker
+  ordinary way to help out.  The starter becomes the claimant; the
+  assignee stays as it is.
+\item[A restart] An item that the acting worker has claimed already
   may be started again, which is what resuming after a stopped
   tracking session looks like.
 \end{description}
@@ -5948,13 +6033,13 @@ def claim_holder(item, stack, who):
     """Return the worker whose claim on `item` bars `who`.
 
     `item` is claimed while it is on the active `stack`,
-    by `item.who` or the default user when that is unset.
-    Returns `None` when nothing bars `who`: `who` is
-    `None`, the item is not active, or `who` holds it.
+    by `session_worker(item)`.  Returns `None` when
+    nothing bars `who`: `who` is `None`, the item is not
+    active, or `who` holds the claim.
     """
     if who is None or item.id not in stack:
         return None
-    holder = item.who or default_username
+    holder = session_worker(item)
     return holder if holder != who else None
 
 
@@ -5969,24 +6054,24 @@ def refuse_claim(todo_id, holder):
     raise typer.Exit(1)
 @
 
-A forced takeover writes the new owner inside the same callback, so
-the claim changes hands atomically.  It also keeps a copy of the item
-as it was: the previous owner's tracking session still runs the
-item's labels and must be stopped, but once [[who]] has changed
-nothing else would ever stop it.  The previous owner's ID-less
-[[stop]] no longer finds the item, because it is no longer theirs,
-and the new owner's [[stop]] or [[done]] closes the new owner's
-session.  The time would go on accruing to a worker who had stopped
-working on the task.
+A forced takeover moves the claim inside the same callback, so it
+changes hands atomically, and remembers whom it was taken from.  The
+displaced claimant's tracking session still runs the item's labels
+and must be stopped, but once the claim has moved nothing else would
+ever stop it.  The displaced claimant's ID-less [[stop]] no longer
+finds the item, because it is no longer theirs, and the new
+claimant's [[stop]] or [[done]] closes the new claimant's session.
+The time would go on accruing to a worker who had stopped working on
+the task.  The assignee is left alone: taking over the work does not
+move the task to another queue.
 
 The stop itself is tracking I/O and runs after the lock is released,
-in the caller.  That order is safe because [[stop_todo_tracking]]
-takes the worker from the item it is handed rather than reloading
-it, and the copy still names the previous owner.  Stopping first,
-on a decision taken from a snapshot, would be the riskier order: the
-commit can still fail, for instance when the item was removed
-meanwhile, and the previous owner would then have lost the session
-for a takeover that never happened.
+in the caller, which passes the displaced worker to
+[[stop_todo_tracking]] explicitly.  Stopping first, on a decision
+taken from a snapshot, would be the riskier order: the commit can
+still fail, for instance when the item was removed meanwhile, and the
+displaced claimant would then have lost the session for a takeover
+that never happened.
 
 <<claim [[item]] for [[who]]>>=
 displaced = None
@@ -5994,11 +6079,22 @@ holder = claim_holder(item, stack, who)
 if holder is not None:
     if not force:
         refuse_claim(resolved_id, holder)
-    displaced = copy.copy(item)
-    item.who = who
+    displaced = holder
+if who is not None:
+    item.claimed_by = who
 @
 
-A takeover also has to survive the previous owner's run, if one is
+The displaced claimant may also have active descendants of the item,
+sub-tasks it started under it.  A takeover leaves them alone, for the
+same reason that starting a child leaves an active parent alone: each
+item carries its own claim, and taking over one item is not a claim
+on the items around it.  The displaced worker may well still be busy
+with a sub-task while someone else picks up the umbrella item, and
+the labels those sub-tasks share with it stay protected when the
+displaced tracking of the item is stopped.  Whoever wants the
+sub-tasks too takes them over one by one.
+
+A takeover also has to survive the displaced claimant's run, if one is
 still going: when that process exits, its ending must not stop or
 reset an item that is no longer its own.  The run's ending checks
 for that itself (\cref{sec:todo-run-taken-over}).
@@ -6072,8 +6168,8 @@ def test_start_child_ignores_claim_on_active_parent(
 @
 
 Starting another worker's pending item by explicit ID still works,
-here together with the parent it activates, and neither owner is
-rewritten:
+here together with the parent it activates.  Both are claimed by the
+starter, and neither assignee is rewritten:
 
 <<test functions>>=
 def test_start_other_workers_pending_item_keeps_owner(
@@ -6100,6 +6196,72 @@ def test_start_other_workers_pending_item_keeps_owner(
   assert load_active_stack() == [1, 2]
   _, todos = load_todos()
   assert [t.who for t in todos] == ["alice", "alice"]
+  assert [t.claimed_by for t in todos] == [
+    default_username, default_username,
+  ]
+@
+
+The claim, not the assignee, is what the ID-less commands follow.  An
+agent that starts a task from the user's queue finds it again with
+its own [[--who]], the user's own [[stop]] does not see it, and the
+claim is gone once the agent stops:
+
+<<test functions>>=
+def test_agent_claims_users_item(temp_todo_dir):
+  """The claimant, not the assignee, owns the session."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="User's task",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  started = runner.invoke(cli, ["start", "1", "--who", "agent"])
+  assert started.exit_code == 0, started.output
+  _, todos = load_todos()
+  assert todos[0].claimed_by == "agent"
+  assert todos[0].who is None
+
+  noted = runner.invoke(
+    cli, ["note", "--who", "agent", "-m", "Progress"],
+  )
+  assert noted.exit_code == 0, noted.output
+  assert "Note added to #1" in noted.output
+
+  users = runner.invoke(cli, ["stop"])
+  assert users.exit_code == 1
+  assert load_active_stack() == [1]
+
+  stopped = runner.invoke(cli, ["stop", "--who", "agent"])
+  assert stopped.exit_code == 0, stopped.output
+  assert load_active_stack() == []
+  _, todos = load_todos()
+  assert todos[0].claimed_by is None
+@
+
+And a worker may start its own claim again, even on an item assigned
+to somebody else; it is the restart that the earlier, assignee-based
+rule refused:
+
+<<test functions>>=
+def test_restart_of_own_claim_on_others_item(temp_todo_dir):
+  """Starting an item twice as its claimant is allowed."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent's task",
+      created="2026-02-20T10:00:00",
+      who="agent",
+    ),
+  ])
+
+  first = runner.invoke(cli, ["start", "1"])
+  second = runner.invoke(cli, ["start", "1"])
+
+  assert first.exit_code == 0, first.output
+  assert second.exit_code == 0, second.output
+  stopped = runner.invoke(cli, ["stop"])
+  assert stopped.exit_code == 0, stopped.output
+  assert "Stopped: #1" in stopped.output
 @
 
 Let's verify that the tmux context resolution picks the right todo when
@@ -6441,7 +6603,7 @@ def resolve_done_target(todo_id, todos, who=None):
             err=True,
         )
         raise typer.Exit(1)
-    owner = item.who or default_username
+    owner = session_worker(item)
     if who is not None and owner != who:
         typer.echo(
             f"Error: todo #{resolved_id} belongs to "
@@ -6498,10 +6660,8 @@ def auto_complete_parent(item, todos, who=None):
         return
     resolved_who = who
     if resolved_who is None:
-        resolved_who = item.who or default_username
-    if (
-        parent_item.who or default_username
-    ) != resolved_who:
+        resolved_who = session_worker(item)
+    if session_worker(parent_item) != resolved_who:
         return
 
     stop_todo_tracking(parent_item.id, parent_item, todos)
@@ -6566,11 +6726,13 @@ already on the stack.  We collect ancestors from the child upward, then
 reverse the list so that the outermost ancestor is pushed first, giving
 the stack the correct root-to-leaf order.
 
-Each activated ancestor also gets its labels tracked.  Without this, the
-parent would appear in the hierarchy but accumulate no time---defeating
-the purpose of nested tracking.  We reuse the same
-[[start_tracking_labels]] path that [[<<start tracking via track module>>]]
-uses for the explicitly started item.
+Each activated ancestor is claimed by the worker whose session the
+item belongs to, and gets its labels tracked in that session.
+Without this, the parent would appear in the hierarchy but
+accumulate no time---defeating the purpose of nested tracking.  We
+reuse the same [[start_tracking_labels]] path that
+[[<<start tracking via track module>>]] uses for the explicitly
+started item.
 
 Tmux launches need one extra rule.  When [[todo start --pane]] or
 [[todo start --window]] is about to create a new tracked tmux context, the
@@ -6603,12 +6765,19 @@ def ensure_ancestors_active(
     if not missing:
         return []
 
+    worker = session_worker(item)
+
     def push_ancestors(next_id, todos, stack):
+        pushed = set()
         for ancestor in missing:
             if ancestor.id not in stack:
                 idx = stack.index(item.id) \
                     if item.id in stack else len(stack)
                 stack.insert(idx, ancestor.id)
+                pushed.add(ancestor.id)
+        for fresh in todos:
+            if fresh.id in pushed:
+                fresh.claimed_by = worker
         return next_id, todos, stack
 
     mutate_todo_state(push_ancestors)
@@ -6617,7 +6786,6 @@ def ensure_ancestors_active(
         from nytid.cli.track import (
             start_tracking_labels,
         )
-        worker = item.who or default_username
         for ancestor in missing:
             labels = list(ancestor.labels) + [
                 f"todo:{ancestor.id}"
@@ -7669,7 +7837,7 @@ A third role is the worker a command acts \emph{as}.  [[start]],
 work nor filter a list; they operate on one item, and the worker
 decides two things about it.  Without an ID, it decides which item
 that is: the worker's current active todo, since [[resolve_todo_id]]
-narrows the shared stack to the worker's own entries.  And when
+narrows the shared stack to the entries the worker has claimed.  And when
 [[start]] or [[adopt]] activates an item, the worker is the one
 claiming it, which another worker's claim can refuse
 (\cref{sec:todo-claim}).
@@ -10440,10 +10608,11 @@ one at the very end, so every stored field added since then is listed
 in [[FIELDS_AFTER_COMPUTED]] and moved behind the computed values, in
 the order of the list.  The list only grows: a later field is appended
 to it, after the ones already there, which keeps each of their
-positions too.
+positions too.  [[closed]] came first; [[claimed_by]]
+(\cref{sec:todo-claim}) followed it.
 
 <<constants>>=
-FIELDS_AFTER_COMPUTED = ("closed",)
+FIELDS_AFTER_COMPUTED = ("closed", "claimed_by")
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio):
     """Return the dictionary `todo ls` serializes for `item`.
@@ -11075,8 +11244,9 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: eighteen tab-separated fields, no header,
-and the flattened cells in their record positions.
+Let's verify the pipe form: nineteen tab-separated fields, no header,
+and the flattened cells in their record positions, with the tracked
+hours still in the seventeenth.
 
 <<test functions>>=
 def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
@@ -11096,9 +11266,10 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 18
+  assert len(fields) == 19
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
+  assert fields[16] == "0"
 @
 
 The computed columns must stay where they were before [[closed]]
@@ -11154,7 +11325,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 18
+  assert len(fields) == 19
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -11250,6 +11421,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "created", "deadline", "estimated", "description",
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
+        "claimed_by",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -11847,8 +12019,8 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-4:] == [
-    "tracked_hours", "closed", "path", "ready",
+  assert list(rows[3])[-5:] == [
+    "tracked_hours", "closed", "claimed_by", "path", "ready",
   ]
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -16887,7 +17059,11 @@ stopped, but also to some other todo that remains active.  For example,
 if a parent and child both carry [[DD1310]], completing the child should
 stop [[todo:child]] but leave [[DD1310]] running for the parent.
 
-Protection only considers items belonging to the \emph{same} worker.
+Protection only considers items belonging to the \emph{same} worker,
+that is, the same session ([[session_worker]]).  The worker defaults
+to the item's own, and a caller passes another when it knows better:
+a takeover stops the \emph{displaced} claimant's session
+(\cref{sec:todo-claim}).
 Each worker has an independent tracking session, so another worker's
 active todo cannot keep your labels alive---and should not prevent them
 from being stopped.  Without this restriction, a parent task owned by
@@ -16905,18 +17081,20 @@ wrappers around track semantics rather than a second implementation of
 them.
 
 <<helpers>>=
-def stop_todo_tracking(todo_id, item, todos):
+def stop_todo_tracking(todo_id, item, todos, worker=None):
     """Stop tracking labels for a todo item.
 
-    Protects labels still needed by other active
-    todos on the stack.
+    Stops them in `worker`'s session, by default the
+    session the item belongs to.  Protects labels still
+    needed by that worker's other active todos.
     """
     try:
         from nytid.cli.track import (
             stop_tracking_labels_if_active,
         )
 
-        worker = item.who or default_username
+        if worker is None:
+            worker = session_worker(item)
         todo_label = f"todo:{todo_id}"
         stack = normalize_active_stack(
             todos, load_active_stack_raw()
@@ -16929,9 +17107,7 @@ def stop_todo_tracking(todo_id, item, todos):
                 (t for t in todos if t.id == sid),
                 None,
             )
-            if stacked and (
-                stacked.who or default_username
-            ) == worker:
+            if stacked and session_worker(stacked) == worker:
                 protected.update(stacked.labels)
 
         labels_to_stop = [todo_label] + [
@@ -17254,14 +17430,14 @@ def stop_todo_hierarchy(todo_id, who=None, launched_by=None):
     ``todo stop`` and returns the refreshed todo
     state after descendants have been deactivated.
     Raises `RunTakenOver`, having stopped nothing, when
-    `launched_by` is given and no longer owns the item.
+    `launched_by` is given and no longer holds the claim.
     """
     resolved_id, item, _, todos, _ = stop_todo_state(
         todo_id, who=who, launched_by=launched_by,
     )
     resolved_who = who
     if resolved_who is None and item is not None:
-        resolved_who = item.who or default_username
+        resolved_who = session_worker(item)
     stop_todo_tracking(resolved_id, item, todos)
     stopped_ids = stop_active_descendants(
         resolved_id, todos, who=resolved_who
@@ -18585,8 +18761,9 @@ def test_status_shows_parallel_active_forest(temp_todo_dir):
 
 Starting a todo delegates to the track system. We start tracking with
 the todo's labels plus a special [[todo:<id>]] label, and set the
-todo's status to \enquote{in-progress}. The track worker is the todo's
-assigned worker, defaulting to \enquote{me}.
+todo's status to \enquote{in-progress}. The track worker is the
+acting worker, who has just become the item's claimant
+(\cref{sec:todo-claim}).
 
 The ordering now matters more than before.  We first update the
 authoritative active stack under the todo lock, then start the matching
@@ -18758,7 +18935,9 @@ created a checkout for an item it may not work on.  The peek has
 the stack at hand, so we ask the same question of it first.  If the
 peek is stale, nothing worse follows than a refusal that a retry
 would not get, or a claim made after the peek, which the locked
-check still refuses a moment later.
+check still refuses a moment later.  In that second case the worktree
+has been created by then and is left behind; the next start of the
+item reuses it, so the cost is an unused checkout, not a wrong one.
 
 <<refuse another worker's active todo early>>=
 if peek_item is not None and not force:
@@ -18794,9 +18973,9 @@ def test_start_refuses_claim_before_worktree(temp_todo_dir):
 [[--force]] takes the item over instead of refusing.  It is a
 separate, command-qualified option for the same reason as [[done]]'s
 and [[rm]]'s (\cref{sec:todo-done}): each [[--force]] promises
-something different.  This one writes the acting worker as the
-item's owner, which is why the help says \enquote{take over} rather
-than just \enquote{force}.
+something different.  This one moves the claim to the acting worker,
+which is why the help says \enquote{take over} rather than just
+\enquote{force}.
 
 <<argument and option definitions>>=
 start_force_opt = typer.Option(
@@ -18809,19 +18988,18 @@ start_force_opt = typer.Option(
 force: Annotated[bool, start_force_opt] = False,
 @
 
-After a takeover the previous owner's session still runs the item's
-labels.  We stop them from the copy [[activate_todo_state]] kept,
-which still names that owner, before the new owner's tracking starts
-(\cref{sec:todo-claim}).  Labels that the previous owner's other
+After a takeover the displaced claimant's session still runs the
+item's labels.  We stop them for the worker [[activate_todo_state]]
+named, before the new claimant's tracking starts
+(\cref{sec:todo-claim}).  Labels that the displaced claimant's other
 active items share stay protected, as in every other stop.
 
 <<stop the displaced owner's tracking>>=
 if displaced is not None:
-    typer.echo(
-        f"Took over #{todo_id} from "
-        f"{displaced.who or default_username}"
+    typer.echo(f"Took over #{todo_id} from {displaced}")
+    stop_todo_tracking(
+        todo_id, item, todos, worker=displaced,
     )
-    stop_todo_tracking(todo_id, displaced, todos)
 @
 
 Let's verify a takeover end to end with real tracking sessions: the
@@ -18856,7 +19034,8 @@ def test_start_force_takes_over_active_item(temp_todo_dir):
   assert result.exit_code == 0, result.output
   assert "Took over #1 from alice" in result.output
   _, todos = load_todos()
-  assert todos[0].who == default_username
+  assert todos[0].claimed_by == default_username
+  assert todos[0].who == "alice"
   assert load_active_stack() == [1]
   alice = load_active_session("alice").get_active_labels()
   assert "todo:1" not in alice
@@ -18990,43 +19169,49 @@ def record_run_outcome(
 A run can outlast its claim on the item.  An agent's session is
 still running when the user takes the item over with
 [[start --force]] (\cref{sec:todo-claim}); the takeover stops the
-agent's tracking and makes the user the owner, but the agent's
+agent's tracking and moves the claim to the user, but the agent's
 process carries on until it exits.  Left to itself, its ending would
 undo the takeover: the stop would remove the item from the stack and
-close the tracking of the item's \emph{current} owner, the new one,
-and the outcome would reset the item to pending, hand it to the
+close the tracking of the item's \emph{current} claimant, the new
+one, and the outcome would reset the item to pending, hand it to the
 [[--reassign-to]] worker, or, after a \enquote{yes} at the prompt,
-mark it done under the new owner's hands.
+mark it done under the new claimant's hands.
 
-What the run's ending may change is what the run still owns.  Every
-run therefore remembers the worker that launched it, and the ending
-compares that worker with the item's owner.  If they differ, the
-item belongs to somebody else now: it stays active for them, their
-tracking and the descendants are left alone, and the run neither
-asks whether the item is done nor stores done or pending.  All the
-run still does is end its launcher's own tracking of the item and
-leave its record: the run's note, if it has one, and a line saying
-who took the item over.
+What the run's ending may change is what the run still holds.  Every
+run therefore remembers the acting worker that launched it,
+[[launched_by]], and the ending compares that worker with the item's
+claimant.  If the item is still active and someone else holds the
+claim, it belongs to them now: it stays active, their tracking and
+the descendants are left alone, and the run neither asks whether the
+item is done nor stores done or pending.  All the run still does is
+end its launcher's own tracking of the item and leave its record:
+the run's note, if it has one, and a line saying who took the item
+over.
 
-Ownership is the right test because only a forced takeover rewrites
-[[who]] on an active item (\cref{sec:todo-claim}); a restart by the
-same worker, the case the claim allows, leaves the run alone, as it
-always did.  Runs started before this check existed carry no
-launcher, and [[None]] keeps their old behaviour.
+The claimant is the right thing to compare because only a start
+moves it, and only a forced start moves it away from someone who
+holds it (\cref{sec:todo-claim}).  Reassigning the item with
+[[edit --who]] while it runs changes the assignee and nothing else,
+so the run ends as it always did.  A restart by the same worker
+keeps the claim where it was.  An item that is no longer active at
+all was stopped or completed by someone, which is not a takeover and
+is handled as before.  Runs started before this check existed carry
+no launcher, and [[None]] keeps their old behaviour.
 
 <<helpers>>=
-def run_taken_over_by(item, launched_by):
+def run_taken_over_by(item, stack, launched_by):
     """Return the worker who took `item` from a run.
 
-    `launched_by` is the worker that launched the run.
-    Returns `None` while that worker still owns the item,
-    and when `launched_by` is `None` (an older run that
-    did not record its launcher).
+    `launched_by` is the acting worker that launched the
+    run.  Returns the claimant if `item` is active on
+    `stack` and claimed by someone else, otherwise `None`
+    (also when `launched_by` is `None`: an older run
+    that did not record its launcher).
     """
-    if launched_by is None:
+    if launched_by is None or item.id not in stack:
         return None
-    owner = item.who or default_username
-    return owner if owner != launched_by else None
+    holder = session_worker(item)
+    return holder if holder != launched_by else None
 @
 
 The comparison is made twice, both times under the lock, because the
@@ -19042,30 +19227,31 @@ write (\cref{sec:todo-read-modify-write}).
 class RunTakenOver(Exception):
     """A run ended after another worker took its item."""
 
-    def __init__(self, todo_id, item, owner):
+    def __init__(self, todo_id, item, holder):
         super().__init__(
-            f"todo #{todo_id} was taken over by {owner}"
+            f"todo #{todo_id} was taken over by {holder}"
         )
         self.todo_id = todo_id
         self.item = item
-        self.owner = owner
+        self.holder = holder
 <<refuse to stop a run that was taken over>>=
-owner = run_taken_over_by(item, launched_by)
-if owner is not None:
-    raise RunTakenOver(resolved_id, item, owner)
+holder = run_taken_over_by(item, stack, launched_by)
+if holder is not None:
+    raise RunTakenOver(resolved_id, item, holder)
 @
 
-The second is the commit of the outcome.  A takeover can also land
-while the prompt is open, so [[record_run_outcome]] looks again and,
-if the item has changed hands, stores only the run's notes and the
-line about the takeover.
+The second is the commit of the outcome.  By then the stop has taken
+the item off the stack, so a normal ending finds it inactive and goes
+ahead.  But the item can be started again while the prompt is open,
+and if someone else claimed it then, [[record_run_outcome]] stores
+only the run's notes and the line about the takeover.
 
 <<only note a run whose item was taken over>>=
-owner = run_taken_over_by(item, launched_by)
-if owner is not None:
+holder = run_taken_over_by(item, stack, launched_by)
+if holder is not None:
     append_note_to_item(
         item,
-        f"Run by {launched_by} ended after {owner} "
+        f"Run by {launched_by} ended after {holder} "
         "took the item over; its outcome was not applied.",
         who=launched_by,
     )
@@ -19074,22 +19260,23 @@ if owner is not None:
 
 Both exit paths, the blocking one and the detached finalizer, stop a
 run the same way, so the handling of a taken-over stop lives in one
-function.  The launcher's tracking is stopped from a copy of the
-item that names the launcher, the same device the takeover itself
-uses (\cref{sec:todo-claim}), since [[stop_todo_tracking]] takes the
-worker from the item it is handed.  Usually the takeover has already
-stopped those labels and this stop finds nothing to do; it matters
-when the launcher has started them again since, by hand or through
-auto-suspend.
+function.  It stops the launcher's tracking of the item by naming the
+launcher to [[stop_todo_tracking]], since the item's own session is
+now the new claimant's.  Usually the takeover has already stopped
+those labels and this stop finds nothing to do; it matters when the
+launcher has started them again since, by hand.  The fourth value it
+returns tells the caller whether there is an outcome to decide at
+all.
 
 <<helpers>>=
 def stop_run(todo_id, launched_by=None):
     """Stop what a run of `todo_id` was tracking.
 
     Returns the resolved ID, the item (`None` if it is
-    gone) and the descendants that were stopped.  If the
-    item was taken over during the run, only
-    `launched_by`'s own tracking of it is stopped and no
+    gone), the descendants that were stopped, and the
+    worker who took the item over during the run (`None`
+    if nobody did).  After a takeover only `launched_by`'s
+    own tracking of the item is stopped and no
     descendants are touched.
     """
     try:
@@ -19099,18 +19286,17 @@ def stop_run(todo_id, launched_by=None):
             todo_id, launched_by=launched_by,
         )
     except RunTakenOver as taken:
-        launchers_view = copy.copy(taken.item)
-        launchers_view.who = launched_by
         _, todos = load_todos()
         stop_todo_tracking(
-            taken.todo_id, launchers_view, todos,
+            taken.todo_id, taken.item, todos,
+            worker=launched_by,
         )
         typer.echo(
             f"  #{taken.todo_id} was taken over by "
-            f"{taken.owner}; leaving it active"
+            f"{taken.holder}; leaving it active"
         )
-        return taken.todo_id, taken.item, []
-    return todo_id, item, descendants
+        return taken.todo_id, taken.item, [], taken.holder
+    return todo_id, item, descendants, None
 @
 
 The detached helper uses it directly: it has no prompt, only the exit
@@ -19131,7 +19317,7 @@ def finalize_detached_todo(
         exit_code = read_detached_exit_code(
             exit_code_file
         )
-    todo_id, item, descendants = stop_run(
+    todo_id, item, descendants, _ = stop_run(
         todo_id, launched_by
     )
     if item is None:
@@ -19573,7 +19759,7 @@ try:
         start_tracking_labels,
     )
 
-    worker = item.who or default_username
+    worker = session_worker(item)
 
     track_labels = todo_track_labels(item, todo_id)
     started, _, _ = start_tracking_labels(
@@ -19937,7 +20123,7 @@ def adopt_untracked_window_for_start(
         register_tmux_context_labels,
     )
 
-    worker = item.who or default_username
+    worker = session_worker(item)
     if is_current_tmux_context_tracked(worker):
         return False
     adopt_window_for_todo(
@@ -20473,13 +20659,11 @@ default here.  Without one, the shared exit handler would raise
 timed_out = False
 @
 
-The run also has to know whose it is when it ends, which is the
-item's owner now, at launch (\cref{sec:todo-run-taken-over}).  After
-a forced takeover that is already the new owner, since
-[[activate_todo_state]] rewrote [[who]] before we got here.
+The run also has to know whose it is when it ends: the acting worker,
+who has just claimed the item (\cref{sec:todo-run-taken-over}).
 
 <<initialize run outcome>>=
-launched_by = item.who or default_username
+launched_by = who
 @
 
 Todo launches now follow the same context-building path as track launches.
@@ -20743,7 +20927,7 @@ rather than relying on the earlier tracking block, which may have
 been skipped if the [[track]] module was unavailable.
 
 <<resolve todo auto-suspend>>=
-worker = item.who or default_username
+worker = session_worker(item)
 track_labels = todo_track_labels(item, todo_id)
 use_auto_suspend = should_auto_suspend(
     worker, auto_suspend,
@@ -21424,7 +21608,8 @@ def test_detached_finalize_leaves_taken_over_item(
 
   assert load_active_stack() == [1]
   _, todos = load_todos()
-  assert todos[0].who == default_username
+  assert todos[0].claimed_by == default_username
+  assert todos[0].who == "alice"
   assert " alice]\nExit code: 1" in todos[0].notes
   assert " alice]\nRun by alice ended after" in todos[0].notes
   mine = load_active_session(
@@ -21433,6 +21618,39 @@ def test_detached_finalize_leaves_taken_over_item(
   assert "todo:1" in mine
   alice = load_active_session("alice").get_active_labels()
   assert "todo:1" not in alice
+@
+
+Reassigning a running item is not a takeover.  The agent's run below
+ends after the item was handed to bob with [[edit --who]]; it ends as
+any failed run does, stopping the agent's tracking and handing the
+item to the teacher, instead of leaving it stranded on the stack:
+
+<<test functions>>=
+def test_edit_who_during_run_is_not_a_takeover(temp_todo_dir):
+  """Changing the assignee leaves the run's ending alone."""
+  from nytid.cli.track import load_active_session
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Agent's task",
+      created="2026-02-20T10:00:00",
+      who="agent",
+    ),
+  ])
+  runner.invoke(cli, ["start", "1", "--who", "agent"])
+  edited = runner.invoke(cli, ["edit", "1", "--who", "bob"])
+  assert edited.exit_code == 0, edited.output
+
+  finalize_detached_todo(
+    1, 1, reassign_to="teacher", launched_by="agent",
+  )
+
+  assert load_active_stack() == []
+  _, todos = load_todos()
+  assert todos[0].who == "teacher"
+  assert todos[0].status == "pending"
+  assert "took the item over" not in todos[0].notes
+  agent = load_active_session("agent").get_active_labels()
+  assert "todo:1" not in agent
 
 
 def test_finalize_detached_todo_reads_status_file(
@@ -21770,13 +21988,13 @@ partial output as a note so the teacher sees what the agent managed
 to do, and reset the item to pending.
 
 What we deliberately do \emph{not} do here is reassign the task, even
-though this is where we learn that it timed out.  Ownership is what
-[[stop_todo_hierarchy]] uses to decide whose tracking session to close:
-it reloads the item from disk and derives the worker as
-[[item.who or default_username]].  Writing the new owner before the
-stop would therefore aim the stop at somebody who never started
-tracking, and the agent's clock would keep running long after its
-process was killed.  Recording [[timed_out]] instead lets the exit
+though this is where we learn that it timed out.  Reassigning is part
+of the outcome, and the outcome is decided in one place, the exit
+handler, after the stop and only if the run still holds the item
+(\cref{sec:todo-run-taken-over}).  For an item activated by an older
+version, which has no claimant, the stop also still takes the worker
+from the assignee, and reassigning first would aim it at somebody who
+never started tracking.  Recording [[timed_out]] lets the exit
 handler apply the reassignment on the far side of the stop, which is
 exactly what the non-timeout failure path in
 [[<<handle headless exit status>>]] already does.
@@ -21839,10 +22057,11 @@ After the subprocess exits, we stop the todo through the same shared
 hierarchy helper used by manual [[todo stop]] and detached tmux cleanup
 (by way of [[stop_run]], which leaves an item that was taken over
 during the run alone, \cref{sec:todo-run-taken-over}), then prompt
-the user about completion status.  The prompt is the reason this handler only \emph{decides} on the snapshot and leaves the
-storing to [[record_run_outcome]] (\cref{sec:todo-run-outcome}): the
-question can stay open for hours, and a note the agent's session adds
-in that time must not be erased by the answer.  In headless mode we skip
+the user about completion status.  The prompt is the reason this
+handler only \emph{decides} on the snapshot and leaves the storing to
+[[record_run_outcome]] (\cref{sec:todo-run-outcome}): the question
+can stay open for hours, and a note the agent's session adds in that
+time must not be erased by the answer.  In headless mode we skip
 the prompt: if the subprocess already marked the todo done (via
 [[todo done]]), we respect that; otherwise we reset the todo and any
 auto-stopped descendants to pending for retry.
@@ -21853,7 +22072,9 @@ the teacher can review what the agent did, even if the task
 failed or was reset.
 
 <<handle subprocess exit>>=
-todo_id, item, descendants = stop_run(todo_id, launched_by)
+todo_id, item, descendants, taken_by = stop_run(
+    todo_id, launched_by
+)
 if item is None:
     return
 run_notes = []
@@ -21861,10 +22082,7 @@ run_notes = []
 
 mark_done = False
 hand_to = None
-if (
-    item.status == "done"
-    or run_taken_over_by(item, launched_by)
-):
+if item.status == "done" or taken_by is not None:
     pass
 elif timed_out:
     <<handle timeout exit status>>
@@ -22064,12 +22282,13 @@ def run_taken_over_midway(temp_todo_dir):
   return run
 
 
-def assert_kept_by_new_owner():
+def assert_kept_by_new_claimant():
   """The item is still the user's, active and tracked."""
   from nytid.cli.track import load_active_session
   assert load_active_stack() == [1]
   _, todos = load_todos()
-  assert todos[0].who == default_username
+  assert todos[0].claimed_by == default_username
+  assert todos[0].who == "alice"
   assert todos[0].status == "in-progress"
   assert " alice]\nRun by alice ended after" in todos[0].notes
   mine = load_active_session(
@@ -22088,7 +22307,7 @@ def test_start_yes_after_takeover_leaves_item(
 
   assert result.exit_code == 0, result.output
   confirm.assert_not_called()
-  assert_kept_by_new_owner()
+  assert_kept_by_new_claimant()
 
 
 def test_start_headless_after_takeover_leaves_item(
@@ -22100,9 +22319,47 @@ def test_start_headless_after_takeover_leaves_item(
   )
 
   assert result.exit_code == 0, result.output
-  assert_kept_by_new_owner()
+  assert_kept_by_new_claimant()
   _, todos = load_todos()
   assert " alice]\nExit code: 1" in todos[0].notes
+@
+
+A run killed by [[--timeout]] after a takeover takes the same way out:
+its timeout note is kept, and the item stays with the new claimant.
+
+<<test functions>>=
+def test_start_timeout_after_takeover_leaves_item(
+  temp_todo_dir,
+):
+  """A timed-out run does not reset a taken item."""
+  from nytid.cli.todo import start
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Shared task",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+  ])
+
+  def take_over_then_time_out(cmd, *args, **kwargs):
+    start(None, todo_id=1, force=True)
+    raise subprocess.TimeoutExpired(cmd, 1, output="half")
+
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=take_over_then_time_out,
+  ):
+    result = runner.invoke(
+      cli,
+      ["start", "1", "--who", "alice", "--headless",
+       "--command", "true", "--timeout", "1s",
+       "--reassign-to", "teacher"],
+    )
+
+  assert result.exit_code == 0, result.output
+  assert_kept_by_new_claimant()
+  _, todos = load_todos()
+  assert "Timed out" in todos[0].notes
 @
 
 Let's verify that [[append_note_to_item]] changes the item it is
@@ -22165,11 +22422,12 @@ def test_start_headless_captures_output(temp_todo_dir):
 
 The note of a failed run is signed by the agent that ran it, even
 though the task is handed to someone else in the same commit
-(\cref{sec:todo-run-outcome}):
+(\cref{sec:todo-run-outcome}).  The agent starts the run as itself,
+with [[--who]], as agents do:
 
 <<test functions>>=
-def test_start_headless_note_signed_by_item_worker(temp_todo_dir):
-    """A run's note names the item's worker, not the new owner."""
+def test_start_headless_note_signed_by_launcher(temp_todo_dir):
+    """A run's note names the worker that ran it."""
     save_todos(2, [
         TodoItem(
             id=1, title="Task",
@@ -22179,7 +22437,7 @@ def test_start_headless_note_signed_by_item_worker(temp_todo_dir):
     ])
     result = runner.invoke(
         cli,
-        ["start", "1", "--headless",
+        ["start", "1", "--who", "agent", "--headless",
          "--command", "false",
          "--reassign-to", "teacher"],
     )
@@ -22218,7 +22476,7 @@ def test_start_timeout_stops_original_worker(
   ):
     result = runner.invoke(
       cli,
-      ["start", "1", "--headless",
+      ["start", "1", "--who", "agent", "--headless",
        "--command", "true",
        "--timeout", "1s",
        "--reassign-to", "teacher"],
@@ -22261,7 +22519,7 @@ def test_start_timeout_keeps_completion(temp_todo_dir):
   ):
     result = runner.invoke(
       cli,
-      ["start", "1", "--headless",
+      ["start", "1", "--who", "agent", "--headless",
        "--command", "true",
        "--timeout", "1s",
        "--reassign-to", "teacher"],
@@ -22477,7 +22735,7 @@ ensure_ancestors_active(
     item, todos, stack,
     update_tmux_context=False,
 )
-worker = item.who or default_username
+worker = session_worker(item)
 @
 
 The window work is one call into [[track]].  If the tmux context
