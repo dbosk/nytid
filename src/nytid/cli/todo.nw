@@ -13759,6 +13759,183 @@ def test_add_refuses_bad_discovered_from(
   assert len(todos) == 2
 @
 
+\paragraph{What the new item waits for}%
+\label{sec:todo-add-blockers}
+
+An item is often added because of what it depends on or what depends
+on it: the grading that has to wait for the submissions, or the
+prerequisite that turned up while planning a lecture.  [[--blocked-by]]
+names the todos the new item waits for, and [[--blocks]] the todos that
+wait for it (\cref{sec:todo-blockers}); both can be repeated.  Saying
+it at once saves a second command, and an agent that files a
+prerequisite should not leave the dependent work looking ready in the
+meantime.
+
+[[--blocks]] changes other items, since the link is stored on the
+blocked one (\cref{sec:todo-blocked-by-field}), so it is applied inside
+the locked callback, to the items as they are stored then, like
+[[--add-label]] in [[edit]].  Each id given has to exist, which is
+checked with the other flags, before the editor opens or a question is
+asked.  An item to be blocked is looked up again under the lock, since
+the link has to be stored on it; a blocker removed in the meantime
+counts as closed and does no harm.
+
+<<argument and option definitions>>=
+blocked_by_opt = typer.Option(
+    "--blocked-by",
+    help="ID of a todo this one waits for (repeatable)",
+    autocompletion=complete_todo_ids)
+blocks_opt = typer.Option(
+    "--blocks",
+    help="ID of a todo that waits for this one (repeatable)",
+    autocompletion=complete_todo_ids)
+<<add command options>>=
+blocked_by: Annotated[list[int] | None, blocked_by_opt] = None,
+blocks: Annotated[list[int] | None, blocks_opt] = None,
+<<validate add options>>=
+require_existing_todos(todos, blocked_by, "--blocked-by")
+require_existing_todos(todos, blocks, "--blocks")
+<<helpers>>=
+def require_existing_todos(todos, todo_ids, flag):
+    """Exit with an error unless every id in `todo_ids` names
+    a todo in `todos`; `flag` names the option in the error."""
+    known = {t.id for t in todos}
+    for todo_id in todo_ids or []:
+        if todo_id not in known:
+            typer.echo(
+                f"Error: {flag} #{todo_id} not found", err=True,
+            )
+            raise typer.Exit(1)
+@
+
+A new item can make work stuck (\cref{sec:todo-stuck}), but only
+through its links: [[add --parent 7 --blocked-by 7]] makes the new item
+wait for its own parent, which waits for it.  The callback therefore
+notes which items were stuck before it adds anything, when there are
+links at all, and refuses the add if the links leave new ones.  An add
+without links adds a leaf that nothing waits for, which cannot close a
+circle, and skips the simulation.  Both ways of adding share the
+linking, as a function of the fresh state and the new item.
+
+<<note what was stuck before linking>>=
+stuck_before = (
+    find_stuck_items(todos) if blocked_by or blocks else {}
+)
+<<helpers>>=
+def link_new_todo(todos, item, blocked_by, blocks, stuck_before):
+    """Store the blocks links of the newly added `item`.
+
+    `item` waits for the ids in `blocked_by`, and the items in
+    `blocks`, which must exist in `todos`, wait for `item`.
+    Exits if that leaves stuck items that are not in
+    `stuck_before`.
+    """
+    if not (blocked_by or blocks):
+        return
+    item.blocked_by = list(blocked_by or [])
+    for blocked_id in blocks or []:
+        blocked = require_todo(todos, blocked_id)
+        blocked.blocked_by = blocked.blocked_by + [item.id]
+    refuse_new_stuck_items(todos, stuck_before)
+@
+
+The command reports the links with the other properties of the new
+item, by id and title as [[view]] names parents
+(\cref{sec:todo-view-parents}), so that a mistyped id shows up as the
+wrong title at once.
+
+<<helpers>>=
+def format_todo_refs(todos, todo_ids):
+    """Return `todo_ids` as ids and titles, such as
+    `#3 Submissions, #9 (removed)`."""
+    by_id = {t.id: t for t in todos}
+    return ", ".join(
+        f"#{i} {by_id[i].title}" if i in by_id else f"#{i} (removed)"
+        for i in todo_ids
+    )
+@
+
+Let's verify both directions and that the links reach the store:
+
+<<test functions>>=
+def test_add_links_blockers_both_ways(temp_todo_dir):
+  """--blocked-by is stored on the new item, --blocks on others."""
+  save_todos(3, [
+    TodoItem(id=1, title="Submissions", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Report", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, [
+    "add", "-t", "Grade", "--top-level", "--bottom",
+    "--blocked-by", "1", "--blocks", "2",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "  Blocked by: #1 Submissions" in result.output
+  assert "  Blocks: #2 Report" in result.output
+  _, todos = load_todos()
+  by_id = {t.id: t for t in todos}
+  assert by_id[3].blocked_by == [1]
+  assert by_id[2].blocked_by == [3]
+@
+
+The editor path links the same way:
+
+<<test functions>>=
+def test_add_via_editor_links_blockers(temp_todo_dir):
+  """add --edit stores --blocked-by and --blocks too."""
+  save_todos(3, [
+    TodoItem(id=1, title="Submissions", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Report", created="2026-02-20T10:00:00"),
+  ])
+  with patch("nytid.cli.todo.open_editor", return_value="Grade\n"):
+    result = runner.invoke(cli, [
+      "add", "--edit", "--top-level", "--bottom",
+      "--blocked-by", "1", "--blocks", "2",
+    ])
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  by_id = {t.id: t for t in todos}
+  assert by_id[3].blocked_by == [1]
+  assert by_id[2].blocked_by == [3]
+@
+
+An unknown id is refused before anything is stored, and so is a new
+item that would wait for its own parent; a new child that blocks its
+parent is harmless and allowed:
+
+<<test functions>>=
+@pytest.mark.parametrize("args,message", [
+  (["--top-level", "--blocked-by", "9"], "--blocked-by #9 not found"),
+  (["--top-level", "--blocks", "9"], "--blocks #9 not found"),
+  (["--parent", "1", "--blocked-by", "1"],
+   "Error: refused, since #1, #2 could never be done:\n"
+   "  #1 waits for its sub-item #2; #2 is blocked by #1\n"),
+])
+def test_add_refuses_bad_blocker_links(temp_todo_dir, args, message):
+  """Unknown ids and new circles are refused; nothing is stored."""
+  save_todos(2, [
+    TodoItem(id=1, title="Lab", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, ["add", "-t", "New", "--bottom", *args])
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1]
+  assert todos[0].blocked_by == []
+
+
+def test_add_child_may_block_its_parent(temp_todo_dir):
+  """A child blocking its own parent is redundant, not refused."""
+  save_todos(2, [
+    TodoItem(id=1, title="Lab", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, [
+    "add", "-t", "Part", "--parent", "1", "--bottom", "--blocks", "1",
+  ])
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert todos[0].blocked_by == [2]
+@
+
 Priority selection has three modes. [[--prio]] bypasses all inference.
 [[--top]] and [[--bottom]] keep the operation non-interactive by placing
 the item at one end of the current sibling list. Otherwise we fall back
@@ -14254,6 +14431,12 @@ estimated_hours = (
 typer.echo(f"Added todo #{item.id}: {item.title}")
 if len(item.parents) > 1:
     typer.echo(f"  Parents: {format_parents(todos, item.parents)}")
+if item.blocked_by:
+    typer.echo(
+        f"  Blocked by: {format_todo_refs(todos, item.blocked_by)}"
+    )
+if blocks:
+    typer.echo(f"  Blocks: {format_todo_refs(todos, blocks)}")
 if inherited_labels:
     typer.echo(f"  Labels: {', '.join(inherited_labels)}")
 if inherited_deadline:
@@ -14287,6 +14470,7 @@ sibling's subtree in the same callback
 
 <<append the new todo under the lock>>=
 def append_new_todo(next_id, todos, stack):
+    <<note what was stuck before linking>>
     for parent_id in parent_items:
         require_todo(todos, parent_id)
     item = TodoItem(
@@ -14311,6 +14495,7 @@ def append_new_todo(next_id, todos, stack):
         append_note_to_item(item, paragraph)
     todos.append(item)
     settle_placement(todos, item)
+    link_new_todo(todos, item, blocked_by, blocks, stuck_before)
     return next_id + 1, todos, stack, item
 
 *_, item = mutate_todo_state(append_new_todo)
@@ -14526,11 +14711,15 @@ priority_title = parsed.title
 
 
 def append_parsed_todos(next_id, todos, stack):
+    <<note what was stuck before linking>>
     for parent_id in parent_items:
         require_todo(todos, parent_id)
     <<create parent from parsed>>
     settle_placement(todos, parent_item)
     <<create children from parsed>>
+    link_new_todo(
+        todos, parent_item, blocked_by, blocks, stuck_before,
+    )
     return next_id, todos, stack
 
 
@@ -34622,6 +34811,7 @@ from nytid.cli.todo import (
     is_unblocked,
     blocking_ancestors,
     blocking_reasons,
+    format_todo_refs,
     simulate_completion,
     find_stuck_items,
     refuse_new_stuck_items,
