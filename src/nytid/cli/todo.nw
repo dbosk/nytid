@@ -2336,8 +2336,10 @@ at the top of [[ls]].  That is what the transitive walk down is for.
 [[descendants_of]] lists in depth-first order, each item before its
 own children, as the tree walk it replaces did.  [[ancestors_of]]
 follows \emph{every} parent rather than one line, because the
-questions it answers, such as whether an item lies above another, are
-about all of them.  It lists the nearest ancestors first and never includes the root, which is not an
+questions it answers are about all of them---above all, whether an
+item lies above another, which is what keeps a move from making an
+item its own ancestor (\cref{sec:todo-edit-parent}).  It lists the
+nearest ancestors first and never includes the root, which is not an
 item.  An ancestor missing from [[todos]] ends that path, as it does
 in [[context_path]] below.
 
@@ -2530,9 +2532,9 @@ def test_walks_follow_the_single_parent_line():
   ] == [1, 2, 3, 4]
 @
 
-A file edited by hand can hold a cycle, and so can one written by a
-move under the item's own descendant, which [[edit --parent]] still
-accepts (\cref{sec:todo-edit-parent}).  Every walk must then
+A cycle cannot be made through the commands any more
+(\cref{sec:todo-edit-parent}), but a file edited by hand, or written
+before that check existed, can still hold one.  Every walk must then
 end, and must not list the item it started from:
 
 <<test functions>>=
@@ -17132,7 +17134,110 @@ if parent is not None:
                 err=True,
             )
             raise typer.Exit(1)
+        require_acyclic_move(todos, item, parent)
         item.parent_id = parent
+@
+
+A move must not make an item its own ancestor.  Both
+[[edit 5 --parent 5]] and a move of~5 under one of its own
+descendants would.  The
+moved subtree would then be a cycle that no root leads into:
+[[get_visible_roots]] never lists any of it, so the item and
+everything below it would vanish from [[ls]], and a walk down the
+tree without a guard, such as the sub-item listing of [[view]], would
+never end.  We refuse such a move.  The question is whether the item
+lies at or above the new parent, which is what [[ancestors_of]]
+answers, along every parent (\cref{sec:todo-parents}).  The check
+runs on the snapshot, so that it fails before any prompt, and again
+under the lock, because another command may have moved the new parent
+under the item in between.
+
+<<helpers>>=
+def require_acyclic_move(todos, item, parent_id):
+    """Exit with an error if `parent_id` is `item` or below it.
+
+    Making such an item `item`'s parent would make `item` its
+    own ancestor.  Inside a `mutate_todo_state` callback the
+    exit also abandons the write.
+    """
+    parent = next(
+        (t for t in todos if t.id == parent_id), None
+    )
+    if parent is None:
+        return
+    if parent.id == item.id or item.id in {
+        a.id for a in ancestors_of(todos, parent)
+    }:
+        typer.echo(
+            f"Error: cannot move #{item.id} under "
+            f"#{parent_id}, which is #{item.id} itself "
+            "or below it",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+Let's verify both moves the snapshot check refuses, the item itself
+and a grandchild, and that the refusal leaves the file as it was:
+
+<<test functions>>=
+def test_edit_refuses_parent_cycle(temp_todo_dir):
+    """--parent refuses the item itself and its descendants."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="A", created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="B", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="C", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    stored = load_todos()
+
+    for target in ("1", "3"):
+        result = runner.invoke(
+            cli, ["edit", "1", "--parent", target, "--keep-prio"],
+        )
+        assert result.exit_code == 1
+        assert "cannot move #1 under" in result.output
+    assert load_todos() == stored
+@
+
+The check under the lock needs two moves that are each harmless on
+their own: [[A]] under [[B]] and [[B]] under [[A]], started from the
+same old state.  Whichever commits second would close a cycle, so it
+must fail and leave the first move standing.
+
+<<test functions>>=
+def test_overlapping_moves_cannot_make_a_cycle(temp_todo_dir):
+    """Two moves from one snapshot cannot make a cycle."""
+    from nytid.cli.todo import edit
+    save_todos(3, [
+        TodoItem(
+            id=1, title="A", created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="B", created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with pytest.raises(typer.Exit):
+        run_with_shared_snapshot(
+            lambda: edit(
+                None, todo_id=1, parent=2, top=True,
+            ),
+            lambda: edit(
+                None, todo_id=2, parent=1, top=True,
+            ),
+        )
+
+    _, todos = load_todos()
+    parents = {t.id: t.parent_id for t in todos}
+    assert parents in ({1: 2, 2: None}, {1: None, 2: 1})
 @
 
 [[--discovered-from]] sets the provenance link
@@ -17326,6 +17431,9 @@ def commit_flag_edits(next_id, todos, stack):
         for parent_id in real_parents_of(item):
             require_todo(todos, parent_id)
     fresh = require_todo(todos, todo_id)
+    if moved:
+        for parent_id in real_parents_of(item):
+            require_acyclic_move(todos, fresh, parent_id)
     old_range = child_priority_range_or_none(todos, fresh)
     old_place = (fresh.priority, fresh.parent_id)
     relative_labels = bool(add_label or remove_label)
