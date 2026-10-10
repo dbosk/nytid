@@ -1813,6 +1813,19 @@ must be a deep copy, because [[to_dict]] hands out the item's own label
 list and environment dictionary, which a later in-place change would
 otherwise alter on both sides of the comparison.
 
+Sometimes the right \enquote{before} is not what was read.  An editor
+buffer is not stored verbatim: saving it strips the title and notes and
+normalizes the front matter (\cref{sec:edit-via-editor}).  The changes
+a user made in a buffer are therefore the differences from what saving
+the \emph{untouched} buffer would store, and comparing with the raw
+item instead would mistake a lost trailing newline for an edit.  That
+baseline still differs from what was read, though, and saving an
+untouched buffer has always tidied such values in the store.  The
+optional [[read]] argument keeps that: a field the user left alone is
+still written if the store holds exactly what was read, which means no
+other process changed it meanwhile.  Without [[read]], the baseline is
+what was read and the rule is the simple one above.
+
 The replay is right for setting a field and wrong for adding to one: if
 two commands both append to [[notes]], each sees its own text as the
 change and the later one erases the earlier.  Appends are therefore
@@ -1825,15 +1838,24 @@ def item_fields(item):
     return copy.deepcopy(item.to_dict())
 
 
-def replay_item_edits(target, before, edited):
+def replay_item_edits(target, before, edited, read=None):
     """Copy to `target` the fields `edited` changed.
 
-    `before` is `item_fields` of `edited` as it was
-    read; fields equal to it are left as `target` has
-    them.
+    `before` is the baseline `edited` started from,
+    normally `item_fields` of the item as it was read.
+    A field equal to `before` is left as `target` has
+    it, unless `read` (the fields as read, if they
+    differ from `before`) shows it unchanged in the
+    store, in which case `edited`'s value is written.
     """
+    if read is None:
+        read = before
+    current = target.to_dict()
     for key, value in edited.to_dict().items():
-        if before.get(key) != value:
+        if (
+            before.get(key) != value
+            or current.get(key) == read.get(key)
+        ):
             setattr(target, key, copy.deepcopy(value))
 @
 
@@ -12963,11 +12985,14 @@ the user deleted from one that did not exist when the buffer was
 rendered.
 
 <<edit via editor>>=
-shown = {
+md = render_todo_markdown(item, todos)
+shown = buffer_baseline(
+    item, todos, parse_editor_content(md)
+)
+as_read = {
     t.id: item_fields(t)
     for t in [item, *get_descendants(todos, item.id)]
 }
-md = render_todo_markdown(item, todos)
 content = open_editor(md)
 parsed = parse_editor_content(content)
 if not parsed.title:
@@ -12978,6 +13003,56 @@ if not parsed.title:
 <<update parent from parsed>>
 <<commit the buffer under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+The \enquote{before} must be the item as the \emph{unedited} buffer
+would store it, not the item as it is stored.  Saving does not copy
+the buffer verbatim: the parser strips the title and the notes, and
+[[apply_metadata]] normalizes the front matter.  An item whose notes
+end in a newline, as notes read from standard input usually do, would
+otherwise look edited on every save merely because the buffer lost
+that newline, and the replay would then overwrite a note that arrived
+during the session.  [[buffer_baseline]] therefore saves the untouched
+buffer onto copies of the shown items, through the same steps the real
+save takes, and records the fields that results in.  Whatever the user
+changed differs from that baseline; whatever they left alone does not,
+however it was formatted in the store.  The fields as read are kept
+too, in [[as_read]], so that the replay can still tidy a field nobody
+else touched (\cref{sec:todo-read-modify-write}).
+
+Sections are paired with items the way reconciliation pairs them, by
+normalized title, so every item the buffer showed gets an entry.
+
+<<helpers>>=
+def buffer_baseline(item, todos, parsed):
+    """Return what saving an untouched buffer would store.
+
+    `parsed` is the parse of the buffer rendered from
+    `item`.  Returns `item_fields` of copies of `item`
+    and its shown descendants after the buffer's sections
+    are applied to them, keyed by ID.
+    """
+    baseline = {}
+
+    def settle(original, section):
+        saved = TodoItem.from_dict(item_fields(original))
+        saved.title = section.title
+        saved.notes = section.notes
+        apply_metadata(saved, section.metadata)
+        baseline[original.id] = item_fields(saved)
+        by_title = {
+            c.title.strip().lower(): c
+            for c in get_children(todos, original.id)
+        }
+        for child_section in section.children:
+            child = by_title.get(
+                child_section.title.strip().lower()
+            )
+            if child is not None:
+                settle(child, child_section)
+
+    settle(item, parsed)
+    return baseline
 @
 
 The front matter is handed to [[apply_metadata]]
@@ -13006,7 +13081,9 @@ reaches that [[next_id]] and [[todos]] through [[nonlocal]].
 <<commit the buffer under the lock>>=
 def commit_the_buffer(next_id, todos, stack):
     edited = require_todo(todos, todo_id)
-    replay_item_edits(edited, before, item)
+    replay_item_edits(
+        edited, shown[todo_id], item, as_read[todo_id]
+    )
     <<reconcile children>>
     reconcile_children(edited, parsed.children)
     return next_id, todos, stack
@@ -13178,8 +13255,9 @@ for parsed_child in parsed_children:
 @
 
 A matched child is updated the way the parent is: the section is
-applied to a copy of the child as the buffer showed it, and only what
-the section changed is replayed onto the stored child, so that a note
+applied to a copy of the child as the untouched buffer would have
+stored it, and only what the section changed is replayed onto the
+stored child, so that a note
 added to a sub-item during the session survives.  A child that matched
 a section but was not shown was added by someone else under the same
 title meanwhile; there is no earlier version to compare with, so the
@@ -13197,7 +13275,10 @@ edited_child.notes = parsed_child.notes
 edited_child.priority = prio
 apply_metadata(edited_child, parsed_child.metadata)
 if edited_child is not child:
-    replay_item_edits(child, shown_child, edited_child)
+    replay_item_edits(
+        child, shown_child, edited_child,
+        as_read[child.id],
+    )
 @
 
 Children remaining in [[existing_by_title]] were not present in the
@@ -13595,19 +13676,24 @@ of concurrent work must survive the save: the notes because the
 buffer left them as they were shown, and the new child because the
 buffer never showed it.
 
+The stored notes are tried both bare and with the trailing newline
+that notes read from standard input carry.  The buffer loses that
+newline, which must not count as the user editing the notes.
+
 <<test functions>>=
-def test_edit_editor_keeps_concurrent_work(temp_todo_dir):
+@pytest.mark.parametrize("tail", ["", "\n"])
+def test_edit_editor_keeps_concurrent_work(temp_todo_dir, tail):
     """Work stored during an edit -E session survives it."""
     from nytid.cli.todo import add, note
     save_todos(3, [
         TodoItem(
             id=1, title="Parent", priority=5.0,
-            notes="First",
+            notes="First" + tail,
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
             id=2, title="Child", parent_id=1, priority=4.0,
-            notes="Child notes",
+            notes="Child notes" + tail,
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -13631,8 +13717,8 @@ def test_edit_editor_keeps_concurrent_work(temp_todo_dir):
     _, todos = load_todos()
     by_id = {t.id: t for t in todos}
     assert by_id[1].title == "Renamed"
-    assert by_id[1].notes == "First\nAgent"
-    assert by_id[2].notes == "Child notes\nAgent too"
+    assert by_id[1].notes == "First" + tail + "\nAgent"
+    assert by_id[2].notes == "Child notes" + tail + "\nAgent too"
     assert by_id[3].title == "Agent child"
 @
 
@@ -22267,13 +22353,26 @@ about the notes, so storing it would erase whatever arrived meanwhile
 for no reason; a changed buffer is the user's version and replaces the
 stored one, as it always has.
 
+\enquote{Changed} has to be judged on what saving would store, not on
+the raw text.  Saving strips the buffer, so an untouched buffer opened
+on notes that end in a newline---as notes read from standard input
+usually do---would differ from [[item.notes]] by that newline alone
+and pass for an edit.  We therefore compare with [[initial]] stripped
+the same way: that is exactly what the untouched buffer stores.  When
+the stored notes are still the ones the buffer was opened on, nobody
+else wrote meanwhile, and we store the buffer either way, which keeps
+the tidying an untouched save has always done.
+
 <<record the note>>=
 if replace_notes:
     edited_notes = note_text.strip()
 
     def replace_the_notes(next_id, todos, stack):
         fresh = require_todo(todos, todo_id)
-        if edited_notes != item.notes:
+        if (
+            edited_notes != initial.strip()
+            or fresh.notes == item.notes
+        ):
             fresh.notes = edited_notes
         return next_id, todos, stack
 
@@ -22598,6 +22697,47 @@ def test_note_edit_while_another_note_lands(
     with patch(
         "nytid.cli.todo.open_editor",
         side_effect=editor_meanwhile,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == expected
+@
+
+Notes read from standard input usually end in a newline, which the
+saved buffer drops.  That alone must not count as an edit when a note
+landed meanwhile, while an untouched save with nothing landing still
+tidies the newline away as it always has:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+    "meanwhile,expected",
+    [
+        (True, "First\n\nAgent"),
+        (False, "First"),
+    ],
+)
+def test_note_edit_untouched_buffer_with_trailing_newline(
+    temp_todo_dir, meanwhile, expected,
+):
+    """A dropped trailing newline is not an edit."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First\n",
+        ),
+    ])
+
+    def untouched_editor(initial=""):
+        if meanwhile:
+            note(1, message="Agent", edit=False)
+        return initial
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=untouched_editor,
     ):
         result = runner.invoke(cli, ["note", "1", "--edit"])
     assert result.exit_code == 0, result.stdout
