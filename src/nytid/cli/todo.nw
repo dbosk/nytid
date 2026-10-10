@@ -20818,6 +20818,11 @@ def edit(
     keep_prio: Annotated[bool, keep_prio_opt] = False,
     discovered_from: Annotated[int | None,
                                edit_discovered_from_opt] = None,
+    add_blocker: Annotated[list[int] | None,
+                           add_blocker_opt] = None,
+    remove_blocker: Annotated[list[int] | None,
+                              remove_blocker_opt] = None,
+    blocks: Annotated[list[int] | None, blocks_opt] = None,
 ):
     """Edit an existing todo item.
 
@@ -20910,6 +20915,7 @@ if clear_command:
 elif run_command is not None:
     item.command = run_command
 <<set the edited item's [[discovered_from]]>>
+<<check the blocker edits>>
 @
 
 Clearing must leave the JSON with [[None]], not [[""]], and we check
@@ -21367,7 +21373,9 @@ list should be, so combining them is refused; and an id both added and
 removed is refused as well.  Adding a place the item already has, or
 removing one it does not have, is a no-op that warns, as for labels.
 Each added parent must exist and must not lie below the item, the
-check [[--parent]] makes (\cref{sec:todo-edit-parent}).  The ranking
+check [[--parent]] makes (\cref{sec:todo-edit-parent}), and a change
+of places that leaves work waiting in a circle with the blockers is
+refused under the lock (\cref{sec:todo-stuck}).  The ranking
 context the item had before the change is kept, since the priority
 below depends on whether the change took it away.
 
@@ -21924,6 +21932,142 @@ def test_edit_refuses_bad_discovered_from(
   assert todos[1].discovered_from == 1
 @
 
+\paragraph{Adding and removing blockers}%
+\label{sec:todo-edit-blockers}
+
+Blockers are found after the fact more often than parents are: work
+turns out to need something only once it has started.
+[[--add-blocker]] and [[--remove-blocker]] change the item's
+[[blocked_by]] relative to what it holds, and can be repeated, as
+[[--add-label]] and [[--remove-label]] do for the labels; there is no
+flag that replaces the whole list, since one rarely knows all of an
+item's blockers at once.  [[--blocks]] is [[add]]'s option
+(\cref{sec:todo-add-blockers}): it makes other items wait for this
+one.  An id added and removed at once is refused, and so is the item
+itself, which cannot wait for itself
+(\cref{sec:todo-blocked-by-field}).  Adding a blocker the item already
+has, or removing one it does not have, is a no-op that warns.  An added
+blocker and an item to be blocked must exist; a removed one need not,
+since removing what is no longer there is how a stale link is cleaned
+up.
+
+The check runs on the snapshot, before anything is stored; the edit
+itself happens under the lock (below).
+
+<<argument and option definitions>>=
+add_blocker_opt = typer.Option(
+    "--add-blocker",
+    help="Make the item wait for this todo ID (repeatable)",
+    autocompletion=complete_todo_ids)
+remove_blocker_opt = typer.Option(
+    "--remove-blocker",
+    help="Stop the item waiting for this todo ID (repeatable)",
+    autocompletion=complete_todo_ids)
+<<check the blocker edits>>=
+for flag, ids in [("--add-blocker", add_blocker), ("--blocks", blocks)]:
+    require_existing_todos(todos, ids, flag)
+    if item.id in (ids or []):
+        typer.echo(f"Error: #{item.id} cannot block itself", err=True)
+        raise typer.Exit(1)
+try:
+    _, warnings = apply_blocker_edits(
+        item.blocked_by, add_blocker or [], remove_blocker or [],
+    )
+except ValueError as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(1)
+for warning in warnings:
+    typer.echo(f"Warning: {warning}", err=True)
+@
+
+The edit is a function of the list, so that the commit can apply it
+again to the list as it is stored then, as [[apply_parent_edits]] does
+for the parents.
+
+<<helpers>>=
+def apply_blocker_edits(blocked_by, add, remove):
+    """Return `blocked_by` with `add` added and `remove`
+    removed, and the warnings for no-op edits.
+
+    Raises `ValueError` when an id is both added and removed.
+    """
+    both = sorted(set(add) & set(remove))
+    if both:
+        raise ValueError(
+            f"#{both[0]} cannot be both added and removed"
+        )
+    warnings = [
+        f"already blocked by #{b}" for b in add if b in blocked_by
+    ] + [
+        f"not blocked by #{b}" for b in remove if b not in blocked_by
+    ]
+    return sorted((set(blocked_by) - set(remove)) | set(add)), warnings
+@
+
+Let's verify the three flags and what the command says about them:
+
+<<test functions>>=
+def save_three_items():
+  """Store three top-level items, #3 waiting for #1."""
+  save_todos(4, [
+    TodoItem(id=1, title="One", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Two", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=3, title="Three", created="2026-02-20T10:00:00",
+      blocked_by=[1],
+    ),
+  ])
+
+
+def test_edit_adds_and_removes_blockers(temp_todo_dir):
+  """--add-blocker, --remove-blocker and --blocks change the links."""
+  save_three_items()
+  result = runner.invoke(cli, [
+    "edit", "3", "--add-blocker", "2", "--remove-blocker", "1",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "#3 now waits for #2 Two" in result.output
+  assert "#3 no longer waits for #1 One" in result.output
+  result = runner.invoke(cli, ["edit", "1", "--blocks", "2"])
+  assert result.exit_code == 0, result.output
+  assert "Now waiting for #1: #2 Two" in result.output
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos] == [[], [1], [2]]
+@
+
+Contradictions, the item itself and unknown ids are refused, and a
+no-op only warns:
+
+<<test functions>>=
+@pytest.mark.parametrize("args,message", [
+  (["--add-blocker", "2", "--remove-blocker", "2"],
+   "#2 cannot be both added and removed"),
+  (["--add-blocker", "3"], "#3 cannot block itself"),
+  (["--blocks", "3"], "#3 cannot block itself"),
+  (["--add-blocker", "9"], "--add-blocker #9 not found"),
+  (["--blocks", "9"], "--blocks #9 not found"),
+])
+def test_edit_refuses_bad_blocker_edits(temp_todo_dir, args, message):
+  """Bad blocker edits change nothing."""
+  save_three_items()
+  result = runner.invoke(cli, ["edit", "3", *args])
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos] == [[], [], [1]]
+
+
+def test_edit_blocker_no_op_warns(temp_todo_dir):
+  """A blocker already there, or one not there, only warns."""
+  save_three_items()
+  result = runner.invoke(cli, [
+    "edit", "3", "--add-blocker", "1", "--remove-blocker", "2",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "Warning: already blocked by #1" in result.output
+  assert "Warning: not blocked by #2" in result.output
+@
+
 A priority is a position in one list, not a property of the item.  The
 number~[[5.0]] means \enquote{above the [[4.5]] next to me}; carried
 into a different set of siblings it means whatever those siblings
@@ -21979,6 +22123,7 @@ if added_places:
     typer.echo(
         f"#{todo_id} is now also {describe_places(added_places)}"
     )
+<<report the blocker edits>>
 @
 
 A kept number is only a position if it falls inside the new parent's
@@ -22058,6 +22203,7 @@ leaves every range as it was, and nothing moves.
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
     fresh = require_todo(todos, todo_id)
+    <<note what was stuck before the edit>>
     relative_parents = bool(add_parent or remove_parent)
     if relative_parents:
         new_parents, _ = apply_parent_edits(
@@ -22088,10 +22234,172 @@ def commit_flag_edits(next_id, todos, stack):
         )
     fresh.parents = new_parents
     settle_placement(todos, fresh, old_range, old_place)
+    <<apply the blocker edits to the fresh state>>
     return next_id, todos, stack, fresh.priority
 
 
 *_, kept_priority = mutate_todo_state(commit_flag_edits)
+@
+
+The blocker edits are relative too, and since no flag sets
+[[blocked_by]] outright, the snapshot's list is never changed and the
+replay leaves the stored list alone.  The edits are applied to the
+fresh list instead, so that a blocker another process added meanwhile
+survives, and [[--blocks]] is applied to the items to be blocked as
+they are stored now; each of them must still exist, since the link is
+stored on it.
+
+A move, a new place and a new blocker can each close a circle of
+waiting (\cref{sec:todo-stuck}): [[--add-blocker]] of the item's own
+ancestor, or [[--add-parent]] under an item it already waits for, as
+well as two items blocking each other.  So whenever an edit changes
+links of either kind, the callback notes the stuck items first and
+refuses the edit if it leaves new ones.  Doing it here, on the fresh
+state, is what makes two edits from one snapshot safe: each closes
+only half the circle, and the one that commits second sees the first.
+Removing a link is checked as well, since removing a place can close
+a circle too: an item that is top-level and under A escapes a circle
+through A only as long as it stays top-level.
+
+<<note what was stuck before the edit>>=
+links_edited = bool(
+    parent is not None or add_parent or remove_parent
+    or add_blocker or remove_blocker or blocks
+)
+stuck_before = find_stuck_items(todos) if links_edited else {}
+<<apply the blocker edits to the fresh state>>=
+fresh.blocked_by, _ = apply_blocker_edits(
+    fresh.blocked_by, add_blocker or [], remove_blocker or [],
+)
+for blocked_id in blocks or []:
+    blocked = require_todo(todos, blocked_id)
+    blocked.blocked_by = blocked.blocked_by + [todo_id]
+if links_edited:
+    refuse_new_stuck_items(todos, stuck_before)
+@
+
+The command reports the links it changed, by id and title, after the
+places:
+
+<<report the blocker edits>>=
+for verb, ids in (
+    ("now waits for", add_blocker),
+    ("no longer waits for", remove_blocker),
+):
+    if ids:
+        typer.echo(
+            f"#{todo_id} {verb} {format_todo_refs(todos, ids)}"
+        )
+if blocks:
+    typer.echo(
+        f"Now waiting for #{todo_id}: {format_todo_refs(todos, blocks)}"
+    )
+@
+
+Let's verify that every way of closing a circle is refused and leaves
+the file as it was: an ancestor made the blocker of its descendant, two
+items made to block each other, a circle through an inherited block,
+and an item put under the very item it waits for, as an added place or
+by a move.  Each fixture starts from the same three top-level items,
+\#3 waiting for \#1, with whatever else the case needs.
+
+<<test functions>>=
+@pytest.mark.parametrize("extra,args", [
+  ([TodoItem(id=4, title="Four", parents=[2])],
+   ["4", "--add-blocker", "2"]),
+  ([], ["1", "--add-blocker", "3"]),
+  ([TodoItem(id=4, title="Four", parents=[1])],
+   ["2", "--blocks", "1", "--add-blocker", "4"]),
+  ([], ["3", "--add-parent", "1", "--top"]),
+  ([], ["3", "--parent", "1", "--top"]),
+])
+def test_edit_refuses_a_circle_of_waiting(temp_todo_dir, extra, args):
+  """Edits that leave work stuck are refused; the file stays."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + extra)
+  stored = get_todo_file().read_text()
+  result = runner.invoke(cli, ["edit", *args])
+  assert result.exit_code == 1, result.output
+  assert "could never be done" in result.output
+  assert get_todo_file().read_text() == stored
+@
+
+A removed place can close a circle as well.  \#4 is under \#3, which
+waits for \#1, and is also top-level; \#1 may then wait for \#4, which
+can start through the top level, but taking \#4 off the top level
+would close the circle:
+
+<<test functions>>=
+def test_edit_refuses_removing_the_way_out(temp_todo_dir):
+  """Dropping the clear place of a shared item can deadlock."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + [
+    TodoItem(id=4, title="Four", parents=[ROOT_ID, 3]),
+  ])
+  result = runner.invoke(cli, ["edit", "1", "--add-blocker", "4"])
+  assert result.exit_code == 0, result.output
+  result = runner.invoke(
+    cli, ["edit", "4", "--remove-parent", "0", "--top"],
+  )
+  assert result.exit_code == 1, result.output
+  assert (
+    "#4 is blocked via #3 by #1; #1 is blocked by #4" in result.output
+  )
+@
+
+A child blocking its own parent is no circle, and is allowed; and work
+that is stuck already, say since a hand edit, does not keep the user
+from editing other items, or from repairing it:
+
+<<test functions>>=
+def test_edit_allows_harmless_and_repairing_edits(temp_todo_dir):
+  """Child-blocks-parent passes; old circles do not block edits."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + [
+    TodoItem(id=4, title="Four", parents=[2]),
+    TodoItem(id=5, title="Stuck", blocked_by=[6]),
+    TodoItem(id=6, title="Stuck too", blocked_by=[5]),
+  ])
+  for args in (
+    ["2", "--add-blocker", "4"],
+    ["3", "--add-blocker", "2"],
+    ["5", "--remove-blocker", "6"],
+  ):
+    result = runner.invoke(cli, ["edit", *args])
+    assert result.exit_code == 0, (args, result.output)
+  _, todos = load_todos()
+  assert {t.id: t.blocked_by for t in todos}[5] == []
+@
+
+The check holds under the lock: two edits from one snapshot, each
+making one item wait for the other, cannot both be stored.  And the
+relative edits are applied to the stored list: a blocker removed by
+one edit and another added through [[--blocks]] by a second, from the
+same snapshot, both take effect.
+
+<<test functions>>=
+def test_overlapping_blocker_edits(temp_todo_dir):
+  """A circle split over two edits is refused; adds both survive."""
+  from nytid.cli.todo import edit
+  save_three_items()
+  with pytest.raises(typer.Exit):
+    run_with_shared_snapshot(
+      lambda: edit(None, todo_id=1, add_blocker=[2]),
+      lambda: edit(None, todo_id=2, add_blocker=[1]),
+    )
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos[:2]] in ([[2], []], [[], [1]])
+
+  save_three_items()
+  run_with_shared_snapshot(
+    lambda: edit(None, todo_id=3, remove_blocker=[1]),
+    lambda: edit(None, todo_id=2, blocks=[3]),
+  )
+  _, todos = load_todos()
+  assert todos[2].blocked_by == [2]
 @
 
 Let's verify the replay with the overlap harness from
@@ -34812,6 +35120,7 @@ from nytid.cli.todo import (
     blocking_ancestors,
     blocking_reasons,
     format_todo_refs,
+    apply_blocker_edits,
     simulate_completion,
     find_stuck_items,
     refuse_new_stuck_items,
