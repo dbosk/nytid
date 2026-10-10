@@ -7558,19 +7558,29 @@ guessing why a key never took effect.  Each warning is one plain
 sentence, so the same list serves both [[add]] and [[edit]] without
 either of them having to know what can go wrong.
 
+A sub-item's heading may also name the item it shows, by its ID, and
+say whether it shows it in full or only refers to an item shown in
+full elsewhere in the buffer (\cref{sec:heading-ids}).  The parser
+records both in [[id]] and [[reference]] and leaves their meaning to
+the caller.
+
 <<editor infrastructure>>=
 @dataclass
 class ParsedItem:
     """A single item parsed from editor content.
 
     Represents either a heading-delimited sub-item or
-    the top-level item in an editor document.
+    the top-level item in an editor document.  `id` is
+    the item a heading names, if any, and `reference`
+    tells a heading that only refers to it.
     """
 
     title: str
     notes: str = ""
     metadata: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
+    id: int | None = None
+    reference: bool = False
 
 
 @dataclass
@@ -8151,8 +8161,12 @@ push it onto the appropriate children list:
 <<handle heading line>>=
 <<finalize current item>>
 level = len(heading_match.group(1))
-item_title = heading_match.group(2).strip()
-current_item = ParsedItem(title=item_title)
+item_title, item_id, reference = split_heading_id(
+    heading_match.group(2).strip()
+)
+current_item = ParsedItem(
+    title=item_title, id=item_id, reference=reference,
+)
 current_notes_lines = []
 current_yaml_lines = None
 in_yaml = False
@@ -8436,6 +8450,96 @@ Child notes.
     assert "Child" in result.warnings[0]
 @
 
+\subsection{Naming Items in Headings}
+\label{sec:heading-ids}
+
+A buffer rendered from stored items used to connect a heading to its
+item by the title alone.  That connection is weak in three ways.
+Renaming a sub-item in the buffer breaks it: the old item looks
+deleted and the new title looks like a new item, so the ID, the
+status and the tracked time are lost.  Two siblings with the same title
+cannot be told apart.  And an item with several parents
+(\cref{sec:todo-parents}) is shown under each of them, so the same title
+turns up twice for one item.
+
+So every heading of an existing item ends with the item's ID:
+\begin{verbatim}
+# Collect the data {#7}
+\end{verbatim}
+The marker goes last, in braces, which is how Pandoc writes a heading's
+identifier.  The title stays at the start of the line, where the user
+reads and edits it, and Markdown highlighters show the marker as an
+attribute rather than as part of the title.  A heading without a marker
+is a new item, or an old buffer, which is matched by title as before
+(\cref{sec:edit-via-editor}).
+
+The item below two parents that are both in the buffer, the bottom of
+a diamond, is shown in full only once, at its first heading, with its
+front matter, notes and sub-items.  Its later headings refer to it:
+\begin{verbatim}
+## Collect the data {also #7}
+\end{verbatim}
+A reference has no body, and that is why it needs a marker of its own.
+Read as an ordinary section, its empty body would empty the item's
+notes and its missing sub-headings would remove the item's children.
+Telling the two apart by order, the first heading being the full one,
+would not do either: a user who deletes the full section to take the
+item away from one parent would turn the reference into the first
+heading, and the item would lose its notes and children.  So the
+difference is spelt out in the marker, and it does not depend on where
+the heading stands or what is written around it.  A reference cannot be
+mistaken for a new item, since it names one.
+
+<<editor infrastructure>>=
+def split_heading_id(text):
+    """Split a heading into its title and the item it names.
+
+    Returns `(title, id, reference)`.  A heading ending in
+    `{#7}` names item 7 in full, one ending in
+    `{also #7}` refers to it; any other heading names no
+    item, `id` is `None` and the text is the title.
+    """
+    match = HEADING_ID_PATTERN.search(text)
+    if match is None:
+        return text, None, False
+    return (
+        text[:match.start()].rstrip(),
+        int(match.group(2)),
+        match.group(1) is not None,
+    )
+
+
+def heading_id_marker(item_id, reference=False):
+    """Return the marker that ends the heading of item
+    `item_id`, the form for a reference if `reference`."""
+    if reference:
+        return f"{{also #{item_id}}}"
+    return f"{{#{item_id}}}"
+<<constants>>=
+HEADING_ID_PATTERN = re.compile(r"\s*\{(also\s+)?#(\d+)\}$")
+@
+
+Let's verify both forms, and that a heading whose title merely
+contains a marker keeps it: only the last marker on the line counts.
+
+<<test functions>>=
+@pytest.mark.parametrize("text,expected", [
+  ("Collect {#7}", ("Collect", 7, False)),
+  ("Collect {also #7}", ("Collect", 7, True)),
+  ("Collect", ("Collect", None, False)),
+  ("Fix {#3} again {#7}", ("Fix {#3} again", 7, False)),
+  ("{#7}", ("", 7, False)),
+])
+def test_split_heading_id(text, expected):
+  """The marker at the end names the item."""
+  assert split_heading_id(text) == expected
+  title, item_id, reference = expected
+  if item_id is not None:
+    assert split_heading_id(
+      f"{title} {heading_id_marker(item_id, reference)}".strip()
+    ) == expected
+@
+
 \subsection{Rendering Todo as Markdown}
 
 The renderer is the inverse of the parser: given a [[TodoItem]]
@@ -8492,9 +8596,12 @@ def render_todo_markdown(
     children = sort_todos_for_display(
         children_of(todos, item.id)
     )
+    shown_in_full = {item.id}
     for child in children:
         lines.extend(
-            render_child_markdown(child, todos, 1)
+            render_child_markdown(
+                child, todos, 1, shown_in_full
+            )
         )
     return "\n".join(lines)
 @
@@ -8641,15 +8748,34 @@ at each depth.  This mirrors the parser's stack-based approach: a
 level-1 child becomes [[#]], a level-2 grandchild becomes [[##]],
 and so on.
 
+Each heading ends with the item's ID (\cref{sec:heading-ids}).  The
+set [[shown_in_full]] holds the items already shown in full, and an
+item met again, the bottom of a diamond, gets a reference heading and
+nothing else.  The edited item starts in the set, so it can never be
+shown again below itself; a cycle in a hand-edited file ends there
+too, as a reference, instead of recursing forever.
+
 <<editor infrastructure>>=
-def render_child_markdown(item, todos, level):
+def render_child_markdown(
+    item, todos, level, shown_in_full=None,
+):
     """Render a child item as markdown heading section.
 
     Returns a list of lines. Level determines the
-    heading depth (1 = #, 2 = ##, etc.).
+    heading depth (1 = #, 2 = ##, etc.).  An item already
+    in `shown_in_full` is rendered as a reference heading
+    only; otherwise it is added to the set.
     """
+    if shown_in_full is None:
+        shown_in_full = set()
     prefix = "#" * level
-    lines = [f"{prefix} {item.title}"]
+    if item.id in shown_in_full:
+        marker = heading_id_marker(item.id, reference=True)
+        return [f"{prefix} {item.title} {marker}", ""]
+    shown_in_full.add(item.id)
+    lines = [
+        f"{prefix} {item.title} {heading_id_marker(item.id)}"
+    ]
     meta = build_item_metadata(item)
     yaml_block = render_yaml_block(meta)
     if yaml_block:
@@ -8664,7 +8790,7 @@ def render_child_markdown(item, todos, level):
     for child in grandchildren:
         lines.extend(
             render_child_markdown(
-                child, todos, level + 1
+                child, todos, level + 1, shown_in_full
             )
         )
     return lines
@@ -8736,6 +8862,38 @@ def test_render_todo_markdown_description():
     assert parsed.children[0].metadata["description"] == (
         "What to check once fetched."
     )
+
+
+def test_render_diamond_shows_the_shared_item_once():
+    """The bottom of a diamond is shown in full once and
+    referred to under its other parent."""
+    todos = [
+        TodoItem(id=1, title="Report"),
+        TodoItem(id=2, title="Draft", parents=[1], priority=2.0),
+        TodoItem(id=3, title="Slides", parents=[1], priority=1.0),
+        TodoItem(
+            id=4, title="Data", parents=[2, 3], priority=1.5,
+            notes="From the survey.",
+        ),
+        TodoItem(id=5, title="Clean", parents=[4], priority=1.2),
+    ]
+    md = render_todo_markdown(todos[0], todos)
+    assert md.count("Data {#4}") == 1
+    assert md.count("Data {also #4}") == 1
+    assert md.index("{#4}") < md.index("{also #4}")
+    assert md.count("From the survey.") == 1
+    assert md.count("Clean {#5}") == 1
+
+    parsed = parse_editor_content(md)
+    draft, slides = parsed.children
+    assert (draft.id, slides.id) == (2, 3)
+    full, = draft.children
+    reference, = slides.children
+    assert (full.id, full.reference) == (4, False)
+    assert full.notes == "From the survey."
+    assert [c.id for c in full.children] == [5]
+    assert (reference.id, reference.reference) == (4, True)
+    assert (reference.notes, reference.children) == ("", [])
 
 
 def test_github_field_roundtrip():
@@ -15662,7 +15820,21 @@ another directory does not silently discard the captured environment.
 
 We append the new item to [[todos]] immediately so that recursive
 calls can see it as a parent when processing grandchildren.
+
+Every heading in an [[add]] buffer is a new item, so the buffer has no
+use for the ID markers of an [[edit]] buffer (\cref{sec:heading-ids}).
+A user may still paste a section from one, and the parser has already
+taken the marker off the title.  We create the item under that title
+and say that the item named was not linked; putting an existing item
+under another is what [[edit --add-parent]] is for.
 <<create and append child item>>=
+if parsed_child.id is not None:
+    typer.echo(
+        f"Warning: sub-item {parsed_child.title!r}: "
+        f"add --edit does not link #{parsed_child.id}; "
+        "created a new item instead",
+        err=True,
+    )
 child = TodoItem(
     id=next_id,
     title=parsed_child.title,
@@ -15684,6 +15856,28 @@ typer.echo(
     f"  Added sub-item #{child.id}: "
     f"{child.title}"
 )
+@
+
+<<test functions>>=
+def test_add_edit_marker_creates_a_new_item(temp_todo_dir):
+  """A pasted ID marker warns and does not link the item."""
+  save_todos(2, [
+    TodoItem(id=1, title="Old", created="2026-02-20T10:00:00"),
+  ])
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="New task\n\n# Old {#1}\n",
+  ):
+    result = runner.invoke(
+      cli, ["add", "--edit", "--top-level", "--skip-priority"],
+    )
+  assert result.exit_code == 0, result.output
+  assert "does not link #1" in result.output
+  _, todos = load_todos()
+  assert [(t.id, t.title, t.parents) for t in todos] == [
+    (1, "Old", [ROOT_ID]), (2, "New task", [ROOT_ID]),
+    (3, "Old", [2]),
+  ]
 @
 
 The inherited deadline needs no [[normalize_deadline]] pass of its own.
@@ -21888,7 +22082,7 @@ def test_edit_editor_child_description(temp_todo_dir):
     ])
 
     def fake_editor(text):
-        assert "# Existing\n---\ndescription: |\n  Old text.\n---" in text
+        assert "# Existing {#2}\n---\ndescription: |\n  Old text.\n---" in text
         return text.replace(
             "  Old text.", "  New text."
         ) + (
@@ -36425,6 +36619,8 @@ from nytid.cli.todo import (
     format_stored_priority,
     parse_editor_content,
     render_todo_markdown,
+    split_heading_id,
+    heading_id_marker,
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
