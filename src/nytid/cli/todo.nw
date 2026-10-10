@@ -38,7 +38,11 @@ Any todo can have children (sub-items). A sub-item inherits the
 parent's deadline and labels by default, tracks priority among its
 siblings, and can be started/stopped independently via the track
 system. When all children of a parent are done, the parent is
-automatically marked done.
+automatically marked done.  Each item stores a list of parents, in
+which the top level counts as the parent~0
+(\cref{sec:todo-parents-field}).  The commands still give an item one
+parent or the top level, but the list leaves room for an item that
+belongs to several projects at once.
 
 A child is \emph{part of} its parent, which is a stronger claim than
 \enquote{found while working on it}.  An item that is only the latter
@@ -440,8 +444,8 @@ Each todo item carries an integer ID, a title, labels that connect to
 the track system, an optional numeric priority, a
 status, timestamps for when it was created and when it was closed
 (\cref{sec:todo-closed}), an optional deadline, an estimated duration in
-hours, a longer description, an optional parent ID for sub-items, and
-an optional worker assignment.
+hours, a longer description, the parents of a sub-item
+(\cref{sec:todo-parents-field}), and an optional worker assignment.
 
 To support work-session management (inspired by the UNIX [[at]]
 command), each item can also capture the working directory and
@@ -481,7 +485,7 @@ which is what lets the claim go again when that descendant stops
 
 The [[discovered_from]] field records provenance rather than
 placement: the ID of the todo whose work turned this one up.  It is
-separate from [[parent_id]] because the two answer different
+separate from [[parents]] because the two answer different
 questions.  A parent says what an item is \emph{part of}, and
 completing every part completes the whole; the item an agent stumbled
 on while fixing something else is usually not part of that fix at all,
@@ -538,7 +542,9 @@ class TodoItem:
     deadline: str | None = None
     estimated: float | None = None
     description: str = ""
-    parent_id: int | None = None
+    parents: list[int] = field(
+        default_factory=lambda: [ROOT_ID]
+    )
     who: str | None = None
     notes: str = ""
     wd: str | None = None
@@ -552,11 +558,18 @@ class TodoItem:
     discovered_from: int | None = None
 
     def to_dict(self) -> dict:
-        """Convert explicit values to a JSON-serializable dict."""
-        return {
-            f.name: self.__dict__.get(f.name)
-            for f in self.__dataclass_fields__.values()
-        }
+        """Convert explicit values to a JSON-serializable dict.
+
+        Besides the stored fields, the dict carries
+        `parent_id`, derived from `parents`, for readers
+        that predate `parents`.
+        """
+        data = {}
+        for f in self.__dataclass_fields__.values():
+            if f.name == "parents":
+                <<derive [[parent_id]] for older readers>>
+            data[f.name] = self.__dict__.get(f.name)
+        return data
 
     def __getattribute__(self, name):
         """Return explicit value or worker default.
@@ -588,11 +601,13 @@ class TodoItem:
         Unknown keys are silently ignored for forward
         compatibility. Missing priority keeps the legacy
         default of ``0.0``, while an explicit JSON null is
-        preserved as an unset priority.
+        preserved as an unset priority.  A `parent_id`
+        stored without `parents` is migrated to it.
         """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
         <<coerce stored estimate to hours>>
+        <<migrate a stored [[parent_id]] to [[parents]]>>
         return cls(**filtered)
 @
 
@@ -670,10 +685,166 @@ matches the [[track]] command.
 
 <<normalize labels on assignment>>=
 def __setattr__(self, name, value):
-    """Keep `labels` a sorted, duplicate-free list."""
+    """Keep `labels` a sorted, duplicate-free list and
+    `parents` an ordered one (see `normalize_parents`)."""
     if name == "labels" and value is not None:
         value = sorted(set(value))
+    <<normalize [[parents]] on assignment>>
     object.__setattr__(self, name, value)
+@
+
+\subsection{An Item's Parents}%
+\label{sec:todo-parents-field}
+
+An item lists its parents in [[parents]], a list of ids, and the top
+level is a parent like the others, under the id [[ROOT_ID]]
+(\cref{sec:todo-parents}).  [[[0] ]] means top-level only, [[[12] ]]
+only under~\#12, and [[[0, 12] ]] both.  The list lives on the item,
+rather than in a separate list of parent--child links, because the item
+is what every command loads, edits and saves: a link stored elsewhere
+would be one more thing to keep consistent with the items under the
+lock, and one more place a hand edit of [[todos.json]] could get wrong.
+
+Naming the top level by an id, instead of a separate
+\enquote{top-level} flag next to the list, leaves no combination that
+means nothing.  A flag that is false next to an empty list would be an
+item that is nowhere; with the root among the ids, being top-level is
+membership like any other, and an item is somewhere as long as the list
+is not empty.  We make sure it never is.
+
+Like the labels, the list is normalized on every assignment, for the
+same reason: it is set in many places, by the constructor,
+deserialization and the commands, and one normalization point covers
+them all.  Unlike the labels, it is not sorted, because its order means
+something: without other context, an item's line runs through its first
+parent that is an item ([[primary_parent]]).  So a repeated id keeps its
+first place.  An empty list becomes [[[ROOT_ID] ]], because an item
+with no parent is a top-level item.  A [[None]] in the list is dropped,
+so that a command holding an optional parent, where [[None]] means the
+top level just as it did for [[parent_id]], can pass [[[parent] ]]
+without a case of its own; and a single id where a list should be, as a
+hand edit may leave it, is read as that one parent.
+
+<<helpers>>=
+def normalize_parents(parents):
+    """Return `parents` as a list of parent ids in order.
+
+    Repeated ids keep their first place, `None` entries are
+    dropped, a single id counts as a list of one, and an
+    empty result means the top level, `[ROOT_ID]`.
+    """
+    if isinstance(parents, int):
+        parents = [parents]
+    normalized = []
+    for parent_id in parents or []:
+        if parent_id is not None and parent_id not in normalized:
+            normalized.append(parent_id)
+    return normalized or [ROOT_ID]
+<<normalize [[parents]] on assignment>>=
+if name == "parents":
+    value = normalize_parents(value)
+@
+
+Let's verify the normalization on construction and on assignment:
+
+<<test functions>>=
+def test_parents_are_normalized():
+  """Order is kept, repeats and `None` dropped, empty is root."""
+  assert TodoItem(id=1, title="T").parents == [ROOT_ID]
+  item = TodoItem(id=1, title="T", parents=[12, 12, 0, 12])
+  assert item.parents == [12, ROOT_ID]
+  item.parents = []
+  assert item.parents == [ROOT_ID]
+  item.parents = [None]
+  assert item.parents == [ROOT_ID]
+  item.parents = 7
+  assert item.parents == [7]
+@
+
+Files written before [[parents]] existed store a single [[parent_id]]
+instead, [[null]] for a top-level item.  [[from_dict]] migrates it:
+[[null]] becomes [[[0] ]] and [[N]] becomes [[[N] ]], both through the
+normalization above.  A file that has [[parents]] is read from that
+alone.
+
+<<migrate a stored [[parent_id]] to [[parents]]>>=
+if "parents" not in filtered:
+    filtered["parents"] = [data.get("parent_id")]
+@
+
+The other direction matters as much, because an older version of
+nytid may read the same file: the deployment on another machine,
+say.  It ignores keys it does not know, so without a [[parent_id]] it
+would show every sub-item as a top-level item.  [[to_dict]] therefore
+also writes [[parent_id]], derived from [[parents]]: the first parent
+that is an item, or [[null]] for an item that is only top-level.  That
+is the answer an older version can understand, and for an item with a
+single parent it is the whole truth.  An older version that
+\emph{saves} the file writes back only [[parent_id]], so further
+parents are lost then; that is why the deployment must be upgraded
+before an item is given a second parent.
+
+The derived key comes right before [[parents]], which keeps it at the
+position [[parent_id]] has always had in the dictionary.  Readers that
+take the keys in order, the headerless listing formats among them,
+find it where they always did; [[ls]] moves [[parents]] itself behind
+its computed columns (\cref{sec:todo-ls-record}).  The derived key is
+never read back, and [[replay_item_edits]] does not copy it either,
+since it is not a field (\cref{sec:todo-read-modify-write}).
+
+<<derive [[parent_id]] for older readers>>=
+data["parent_id"] = next(iter(real_parents_of(self)), None)
+@
+
+Let's verify the migration both ways: an item read from the old form,
+and the old key written next to the new one at its old position.
+
+<<test functions>>=
+def test_parent_id_migrates_to_parents():
+  """`parent_id` loads as `parents` and is written alongside."""
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": 7}
+  ).parents == [7]
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": None}
+  ).parents == [ROOT_ID]
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": 7, "parents": [0, 9]}
+  ).parents == [ROOT_ID, 9]
+
+  data = TodoItem(id=2, title="T", parents=[0, 12]).to_dict()
+  keys = list(data)
+  assert keys.index("parent_id") == 9
+  assert keys.index("parents") == 10
+  assert data["parent_id"] == 12
+  assert data["parents"] == [ROOT_ID, 12]
+  assert TodoItem(id=3, title="T").to_dict()["parent_id"] is None
+@
+
+The same holds for a whole file.  A [[todos.json]] in the old form
+loads with the parents migrated, and saving it again writes both keys,
+consistent with each other:
+
+<<test functions>>=
+def test_old_todo_file_round_trips(temp_todo_dir):
+  """An old file gains `parents` and keeps `parent_id`."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "Parent", "parent_id": None},
+      {"id": 2, "title": "Child", "parent_id": 1},
+    ],
+  }))
+
+  next_id, todos = load_todos()
+  assert [t.parents for t in todos] == [[ROOT_ID], [1]]
+  save_todos(next_id, todos)
+
+  stored = json.loads(get_todo_file().read_text())["todos"]
+  assert [(t["parents"], t["parent_id"]) for t in stored] == [
+    ([ROOT_ID], None), ([1], 1),
+  ]
 @
 
 \subsection{Estimates Are Numbers, Not Strings}
@@ -1647,6 +1818,44 @@ IDs and collapse duplicates while preserving order.  That keeps the
 stack usable even after an interrupted command, without silently
 inventing new active work.
 
+The same repair would also hide a bug.  The top level is a parent with
+the id [[ROOT_ID]] (\cref{sec:todo-parents}), but it is not an item, so
+it can never be worked on.  If a walk up the parents ever handed the
+root to the code that activates ancestors, the root would be pushed,
+and the next normalization would drop it again as an id with no
+item---silently, so the walk's mistake would never show.  Every push
+therefore goes through [[push_active]], which refuses the root loudly
+instead.  It raises rather than asserts, so that the check survives
+[[python -O]].
+
+<<active stack helpers>>=
+def push_active(stack, todo_id, index=None):
+    """Put `todo_id` on `stack`, at `index` or on top.
+
+    Raises `ValueError` for `ROOT_ID`, which stands for the top
+    level and is not an item that can be active.
+    """
+    if todo_id == ROOT_ID:
+        raise ValueError(
+            "the top level (id 0) cannot be on the active stack"
+        )
+    if index is None:
+        stack.append(todo_id)
+    else:
+        stack.insert(index, todo_id)
+@
+
+<<test functions>>=
+def test_root_is_never_pushed():
+  """Pushing the root id is refused, any other id is not."""
+  stack = [3]
+  push_active(stack, 5)
+  push_active(stack, 4, index=1)
+  assert stack == [3, 4, 5]
+  with pytest.raises(ValueError):
+    push_active(stack, ROOT_ID)
+@
+
 <<active stack helpers>>=
 def synchronize_todo_statuses(
     todos: list[TodoItem], stack: list[int]
@@ -2047,6 +2256,12 @@ would drop a label that another process added meanwhile.  The [[skip]]
 argument keeps such fields out of the replay, and the caller applies
 the increment to the fresh item instead.
 
+Only fields are replayed.  The dictionary also carries [[parent_id]],
+which is derived from [[parents]] for older readers
+(\cref{sec:todo-parents-field}); replaying it would create a stray
+attribute of that name rather than move the item, and the move it
+reflects arrives through [[parents]] anyway.
+
 <<active stack helpers>>=
 def item_fields(item):
     """Return a detached copy of the item's stored fields."""
@@ -2070,7 +2285,7 @@ def replay_item_edits(
         read = before
     current = target.to_dict()
     for key, value in edited.to_dict().items():
-        if key in skip:
+        if key in skip or key not in TodoItem.__dataclass_fields__:
             continue
         if (
             before.get(key) != value
@@ -2210,7 +2425,7 @@ navigate it: finding parents and children, finding siblings (for
 priority comparison), walking up and down, and checking whether a
 parent's children are all done.
 
-Why store sub-items flat, with each item naming its parent, rather
+Why store sub-items flat, with each item naming its parents, rather
 than nesting them?  Because flat storage simplifies JSON
 serialization, avoids recursive data structures, and lets commands
 like [[todo ls --flat]] work without flattening logic.
@@ -2233,20 +2448,21 @@ to those belonging to a given worker, treating [[who=None]] as
 \subsection{Parents, the top level, and context}%
 \label{sec:todo-parents}
 
-So far every item has at most one parent, stored in [[parent_id]], and
-the items form a forest.  That is about to change.  An item will be
-allowed several parents, all equal, and it may be a top-level item and
-a sub-item at the same time---a prerequisite shared by two projects,
-say.  The items then form a directed acyclic graph rather than a
-forest, and questions that have one answer in a tree, such as
-\enquote{which is the parent?} or \enquote{what is the path from the
-top?}, get several.
+An item may have several parents, all equal, and it may be a
+top-level item and a sub-item at the same time---a prerequisite shared
+by two projects, say.  The items then form a directed acyclic graph
+rather than a forest, and questions that have one answer in a tree,
+such as \enquote{which is the parent?} or \enquote{what is the path
+from the top?}, get several.  The commands do not yet give an item a
+second parent, but a hand-edited [[todos.json]] can
+(\cref{sec:todo-parents-field}), and every part of the module must
+then still behave.
 
-We prepare for that by asking every such question through the helpers
-of this subsection.  They still read [[parent_id]], so the change of
-storage will touch them and nothing else.  Each helper answers the
-question as it is asked of a graph; with one parent per item, the
-answer is exactly the one the tree code it replaced gave.
+We ensure that by asking every such question through the helpers of
+this subsection, which are the only code that reads [[parents]].  Each
+helper answers the question as it is asked of a graph; with one parent
+per item, the answer is exactly the one the tree code it replaced
+gave.
 
 The top level is treated as a parent of its own: a virtual root with
 the id [[ROOT_ID]], zero.  That turns \enquote{top-level} from a special
@@ -2268,9 +2484,7 @@ def parents_of(item: TodoItem) -> list[int]:
     The top level counts as a parent with the id `ROOT_ID`,
     so a top-level item answers `[ROOT_ID]`.
     """
-    if item.parent_id is None:
-        return [ROOT_ID]
-    return [item.parent_id]
+    return item.parents
 
 
 def real_parents_of(item: TodoItem) -> list[int]:
@@ -2414,7 +2628,7 @@ answering what it always has, and [[get_parent]] goes on placing it
 against the top level.  The root comes last, for a top-level item with
 no other parent.  An item with only one parent has nothing to choose
 between, so it answers that parent without looking anything up, which
-keeps the common case as cheap as reading [[parent_id]] was.
+keeps the common case as cheap as reading the one parent.
 
 [[context_path]] follows primary parents up to the root and returns
 the line root first, the reading order of a path ([[353 > 356 > 359]])
@@ -2549,6 +2763,56 @@ def test_walks_survive_a_parent_cycle():
   assert [t.id for t in ancestors_of(todos, todos[0])] == [3, 2]
   assert [t.id for t in context_path(todos, todos[0])] == [2, 3]
   assert descendants_of(todos, ROOT_ID) == []
+@
+
+Several parents bring the shapes a tree cannot have.  In a diamond,
+\#4 is below both \#2 and \#3, which are both below \#1: the walks
+list \#4 and \#1 once each.  An item that is also top-level has the
+root among its parents, yet the root never turns up as an ancestor or
+on a path, since it is not an item.
+
+<<test functions>>=
+def test_walks_list_a_diamond_once():
+  """Below and above, a shared item is listed once."""
+  todos = [
+    TodoItem(id=1, title="Top"),
+    TodoItem(id=2, title="Left", parents=[1]),
+    TodoItem(id=3, title="Right", parents=[1]),
+    TodoItem(id=4, title="Shared", parents=[2, 3]),
+    TodoItem(id=5, title="Also top-level", parents=[ROOT_ID, 4]),
+  ]
+  assert [t.id for t in children_of(todos, 1)] == [2, 3]
+  assert [t.id for t in descendants_of(todos, 1)] == [2, 4, 5, 3]
+  assert [t.id for t in ancestors_of(todos, todos[3])] == [2, 3, 1]
+  assert [t.id for t in ancestors_of(todos, todos[4])] == [4, 2, 3, 1]
+  assert [t.id for t in context_path(todos, todos[4])] == [1, 2, 4]
+  assert [
+    t.id for t in children_of(todos, ROOT_ID)
+  ] == [1, 5]
+@
+
+Which parent a line runs through follows the rules of
+[[primary_parent]]: the context first, then the first parent that
+exists, and a missing one only when no other is left.
+
+<<test functions>>=
+def test_primary_parent_prefers_context_then_existing():
+  """Context first, then an existing parent, then any."""
+  todos = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="B"),
+    TodoItem(id=3, title="Child", parents=[1, 2]),
+    TodoItem(id=4, title="Orphan", parents=[98, 99]),
+    TodoItem(id=5, title="Half orphan", parents=[99, 2]),
+  ]
+  assert primary_parent(todos, todos[2]) == 1
+  assert primary_parent(todos, todos[2], context_ids=[2]) == 2
+  assert [
+    t.id for t in context_path(todos, todos[2], [2])
+  ] == [2]
+  assert primary_parent(todos, todos[3]) == 98
+  assert primary_parent(todos, todos[4]) == 2
+  assert get_parent(todos, todos[3]) is None
 @
 
 \subsection{Helpers for the commands}
@@ -3652,7 +3916,7 @@ def set_priority_with_subtree(
     """Store `priority` on `item` and move the subtrees
     its new place affects (see `settle_placement`)."""
     old_range = child_priority_range_or_none(todos, item)
-    old_place = (item.priority, item.parent_id)
+    old_place = (item.priority, list(item.parents))
     item.priority = priority
     settle_placement(todos, item, old_range, old_place)
 @
@@ -3878,7 +4142,7 @@ def squeeze_sibling_above(
     `item`, whose child range `item` has just cut short,
     and return the items it moved.
 
-    `old_place` is `item`'s `(priority, parent_id)`
+    `old_place` is `item`'s `(priority, parents)`
     before it moved, or `None` when `item` is new.
     """
     if item.priority is None or item.status == "done":
@@ -3920,7 +4184,7 @@ moved item differs, and only in its number and parent, which are all
 before = [t for t in todos if t is not item]
 if old_place is not None:
     stand_in = copy.copy(item)
-    stand_in.priority, stand_in.parent_id = old_place
+    stand_in.priority, stand_in.parents = old_place
     before.append(stand_in)
 @
 
@@ -3945,7 +4209,7 @@ def settle_placement(
     Renumber everything if that left too little room.
 
     `old_range` is `item`'s child range before the
-    change and `old_place` its `(priority, parent_id)`;
+    change and `old_place` its `(priority, parents)`;
     both are `None` for an item that is new.
     """
     touched = [item]
@@ -7538,7 +7802,7 @@ def activate_todo_state(todo_id, who=None, force=False):
             raise typer.Exit(1)
         <<claim [[item]] for [[who]]>>
         if resolved_id not in stack:
-            stack.append(resolved_id)
+            push_active(stack, resolved_id)
         return (
             next_id, todos, stack,
             resolved_id, item, displaced,
@@ -8583,7 +8847,7 @@ def ensure_ancestors_active(
             if ancestor.id not in stack:
                 idx = stack.index(item.id) \
                     if item.id in stack else len(stack)
-                stack.insert(idx, ancestor.id)
+                push_active(stack, ancestor.id, idx)
                 pushed.add(ancestor.id)
         for fresh in todos:
             if fresh.id in pushed:
@@ -8697,6 +8961,33 @@ def test_start_grandchild_auto_activates_chain(
 
     stack = load_active_stack()
     assert stack == [1, 2, 3]
+@
+
+An item with several parents, as a hand-edited file can give it, is
+started in the line the user is already working in.  Item~3 is
+top-level and under both~1 and~2; with~2 active, starting~3 must
+activate nothing but~3 itself, neither~1, its first parent, nor the
+root.
+
+<<test functions>>=
+def test_start_shared_item_follows_the_active_parent(
+    temp_todo_dir,
+):
+    """Starting a multi-parent item adds no other line."""
+    save_todos(4, [
+        TodoItem(id=1, title="A", created="2026-02-20T10:00:00"),
+        TodoItem(id=2, title="B", created="2026-02-20T10:00:00"),
+        TodoItem(
+            id=3, title="Shared", parents=[ROOT_ID, 1, 2],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    save_active_stack([2])
+
+    result = runner.invoke(cli, ["start", "3"])
+    assert result.exit_code == 0, result.output
+
+    assert load_active_stack() == [2, 3]
 
 
 def test_start_window_disables_generic_tmux_context_sync(
@@ -10377,15 +10668,16 @@ out of the active todo is exactly the item auto-parenting would have
 put under it.
 
 <<helpers>>=
-def discovered_while_working_on(todos, parent_id):
+def discovered_while_working_on(todos, parents):
     """Return the active todo a new item is not placed under.
 
     That is the active todo of the current context, as
-    auto-parenting finds it, unless it is `parent_id`;
-    `None` when there is no such todo.
+    auto-parenting finds it, unless it is among `parents`,
+    the new item's parents; `None` when there is no such
+    todo.
     """
     active = get_current_context_todo(todos)
-    if active is None or active.id == parent_id:
+    if active is None or active.id in parents:
         return None
     return active
 @
@@ -10405,7 +10697,9 @@ if (
     and not no_discovered_from
     and (parent is not None or top_level)
 ):
-    source = discovered_while_working_on(todos, resolved_parent)
+    source = discovered_while_working_on(
+        todos, normalize_parents([resolved_parent])
+    )
     if source is not None:
         resolved_discovered_from = source.id
         typer.echo(
@@ -10604,7 +10898,7 @@ CANDIDATE_ID = -1
 candidate = TodoItem(
     id=CANDIDATE_ID,
     title=priority_title,
-    parent_id=resolved_parent,
+    parents=[resolved_parent],
     labels=inherited_labels,
     deadline=inherited_deadline,
     estimated=(
@@ -10975,7 +11269,7 @@ def append_new_todo(next_id, todos, stack):
         deadline=inherited_deadline,
         estimated=estimated_hours,
         description=description or "",
-        parent_id=resolved_parent,
+        parents=[resolved_parent],
         who=resolved_who,
         wd=resolved_wd,
         worktree=normalize_worktree_name(worktree),
@@ -11336,7 +11630,7 @@ parent_item = TodoItem(
     status="pending",
     created=now,
     deadline=inherited_deadline,
-    parent_id=resolved_parent,
+    parents=[resolved_parent],
     notes=parsed.notes,
     discovered_from=resolved_discovered_from,
 )
@@ -11783,7 +12077,7 @@ child = TodoItem(
     status="pending",
     created=now,
     deadline=parent_deadline,
-    parent_id=parent_id,
+    parents=[parent_id],
     who=parent_who,
     notes=parsed_child.notes,
     env=parent_env,
@@ -13150,9 +13444,19 @@ then move them.  [[ls_record]] therefore takes such columns as
 the late stored fields, so that in every record the late stored fields
 are the very end, and a new one moves nothing.
 
+[[parents]] (\cref{sec:todo-parents-field}) took over from
+[[parent_id]], so it might seem to belong in [[parent_id]]'s column.
+But a script that reads that column expects one id or nothing, and a
+list there would break it as surely as a shifted column would.  The
+derived [[parent_id]] that [[to_dict()]] writes keeps that column, with
+the meaning it always had, and [[parents]] is the fifth field to move
+behind the computed values.  The headerless rows thus grow by one
+column at the end and lose none.
+
 <<constants>>=
 FIELDS_AFTER_COMPUTED = (
     "closed", "claimed_by", "context_claim", "discovered_from",
+    "parents",
 )
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio, computed=None):
@@ -13395,7 +13699,7 @@ for item in sorted_items:
 
 The tree is a depth-first walk that starts at the visible roots and
 descends only into children that are themselves in [[filtered]].
-Membership in the filtered list, not [[parent_id]] alone, decides
+Membership in the filtered list, not the parents alone, decides
 both where the walk starts and where it goes next, so the promotion
 that [[get_visible_roots]] performs for a child whose parent a filter
 removed holds at every depth: an orphaned grandchild is a root, not a
@@ -13608,7 +13912,9 @@ table.add_row(
 Two of the record's values are not strings, and a cell has to be.
 Labels are a list, joined here with semicolons rather than commas so
 that the value stays one word to a reader that splits on the delimiter
-even after the quoting has been stripped away.  The GitHub link is a
+even after the quoting has been stripped away.  The parents are a list
+of ids and are joined the same way, the top level included as~[[0]]
+(\cref{sec:todo-parents-field}).  The GitHub link is a
 dictionary of repository, type and number, rendered as [[repo#number]]:
 the spelling [[gh]] itself accepts and the one a reader would write in
 a commit message.  Flattening it drops the issue-versus-pull-request
@@ -13632,13 +13938,15 @@ CSV_OMITTED_FIELDS = ("env",)
 def csv_cell(name, value):
     """Return `value` rendered as the CSV cell of column `name`.
 
-    Labels are joined with semicolons, a GitHub link becomes
-    `repo#number`, a path becomes its titles, and `None` becomes the
-    empty string.  Every other value is rendered with `str`,
+    Labels and parents are joined with semicolons, a GitHub
+    link becomes `repo#number`, a path becomes its titles, and
+    `None` becomes the empty string.  Every other value is rendered with `str`,
     matching what JSON would show.
     """
     if name == "labels":
         return ";".join(value or [])
+    if name == "parents":
+        return ";".join(str(p) for p in value or [])
     if name == "path":
         return format_todo_path(value)
     if name == "github":
@@ -13788,7 +14096,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: twenty-one tab-separated fields, no header,
+Let's verify the pipe form: twenty-two tab-separated fields, no header,
 and the flattened cells in their record positions, with the tracked
 hours still in the seventeenth.
 
@@ -13810,7 +14118,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 21
+  assert len(fields) == 22
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
   assert fields[16] == "0"
@@ -13850,6 +14158,36 @@ def test_ls_piped_keeps_computed_columns_in_place(temp_todo_dir):
   assert fields[21] == "7"
 @
 
+The parents are the latest of those fields.  The derived [[parent_id]]
+keeps the tenth column, holding one id as it always has, and the list
+comes last, after [[discovered_from]]:
+
+<<test functions>>=
+def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
+  """parent_id keeps column ten; parents is appended last."""
+  save_todos(5, [
+    TodoItem(
+      id=4, title="Parent", created="2026-02-20T10:00:00",
+      who="me",
+    ),
+    TodoItem(
+      id=1, title="Shared", created="2026-02-20T10:00:00",
+      who="me", parents=[ROOT_ID, 4],
+    ),
+  ])
+
+  for flags, last in (([], 21), (["--prio"], 22)):
+    result = runner.invoke(cli, ["ls", "--who", "", *flags])
+    assert result.exit_code == 0, result.output
+    row = next(
+      line.split("\t") for line in result.output.splitlines()
+      if line.startswith("1\t")
+    )
+    assert len(row) == last + 1
+    assert row[9] == "4"
+    assert row[last] == "0;4"
+@
+
 Free text is the case that rule exists for.  A note that spans two
 lines, and a tab inside a title, must leave the piped record one
 line wide---while the named form hands back the characters
@@ -13872,7 +14210,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 21
+  assert len(fields) == 22
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -13969,6 +14307,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
         "claimed_by", "context_claim", "discovered_from",
+        "parents",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -14578,12 +14917,13 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-7:] == [
+  assert list(rows[3])[-8:] == [
     "tracked_hours", "path", "ready",
     *FIELDS_AFTER_COMPUTED,
   ]
   assert FIELDS_AFTER_COMPUTED == (
     "closed", "claimed_by", "context_claim", "discovered_from",
+    "parents",
   )
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -17122,7 +17462,7 @@ reassigns the item under a different parent:
 <<edit via cli flags>>=
 if parent is not None:
     if parent == ROOT_ID:
-        item.parent_id = None
+        item.parents = [ROOT_ID]
     else:
         new_parent = next(
             (t for t in todos if t.id == parent),
@@ -17135,7 +17475,7 @@ if parent is not None:
             )
             raise typer.Exit(1)
         require_acyclic_move(todos, item, parent)
-        item.parent_id = parent
+        item.parents = [parent]
 @
 
 A move must not make an item its own ancestor.  Both
@@ -17426,7 +17766,7 @@ leaves every range as it was, and nothing moves.
 
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
-    moved = item.parent_id != before["parent_id"]
+    moved = item.parents != before["parents"]
     if moved:
         for parent_id in real_parents_of(item):
             require_todo(todos, parent_id)
@@ -17435,7 +17775,7 @@ def commit_flag_edits(next_id, todos, stack):
         for parent_id in real_parents_of(item):
             require_acyclic_move(todos, fresh, parent_id)
     old_range = child_priority_range_or_none(todos, fresh)
-    old_place = (fresh.priority, fresh.parent_id)
+    old_place = (fresh.priority, list(fresh.parents))
     relative_labels = bool(add_label or remove_label)
     replay_item_edits(
         fresh, before, item,
@@ -18163,7 +18503,7 @@ for parsed_child in parsed_children:
             status="pending",
             created=now,
             deadline=parent.deadline,
-            parent_id=parent.id,
+            parents=[parent.id],
             who=parent.who,
             notes=parsed_child.notes,
         )
@@ -22160,7 +22500,7 @@ def status():
 @
 
 Let's verify the two boundary cases: no active todo, and active
-hierarchies that should be rendered from [[parent_id]] rather than raw
+hierarchies that should be rendered from the parents rather than raw
 stack order.
 
 <<test functions>>=
@@ -27323,7 +27663,7 @@ for gh_item in new_items:
             id=CANDIDATE_ID,
             title=gh_item["title"],
             labels=gh_labels,
-            parent_id=resolved_parent,
+            parents=[resolved_parent],
             deadline=inherited_deadline,
             estimated=(
                 parse_hours(estimate)
@@ -27355,7 +27695,7 @@ for gh_item in new_items:
             if estimate else None
         ),
         description=description or "",
-        parent_id=resolved_parent,
+        parents=[resolved_parent],
         wd=resolved_wd,
         worktree=normalize_worktree_name(worktree),
         env=resolved_env,
@@ -29510,6 +29850,8 @@ from nytid.cli.todo import (
     get_worker_default,
     should_spawn_shell,
     ROOT_ID,
+    push_active,
+    normalize_parents,
     parents_of,
     real_parents_of,
     children_of,
