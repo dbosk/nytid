@@ -2106,13 +2106,13 @@ def load_todo_state(nest=True) -> tuple:
     the next write will store them (`nest_stored_priorities`).
     """
     next_id, todos = load_todos_raw()
-    if nest:
-        nest_stored_priorities(todos, report=False)
     stack = normalize_active_stack(
         todos, load_active_stack_raw()
     )
     synchronize_todo_statuses(todos, stack)
     release_inactive_claims(todos, stack)
+    if nest:
+        nest_stored_priorities(todos, warn=False)
     return next_id, todos, stack
 @
 
@@ -2335,7 +2335,9 @@ cycle.
 Every write is also where old priorities are brought into nested
 ranges, before the callback sees the list
 (\cref{sec:normalise-priorities}); every read shows them as that write
-will store them.  [[save_todos]], which replaces the
+will store them.  The step is counted before the callback and announced
+after the state is saved, since a callback that refuses, by raising,
+abandons the write and with it the renumbering.  [[save_todos]], which replaces the
 whole list with one the caller built, asks for no such step: the list
 it replaces is thrown away anyway.
 
@@ -2352,8 +2354,7 @@ def mutate_todo_state(callback, nest=True):
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         try:
             next_id, todos, stack = load_todo_state(nest=False)
-            if nest:
-                nest_stored_priorities(todos)
+            renumbered = nest_stored_priorities(todos) if nest else 0
             callback_result = callback(next_id, todos, stack)
             if callback_result is None:
                 updated_next_id = next_id
@@ -2370,6 +2371,7 @@ def mutate_todo_state(callback, nest=True):
                 updated_todos,
                 updated_stack,
             )
+            announce_renumbering(renumbered)
             if extra:
                 return (
                     updated_next_id,
@@ -5628,13 +5630,25 @@ among old numbers would be stored among new ones: a child kept at its
 number while it moves would land above its new parent.  So every read
 normalises the list in memory, in the same deterministic way, without
 a word and without writing; the reading commands show the order the
-next write will store, and the commands that write decide on it.
+next write will store, and the commands that write decide on it.  Both
+normalise the list as [[load_todo_state]] returns it, after the
+statuses are brought in line with the active stack: which items are
+laid out depends on their status, so the step must see the statuses
+that both the snapshot and the commit see, whatever the
+synchronisation may change.
 For the same reason, a test that checks what a command stored reads
 the file with [[load_todos_raw]]: [[load_todos]] would show it a list
 normalised in memory, nested even when the file is not.
 
 The step is never silent.  When it changed numbers it says how many,
-on standard error, once.  One pass of renumbering and lifting nests
+on standard error, once, after the list is saved: a command that
+refuses, say [[stop]] with nothing active, writes nothing and so has
+renumbered nothing.  The first write need not come from a command the
+user watches, though.  It may be a background writer---the hook that
+finalises a detached run when its pane exits, or a [[next]] started by
+cron---and there the notice goes where that process's standard error
+goes, often nowhere.  We accept that: the renumbering keeps every
+family's order, and there is no log file to put it in.  One pass of renumbering and lifting nests
 any list the commands can produce, a few rounds at most where lifts
 disturb the layout.  If a list still does not nest after that, the
 step leaves the numbers as they were, rather than rewrite them on every
@@ -5660,11 +5674,11 @@ def normalise_priorities(todos: list[TodoItem]) -> int:
 
 
 def nest_stored_priorities(
-    todos: list[TodoItem], report: bool = True,
+    todos: list[TodoItem], warn: bool = True,
 ) -> int:
     """Normalise the priorities of a stored list that does
-    not nest and return how many changed; with `report`,
-    say so on standard error."""
+    not nest and return how many changed; with `warn`,
+    report a list that cannot be nested."""
     if ranking_is_consistent(todos):
         return 0
     before = {t.id: t.priority for t in todos}
@@ -5672,16 +5686,21 @@ def nest_stored_priorities(
     if not ranking_is_consistent(todos):
         for t in todos:
             t.priority = before[t.id]
-        if report:
+        if warn:
             report_unnestable_list()
         return 0
-    if changed and report:
+    return changed
+
+
+def announce_renumbering(changed: int) -> None:
+    """Say on standard error that `changed` stored numbers
+    were renumbered, if any were."""
+    if changed:
         typer.echo(
             f"Renumbered {changed} priorities so sub-items rank "
             "below their parents",
             err=True,
         )
-    return changed
 
 
 def report_unnestable_list() -> None:
@@ -5811,6 +5830,73 @@ def test_normalise_priorities_lifts_and_repeats(items):
   assert not ranking_is_consistent(renumbered)
   assert normalise_priorities(todos) > 0
   assert ranking_is_consistent(todos)
+@
+
+A command decides on the numbers the reading commands show, which are
+the numbers its commit will find.  In an old list where A's children
+sit above and below A's range, [[reprioritize]] puts a child just above
+its sibling, and [[edit --prio]] with a number between two children as
+[[ls]] shows them puts the item between them, leaving the shown numbers
+of the others as they are.
+
+<<test functions>>=
+def save_unnested_family():
+  """A at 5 with children at 3, 1 and 9; B at 4, a child at 9.5."""
+  save_todos(7, [
+    ranked_child(1, None, 5.0), ranked_child(2, None, 4.0),
+    ranked_child(3, 1, 3.0), ranked_child(4, 1, 1.0),
+    ranked_child(5, 1, 9.0), ranked_child(6, 2, 9.5),
+  ])
+
+
+def shown_priorities():
+  """The numbers `ls` shows, by id."""
+  result = runner.invoke(cli, ["ls", "-r", "-f", "json"])
+  return {
+    record["id"]: record["priority"]
+    for record in json.loads(result.stdout)
+  }
+
+
+def test_commands_decide_on_the_numbers_shown(temp_todo_dir):
+  """Snapshot and commit see the same normalised numbers."""
+  save_unnested_family()
+  result = runner.invoke(cli, ["reprioritize", "4", "--above", "3"])
+  assert result.exit_code == 0, result.output
+  assert stored_priority(1) > stored_priority(4) > stored_priority(3)
+
+  save_unnested_family()
+  shown = shown_priorities()
+  middle = (shown[3] + shown[4]) / 2
+  result = runner.invoke(cli, ["edit", "5", "--prio", str(middle)])
+  assert result.exit_code == 0, result.output
+  stored = {t.id: t.priority for t in load_todos_raw()[1]}
+  assert stored[3] > stored[5] > stored[4]
+  assert {i: p for i, p in stored.items() if i != 5} == {
+    i: p for i, p in shown.items() if i != 5
+  }
+@
+
+A command that refuses writes nothing, so it must not claim to have
+renumbered anything: [[stop]] and [[done]] with nothing active refuse
+inside the lock, after the step has run on the list in memory.  The
+notice comes with the first write that is actually saved.
+
+<<test functions>>=
+@pytest.mark.parametrize("refused", [["stop"], ["done"]])
+def test_a_refused_write_announces_nothing(temp_todo_dir, refused):
+  """No notice without a saved write; then one with it."""
+  save_legacy_list()
+  before = get_todo_file().read_text()
+  for _ in range(2):
+    result = runner.invoke(cli, refused)
+    assert result.exit_code != 0, result.output
+    assert "Renumbered" not in result.stderr
+  assert get_todo_file().read_text() == before
+
+  result = runner.invoke(cli, ["note", "8", "-m", "saved"])
+  assert result.exit_code == 0, result.output
+  assert result.stderr.count("Renumbered") == 1
 @
 
 A list that one pass cannot nest is left as it was, with one warning
