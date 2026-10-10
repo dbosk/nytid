@@ -38,7 +38,11 @@ Any todo can have children (sub-items). A sub-item inherits the
 parent's deadline and labels by default, tracks priority among its
 siblings, and can be started/stopped independently via the track
 system. When all children of a parent are done, the parent is
-automatically marked done.
+automatically marked done.  Each item stores a list of parents, in
+which the top level counts as the parent~0
+(\cref{sec:todo-parents-field}).  The commands still give an item one
+parent or the top level, but the list leaves room for an item that
+belongs to several projects at once.
 
 A child is \emph{part of} its parent, which is a stronger claim than
 \enquote{found while working on it}.  An item that is only the latter
@@ -440,8 +444,8 @@ Each todo item carries an integer ID, a title, labels that connect to
 the track system, an optional numeric priority, a
 status, timestamps for when it was created and when it was closed
 (\cref{sec:todo-closed}), an optional deadline, an estimated duration in
-hours, a longer description, an optional parent ID for sub-items, and
-an optional worker assignment.
+hours, a longer description, the parents of a sub-item
+(\cref{sec:todo-parents-field}), and an optional worker assignment.
 
 To support work-session management (inspired by the UNIX [[at]]
 command), each item can also capture the working directory and
@@ -481,7 +485,7 @@ which is what lets the claim go again when that descendant stops
 
 The [[discovered_from]] field records provenance rather than
 placement: the ID of the todo whose work turned this one up.  It is
-separate from [[parent_id]] because the two answer different
+separate from [[parents]] because the two answer different
 questions.  A parent says what an item is \emph{part of}, and
 completing every part completes the whole; the item an agent stumbled
 on while fixing something else is usually not part of that fix at all,
@@ -538,7 +542,9 @@ class TodoItem:
     deadline: str | None = None
     estimated: float | None = None
     description: str = ""
-    parent_id: int | None = None
+    parents: list[int] = field(
+        default_factory=lambda: [ROOT_ID]
+    )
     who: str | None = None
     notes: str = ""
     wd: str | None = None
@@ -552,11 +558,18 @@ class TodoItem:
     discovered_from: int | None = None
 
     def to_dict(self) -> dict:
-        """Convert explicit values to a JSON-serializable dict."""
-        return {
-            f.name: self.__dict__.get(f.name)
-            for f in self.__dataclass_fields__.values()
-        }
+        """Convert explicit values to a JSON-serializable dict.
+
+        Besides the stored fields, the dict carries
+        `parent_id`, derived from `parents`, for readers
+        that predate `parents`.
+        """
+        data = {}
+        for f in self.__dataclass_fields__.values():
+            if f.name == "parents":
+                <<derive [[parent_id]] for older readers>>
+            data[f.name] = self.__dict__.get(f.name)
+        return data
 
     def __getattribute__(self, name):
         """Return explicit value or worker default.
@@ -588,11 +601,13 @@ class TodoItem:
         Unknown keys are silently ignored for forward
         compatibility. Missing priority keeps the legacy
         default of ``0.0``, while an explicit JSON null is
-        preserved as an unset priority.
+        preserved as an unset priority.  A `parent_id`
+        stored without `parents` is migrated to it.
         """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
         <<coerce stored estimate to hours>>
+        <<migrate a stored [[parent_id]] to [[parents]]>>
         return cls(**filtered)
 @
 
@@ -670,10 +685,280 @@ matches the [[track]] command.
 
 <<normalize labels on assignment>>=
 def __setattr__(self, name, value):
-    """Keep `labels` a sorted, duplicate-free list."""
+    """Keep `labels` a sorted, duplicate-free list and
+    `parents` an ordered one (see `normalize_parents`)."""
     if name == "labels" and value is not None:
         value = sorted(set(value))
+    <<normalize [[parents]] on assignment>>
     object.__setattr__(self, name, value)
+@
+
+\subsection{An Item's Parents}%
+\label{sec:todo-parents-field}
+
+An item lists its parents in [[parents]], a list of ids, and the top
+level is a parent like the others, under the id [[ROOT_ID]]
+(\cref{sec:todo-parents}).  [[[0] ]] means top-level only, [[[12] ]]
+only under~\#12, and [[[0, 12] ]] both.  The list lives on the item,
+rather than in a separate list of parent--child links, because the item
+is what every command loads, edits and saves: a link stored elsewhere
+would be one more thing to keep consistent with the items under the
+lock, and one more place a hand edit of [[todos.json]] could get wrong.
+
+Naming the top level by an id, instead of a separate
+\enquote{top-level} flag next to the list, leaves no combination that
+means nothing.  A flag that is false next to an empty list would be an
+item that is nowhere; with the root among the ids, being top-level is
+membership like any other, and an item is somewhere as long as the list
+is not empty.  We make sure it never is.
+
+Like the labels, the list is normalized on every assignment, for the
+same reason: it is set in many places, by the constructor,
+deserialization and the commands, and one normalization point covers
+them all.  Unlike the labels, it is not sorted, because its order means
+something: without other context, an item's line runs through its first
+parent that is an item ([[primary_parent]]).  So a repeated id keeps its
+first place.  An empty list becomes [[[ROOT_ID] ]], because an item
+with no parent is a top-level item.  A [[None]] in the list is dropped,
+so that a command holding an optional parent, where [[None]] means the
+top level just as it did for [[parent_id]], can pass [[[parent] ]]
+without a case of its own; and a single id where a list should be, as a
+hand edit may leave it, is read as that one parent.
+
+Anything else is refused.  An id is a non-negative integer, and a
+value that merely looks like one---the string [[12]], the float
+[[12.0]], a list [[[12] ]] nested in the list---is not, however
+plausible the guess: [[1.5]] or [[true]] has no plausible guess at all,
+and a rule that repairs some values and not others is one more thing a
+person editing the file would have to know.  A boolean is excluded
+explicitly, since Python counts [[True]] as the integer one.  The
+refusal is its own exception, [[InvalidParentsError]], rather than a
+[[ValueError]], because the file reader turns a [[ValueError]] into an
+empty list and the next save would then wipe the file; the reader
+instead stops with an error that names the file and the item
+(\cref{sec:todo-refused-files}).
+
+<<helpers>>=
+class InvalidParentsError(Exception):
+    """A parents value that is neither a todo id nor a list of
+    them."""
+
+
+def is_parent_id(value):
+    """Tell whether `value` can be a parent id: a non-negative
+    integer that is not a boolean."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def normalize_parents(parents):
+    """Return `parents` as a list of parent ids in order.
+
+    Repeated ids keep their first place, `None` entries are
+    dropped, a single id counts as a list of one, and an
+    empty result means the top level, `[ROOT_ID]`.  Raises
+    `InvalidParentsError` for anything that is not an id.
+    """
+    if parents is None or is_parent_id(parents):
+        parents = [parents]
+    if not isinstance(parents, (list, tuple)):
+        raise InvalidParentsError(
+            f"parents {parents!r}, which is not a list of ids"
+        )
+    normalized = []
+    for parent_id in parents:
+        if parent_id is None:
+            continue
+        if not is_parent_id(parent_id):
+            raise InvalidParentsError(
+                f"parent {parent_id!r}, which is not a todo id"
+            )
+        if parent_id not in normalized:
+            normalized.append(int(parent_id))
+    return normalized or [ROOT_ID]
+<<normalize [[parents]] on assignment>>=
+if name == "parents":
+    value = normalize_parents(value)
+@
+
+Let's verify the normalization on construction and on assignment:
+
+<<test functions>>=
+def test_parents_are_normalized():
+  """Order is kept, repeats and `None` dropped, empty is root."""
+  assert TodoItem(id=1, title="T").parents == [ROOT_ID]
+  item = TodoItem(id=1, title="T", parents=[12, 12, 0, 12])
+  assert item.parents == [12, ROOT_ID]
+  item.parents = []
+  assert item.parents == [ROOT_ID]
+  item.parents = [None]
+  assert item.parents == [ROOT_ID]
+  item.parents = 7
+  assert item.parents == [7]
+@
+
+Values that only resemble ids are refused, each of them:
+
+<<test functions>>=
+@pytest.mark.parametrize("parents", [
+  "12", [[1]], 1.5, ["1"], [1.0], [True], [-2], {"id": 1},
+])
+def test_parents_refuse_what_is_not_an_id(parents):
+  """Strings, nested lists, floats, booleans are not ids."""
+  with pytest.raises(InvalidParentsError):
+    TodoItem(id=1, title="T", parents=parents)
+  with pytest.raises(InvalidParentsError):
+    TodoItem.from_dict({"id": 1, "title": "T", "parents": parents})
+@
+
+Files written before [[parents]] existed store a single [[parent_id]]
+instead, [[null]] for a top-level item.  [[from_dict]] migrates it:
+[[null]] becomes [[[0] ]] and [[N]] becomes [[[N] ]], both through the
+normalization above.
+
+A file that has both keys normally has them in agreement, since
+[[to_dict]] derives one from the other (below).  When they disagree,
+someone changed [[parent_id]] after nytid wrote the file: by hand, with
+[[jq]], or with a script written before [[parents]] existed---users
+have always been able to move an item that way.  We honour the edit as
+a move, as [[edit --parent]] would make it: the item's parents become
+[[[parent_id] ]], or the top level for [[null]].  Refusing the file
+would punish a change that says clearly what was meant, and ignoring
+it would silently undo that change on the next save.  A move drops the
+item's other places, though, which the person who edited one key may
+not have thought of, so we say what happened on standard error.  The
+warning repeats on every load until a command saves the file, after
+which the keys agree again.
+
+<<migrate a stored [[parent_id]] to [[parents]]>>=
+if "parents" not in filtered:
+    filtered["parents"] = [data.get("parent_id")]
+elif "parent_id" in data:
+    <<honour a [[parent_id]] edited by hand>>
+@
+
+<<honour a [[parent_id]] edited by hand>>=
+stored = normalize_parents(filtered["parents"])
+derived = next((p for p in stored if p != ROOT_ID), None)
+if data["parent_id"] != derived:
+    filtered["parents"] = [data["parent_id"]]
+    place = (
+        "the top level" if data["parent_id"] is None
+        else f"#{data['parent_id']}"
+    )
+    typer.echo(
+        f"Warning: todo #{data.get('id')} has parent_id "
+        f"{data['parent_id']} but parents {stored}; "
+        f"moving it to {place}, as parent_id says",
+        err=True,
+    )
+@
+
+The other direction matters as much, because an older version of
+nytid may read the same file: the deployment on another machine,
+say.  It ignores keys it does not know, so without a [[parent_id]] it
+would show every sub-item as a top-level item.  [[to_dict]] therefore
+also writes [[parent_id]], derived from [[parents]]: the first parent
+that is an item, or [[null]] for an item that is only top-level.  That
+is the answer an older version can understand, and for an item with a
+single parent it is the whole truth.  An older version that
+\emph{saves} the file writes back only [[parent_id]], so further
+parents are lost then; that is why the deployment must be upgraded
+before an item is given a second parent.
+
+The derived key comes right before [[parents]], which keeps it at the
+position [[parent_id]] has always had in the dictionary.  Readers that
+take the keys in order, the headerless listing formats among them,
+find it where they always did; [[ls]] moves [[parents]] itself behind
+its computed columns (\cref{sec:todo-ls-record}).  The derived key is
+read back only to notice a hand edit (above), and
+[[replay_item_edits]] does not copy it, since it is not a field
+(\cref{sec:todo-read-modify-write}).
+
+<<derive [[parent_id]] for older readers>>=
+data["parent_id"] = next(iter(real_parents_of(self)), None)
+@
+
+Let's verify the migration both ways: an item read from the old form,
+and the old key written next to the new one at its old position.
+
+<<test functions>>=
+def test_parent_id_migrates_to_parents():
+  """`parent_id` loads as `parents` and is written alongside."""
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": 7}
+  ).parents == [7]
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": None}
+  ).parents == [ROOT_ID]
+  assert TodoItem.from_dict(
+    {"id": 2, "title": "T", "parent_id": 9, "parents": [0, 9]}
+  ).parents == [ROOT_ID, 9]
+
+  data = TodoItem(id=2, title="T", parents=[0, 12]).to_dict()
+  keys = list(data)
+  assert keys.index("parent_id") == 9
+  assert keys.index("parents") == 10
+  assert data["parent_id"] == 12
+  assert data["parents"] == [ROOT_ID, 12]
+  assert TodoItem(id=3, title="T").to_dict()["parent_id"] is None
+@
+
+A [[parent_id]] changed by hand moves the item, to another parent or
+to the top level, and says so; keys that agree say nothing:
+
+<<test functions>>=
+@pytest.mark.parametrize("parent_id,parents,place", [
+  (3, [3], "#3"),
+  (None, [ROOT_ID], "the top level"),
+])
+def test_edited_parent_id_moves_the_item(
+  capsys, parent_id, parents, place,
+):
+  """A disagreeing `parent_id` wins, with a warning."""
+  item = TodoItem.from_dict({
+    "id": 5, "title": "T", "parent_id": parent_id,
+    "parents": [ROOT_ID, 12],
+  })
+  assert item.parents == parents
+  warning = capsys.readouterr().err
+  assert "todo #5 has parent_id" in warning
+  assert f"moving it to {place}" in warning
+
+  TodoItem.from_dict({
+    "id": 5, "title": "T", "parent_id": 12,
+    "parents": [ROOT_ID, 12],
+  })
+  assert capsys.readouterr().err == ""
+@
+
+The same holds for a whole file.  A [[todos.json]] in the old form
+loads with the parents migrated, and saving it again writes both keys,
+consistent with each other:
+
+<<test functions>>=
+def test_old_todo_file_round_trips(temp_todo_dir):
+  """An old file gains `parents` and keeps `parent_id`."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "Parent", "parent_id": None},
+      {"id": 2, "title": "Child", "parent_id": 1},
+    ],
+  }))
+
+  next_id, todos = load_todos()
+  assert [t.parents for t in todos] == [[ROOT_ID], [1]]
+  save_todos(next_id, todos)
+
+  stored = json.loads(get_todo_file().read_text())["todos"]
+  assert [(t["parents"], t["parent_id"]) for t in stored] == [
+    ([ROOT_ID], None), ([1], 1),
+  ]
 @
 
 \subsection{Estimates Are Numbers, Not Strings}
@@ -849,7 +1134,7 @@ def test_todo_item_roundtrip():
         deadline="2026-02-28T23:59:00",
         estimated=3.0,
         description="Grade lab 3",
-        parent_id=None,
+        parents=[ROOT_ID],
         who="me",
         notes="Check Canvas for submissions",
         wd="/home/user/courses/DD1310",
@@ -1647,6 +1932,47 @@ IDs and collapse duplicates while preserving order.  That keeps the
 stack usable even after an interrupted command, without silently
 inventing new active work.
 
+The same repair would also hide a bug.  The top level is a parent with
+the id [[ROOT_ID]] (\cref{sec:todo-parents}), but it is not an item, so
+it can never be worked on.  If a walk up the parents ever handed the
+root to the code that activates ancestors, the root would be pushed,
+and the next normalization would drop it again as an id with no
+item---silently, so the walk's mistake would never show.  Every push
+therefore goes through [[push_active]], which refuses the root loudly
+instead.  It raises rather than asserts, so that the check survives
+[[python -O]].
+
+<<active stack helpers>>=
+def push_active(stack, todo_id, index=None):
+    """Put `todo_id` on `stack`, at `index` or on top.
+
+    Raises `ValueError` for `ROOT_ID`, which stands for the top
+    level and is not an item that can be active.
+    """
+    if todo_id == ROOT_ID:
+        raise ValueError(
+            "the top level (id 0) cannot be on the active stack"
+        )
+    if index is None:
+        stack.append(todo_id)
+    else:
+        stack.insert(index, todo_id)
+@
+
+Let's verify that an ordinary id is pushed where it is asked to go,
+and that the root is refused:
+
+<<test functions>>=
+def test_root_is_never_pushed():
+  """Pushing the root id is refused, any other id is not."""
+  stack = [3]
+  push_active(stack, 5)
+  push_active(stack, 4, index=1)
+  assert stack == [3, 4, 5]
+  with pytest.raises(ValueError):
+    push_active(stack, ROOT_ID)
+@
+
 <<active stack helpers>>=
 def synchronize_todo_statuses(
     todos: list[TodoItem], stack: list[int]
@@ -1729,11 +2055,12 @@ def load_todos_raw() -> tuple:
     try:
         with open(todo_file, "r") as f:
             data = json.load(f)
-            todos = [
-                TodoItem.from_dict(t)
-                for t in data.get("todos", [])
-            ]
-            return data.get("next_id", 1), todos
+            todos = []
+            for record in data.get("todos", []):
+                <<read one stored todo or refuse the file>>
+            <<refuse a todo whose id is the root's>>
+            <<keep [[next_id]] above every stored id>>
+            return next_id, todos
     except (
         json.JSONDecodeError,
         KeyError,
@@ -1775,6 +2102,157 @@ def load_todo_state() -> tuple:
     synchronize_todo_statuses(todos, stack)
     release_inactive_claims(todos, stack)
     return next_id, todos, stack
+@
+
+\paragraph{Files we refuse to read}%
+\label{sec:todo-refused-files}
+
+One stored id cannot be read at all: zero.  It is [[ROOT_ID]], the id
+the top level has among parent ids (\cref{sec:todo-parents}), and the
+commands never hand it out, since ids start at one.  A file edited by
+hand can still contain it, and then every item whose parents list~0
+might be top-level or a sub-item of that todo; nothing in the file
+says which.
+
+We refuse to load such a file rather than repair it.  Skipping the
+item would lose it, because the next save writes back only what was
+loaded.  Renumbering it would not lose it, but would silently change
+an id that notes, branch names, tracking labels such as [[todo:0]]
+and GitHub links may refer to, and it still could not tell which
+items listing~0 were meant to be its children.  Only the person who
+wrote the file can, so we name the file and the problem and stop.
+The check is not a [[ValueError]], which the reader turns into an
+empty list: that would make the next save wipe the file.  Exiting
+inside a [[mutate_todo_state]] callback abandons the write instead
+(\cref{sec:todo-read-modify-write}), so the file stays as it is.
+
+<<refuse a todo whose id is the root's>>=
+if any(t.id == ROOT_ID for t in todos):
+    refuse_todo_file(
+        todo_file,
+        f"holds a todo with id {ROOT_ID}, which stands for the "
+        "top level; give it another id, and its children their "
+        "new parent",
+    )
+@
+
+A [[parents]] value that is not a list of ids
+(\cref{sec:todo-parents-field}) is refused the same way, and for the
+same reasons: only the person who wrote it knows what it should have
+been, and the alternative to stopping, an empty list, would cost the
+whole file at the next save.  The error names the item, since the file
+may hold hundreds.
+
+<<read one stored todo or refuse the file>>=
+try:
+    todos.append(TodoItem.from_dict(record))
+except InvalidParentsError as error:
+    refuse_todo_file(
+        todo_file,
+        f"holds todo #{record.get('id')} with {error}",
+    )
+@
+
+Both refusals share one helper, so that they look alike and both end
+in [[typer.Exit]], whose meaning inside a callback is what keeps the
+file safe.
+
+<<active stack helpers>>=
+def refuse_todo_file(todo_file, problem):
+    """Exit with an error naming `todo_file` and `problem`.
+
+    Inside a `mutate_todo_state` callback the exit also
+    abandons the write, so the file stays as it is.
+    """
+    typer.echo(
+        f"Error: {todo_file} {problem}; fix it by hand",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+A stored [[next_id]] is repaired rather than refused, because its
+meaning is not in doubt: it is the id the next [[add]] takes, and the
+only values that work are those above every stored id.  One that is
+too low, after a hand edit or a merge of two files, would make the
+next item share an id with an old one, and one below~1 would hand out
+the root's id or a negative one.  We take the largest of the stored
+value, one, and one above the highest id in the file, so a correct
+value is kept as it is.
+
+<<keep [[next_id]] above every stored id>>=
+next_id = max(
+    data.get("next_id", 1), 1,
+    *(t.id + 1 for t in todos),
+)
+@
+
+Let's verify that a file with such a todo is refused by a reading
+command and by a writing one, and that neither changes it:
+
+<<test functions>>=
+def test_todo_with_root_id_is_refused(temp_todo_dir):
+  """A stored todo #0 stops every command; the file stays."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 2,
+    "todos": [
+      {"id": 0, "title": "Zero", "parents": [0]},
+      {"id": 1, "title": "One", "parents": [0]},
+    ],
+  }))
+  stored = get_todo_file().read_text()
+
+  for args in (["ls", "--who", ""], ["add", "-t", "New", "--prio", "1"]):
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 1
+    assert "holds a todo with id 0" in result.output
+    assert get_todo_file().read_text() == stored
+@
+
+A parents value that is not a list of ids stops the commands the same
+way, naming the item:
+
+<<test functions>>=
+def test_todo_with_bad_parents_is_refused(temp_todo_dir):
+  """A string parent stops every command; the file stays."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "One", "parents": [0]},
+      {"id": 2, "title": "Two", "parents": ["1"]},
+    ],
+  }))
+  stored = get_todo_file().read_text()
+
+  for args in (["ls", "--who", ""], ["add", "-t", "New", "--prio", "1"]):
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 1
+    assert "holds todo #2 with parent '1'" in result.output
+    assert get_todo_file().read_text() == stored
+@
+
+And a [[next_id]] that is too low is raised to the first free id,
+while a correct one is kept:
+
+<<test functions>>=
+@pytest.mark.parametrize("stored,ids,loaded", [
+  (0, [1, 5], 6),
+  (-3, [], 1),
+  (9, [1], 9),
+])
+def test_next_id_stays_above_every_id(
+  temp_todo_dir, stored, ids, loaded,
+):
+  """next_id is at least 1 and above the highest stored id."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": stored,
+    "todos": [{"id": i, "title": f"#{i}"} for i in ids],
+  }))
+  next_id, _ = load_todos()
+  assert next_id == loaded
 @
 
 
@@ -2047,6 +2525,12 @@ would drop a label that another process added meanwhile.  The [[skip]]
 argument keeps such fields out of the replay, and the caller applies
 the increment to the fresh item instead.
 
+Only fields are replayed.  The dictionary also carries [[parent_id]],
+which is derived from [[parents]] for older readers
+(\cref{sec:todo-parents-field}); replaying it would create a stray
+attribute of that name rather than move the item, and the move it
+reflects arrives through [[parents]] anyway.
+
 <<active stack helpers>>=
 def item_fields(item):
     """Return a detached copy of the item's stored fields."""
@@ -2070,7 +2554,7 @@ def replay_item_edits(
         read = before
     current = target.to_dict()
     for key, value in edited.to_dict().items():
-        if key in skip:
+        if key in skip or key not in TodoItem.__dataclass_fields__:
             continue
         if (
             before.get(key) != value
@@ -2210,7 +2694,7 @@ navigate it: finding parents and children, finding siblings (for
 priority comparison), walking up and down, and checking whether a
 parent's children are all done.
 
-Why store sub-items flat, with each item naming its parent, rather
+Why store sub-items flat, with each item naming its parents, rather
 than nesting them?  Because flat storage simplifies JSON
 serialization, avoids recursive data structures, and lets commands
 like [[todo ls --flat]] work without flattening logic.
@@ -2233,20 +2717,26 @@ to those belonging to a given worker, treating [[who=None]] as
 \subsection{Parents, the top level, and context}%
 \label{sec:todo-parents}
 
-So far every item has at most one parent, stored in [[parent_id]], and
-the items form a forest.  That is about to change.  An item will be
-allowed several parents, all equal, and it may be a top-level item and
-a sub-item at the same time---a prerequisite shared by two projects,
-say.  The items then form a directed acyclic graph rather than a
-forest, and questions that have one answer in a tree, such as
-\enquote{which is the parent?} or \enquote{what is the path from the
-top?}, get several.
+An item may have several parents, all equal, and it may be a
+top-level item and a sub-item at the same time---a prerequisite shared
+by two projects, say.  The items then form a directed acyclic graph
+rather than a forest, and questions that have one answer in a tree,
+such as \enquote{which is the parent?} or \enquote{what is the path
+from the top?}, get several.  The commands do not yet give an item a
+second parent, but a hand-edited [[todos.json]] can
+(\cref{sec:todo-parents-field}), and every part of the module must
+then still behave.
 
-We prepare for that by asking every such question through the helpers
-of this subsection.  They still read [[parent_id]], so the change of
-storage will touch them and nothing else.  Each helper answers the
-question as it is asked of a graph; with one parent per item, the
-answer is exactly the one the tree code it replaced gave.
+We ensure that by asking every such question through the helpers of
+this subsection.  They are the only code that navigates by
+[[parents]]; the few other places that touch the list treat it as a
+stored value, not as a question about the graph.  [[edit]] compares
+it with the snapshot to see whether the item moved and replaces it on
+a move, and the placement helpers ([[set_priority_with_subtree]],
+[[commit_flag_edits]]) keep a copy of it as part of the item's old
+place.  Each helper answers its question as it is asked of a graph;
+with one parent per item, the answer is exactly the one the tree code
+it replaced gave.
 
 The top level is treated as a parent of its own: a virtual root with
 the id [[ROOT_ID]], zero.  That turns \enquote{top-level} from a special
@@ -2268,9 +2758,7 @@ def parents_of(item: TodoItem) -> list[int]:
     The top level counts as a parent with the id `ROOT_ID`,
     so a top-level item answers `[ROOT_ID]`.
     """
-    if item.parent_id is None:
-        return [ROOT_ID]
-    return [item.parent_id]
+    return item.parents
 
 
 def real_parents_of(item: TodoItem) -> list[int]:
@@ -2414,7 +2902,7 @@ answering what it always has, and [[get_parent]] goes on placing it
 against the top level.  The root comes last, for a top-level item with
 no other parent.  An item with only one parent has nothing to choose
 between, so it answers that parent without looking anything up, which
-keeps the common case as cheap as reading [[parent_id]] was.
+keeps the common case as cheap as reading the one parent.
 
 [[context_path]] follows primary parents up to the root and returns
 the line root first, the reading order of a path ([[353 > 356 > 359]])
@@ -2501,7 +2989,7 @@ def test_root_is_the_parent_of_top_level_items():
   """`ROOT_ID` stands for the top level among parent ids."""
   todos = [
     TodoItem(id=1, title="Top"),
-    TodoItem(id=2, title="Child", parent_id=1),
+    TodoItem(id=2, title="Child", parents=[1]),
     TodoItem(id=3, title="Other top"),
   ]
   assert parents_of(todos[0]) == [ROOT_ID]
@@ -2520,9 +3008,9 @@ def test_walks_follow_the_single_parent_line():
   """Ancestors nearest first, the path root first."""
   todos = [
     TodoItem(id=1, title="A"),
-    TodoItem(id=2, title="B", parent_id=1),
-    TodoItem(id=3, title="C", parent_id=2),
-    TodoItem(id=4, title="D", parent_id=1),
+    TodoItem(id=2, title="B", parents=[1]),
+    TodoItem(id=3, title="C", parents=[2]),
+    TodoItem(id=4, title="D", parents=[1]),
   ]
   assert [t.id for t in ancestors_of(todos, todos[2])] == [2, 1]
   assert [t.id for t in context_path(todos, todos[2])] == [1, 2]
@@ -2541,14 +3029,64 @@ end, and must not list the item it started from:
 def test_walks_survive_a_parent_cycle():
   """A cycle ends every walk, without listing the start."""
   todos = [
-    TodoItem(id=1, title="A", parent_id=3),
-    TodoItem(id=2, title="B", parent_id=1),
-    TodoItem(id=3, title="C", parent_id=2),
+    TodoItem(id=1, title="A", parents=[3]),
+    TodoItem(id=2, title="B", parents=[1]),
+    TodoItem(id=3, title="C", parents=[2]),
   ]
   assert [t.id for t in descendants_of(todos, 1)] == [2, 3]
   assert [t.id for t in ancestors_of(todos, todos[0])] == [3, 2]
   assert [t.id for t in context_path(todos, todos[0])] == [2, 3]
   assert descendants_of(todos, ROOT_ID) == []
+@
+
+Several parents bring the shapes a tree cannot have.  In a diamond,
+\#4 is below both \#2 and \#3, which are both below \#1: the walks
+list \#4 and \#1 once each.  An item that is also top-level has the
+root among its parents, yet the root never turns up as an ancestor or
+on a path, since it is not an item.
+
+<<test functions>>=
+def test_walks_list_a_diamond_once():
+  """Below and above, a shared item is listed once."""
+  todos = [
+    TodoItem(id=1, title="Top"),
+    TodoItem(id=2, title="Left", parents=[1]),
+    TodoItem(id=3, title="Right", parents=[1]),
+    TodoItem(id=4, title="Shared", parents=[2, 3]),
+    TodoItem(id=5, title="Also top-level", parents=[ROOT_ID, 4]),
+  ]
+  assert [t.id for t in children_of(todos, 1)] == [2, 3]
+  assert [t.id for t in descendants_of(todos, 1)] == [2, 4, 5, 3]
+  assert [t.id for t in ancestors_of(todos, todos[3])] == [2, 3, 1]
+  assert [t.id for t in ancestors_of(todos, todos[4])] == [4, 2, 3, 1]
+  assert [t.id for t in context_path(todos, todos[4])] == [1, 2, 4]
+  assert [
+    t.id for t in children_of(todos, ROOT_ID)
+  ] == [1, 5]
+@
+
+Which parent a line runs through follows the rules of
+[[primary_parent]]: the context first, then the first parent that
+exists, and a missing one only when no other is left.
+
+<<test functions>>=
+def test_primary_parent_prefers_context_then_existing():
+  """Context first, then an existing parent, then any."""
+  todos = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="B"),
+    TodoItem(id=3, title="Child", parents=[1, 2]),
+    TodoItem(id=4, title="Orphan", parents=[98, 99]),
+    TodoItem(id=5, title="Half orphan", parents=[99, 2]),
+  ]
+  assert primary_parent(todos, todos[2]) == 1
+  assert primary_parent(todos, todos[2], context_ids=[2]) == 2
+  assert [
+    t.id for t in context_path(todos, todos[2], [2])
+  ] == [2]
+  assert primary_parent(todos, todos[3]) == 98
+  assert primary_parent(todos, todos[4]) == 2
+  assert get_parent(todos, todos[3]) is None
 @
 
 \subsection{Helpers for the commands}
@@ -2613,8 +3151,8 @@ def test_get_descendants_reaches_grandchildren():
   """Descendants include deeper levels, children do not."""
   todos = [
     TodoItem(id=1, title="Root"),
-    TodoItem(id=2, title="Child", parent_id=1),
-    TodoItem(id=3, title="Grandchild", parent_id=2),
+    TodoItem(id=2, title="Child", parents=[1]),
+    TodoItem(id=3, title="Grandchild", parents=[2]),
     TodoItem(id=4, title="Unrelated"),
   ]
   assert {t.id for t in get_children(todos, 1)} == {2}
@@ -2914,11 +3452,11 @@ def get_current_context_todo(
 
 <<test functions>>=
 def test_get_children():
-    """Children are items with matching parent_id."""
+    """Children are items listing the parent in parents."""
     todos = [
         TodoItem(id=1, title="Parent"),
-        TodoItem(id=2, title="Child 1", parent_id=1),
-        TodoItem(id=3, title="Child 2", parent_id=1),
+        TodoItem(id=2, title="Child 1", parents=[1]),
+        TodoItem(id=3, title="Child 2", parents=[1]),
         TodoItem(id=4, title="Other"),
     ]
     children = get_children(todos, 1)
@@ -2932,11 +3470,11 @@ def test_check_parent_completion():
         TodoItem(id=1, title="Parent"),
         TodoItem(
             id=2, title="C1",
-            parent_id=1, status="done"
+            parents=[1], status="done"
         ),
         TodoItem(
             id=3, title="C2",
-            parent_id=1, status="pending"
+            parents=[1], status="pending"
         ),
     ]
     assert not check_parent_completion(todos, 1)
@@ -2948,8 +3486,8 @@ def test_get_ancestors_root_first():
     """The chain is returned from the root down."""
     todos = [
         TodoItem(id=353, title="Root"),
-        TodoItem(id=356, title="Mid", parent_id=353),
-        TodoItem(id=359, title="Leaf", parent_id=356),
+        TodoItem(id=356, title="Mid", parents=[353]),
+        TodoItem(id=359, title="Leaf", parents=[356]),
     ]
     chain = get_ancestors(todos, todos[2])
     assert [t.id for t in chain] == [353, 356]
@@ -2960,12 +3498,12 @@ def test_get_ancestors_root_first():
 def test_get_ancestors_stops_at_orphan_and_cycle():
     """A missing parent ends the chain; a cycle cannot hang it."""
     orphan = [
-        TodoItem(id=2, title="Orphan", parent_id=99),
+        TodoItem(id=2, title="Orphan", parents=[99]),
     ]
     assert get_ancestors(orphan, orphan[0]) == []
     cycle = [
-        TodoItem(id=1, title="A", parent_id=2),
-        TodoItem(id=2, title="B", parent_id=1),
+        TodoItem(id=1, title="A", parents=[2]),
+        TodoItem(id=2, title="B", parents=[1]),
     ]
     assert [
         t.id for t in get_ancestors(cycle, cycle[0])
@@ -3297,10 +3835,10 @@ def test_compute_child_priority_range_lone_child():
         TodoItem(id=1, title="A", priority=5.0),
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(
-            id=3, title="X", priority=4.0, parent_id=1,
+            id=3, title="X", priority=4.0, parents=[1],
         ),
         TodoItem(
-            id=4, title="Y", priority=3.5, parent_id=3,
+            id=4, title="Y", priority=3.5, parents=[3],
         ),
     ]
     assert compute_child_priority_range(
@@ -3320,7 +3858,7 @@ def test_compute_child_priority_range_lone_top_level():
     todos = [
         TodoItem(id=1, title="A", priority=5.0),
         TodoItem(
-            id=2, title="X", priority=0.0, parent_id=1,
+            id=2, title="X", priority=0.0, parents=[1],
         ),
     ]
     assert compute_child_priority_range(
@@ -3335,7 +3873,7 @@ def test_compute_child_priority_range_level_ancestor():
         TodoItem(id=1, title="A", priority=5.0),
         TodoItem(id=2, title="A2", priority=5.0),
         TodoItem(
-            id=3, title="X", priority=4.5, parent_id=1,
+            id=3, title="X", priority=4.5, parents=[1],
         ),
     ]
     assert compute_child_priority_range(
@@ -3349,10 +3887,10 @@ def test_compute_child_priority_range_tie_stays_enclosed():
         TodoItem(id=1, title="A", priority=5.0),
         TodoItem(id=2, title="B", priority=4.5),
         TodoItem(
-            id=3, title="c1", priority=4.8, parent_id=1,
+            id=3, title="c1", priority=4.8, parents=[1],
         ),
         TodoItem(
-            id=4, title="c2", priority=4.8, parent_id=1,
+            id=4, title="c2", priority=4.8, parents=[1],
         ),
     ]
     high, low = compute_child_priority_range(
@@ -3366,10 +3904,10 @@ def test_compute_child_priority_range_survives_cycle():
     """A parent cycle ends the walk instead of hanging."""
     todos = [
         TodoItem(
-            id=1, title="A", priority=5.0, parent_id=2,
+            id=1, title="A", priority=5.0, parents=[2],
         ),
         TodoItem(
-            id=2, title="B", priority=4.0, parent_id=1,
+            id=2, title="B", priority=4.0, parents=[1],
         ),
     ]
     assert compute_child_priority_range(
@@ -3652,7 +4190,7 @@ def set_priority_with_subtree(
     """Store `priority` on `item` and move the subtrees
     its new place affects (see `settle_placement`)."""
     old_range = child_priority_range_or_none(todos, item)
-    old_place = (item.priority, item.parent_id)
+    old_place = (item.priority, list(item.parents))
     item.priority = priority
     settle_placement(todos, item, old_range, old_place)
 @
@@ -3669,13 +4207,13 @@ def abc_with_children():
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(id=3, title="C", priority=1.0),
         TodoItem(
-            id=4, title="A1", priority=4.5, parent_id=1,
+            id=4, title="A1", priority=4.5, parents=[1],
         ),
         TodoItem(
-            id=5, title="A2", priority=4.0, parent_id=1,
+            id=5, title="A2", priority=4.0, parents=[1],
         ),
         TodoItem(
-            id=6, title="A3", priority=3.5, parent_id=1,
+            id=6, title="A3", priority=3.5, parents=[1],
         ),
     ]
 
@@ -3684,7 +4222,7 @@ def child_priorities(todos, parent_id):
     """The children's stored priorities, by id."""
     return [
         t.priority for t in todos
-        if t.parent_id == parent_id
+        if t.parents == [parent_id]
     ]
 
 
@@ -3702,7 +4240,7 @@ def test_move_subtree_promotion():
     sibling it passed."""
     todos = abc_with_children()
     todos.append(TodoItem(
-        id=7, title="C1", priority=-4.0, parent_id=3,
+        id=7, title="C1", priority=-4.0, parents=[3],
     ))
     set_priority_with_subtree(todos, todos[2], 6.0)
     assert todos[6].priority == pytest.approx(5.5)
@@ -3731,7 +4269,7 @@ def test_move_subtree_grandchildren_once():
     parent and that parent's lower sibling."""
     todos = abc_with_children()
     todos.append(TodoItem(
-        id=7, title="A1a", priority=4.25, parent_id=4,
+        id=7, title="A1a", priority=4.25, parents=[4],
     ))
     set_priority_with_subtree(todos, todos[0], 2.0)
     assert todos[6].priority == 1.625
@@ -3747,7 +4285,7 @@ def test_move_subtree_lone_child_grandchild():
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(id=3, title="C", priority=1.0),
         TodoItem(
-            id=4, title="X", priority=4.0, parent_id=1,
+            id=4, title="X", priority=4.0, parents=[1],
         ),
     ]
     first = default_priority_without_siblings(
@@ -3755,7 +4293,7 @@ def test_move_subtree_lone_child_grandchild():
     )
     assert 3.0 < first < 4.0
     todos.append(TodoItem(
-        id=5, title="X1", priority=first, parent_id=4,
+        id=5, title="X1", priority=first, parents=[4],
     ))
     set_priority_with_subtree(todos, todos[0], 2.0)
     assert 1.0 < todos[4].priority < todos[3].priority
@@ -3774,15 +4312,15 @@ def test_move_subtree_leaves_others_alone():
     todos += [
         TodoItem(
             id=7, title="Unranked", priority=None,
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=8, title="Done", priority=3.75,
-            parent_id=1, status="done",
+            parents=[1], status="done",
         ),
         TodoItem(
             id=9, title="Legacy", priority=8.0,
-            parent_id=1,
+            parents=[1],
         ),
     ]
     set_priority_with_subtree(todos, todos[0], 2.0)
@@ -3800,7 +4338,7 @@ def test_move_subtree_stays_strictly_inside():
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(id=3, title="C", priority=1.0),
         TodoItem(
-            id=4, title="Tied", priority=5.0, parent_id=1,
+            id=4, title="Tied", priority=5.0, parents=[1],
         ),
     ]
     set_priority_with_subtree(todos, todos[0], 2.0)
@@ -3813,7 +4351,7 @@ def test_move_subtree_from_unranked_parent():
         TodoItem(id=1, title="A", priority=None),
         TodoItem(
             id=2, title="Child", priority=4.0,
-            parent_id=1,
+            parents=[1],
         ),
     ]
     set_priority_with_subtree(todos, todos[0], 2.0)
@@ -3826,10 +4364,10 @@ def test_move_subtree_survives_cycle():
     and is not mapped twice."""
     todos = [
         TodoItem(
-            id=1, title="A", priority=5.0, parent_id=2,
+            id=1, title="A", priority=5.0, parents=[2],
         ),
         TodoItem(
-            id=2, title="B", priority=4.5, parent_id=1,
+            id=2, title="B", priority=4.5, parents=[1],
         ),
     ]
     set_priority_with_subtree(todos, todos[0], 7.0)
@@ -3878,7 +4416,7 @@ def squeeze_sibling_above(
     `item`, whose child range `item` has just cut short,
     and return the items it moved.
 
-    `old_place` is `item`'s `(priority, parent_id)`
+    `old_place` is `item`'s `(priority, parents)`
     before it moved, or `None` when `item` is new.
     """
     if item.priority is None or item.status == "done":
@@ -3920,7 +4458,7 @@ moved item differs, and only in its number and parent, which are all
 before = [t for t in todos if t is not item]
 if old_place is not None:
     stand_in = copy.copy(item)
-    stand_in.priority, stand_in.parent_id = old_place
+    stand_in.priority, stand_in.parents = old_place
     before.append(stand_in)
 @
 
@@ -3945,7 +4483,7 @@ def settle_placement(
     Renumber everything if that left too little room.
 
     `old_range` is `item`'s child range before the
-    change and `old_place` its `(priority, parent_id)`;
+    change and `old_place` its `(priority, parents)`;
     both are `None` for an item that is new.
     """
     touched = [item]
@@ -3971,10 +4509,10 @@ def test_settle_squeezes_the_sibling_above():
     todos = abc_with_children()
     todos += [
         TodoItem(
-            id=7, title="B1", priority=2.5, parent_id=2,
+            id=7, title="B1", priority=2.5, parents=[2],
         ),
         TodoItem(
-            id=8, title="B2", priority=1.5, parent_id=2,
+            id=8, title="B2", priority=1.5, parents=[2],
         ),
     ]
     set_priority_with_subtree(todos, todos[0], 2.0)
@@ -3991,7 +4529,7 @@ def test_settle_leaves_a_widened_range_alone():
         TodoItem(id=2, title="X", priority=5.0),
         TodoItem(id=3, title="Y", priority=1.0),
         TodoItem(
-            id=4, title="S1", priority=6.5, parent_id=1,
+            id=4, title="S1", priority=6.5, parents=[1],
         ),
     ]
     set_priority_with_subtree(todos, todos[1], 3.0)
@@ -4141,19 +4679,19 @@ def test_renumber_priorities_restores_room():
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(
             id=3, title="A1", priority=3.0 + 2e-9,
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=4, title="A2", priority=3.0 + 1e-9,
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=5, title="A1a", priority=3.0 + 1.5e-9,
-            parent_id=3,
+            parents=[3],
         ),
         TodoItem(
             id=6, title="Done", priority=3.0 + 1e-9,
-            parent_id=1, status="done",
+            parents=[1], status="done",
         ),
     ]
     renumber_priorities(todos)
@@ -4183,12 +4721,12 @@ def test_settle_renumbers_when_room_runs_out():
         TodoItem(id=2, title="B", priority=3.0),
         TodoItem(
             id=3, title="A1", priority=3.0 + 1e-9,
-            parent_id=1,
+            parents=[1],
         ),
     ]
     new = TodoItem(
         id=4, title="A2", priority=3.0 + 5e-10,
-        parent_id=1,
+        parents=[1],
     )
     todos.append(new)
     settle_placement(todos, new)
@@ -4219,7 +4757,7 @@ def test_many_bottom_children_keep_distinct_numbers(
         ])
         assert result.exit_code == 0, result.output
     _, todos = load_todos()
-    children = [t.priority for t in todos if t.parent_id == 1]
+    children = [t.priority for t in todos if t.parents == [1]]
     assert len(set(children)) == 60
     assert all(3.0 < p < 5.0 for p in children)
 @
@@ -5389,12 +5927,12 @@ def test_render_todo_markdown():
     )
     child1 = TodoItem(
         id=2, title="Download",
-        parent_id=1, priority=1.0,
+        parents=[1], priority=1.0,
         notes="From Canvas",
     )
     child2 = TodoItem(
         id=3, title="Run tests",
-        parent_id=1, priority=2.0,
+        parents=[1], priority=2.0,
     )
     todos = [parent, child1, child2]
 
@@ -5420,7 +5958,7 @@ def test_render_todo_markdown_description():
     )
     child = TodoItem(
         id=2, title="Download",
-        parent_id=1, priority=1.0,
+        parents=[1], priority=1.0,
         description="What to check once fetched.",
     )
     todos = [parent, child]
@@ -6309,7 +6847,7 @@ def test_add_other_workers_child_avoids_mine(
     number below the existing subtree."""
     save_todos(4, [
         TodoItem(
-            id=n, title=t, priority=p, parent_id=parent,
+            id=n, title=t, priority=p, parents=[parent],
             created="2026-02-20T10:00:00",
             who=default_username,
         )
@@ -6485,7 +7023,7 @@ def parent_with_children(*priorities):
     todos += [
         TodoItem(
             id=10 + i, title=f"A{i}", priority=p,
-            parent_id=1,
+            parents=[1],
         )
         for i, p in enumerate(priorities)
     ]
@@ -6673,7 +7211,7 @@ def test_place_existing_item_under_unranked_parent():
                  priority=None,
                  created="2026-01-01T00:00:00"),
         TodoItem(id=2, title="Child", priority=3.0,
-                 parent_id=1,
+                 parents=[1],
                  created="2026-01-01T00:00:00"),
     ]
     assert place_existing_item(
@@ -7538,7 +8076,7 @@ def activate_todo_state(todo_id, who=None, force=False):
             raise typer.Exit(1)
         <<claim [[item]] for [[who]]>>
         if resolved_id not in stack:
-            stack.append(resolved_id)
+            push_active(stack, resolved_id)
         return (
             next_id, todos, stack,
             resolved_id, item, displaced,
@@ -7911,7 +8449,7 @@ def test_start_child_ignores_claim_on_active_parent(
     TodoItem(
       id=2, title="My child",
       created="2026-02-20T10:00:00",
-      parent_id=1,
+      parents=[1],
     ),
   ])
   save_active_stack([1])
@@ -7942,7 +8480,7 @@ def test_start_other_workers_pending_item_keeps_owner(
     TodoItem(
       id=2, title="Alice's queued task",
       created="2026-02-20T10:00:00",
-      parent_id=1,
+      parents=[1],
       who="alice",
     ),
   ])
@@ -8498,7 +9036,7 @@ def test_done_stamps_closed_on_item_and_parent(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -8583,7 +9121,7 @@ def ensure_ancestors_active(
             if ancestor.id not in stack:
                 idx = stack.index(item.id) \
                     if item.id in stack else len(stack)
-                stack.insert(idx, ancestor.id)
+                push_active(stack, ancestor.id, idx)
                 pushed.add(ancestor.id)
         for fresh in todos:
             if fresh.id in pushed:
@@ -8648,7 +9186,7 @@ def test_start_child_auto_activates_parent(
         TodoItem(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310"],
         ),
     ])
@@ -8681,13 +9219,13 @@ def test_start_grandchild_auto_activates_chain(
         TodoItem(
             id=2, title="Parent",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310"],
         ),
         TodoItem(
             id=3, title="Grandchild",
             created="2026-02-20T10:00:00",
-            parent_id=2,
+            parents=[2],
             labels=["DD1310"],
         ),
     ])
@@ -8697,6 +9235,33 @@ def test_start_grandchild_auto_activates_chain(
 
     stack = load_active_stack()
     assert stack == [1, 2, 3]
+@
+
+An item with several parents, as a hand-edited file can give it, is
+started in the line the user is already working in.  Item~3 is
+top-level and under both~1 and~2; with~2 active, starting~3 must
+activate nothing but~3 itself, neither~1, its first parent, nor the
+root.
+
+<<test functions>>=
+def test_start_shared_item_follows_the_active_parent(
+    temp_todo_dir,
+):
+    """Starting a multi-parent item adds no other line."""
+    save_todos(4, [
+        TodoItem(id=1, title="A", created="2026-02-20T10:00:00"),
+        TodoItem(id=2, title="B", created="2026-02-20T10:00:00"),
+        TodoItem(
+            id=3, title="Shared", parents=[ROOT_ID, 1, 2],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    save_active_stack([2])
+
+    result = runner.invoke(cli, ["start", "3"])
+    assert result.exit_code == 0, result.output
+
+    assert load_active_stack() == [2, 3]
 
 
 def test_start_window_disables_generic_tmux_context_sync(
@@ -8748,7 +9313,7 @@ def test_start_window_disables_generic_tmux_context_for_ancestors(
             id=2,
             title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             labels=["review"],
             wd="/tmp/project",
             command="python -m pytest",
@@ -8790,7 +9355,7 @@ def test_start_child_skips_already_active_parent(
         TodoItem(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1])
@@ -8823,7 +9388,7 @@ def test_ancestors_activated_meanwhile_are_not_tracked(
     TodoItem(
       id=2, title="Child",
       created="2026-02-20T10:00:00",
-      parent_id=1,
+      parents=[1],
     ),
   ])
   save_active_stack([1, 2])
@@ -8975,11 +9540,11 @@ def test_context_parent_released_when_child_done(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="User's part", parent_id=1,
+      id=2, title="User's part", parents=[1],
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=3, title="Agent's part", parent_id=1,
+      id=3, title="Agent's part", parents=[1],
       created="2026-02-20T10:00:00", who="dan-claude",
     ),
   ])
@@ -9016,11 +9581,11 @@ def test_context_parent_handed_to_other_worker(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="User's part", parent_id=1,
+      id=2, title="User's part", parents=[1],
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=3, title="Agent's part", parent_id=1,
+      id=3, title="Agent's part", parents=[1],
       created="2026-02-20T10:00:00", who="dan-claude",
     ),
   ])
@@ -9056,7 +9621,7 @@ def test_run_end_releases_context_parent(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="Agent's part", parent_id=1,
+      id=2, title="Agent's part", parents=[1],
       created="2026-02-20T10:00:00", who="dan-claude",
     ),
     TodoItem(
@@ -9092,11 +9657,11 @@ def test_explicit_parent_stays_after_child_done(temp_todo_dir):
   save_todos(4, [
     TodoItem(id=1, title="Parent", created="2026-02-20T10:00:00"),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=3, title="Sibling", parent_id=1,
+      id=3, title="Sibling", parents=[1],
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -9114,11 +9679,11 @@ def test_explicit_start_turns_context_into_claim(temp_todo_dir):
   save_todos(4, [
     TodoItem(id=1, title="Parent", created="2026-02-20T10:00:00"),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=3, title="Sibling", parent_id=1,
+      id=3, title="Sibling", parents=[1],
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -10377,15 +10942,16 @@ out of the active todo is exactly the item auto-parenting would have
 put under it.
 
 <<helpers>>=
-def discovered_while_working_on(todos, parent_id):
+def discovered_while_working_on(todos, parents):
     """Return the active todo a new item is not placed under.
 
     That is the active todo of the current context, as
-    auto-parenting finds it, unless it is `parent_id`;
-    `None` when there is no such todo.
+    auto-parenting finds it, unless it is among `parents`,
+    the new item's parents; `None` when there is no such
+    todo.
     """
     active = get_current_context_todo(todos)
-    if active is None or active.id == parent_id:
+    if active is None or active.id in parents:
         return None
     return active
 @
@@ -10405,7 +10971,9 @@ if (
     and not no_discovered_from
     and (parent is not None or top_level)
 ):
-    source = discovered_while_working_on(todos, resolved_parent)
+    source = discovered_while_working_on(
+        todos, normalize_parents([resolved_parent])
+    )
     if source is not None:
         resolved_discovered_from = source.id
         typer.echo(
@@ -10453,7 +11021,7 @@ def test_add_records_active_todo_when_placed_elsewhere(
   assert result.exit_code == 0, result.output
   _, todos = load_todos()
   found = next(t for t in todos if t.title == "Found it")
-  assert found.parent_id == parent_id
+  assert found.parents == normalize_parents([parent_id])
   assert found.discovered_from == source
   announced = "Discovered from: #1 Fix the parser" in result.output
   assert announced == (source is not None)
@@ -10504,7 +11072,7 @@ def test_add_discovered_from_options(
   assert result.exit_code == 0, result.output
   _, todos = load_todos()
   found = next(t for t in todos if t.title == "Found it")
-  assert found.parent_id is None
+  assert found.parents == [ROOT_ID]
   assert found.discovered_from == source
 @
 
@@ -10604,7 +11172,7 @@ CANDIDATE_ID = -1
 candidate = TodoItem(
     id=CANDIDATE_ID,
     title=priority_title,
-    parent_id=resolved_parent,
+    parents=[resolved_parent],
     labels=inherited_labels,
     deadline=inherited_deadline,
     estimated=(
@@ -10975,7 +11543,7 @@ def append_new_todo(next_id, todos, stack):
         deadline=inherited_deadline,
         estimated=estimated_hours,
         description=description or "",
-        parent_id=resolved_parent,
+        parents=[resolved_parent],
         who=resolved_who,
         wd=resolved_wd,
         worktree=normalize_worktree_name(worktree),
@@ -11003,7 +11571,7 @@ def a_and_b_with_children():
     and 3.5."""
     return [
         TodoItem(
-            id=n, title=t, priority=p, parent_id=parent,
+            id=n, title=t, priority=p, parents=[parent],
             created="2026-02-20T10:00:00",
             who=default_username,
         )
@@ -11051,7 +11619,7 @@ def test_rerank_squeezes_the_sibling_above(
     """A dropped below B compresses B's child above it."""
     save_todos(6, a_and_b_with_children() + [
         TodoItem(
-            id=5, title="B1", priority=1.0, parent_id=2,
+            id=5, title="B1", priority=1.0, parents=[2],
             created="2026-02-20T10:00:00",
             who=default_username,
         ),
@@ -11336,7 +11904,7 @@ parent_item = TodoItem(
     status="pending",
     created=now,
     deadline=inherited_deadline,
-    parent_id=resolved_parent,
+    parents=[resolved_parent],
     notes=parsed.notes,
     discovered_from=resolved_discovered_from,
 )
@@ -11783,7 +12351,7 @@ child = TodoItem(
     status="pending",
     created=now,
     deadline=parent_deadline,
-    parent_id=parent_id,
+    parents=[parent_id],
     who=parent_who,
     notes=parsed_child.notes,
     env=parent_env,
@@ -12640,7 +13208,7 @@ def test_ls_default_hides_children(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -12662,7 +13230,7 @@ def test_ls_all_shows_children(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -12689,13 +13257,13 @@ def test_ls_all_stops_at_children(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Grandchild task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=2,
+            parents=[2],
         ),
     ])
     rich = runner.invoke(
@@ -12726,13 +13294,13 @@ def save_three_generations():
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Grandchild task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=2,
+            parents=[2],
         ),
     ])
 
@@ -12793,12 +13361,12 @@ def test_ls_rich_grandchild_indent_survives_wrapping(temp_todo_dir):
             status="pending", who="me",
         ),
         TodoItem(
-            id=2, title="child " + long_title, parent_id=1,
+            id=2, title="child " + long_title, parents=[1],
             created="2026-02-20T10:00:00",
             status="pending", who="me",
         ),
         TodoItem(
-            id=3, title="grandchild " + long_title, parent_id=2,
+            id=3, title="grandchild " + long_title, parents=[2],
             created="2026-02-20T10:00:00",
             status="pending", who="me",
         ),
@@ -12843,7 +13411,7 @@ def test_ls_who_promotes_orphaned_child(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="dan-claude",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -12865,7 +13433,7 @@ def test_ls_all_who_promotes_orphaned_child(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="pending", who="dan-claude",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -12924,13 +13492,13 @@ def test_ls_rich_progress_stays_in_title_column(
             id=2, title="Done child",
             created="2026-02-20T10:00:00",
             status="done", who="me",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Pending child",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -12971,7 +13539,7 @@ def test_ls_rich_keeps_bracketed_titles(temp_todo_dir):
             id=2, title="Child [x] task",
             created="2026-02-20T10:00:00",
             status="pending", who="me",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     result = runner.invoke(
@@ -13150,9 +13718,19 @@ then move them.  [[ls_record]] therefore takes such columns as
 the late stored fields, so that in every record the late stored fields
 are the very end, and a new one moves nothing.
 
+[[parents]] (\cref{sec:todo-parents-field}) took over from
+[[parent_id]], so it might seem to belong in [[parent_id]]'s column.
+But a script that reads that column expects one id or nothing, and a
+list there would break it as surely as a shifted column would.  The
+derived [[parent_id]] that [[to_dict()]] writes keeps that column, with
+the meaning it always had, and [[parents]] is the fifth field to move
+behind the computed values.  The headerless rows thus grow by one
+column at the end and lose none.
+
 <<constants>>=
 FIELDS_AFTER_COMPUTED = (
     "closed", "claimed_by", "context_claim", "discovered_from",
+    "parents",
 )
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio, computed=None):
@@ -13395,7 +13973,7 @@ for item in sorted_items:
 
 The tree is a depth-first walk that starts at the visible roots and
 descends only into children that are themselves in [[filtered]].
-Membership in the filtered list, not [[parent_id]] alone, decides
+Membership in the filtered list, not the parents alone, decides
 both where the walk starts and where it goes next, so the promotion
 that [[get_visible_roots]] performs for a child whose parent a filter
 removed holds at every depth: an orphaned grandchild is a root, not a
@@ -13408,10 +13986,19 @@ The cap applies to roots, and each root brings its subtree along
 uncut---the flat listing caps rows, the tree caps top-level items, as
 [[truncation_hint]] explains.  Rows come back as (depth, item) pairs
 so the renderer is one loop with an indentation rule, the same shape
-the [[view]] command uses for its sub-items.  No cycle guard is
-needed here, unlike in [[context_path]]: a root is an item whose
-parent is absent, and a cycle of parents contains no such item, so
-the walk never enters one.
+the [[view]] command uses for its sub-items.
+
+The walk needs a guard against cycles, as every walk over the parents
+does (\cref{sec:todo-parents}), though not for the reason one would
+first think.  A root is an item that is top-level or whose parents are
+all absent, and with one parent per item a cycle contains no such
+item, so a walk from the roots never enters one.  With several
+parents it can: a hand-edited file may make an item top-level and,
+at the same time, a sub-item of its own descendant.  The walk
+therefore carries the ids on the path from its root and does not
+descend into one of them again.  It is the path, not every id seen so
+far, because an item below two shown parents is not a cycle and is
+listed under each of them.
 
 <<sub-item helpers>>=
 def get_tree_rows(
@@ -13432,15 +14019,40 @@ def get_tree_rows(
     return rows, len(roots) - len(top_level)
 
 
-def get_subtree_rows(items, item, now=None, depth=0):
-    """Return `item` and its descendants in `items` as (depth, item)."""
+def get_subtree_rows(
+    items, item, now=None, depth=0, path=frozenset(),
+):
+    """Return `item` and its descendants in `items` as (depth, item).
+
+    `path` holds the ids above `item` in this walk; a child among
+    them, or `item` itself, closes a cycle and is not descended into.
+    """
     rows = [(depth, item)]
+    path = path | {item.id}
     children = sort_todos_for_display(
-        children_of(items, item.id), now
+        [c for c in children_of(items, item.id) if c.id not in path],
+        now,
     )
     for child in children:
-        rows.extend(get_subtree_rows(items, child, now, depth + 1))
+        rows.extend(
+            get_subtree_rows(items, child, now, depth + 1, path)
+        )
     return rows
+@
+
+Let's verify that a cycle reachable from a root ends the walk: item~1
+is top-level and also below item~2, which is below~1.
+
+<<test functions>>=
+def test_get_tree_rows_survives_a_cycle_below_a_root():
+    """A root inside a cycle is listed once, with its child."""
+    items = [
+        TodoItem(id=1, title="A", parents=[ROOT_ID, 2]),
+        TodoItem(id=2, title="B", parents=[1]),
+    ]
+    rows, hidden = get_tree_rows(items)
+    assert [(d, t.id) for d, t in rows] == [(0, 1), (1, 2)]
+    assert hidden == 0
 @
 
 Let's verify the walk: children nest under their parent at increasing
@@ -13456,11 +14068,11 @@ def test_get_tree_rows_walks_filtered_subtree():
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Grandchild", parent_id=2,
+            id=3, title="Grandchild", parents=[2],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
@@ -13468,7 +14080,7 @@ def test_get_tree_rows_walks_filtered_subtree():
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=5, title="Orphan", parent_id=99,
+            id=5, title="Orphan", parents=[99],
             created="2026-02-20T10:00:00",
         ),
     ]
@@ -13608,7 +14220,9 @@ table.add_row(
 Two of the record's values are not strings, and a cell has to be.
 Labels are a list, joined here with semicolons rather than commas so
 that the value stays one word to a reader that splits on the delimiter
-even after the quoting has been stripped away.  The GitHub link is a
+even after the quoting has been stripped away.  The parents are a list
+of ids and are joined the same way, the top level included as~[[0]]
+(\cref{sec:todo-parents-field}).  The GitHub link is a
 dictionary of repository, type and number, rendered as [[repo#number]]:
 the spelling [[gh]] itself accepts and the one a reader would write in
 a commit message.  Flattening it drops the issue-versus-pull-request
@@ -13632,13 +14246,15 @@ CSV_OMITTED_FIELDS = ("env",)
 def csv_cell(name, value):
     """Return `value` rendered as the CSV cell of column `name`.
 
-    Labels are joined with semicolons, a GitHub link becomes
-    `repo#number`, a path becomes its titles, and `None` becomes the
-    empty string.  Every other value is rendered with `str`,
+    Labels and parents are joined with semicolons, a GitHub
+    link becomes `repo#number`, a path becomes its titles, and
+    `None` becomes the empty string.  Every other value is rendered with `str`,
     matching what JSON would show.
     """
     if name == "labels":
         return ";".join(value or [])
+    if name == "parents":
+        return ";".join(str(p) for p in value or [])
     if name == "path":
         return format_todo_path(value)
     if name == "github":
@@ -13788,7 +14404,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: twenty-one tab-separated fields, no header,
+Let's verify the pipe form: twenty-two tab-separated fields, no header,
 and the flattened cells in their record positions, with the tracked
 hours still in the seventeenth.
 
@@ -13810,7 +14426,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 21
+  assert len(fields) == 22
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
   assert fields[16] == "0"
@@ -13850,6 +14466,36 @@ def test_ls_piped_keeps_computed_columns_in_place(temp_todo_dir):
   assert fields[21] == "7"
 @
 
+The parents are the latest of those fields.  The derived [[parent_id]]
+keeps the tenth column, holding one id as it always has, and the list
+comes last, after [[discovered_from]]:
+
+<<test functions>>=
+def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
+  """parent_id keeps column ten; parents is appended last."""
+  save_todos(5, [
+    TodoItem(
+      id=4, title="Parent", created="2026-02-20T10:00:00",
+      who="me",
+    ),
+    TodoItem(
+      id=1, title="Shared", created="2026-02-20T10:00:00",
+      who="me", parents=[ROOT_ID, 4],
+    ),
+  ])
+
+  for flags, last in (([], 21), (["--prio"], 22)):
+    result = runner.invoke(cli, ["ls", "--who", "", *flags])
+    assert result.exit_code == 0, result.output
+    row = next(
+      line.split("\t") for line in result.output.splitlines()
+      if line.startswith("1\t")
+    )
+    assert len(row) == last + 1
+    assert row[9] == "4"
+    assert row[last] == "0;4"
+@
+
 Free text is the case that rule exists for.  A note that spans two
 lines, and a tab inside a title, must leave the piped record one
 line wide---while the named form hands back the characters
@@ -13872,7 +14518,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 21
+  assert len(fields) == 22
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -13969,6 +14615,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
         "claimed_by", "context_claim", "discovered_from",
+        "parents",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -14113,8 +14760,8 @@ def test_is_ready_leaves_only_by_default():
   """Pending leaves are ready; open parents only when allowed."""
   todos = [
     TodoItem(id=1, title="Parent"),
-    TodoItem(id=2, title="Open child", parent_id=1),
-    TodoItem(id=3, title="Done child", parent_id=1, status="done"),
+    TodoItem(id=2, title="Open child", parents=[1]),
+    TodoItem(id=3, title="Done child", parents=[1], status="done"),
     TodoItem(id=4, title="Active", status="in-progress"),
     TodoItem(id=5, title="Done", status="done"),
   ]
@@ -14138,7 +14785,7 @@ def test_is_ready_counts_children_of_every_worker():
   """A child assigned to someone else still keeps its parent open."""
   todos = [
     TodoItem(id=1, title="Parent", who="me"),
-    TodoItem(id=2, title="Child", parent_id=1, who="dan-claude"),
+    TodoItem(id=2, title="Child", parents=[1], who="dan-claude"),
   ]
   assert not is_ready(todos, todos[0])
 @
@@ -14186,8 +14833,8 @@ def test_todo_path_lists_ancestors_root_first():
   """The path names the ancestors, root first, and none at the top."""
   todos = [
     TodoItem(id=1, title="Course X"),
-    TodoItem(id=2, title="Lab 2", parent_id=1),
-    TodoItem(id=3, title="Grade", parent_id=2),
+    TodoItem(id=2, title="Lab 2", parents=[1]),
+    TodoItem(id=3, title="Grade", parents=[2]),
   ]
   path = todo_path(todos, todos[2])
   assert path == [
@@ -14422,17 +15069,17 @@ def save_ready_fixture():
       labels=["course"],
     ),
     TodoItem(
-      id=2, title="Lab 2", parent_id=1, priority=8.0,
+      id=2, title="Lab 2", parents=[1], priority=8.0,
       created="2026-02-20T10:00:00", who="me",
       labels=["course"],
     ),
     TodoItem(
-      id=3, title="Grade", parent_id=2, priority=7.5,
+      id=3, title="Grade", parents=[2], priority=7.5,
       created="2026-02-20T10:00:00", who="me",
       labels=["course", "grading"],
     ),
     TodoItem(
-      id=4, title="Old grading", parent_id=2, priority=7.0,
+      id=4, title="Old grading", parents=[2], priority=7.0,
       created="2026-02-20T10:00:00", who="me",
       status="done", labels=["grading"],
     ),
@@ -14494,7 +15141,7 @@ def test_ready_parent_waits_on_other_workers_child(temp_todo_dir):
       created="2026-02-20T10:00:00", who="me",
     ),
     TodoItem(
-      id=2, title="Agent's part", parent_id=1, priority=4.0,
+      id=2, title="Agent's part", parents=[1], priority=4.0,
       created="2026-02-20T10:00:00", who="dan-claude",
     ),
   ])
@@ -14578,12 +15225,13 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-7:] == [
+  assert list(rows[3])[-8:] == [
     "tracked_hours", "path", "ready",
     *FIELDS_AFTER_COMPUTED,
   ]
   assert FIELDS_AFTER_COMPUTED == (
     "closed", "claimed_by", "context_claim", "discovered_from",
+    "parents",
   )
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -15251,6 +15899,12 @@ past [[count]], because [[count]] is [[None]] under [[-n 0]]---and
 slicing from [[count]] would report every child as hidden at exactly
 the moment nothing is.
 
+The walk starts at the item the user asked to [[view]], which may lie
+on a cycle of parents that a hand-edited file contains.  Like the tree
+walk of [[ls]] (\cref{sec:todo-ls-walk}), it carries the ids on its
+path and does not descend into one again, so the cycle ends where it
+closes and an item below two parents still shows under each.
+
 The depth limit is the same rule as the cap, applied to levels
 rather than siblings, and the two compose the same way: a level the
 listing does not descend into is not charged to the cap either,
@@ -15263,6 +15917,7 @@ def get_visible_sub_item_rows(
     todos: list[TodoItem], parent_id: int,
     include_done: bool, count: int | None,
     max_depth: int | None = None, depth: int = 0,
+    path: frozenset = frozenset(),
 ) -> tuple[list[tuple[int, TodoItem]], int, int]:
     """Return the shown subtree of `parent_id` as (depth, item) rows.
 
@@ -15271,13 +15926,17 @@ def get_visible_sub_item_rows(
     kept subtree one level deeper, down to `max_depth` (every
     level when None).  The two integers count the done items
     dropped and the items the cap left out, the latter including
-    everything under a cut child that `-n 0` would show.
+    everything under a cut child that `-n 0` would show.  `path`
+    holds the ids above `parent_id` in this walk, and a child among
+    them closes a cycle and is left out.
     """
     rows = []
     hidden_by_cap = 0
+    path = path | {parent_id}
     children, hidden_done = get_visible_sub_items(
         todos, parent_id, include_done
     )
+    children = [c for c in children if c.id not in path]
     shown = children[:count]
     descend = max_depth is None or depth < max_depth
     for child in shown:
@@ -15285,7 +15944,7 @@ def get_visible_sub_item_rows(
         if descend:
             branch, dropped, cut = get_visible_sub_item_rows(
                 todos, child.id, include_done, count,
-                max_depth, depth + 1,
+                max_depth, depth + 1, path,
             )
             rows.extend(branch)
             hidden_done += dropped
@@ -15295,7 +15954,7 @@ def get_visible_sub_item_rows(
         if descend:
             branch, _, _ = get_visible_sub_item_rows(
                 todos, child.id, include_done, None,
-                max_depth, depth + 1,
+                max_depth, depth + 1, path,
             )
             hidden_by_cap += len(branch)
     return rows, hidden_done, hidden_by_cap
@@ -15313,13 +15972,13 @@ def three_generation_items():
     ]
     for c in (2, 3, 4):
         items.append(TodoItem(
-            id=c, title=f"Child {c}", parent_id=1,
+            id=c, title=f"Child {c}", parents=[1],
             priority=float(5 - c), created="2026-02-20T10:00:00",
         ))
         for g in range(3):
             items.append(TodoItem(
                 id=10 * c + g, title=f"Grandchild {c}.{g}",
-                parent_id=c, priority=float(3 - g),
+                parents=[c], priority=float(3 - g),
                 created="2026-02-20T10:00:00",
             ))
     return items
@@ -15363,6 +16022,31 @@ def test_get_visible_sub_item_rows_depth_limit():
     assert [(d, t.id) for d, t in rows] == [(0, 2), (0, 3)]
     assert hidden_done == 0
     assert hidden_by_cap == 1
+@
+
+A cycle ends the walk where it closes, while a diamond is not a
+cycle: item~4 is below both~2 and~3 and is listed under each.
+
+<<test functions>>=
+def test_get_visible_sub_item_rows_stops_at_a_cycle():
+    """A cycle ends where it closes; a diamond shows twice."""
+    cycle = [
+        TodoItem(id=1, title="A", parents=[2]),
+        TodoItem(id=2, title="B", parents=[1]),
+    ]
+    rows, _, _ = get_visible_sub_item_rows(cycle, 1, False, None)
+    assert [(d, t.id) for d, t in rows] == [(0, 2)]
+
+    diamond = [
+        TodoItem(id=1, title="Top"),
+        TodoItem(id=2, title="Left", parents=[1], priority=2.0),
+        TodoItem(id=3, title="Right", parents=[1], priority=1.0),
+        TodoItem(id=4, title="Shared", parents=[2, 3]),
+    ]
+    rows, _, _ = get_visible_sub_item_rows(diamond, 1, False, None)
+    assert [(d, t.id) for d, t in rows] == [
+        (0, 2), (1, 4), (0, 3), (1, 4),
+    ]
 @
 
 With a depth limit the walk stops there, and the hint below owes the
@@ -15565,15 +16249,15 @@ def test_view_default_lists_children_only(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child task", parent_id=1,
+            id=2, title="Child task", parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Grandchild task", parent_id=2,
+            id=3, title="Grandchild task", parents=[2],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=4, title="Leaf child", parent_id=1,
+            id=4, title="Leaf child", parents=[1],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -15615,15 +16299,15 @@ def test_view_depth_hint_respects_the_cap(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child task", parent_id=1, priority=2.0,
+            id=2, title="Child task", parents=[1], priority=2.0,
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Grandchild task", parent_id=2,
+            id=3, title="Grandchild task", parents=[2],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=4, title="Cut child", parent_id=1, priority=1.0,
+            id=4, title="Cut child", parents=[1], priority=1.0,
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -15651,16 +16335,16 @@ def test_view_recursive_reaches_great_grandchildren(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child task", parent_id=1,
+            id=2, title="Child task", parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Grandchild task", parent_id=2,
+            id=3, title="Grandchild task", parents=[2],
             created="2026-02-20T10:00:00",
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Great {n}", parent_id=3,
+            id=n, title=f"Great {n}", parents=[3],
             priority=float(10 - n),
             created="2026-02-20T10:00:00",
         )
@@ -15890,11 +16574,11 @@ def test_view_rich_grandchild_indent_survives_wrapping(
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="child " + long_title, parent_id=1,
+            id=2, title="child " + long_title, parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="grandchild " + long_title, parent_id=2,
+            id=3, title="grandchild " + long_title, parents=[2],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -15969,7 +16653,7 @@ def test_view_command(temp_todo_dir):
         ),
         TodoItem(
             id=2, title="Child task",
-            parent_id=1, priority=1.0,
+            parents=[1], priority=1.0,
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -16010,7 +16694,7 @@ def test_view_format_rich_renders_markdown(temp_todo_dir, monkeypatch):
         ),
         TodoItem(
             id=2, title="Child task",
-            parent_id=1, priority=1.0,
+            parents=[1], priority=1.0,
             created="2026-02-20T10:00:00",
             notes="Child note\nsecond line",
         ),
@@ -16067,19 +16751,19 @@ def test_view_rich_children_keep_order_and_hint(
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Ranked child", parent_id=1,
+            id=2, title="Ranked child", parents=[1],
             priority=1.0, created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Unranked child", parent_id=1,
+            id=3, title="Unranked child", parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=4, title="Done child", parent_id=1,
+            id=4, title="Done child", parents=[1],
             status="done", created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=5, title="Grandchild", parent_id=2,
+            id=5, title="Grandchild", parents=[2],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -16168,17 +16852,17 @@ def test_view_hides_done_children(temp_todo_dir):
         ),
         TodoItem(
             id=2, title="Pending child",
-            parent_id=1, status="pending",
+            parents=[1], status="pending",
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
             id=3, title="Done child",
-            parent_id=1, status="done",
+            parents=[1], status="done",
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
             id=4, title="Done grandchild",
-            parent_id=2, status="done",
+            parents=[2], status="done",
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -16212,20 +16896,20 @@ def test_view_shows_unset_priority_and_mixed_child_order(
         ),
         TodoItem(
             id=2, title="Unranked later",
-            parent_id=1,
+            parents=[1],
             created="2026-02-20T10:00:00",
             priority=None,
             deadline="2026-03-10",
         ),
         TodoItem(
             id=3, title="Ranked child",
-            parent_id=1,
+            parents=[1],
             created="2026-02-20T10:00:00",
             priority=5.0,
         ),
         TodoItem(
             id=4, title="Unranked sooner",
-            parent_id=1,
+            parents=[1],
             created="2026-02-20T10:00:00",
             priority=None,
             deadline="2026-03-01",
@@ -16256,13 +16940,13 @@ def test_view_notes_shows_sub_item_blocks(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="First child", parent_id=1,
+            id=2, title="First child", parents=[1],
             priority=2.0, created="2026-02-20T10:00:00",
             description="What the first child is",
             notes="First preview\nMore of the first note",
         ),
         TodoItem(
-            id=3, title="Second child", parent_id=1,
+            id=3, title="Second child", parents=[1],
             priority=1.0, created="2026-02-20T10:00:00",
             description="What the second child is",
             notes="The second note",
@@ -16300,7 +16984,7 @@ def test_view_notes_rich_renders_sub_item_blocks(
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child task", parent_id=1,
+            id=2, title="Child task", parents=[1],
             priority=1.0, created="2026-02-20T10:00:00",
             description="Standing statement",
             notes="# Heading\n\n- bullet\n",
@@ -16331,7 +17015,7 @@ def test_view_all_includes_done_sub_items(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Done child", parent_id=1,
+            id=2, title="Done child", parents=[1],
             status="done", priority=1.0,
             created="2026-02-20T10:00:00",
             notes="Recap line\nWhat finishing it took",
@@ -16379,7 +17063,7 @@ def test_view_caps_sub_items_at_the_default(temp_todo_dir):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             priority=float(10 - n),
             created="2026-02-20T10:00:00",
         )
@@ -16413,7 +17097,7 @@ def test_view_n_caps_children_and_grandchildren(temp_todo_dir):
     """-n bounds each level, and the hint counts every branch."""
     children = [
         TodoItem(
-            id=n, title=f"Child {letter}", parent_id=1,
+            id=n, title=f"Child {letter}", parents=[1],
             priority=float(4 - n),
             created="2026-02-20T10:00:00",
         )
@@ -16423,7 +17107,7 @@ def test_view_n_caps_children_and_grandchildren(temp_todo_dir):
         TodoItem(
             id=5 + 3 * offset + index,
             title=f"GC {letter}{index + 1}",
-            parent_id=parent,
+            parents=[parent],
             priority=float(3 - index),
             created="2026-02-20T10:00:00",
         )
@@ -16466,7 +17150,7 @@ def test_view_n_zero_shows_all_sub_items(temp_todo_dir):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             priority=float(10 - n),
             created="2026-02-20T10:00:00",
         )
@@ -16496,7 +17180,7 @@ def test_view_cap_applies_after_the_done_filter(temp_todo_dir):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             status="done" if n < 4 else "pending",
             priority=float(8 - n),
             created="2026-02-20T10:00:00",
@@ -16535,7 +17219,7 @@ def test_view_notes_respects_the_cap(temp_todo_dir):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             priority=float(5 - n),
             created="2026-02-20T10:00:00",
             notes=f"Note for {n}",
@@ -16564,7 +17248,7 @@ def test_view_rich_respects_the_cap(temp_todo_dir, monkeypatch):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             priority=float(5 - n),
             created="2026-02-20T10:00:00",
         )
@@ -16594,7 +17278,7 @@ def test_view_says_nothing_when_under_the_cap(temp_todo_dir):
         ),
     ] + [
         TodoItem(
-            id=n, title=f"Child {n}", parent_id=1,
+            id=n, title=f"Child {n}", parents=[1],
             priority=float(5 - n),
             created="2026-02-20T10:00:00",
         )
@@ -16960,7 +17644,7 @@ def test_edit_editor_description_fixed_point(temp_todo_dir):
         created="2026-02-20T10:00:00",
     )
     child = TodoItem(
-        id=2, title="Child", parent_id=1, priority=1.0,
+        id=2, title="Child", parents=[1], priority=1.0,
         description="  starts indented\nthen not",
         notes="Child log.",
         created="2026-02-20T10:00:00",
@@ -17042,7 +17726,7 @@ def test_edit_editor_child_description(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Existing", parent_id=1, priority=1.0,
+            id=2, title="Existing", parents=[1], priority=1.0,
             description="Old text.",
             created="2026-02-20T10:00:00",
         ),
@@ -17117,12 +17801,23 @@ We use [[0]] as a sentinel for \enquote{promote to top-level}
 because valid IDs always start from [[1]], so [[0]] is unambiguous;
 it is the id the top level has among parent ids, [[ROOT_ID]]
 (\cref{sec:todo-parents}).  Passing a positive integer instead
-reassigns the item under a different parent:
+reassigns the item under a different parent.
+
+Either way [[--parent]] replaces the item's whole list of parents
+(\cref{sec:todo-parents-field}): the item ends up in exactly the one
+place named.  With one parent per item that is what a move always
+meant.  An item that a hand edit gave several places, though, loses
+all the others, which the user may not have had in mind, so the
+command names the places the item left, as in \enquote{\#5 is no
+longer under \#1 or at the top level}.  It says so after the change
+is stored, so that a move refused under the lock reports nothing it
+did not do.
 
 <<edit via cli flags>>=
+left_places = []
 if parent is not None:
     if parent == ROOT_ID:
-        item.parent_id = None
+        new_parents = [ROOT_ID]
     else:
         new_parent = next(
             (t for t in todos if t.id == parent),
@@ -17135,7 +17830,11 @@ if parent is not None:
             )
             raise typer.Exit(1)
         require_acyclic_move(todos, item, parent)
-        item.parent_id = parent
+        new_parents = [parent]
+    left_places = [
+        p for p in item.parents if p not in new_parents
+    ]
+    item.parents = new_parents
 @
 
 A move must not make an item its own ancestor.  Both
@@ -17152,6 +17851,20 @@ runs on the snapshot, so that it fails before any prompt, and again
 under the lock, because another command may have moved the new parent
 under the item in between.
 
+The places are worded for a reader: the parents that are items by
+their ids, the root as \enquote{the top level}.
+
+<<helpers>>=
+def describe_places(parent_ids):
+    """Return `parent_ids` as words, such as
+    `under #1 or #3 or at the top level`."""
+    under = [f"#{p}" for p in parent_ids if p != ROOT_ID]
+    places = []
+    if under:
+        places.append("under " + " or ".join(under))
+    if ROOT_ID in parent_ids:
+        places.append("at the top level")
+    return " or ".join(places)
 <<helpers>>=
 def require_acyclic_move(todos, item, parent_id):
     """Exit with an error if `parent_id` is `item` or below it.
@@ -17188,11 +17901,11 @@ def test_edit_refuses_parent_cycle(temp_todo_dir):
             id=1, title="A", created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="B", parent_id=1,
+            id=2, title="B", parents=[1],
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="C", parent_id=2,
+            id=3, title="C", parents=[2],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -17236,8 +17949,10 @@ def test_overlapping_moves_cannot_make_a_cycle(temp_todo_dir):
         )
 
     _, todos = load_todos()
-    parents = {t.id: t.parent_id for t in todos}
-    assert parents in ({1: 2, 2: None}, {1: None, 2: 1})
+    parents = {t.id: t.parents for t in todos}
+    assert parents in (
+        {1: [2], 2: [ROOT_ID]}, {1: [ROOT_ID], 2: [1]},
+    )
 @
 
 [[--discovered-from]] sets the provenance link
@@ -17365,6 +18080,10 @@ elif rerank:
 
 <<commit the flag edits under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+if left_places:
+    typer.echo(
+        f"#{todo_id} is no longer {describe_places(left_places)}"
+    )
 @
 
 A kept number is only a position if it falls inside the new parent's
@@ -17426,7 +18145,7 @@ leaves every range as it was, and nothing moves.
 
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
-    moved = item.parent_id != before["parent_id"]
+    moved = item.parents != before["parents"]
     if moved:
         for parent_id in real_parents_of(item):
             require_todo(todos, parent_id)
@@ -17435,7 +18154,7 @@ def commit_flag_edits(next_id, todos, stack):
         for parent_id in real_parents_of(item):
             require_acyclic_move(todos, fresh, parent_id)
     old_range = child_priority_range_or_none(todos, fresh)
-    old_place = (fresh.priority, fresh.parent_id)
+    old_place = (fresh.priority, list(fresh.parents))
     relative_labels = bool(add_label or remove_label)
     replay_item_edits(
         fresh, before, item,
@@ -17600,13 +18319,13 @@ def two_parents(temp_todo_dir):
     ),
     TodoItem(
       id=3, title="B child", priority=8.0,
-      parent_id=2,
+      parents=[2],
       created="2026-02-20T10:00:00",
       who=default_username,
     ),
     TodoItem(
       id=4, title="Mover", priority=1.0,
-      parent_id=1,
+      parents=[1],
       created="2026-02-20T10:00:00",
       who=default_username,
     ),
@@ -17655,7 +18374,7 @@ def test_edit_parent_keep_prio_outside_range(
   assert result.exit_code == 1
   assert "outside #1's child range (3, 5)" in result.output
   _, todos = load_todos()
-  assert todos[2].parent_id is None
+  assert todos[2].parents == [ROOT_ID]
   assert todos[2].priority == 1.0
 
 
@@ -17670,7 +18389,7 @@ def test_prio_outside_parent_range_is_refused(
   """--prio under a parent must lie inside its range."""
   save_todos(5, [
     TodoItem(
-      id=n, title=t, priority=p, parent_id=parent,
+      id=n, title=t, priority=p, parents=[parent],
       created="2026-02-20T10:00:00",
       who=default_username,
     )
@@ -17687,8 +18406,9 @@ def test_prio_outside_parent_range_is_refused(
   assert "use --top or --bottom" in result.output
   next_id, todos = load_todos()
   assert next_id == 5
-  assert [(t.parent_id, t.priority) for t in todos] == [
-    (None, 5.0), (None, 3.0), (None, 1.0), (1, 4.0),
+  assert [(t.parents, t.priority) for t in todos] == [
+    ([ROOT_ID], 5.0), ([ROOT_ID], 3.0), ([ROOT_ID], 1.0),
+    ([1], 4.0),
   ]
 
 
@@ -17753,7 +18473,7 @@ def ranked_child(todo_id, parent_id, priority):
   `parent_id` or at the top level when that is `None`."""
   return TodoItem(
     id=todo_id, title=f"Child {todo_id}",
-    parent_id=parent_id, priority=priority,
+    parents=[parent_id], priority=priority,
     created="2026-02-20T10:00:00",
     who=default_username,
   )
@@ -18163,7 +18883,7 @@ for parsed_child in parsed_children:
             status="pending",
             created=now,
             deadline=parent.deadline,
-            parent_id=parent.id,
+            parents=[parent.id],
             who=parent.who,
             notes=parsed_child.notes,
         )
@@ -18283,7 +19003,7 @@ def test_edit_editor_grandchild_uses_settled_siblings(
   """Grandchildren are placed against the new numbers."""
   save_todos(7, [
     TodoItem(
-      id=n, title=t, priority=p, parent_id=parent,
+      id=n, title=t, priority=p, parents=[parent],
       created="2026-02-20T10:00:00",
     )
     for n, t, p, parent in [
@@ -18315,7 +19035,7 @@ def test_edit_editor_carries_unshown_grandchild(
   """A grandchild added meanwhile moves with its parent."""
   save_todos(6, [
     TodoItem(
-      id=n, title=t, priority=p, parent_id=parent,
+      id=n, title=t, priority=p, parents=[parent],
       created="2026-02-20T10:00:00",
     )
     for n, t, p, parent in [
@@ -18329,7 +19049,7 @@ def test_edit_editor_carries_unshown_grandchild(
     next_id, todos = load_todos()
     save_todos(next_id + 1, todos + [TodoItem(
       id=next_id, title="Meanwhile", priority=4.8,
-      parent_id=3, created="2026-02-20T10:00:00",
+      parents=[3], created="2026-02-20T10:00:00",
     )])
     return text
 
@@ -18357,7 +19077,7 @@ def test_edit_editor_child_github_applied(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="Child", parent_id=1, priority=4.0,
+      id=2, title="Child", parents=[1], priority=4.0,
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -18399,12 +19119,12 @@ def test_edit_interactive_updates_grandchild(
       priority=5.0,
     ),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
       priority=4.0,
     ),
     TodoItem(
-      id=3, title="Grandchild", parent_id=2,
+      id=3, title="Grandchild", parents=[2],
       created="2026-02-20T10:00:00",
       priority=3.0, status="done",
     ),
@@ -18429,7 +19149,7 @@ def test_edit_interactive_updates_grandchild(
   grandchild = next(t for t in todos if t.id == 3)
   assert grandchild.notes == "Reviewed the notes."
   assert grandchild.status == "done"
-  assert grandchild.parent_id == 2
+  assert grandchild.parents == [2]
 
 
 def test_edit_interactive_adds_grandchild(
@@ -18443,7 +19163,7 @@ def test_edit_interactive_adds_grandchild(
       priority=5.0,
     ),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
       priority=4.0,
     ),
@@ -18466,7 +19186,7 @@ def test_edit_interactive_adds_grandchild(
   added = next(
     t for t in todos if t.title == "Brand new"
   )
-  assert added.parent_id == 2
+  assert added.parents == [2]
 
 
 def test_edit_interactive_removes_subtree(
@@ -18480,12 +19200,12 @@ def test_edit_interactive_removes_subtree(
       priority=5.0,
     ),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
       priority=4.0,
     ),
     TodoItem(
-      id=3, title="Grandchild", parent_id=2,
+      id=3, title="Grandchild", parents=[2],
       created="2026-02-20T10:00:00",
       priority=3.0,
     ),
@@ -18522,12 +19242,12 @@ def test_edit_editor_unclosed_block_keeps_children(
             priority=5.0,
         ),
         TodoItem(
-            id=2, title="First child", parent_id=1,
+            id=2, title="First child", parents=[1],
             created="2026-02-20T10:00:00",
             priority=4.0,
         ),
         TodoItem(
-            id=3, title="Second child", parent_id=1,
+            id=3, title="Second child", parents=[1],
             created="2026-02-20T10:00:00",
             priority=3.0,
         ),
@@ -18569,7 +19289,7 @@ def test_edit_interactive_reconcile():
     )
     child = TodoItem(
         id=2, title="Existing child",
-        parent_id=1, priority=1.0,
+        parents=[1], priority=1.0,
         status="done",
         created="2026-02-20T10:00:00",
     )
@@ -18596,7 +19316,7 @@ def test_edit_interactive_reconcile_keeps_unranked_child(
         ),
         TodoItem(
             id=2, title="Unranked child",
-            parent_id=1,
+            parents=[1],
             created="2026-02-20T10:00:00",
             priority=None,
         ),
@@ -18659,7 +19379,7 @@ def test_child_who_appears_in_editor():
     )
     child = TodoItem(
         id=2, title="Sub-task",
-        parent_id=1, priority=1.0,
+        parents=[1], priority=1.0,
         who="alice",
         created="2026-02-20T10:00:00",
     )
@@ -18689,7 +19409,7 @@ def test_child_who_override():
     )
     child = TodoItem(
         id=2, title="Delegated sub-task",
-        parent_id=1, priority=1.0,
+        parents=[1], priority=1.0,
         who="bob",
         created="2026-02-20T10:00:00",
     )
@@ -18726,7 +19446,7 @@ def test_edit_editor_keeps_concurrent_work(temp_todo_dir, tail):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1, priority=4.0,
+            id=2, title="Child", parents=[1], priority=4.0,
             notes="Child notes" + tail,
             created="2026-02-20T10:00:00",
         ),
@@ -18777,7 +19497,7 @@ def test_edit_editor_keeps_child_renamed_meanwhile(
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1, priority=4.0,
+            id=2, title="Child", parents=[1], priority=4.0,
             notes="Child notes",
             created="2026-02-20T10:00:00",
         ),
@@ -18812,10 +19532,11 @@ second as a silent placement in the new parent's still-empty child
 range.  Neither parent in the second test was given a priority, so
 both hold the constructor default
 (\cref{sec:ranked-and-unranked}) and that range is the unit-wide
-fallback below them (\cref{sec:child-priority-helpers}).  We also
-confirm that supplying an invalid parent ID is
-rejected with a non-zero exit code rather than silently storing a
-dangling reference.
+fallback below them (\cref{sec:child-priority-helpers}).  An item in
+two places, the top level and under~A, is moved under~B, and the
+command names both places it left.  We also confirm that supplying an
+invalid parent ID is rejected with a non-zero exit code rather than
+silently storing a dangling reference.
 
 <<test functions>>=
 def test_edit_reparent_toplevel(temp_todo_dir):
@@ -18826,7 +19547,7 @@ def test_edit_reparent_toplevel(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             priority=0.5,
             created="2026-02-20T10:00:00",
         ),
@@ -18839,7 +19560,7 @@ def test_edit_reparent_toplevel(temp_todo_dir):
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
-    assert child.parent_id is None
+    assert child.parents == [ROOT_ID]
     # The move re-ranks: answering "yes" puts the child
     # above its new sibling instead of keeping 0.5.
     assert child.priority == 1.0
@@ -18856,7 +19577,7 @@ def test_edit_reparent_to_other(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Child", parent_id=1,
+            id=3, title="Child", parents=[1],
             priority=0.5,
             created="2026-02-20T10:00:00",
         ),
@@ -18868,12 +19589,33 @@ def test_edit_reparent_to_other(temp_todo_dir):
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 3)
-    assert child.parent_id == 2
+    assert child.parents == [2]
     # First child of B: the middle of B's child range,
     # asked for without a single question.  A and B both
     # took the default priority of 0.0, so that range is
     # the unit-wide fallback (0.0, -1.0).
     assert child.priority == -0.5
+
+def test_edit_parent_names_the_places_left(temp_todo_dir):
+    """--parent replaces every parent and says which it dropped."""
+    save_todos(4, [
+        TodoItem(id=1, title="A", created="2026-02-20T10:00:00"),
+        TodoItem(id=2, title="B", created="2026-02-20T10:00:00"),
+        TodoItem(
+            id=3, title="Shared", parents=[ROOT_ID, 1],
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    result = runner.invoke(
+        cli, ["edit", "3", "--parent", "2", "--top"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "#3 is no longer under #1 or at the top level" in (
+        result.output
+    )
+    _, todos = load_todos()
+    assert todos[2].parents == [2]
 
 def test_edit_reparent_invalid(temp_todo_dir):
     """--parent with a non-existent ID is an error."""
@@ -19555,7 +20297,7 @@ def test_reprioritize_above_non_sibling(temp_todo_dir):
     ),
     TodoItem(
       id=2, title="Child", priority=4.5,
-      parent_id=1,
+      parents=[1],
       created="2026-02-20T10:00:00",
       who=default_username,
     ),
@@ -19747,7 +20489,7 @@ def test_reprioritize_without_id_batches_current_worker_items(
         TodoItem(
             id=3, title="Child task",
             priority=None,
-            parent_id=2,
+            parents=[2],
             created="2026-02-20T10:00:00",
             who=default_username,
         ),
@@ -19841,21 +20583,21 @@ def test_reprioritize_ignores_other_workers_siblings(
             id=2, title="My task",
             priority=5.0,
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             who=default_username,
         ),
         TodoItem(
             id=3, title="Other's task",
             priority=3.0,
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             who="other-worker",
         ),
         TodoItem(
             id=4, title="Another mine",
             priority=7.0,
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             who=default_username,
         ),
     ])
@@ -19898,7 +20640,7 @@ def test_reprioritize_child_of_unranked_parent_requires_parent_first(
             id=2,
             title="Child",
             priority=None,
-            parent_id=1,
+            parents=[1],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -20017,13 +20759,13 @@ def test_done_pops_stack(temp_todo_dir):
             id=2, title="Child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Sibling",
             created="2026-02-20T10:00:00",
             status="pending",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1, 2])
@@ -20153,7 +20895,7 @@ def test_done_other_worker_child_does_not_auto_complete_my_parent(
             id=2, title="Other child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             who="other-worker",
         ),
     ])
@@ -20192,7 +20934,7 @@ def test_done_completes_abandoned_context_parent(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="User's part", parent_id=1,
+      id=2, title="User's part", parents=[1],
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -20245,7 +20987,7 @@ def test_done_refuses_parent_with_active_children(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1, 2])
@@ -20272,14 +21014,14 @@ def test_done_refuses_only_own_active_descendants(
             id=2, title="My child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             who=default_username,
         ),
         TodoItem(
             id=3, title="Other child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             who="other-worker",
         ),
     ])
@@ -20305,13 +21047,13 @@ def test_done_force_completes_descendants(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Grandchild",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=2,
+            parents=[2],
         ),
     ])
     save_active_stack([1, 2, 3])
@@ -20343,7 +21085,7 @@ def test_done_without_force_on_leaf_works(
             id=2, title="Child (leaf)",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1, 2])
@@ -20377,14 +21119,14 @@ def test_done_force_keeps_other_workers_descendants(
             id=2, title="My child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             who=worker,
         ),
         TodoItem(
             id=3, title="Other child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             who=other_worker,
         ),
     ])
@@ -20551,7 +21293,7 @@ def test_done_preserves_parent_labels(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310", "teaching"],
         ),
     ])
@@ -20609,14 +21351,14 @@ def test_done_preserves_parent_labels_with_pending_sibling(
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310", "teaching"],
         ),
         TodoItem(
             id=3, title="Sibling task",
             created="2026-02-20T10:00:00",
             status="pending",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310", "teaching"],
         ),
     ])
@@ -20677,7 +21419,7 @@ def test_done_cross_worker_labels_not_protected(
             id=2, title="Child (me)",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310", "teaching"],
             who=worker,
         ),
@@ -20717,7 +21459,10 @@ a grandchild appears before its parent, matching the natural LIFO unwind.
 
 Both stopping and force-completing need the same traversal, so we start
 with a pure-read helper that returns the list of active descendant IDs
-without mutating anything.
+without mutating anything.  Each descendant is visited once: a set of
+the ids seen ends a cycle of parents that a hand-edited file may hold,
+and it keeps an item below two of the stopped item's descendants from
+being stopped twice.
 
 <<helpers>>=
 def get_active_descendant_ids(
@@ -20736,16 +21481,37 @@ def get_active_descendant_ids(
             todos, stack, who
         )
     found = []
+    seen = {todo_id}
 
     def collect(parent_id):
         children = children_of(todos, parent_id)
         for child in children:
+            if child.id in seen:
+                continue
+            seen.add(child.id)
             collect(child.id)
             if child.id in stack:
                 found.append(child.id)
 
     collect(todo_id)
     return found
+@
+
+Let's verify that a cycle below the stopped item ends the walk, and
+that each active descendant is reported once:
+
+<<test functions>>=
+def test_active_descendants_survive_a_cycle(temp_todo_dir):
+    """Each active descendant once, even through a cycle."""
+    from nytid.cli.todo import get_active_descendant_ids
+    todos = [
+        TodoItem(id=1, title="A", parents=[3]),
+        TodoItem(id=2, title="B", parents=[1]),
+        TodoItem(id=3, title="C", parents=[2]),
+    ]
+    save_todos(4, todos)
+    save_active_stack([1, 2, 3])
+    assert get_active_descendant_ids(1, todos) == [3, 2]
 @
 
 [[stop_active_descendants]] builds on that traversal: for each active
@@ -20917,7 +21683,7 @@ def test_done_force_stamps_closed_on_descendants(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             created="2026-02-20T10:00:00",
         ),
     ])
@@ -21002,7 +21768,7 @@ def test_stop_parent_auto_stops_child(temp_todo_dir):
             id=2, title="Child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310"],
         ),
     ])
@@ -21056,14 +21822,14 @@ def test_stop_grandparent_auto_stops_chain(
             id=2, title="Parent",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310"],
         ),
         TodoItem(
             id=3, title="Child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=2,
+            parents=[2],
             labels=["DD1310"],
         ),
     ])
@@ -21105,7 +21871,7 @@ def test_stop_parent_ignores_inactive_children(
         TodoItem(
             id=2, title="Inactive child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1])
@@ -21142,7 +21908,7 @@ def test_stop_parent_does_not_stop_other_worker_child(
             title="Other worker child",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310"],
             who=other_worker,
         ),
@@ -21448,11 +22214,11 @@ def test_rm_removes_whole_subtree(temp_todo_dir):
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="Child", parent_id=1,
+      id=2, title="Child", parents=[1],
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=3, title="Grandchild", parent_id=2,
+      id=3, title="Grandchild", parents=[2],
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -21786,12 +22552,12 @@ def test_next_picks_child(temp_todo_dir):
         TodoItem(
             id=2, title="Child A",
             created="2026-02-20T10:00:00",
-            priority=1.0, parent_id=1,
+            priority=1.0, parents=[1],
         ),
         TodoItem(
             id=3, title="Child B",
             created="2026-02-20T10:00:00",
-            priority=5.0, parent_id=1,
+            priority=5.0, parents=[1],
         ),
     ])
     save_active_stack([1])
@@ -21816,7 +22582,7 @@ def test_next_uses_tmux_context_for_parallel_branches(
         TodoItem(
             id=2, title="Tree A child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             priority=5.0,
         ),
         TodoItem(
@@ -21827,7 +22593,7 @@ def test_next_uses_tmux_context_for_parallel_branches(
         TodoItem(
             id=6, title="Tree B child",
             created="2026-02-20T10:00:00",
-            parent_id=5,
+            parents=[5],
             priority=9.0,
         ),
     ])
@@ -21860,7 +22626,7 @@ def test_next_falls_back_to_current_worker_branch(
         TodoItem(
             id=2, title="My child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             priority=5.0,
         ),
         TodoItem(
@@ -21872,7 +22638,7 @@ def test_next_falls_back_to_current_worker_branch(
         TodoItem(
             id=6, title="Other child",
             created="2026-02-20T10:00:00",
-            parent_id=5,
+            parents=[5],
             priority=9.0,
             who="other-worker",
         ),
@@ -21925,7 +22691,7 @@ def test_next_uses_requested_worker_branch(
         TodoItem(
             id=2, title="My child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             priority=5.0,
         ),
         TodoItem(
@@ -21937,7 +22703,7 @@ def test_next_uses_requested_worker_branch(
         TodoItem(
             id=6, title="Other child",
             created="2026-02-20T10:00:00",
-            parent_id=5,
+            parents=[5],
             priority=9.0,
             who="other-worker",
         ),
@@ -21967,7 +22733,7 @@ def test_next_in_untracked_tmux_picks_top_level(
         TodoItem(
             id=2, title="Tree A child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             priority=9.0,
         ),
         TodoItem(
@@ -21978,7 +22744,7 @@ def test_next_in_untracked_tmux_picks_top_level(
         TodoItem(
             id=6, title="Tree B child",
             created="2026-02-20T10:00:00",
-            parent_id=5,
+            parents=[5],
             priority=8.0,
         ),
         TodoItem(
@@ -22056,7 +22822,7 @@ def test_next_silent_when_active_has_no_pending_child(
             id=2, title="Done child",
             created="2026-02-20T10:00:00",
             status="done",
-            parent_id=1,
+            parents=[1],
         ),
     ])
     save_active_stack([1])
@@ -22081,7 +22847,7 @@ def test_next_ignores_non_top_level_when_idle(temp_todo_dir):
         TodoItem(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             priority=9.0,
         ),
         TodoItem(
@@ -22160,7 +22926,7 @@ def status():
 @
 
 Let's verify the two boundary cases: no active todo, and active
-hierarchies that should be rendered from [[parent_id]] rather than raw
+hierarchies that should be rendered from the parents rather than raw
 stack order.
 
 <<test functions>>=
@@ -22187,12 +22953,12 @@ def test_status_shows_active_hierarchy(temp_todo_dir):
         TodoItem(
             id=2, title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=3, title="Leaf",
             created="2026-02-20T10:00:00",
-            parent_id=2,
+            parents=[2],
         ),
     ])
     save_active_stack([1, 2, 3])
@@ -22214,7 +22980,7 @@ def test_status_shows_parallel_active_forest(temp_todo_dir):
         TodoItem(
             id=2, title="Tree A child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
         ),
         TodoItem(
             id=5, title="Tree B root",
@@ -23503,7 +24269,7 @@ def test_start_direct_launch_registers_ancestors(
             labels=["devel"],
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             created="2026-02-20T10:00:00",
             labels=["devel", "nytid"],
         ),
@@ -23724,7 +24490,7 @@ def test_start_no_shell_adopts_untracked_window(temp_todo_dir):
             labels=["devel"],
         ),
         TodoItem(
-            id=2, title="Child", parent_id=1,
+            id=2, title="Child", parents=[1],
             created="2026-02-20T10:00:00",
             labels=["devel", "nytid"],
             wd="/tmp/project",
@@ -24130,7 +24896,7 @@ def test_start_worktree_outside_git_fails_before_tracking(
       created="2026-02-20T10:00:00",
     ),
     TodoItem(
-      id=2, title="Fix bug", parent_id=1,
+      id=2, title="Fix bug", parents=[1],
       wd=str(tmp_path), worktree="x",
       created="2026-02-20T10:00:00",
     ),
@@ -24961,7 +25727,7 @@ def test_start_window_block_resets_descendants_pending(
             id=2,
             title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             status="in-progress",
             labels=["review"],
         ),
@@ -25234,7 +26000,7 @@ def test_finalize_detached_todo_resets_descendants_pending(
             id=2,
             title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             status="in-progress",
             labels=["review"],
         ),
@@ -25266,7 +26032,7 @@ def test_finalize_detached_todo_keeps_done_descendant(
             id=2,
             title="Child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             status="done",
         ),
     ])
@@ -25305,7 +26071,7 @@ def test_finalize_detached_todo_keeps_other_worker_descendant(
             id=2,
             title="Other worker child",
             created="2026-02-20T10:00:00",
-            parent_id=1,
+            parents=[1],
             status="in-progress",
             who=other_worker,
         ),
@@ -25660,7 +26426,7 @@ def test_run_auto_completes_launchers_parent(temp_todo_dir):
       created="2026-02-20T10:00:00", who="dan-claude",
     ),
     TodoItem(
-      id=2, title="User's request", parent_id=1,
+      id=2, title="User's request", parents=[1],
       created="2026-02-20T10:00:00",
     ),
   ])
@@ -26685,7 +27451,7 @@ def test_stop_preserves_parent_labels(temp_todo_dir):
             id=2, title="Child task",
             created="2026-02-20T10:00:00",
             status="in-progress",
-            parent_id=1,
+            parents=[1],
             labels=["DD1310", "teaching"],
         ),
     ])
@@ -27147,7 +27913,7 @@ def test_import_records_discovered_from(
   assert result.exit_code == 0, result.output
   _, todos = load_todos()
   imported = next(t for t in todos if t.title == "Imported")
-  assert imported.parent_id == parent_id
+  assert imported.parents == normalize_parents([parent_id])
   assert imported.discovered_from == source
 @
 
@@ -27323,7 +28089,7 @@ for gh_item in new_items:
             id=CANDIDATE_ID,
             title=gh_item["title"],
             labels=gh_labels,
-            parent_id=resolved_parent,
+            parents=[resolved_parent],
             deadline=inherited_deadline,
             estimated=(
                 parse_hours(estimate)
@@ -27355,7 +28121,7 @@ for gh_item in new_items:
             if estimate else None
         ),
         description=description or "",
-        parent_id=resolved_parent,
+        parents=[resolved_parent],
         wd=resolved_wd,
         worktree=normalize_worktree_name(worktree),
         env=resolved_env,
@@ -27978,7 +28744,7 @@ def test_import_applies_parent_and_wd(temp_todo_dir):
     assert result.exit_code == 0
     _, todos = load_todos()
     child = todos[1]
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.wd == os.path.abspath("project")
     assert child.env is None
     assert child.deadline == "2026-03-01"
@@ -28075,8 +28841,8 @@ def test_import_parented_skip_priority_under_unranked_parent_keeps_children_unra
     _, todos = load_todos()
     older = next(t for t in todos if t.title == "Older import")
     newer = next(t for t in todos if t.title == "Newer import")
-    assert older.parent_id == 1
-    assert newer.parent_id == 1
+    assert older.parents == [1]
+    assert newer.parents == [1]
     assert older.priority is None
     assert newer.priority is None
 
@@ -28124,7 +28890,7 @@ def test_import_under_unranked_parent_skips_binary_search(
     mock_search.assert_not_called()
     _, todos = load_todos()
     child = next(t for t in todos if t.title == "Imported child")
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.priority is None
 @
 
@@ -28243,7 +29009,7 @@ def test_import_auto_parents_under_active_todo(
     assert "Auto-parenting under: #1 Active parent" in result.stdout
     _, todos = load_todos()
     child = todos[1]
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.deadline == "2026-03-02"
     assert child.labels == ["course", "owner/repo"]
 
@@ -28309,7 +29075,7 @@ def test_import_auto_parents_under_tmux_context_todo(
         t for t in todos
         if t.title == "Imported on active branch"
     )
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.labels == ["course", "owner/repo"]
 
 
@@ -28373,7 +29139,7 @@ def test_import_in_untracked_tmux_stays_top_level(
     child = next(
         t for t in todos if t.title == "Imported top level"
     )
-    assert child.parent_id is None
+    assert child.parents == [ROOT_ID]
     assert child.labels == ["owner/repo"]
 
 
@@ -28434,7 +29200,7 @@ def test_import_auto_parent_stays_on_current_worker_branch(
         t for t in todos
         if t.title == "Imported on my branch"
     )
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.labels == ["mine", "owner/repo"]
 
 
@@ -28482,7 +29248,7 @@ def test_import_top_level_overrides_auto_parenting(
     assert "Auto-parenting under:" not in result.stdout
     _, todos = load_todos()
     child = todos[1]
-    assert child.parent_id is None
+    assert child.parents == [ROOT_ID]
 
 
 def test_import_here_captures_wd_and_env(temp_todo_dir):
@@ -29510,6 +30276,9 @@ from nytid.cli.todo import (
     get_worker_default,
     should_spawn_shell,
     ROOT_ID,
+    push_active,
+    normalize_parents,
+    InvalidParentsError,
     parents_of,
     real_parents_of,
     children_of,
@@ -29788,13 +30557,13 @@ def test_add_append_under_parent(temp_todo_dir):
         ),
         TodoItem(
             id=2, title="Child high",
-            parent_id=1,
+            parents=[1],
             priority=4.0,
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
             id=3, title="Child low",
-            parent_id=1,
+            parents=[1],
             priority=3.0,
             created="2026-02-20T10:00:00",
         ),
@@ -29812,7 +30581,7 @@ def test_add_append_under_parent(temp_todo_dir):
     assert result.exit_code == 0
     _, todos = load_todos()
     appended = next(t for t in todos if t.id == 4)
-    assert appended.parent_id == 1
+    assert appended.parents == [1]
     assert appended.priority == -1.0
 
 
@@ -29844,7 +30613,7 @@ def test_add_under_unranked_parent_skips_binary_search(
     mock_search.assert_not_called()
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.priority is None
 
 
@@ -29873,7 +30642,7 @@ def test_add_with_explicit_priority_under_unranked_parent_stays_unranked(
     assert result.exit_code == 0
     _, todos = load_todos()
     child = next(t for t in todos if t.id == 2)
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.priority is None
 
 
@@ -29917,7 +30686,7 @@ def test_add_auto_parents_under_tmux_context_todo(
     child = next(
         t for t in todos if t.title == "Context child"
     )
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.labels == ["course"]
 
 
@@ -29962,7 +30731,7 @@ def test_add_in_untracked_tmux_stays_top_level(
     child = next(
         t for t in todos if t.title == "Top-level task"
     )
-    assert child.parent_id is None
+    assert child.parents == [ROOT_ID]
     assert child.labels == []
 
 
@@ -30004,7 +30773,7 @@ def test_add_auto_parent_stays_on_current_worker_branch(
     child = next(
         t for t in todos if t.title == "My child"
     )
-    assert child.parent_id == 1
+    assert child.parents == [1]
     assert child.labels == ["mine"]
 
 
@@ -30817,12 +31586,12 @@ def test_parent_auto_done(temp_todo_dir):
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=2, title="Child 1", parent_id=1,
+            id=2, title="Child 1", parents=[1],
             status="done",
             created="2026-02-20T10:00:00",
         ),
         TodoItem(
-            id=3, title="Child 2", parent_id=1,
+            id=3, title="Child 2", parents=[1],
             status="pending",
             created="2026-02-20T10:00:00",
         ),
