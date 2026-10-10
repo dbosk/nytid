@@ -4102,6 +4102,7 @@ def move_subtree_priorities(
     parent: TodoItem,
     old_range: tuple | None,
     new_range: tuple | None,
+    keep=frozenset(),
 ) -> list[TodoItem]:
     """Carry `parent`'s descendants from its old child
     range to its new one, and return those it moved.
@@ -4112,7 +4113,8 @@ def move_subtree_priorities(
     ranked, not-done descendant whose stored priority
     lies in the closed old range is mapped linearly onto
     the new range, strictly inside it; the others keep
-    their numbers.
+    their numbers, and so do those whose ids are in
+    `keep`.
     """
     if old_range is None or new_range is None:
         return []
@@ -4128,7 +4130,10 @@ def move_subtree_priorities(
     )
     moved = []
     for item in descendants:
-        if item.status == "done" or item.priority is None:
+        if (
+            item.status == "done" or item.priority is None
+            or item.id in keep
+        ):
             continue
         if old_low <= item.priority <= old_high:
             mapped = new_low + (item.priority - old_low) * scale
@@ -4435,6 +4440,8 @@ def squeeze_sibling_above(
     todos: list[TodoItem],
     item: TodoItem,
     old_place: tuple | None = None,
+    before: list[TodoItem] | None = None,
+    keep: set | None = None,
 ) -> list[TodoItem]:
     """Compress the subtree of the sibling just above
     `item`, whose child range `item` has just cut short,
@@ -4442,6 +4449,9 @@ def squeeze_sibling_above(
 
     `old_place` is `item`'s `(priority, parents)`
     before it moved, or `None` when `item` is new.
+    `before` may pass the list as it was before anything
+    moved, from `list_before_move`, and `keep` the ids of
+    `item` and the subtree ranked under it.
     """
     if item.priority is None or item.status == "done":
         return []
@@ -4467,21 +4477,53 @@ def squeeze_sibling_above(
         )
         if new_range[1] > old_range[1]:
             moved += move_subtree_priorities(
-                todos, sibling, old_range, new_range
+                todos, sibling, old_range, new_range,
+                keep=placed,
             )
     return moved
 @
 
-The copy leaves every other item shared with [[todos]]: only the
-moved item differs, and only in its number and parent, which are all
-[[compute_child_priority_range]] reads from it.
+The copy has to be taken before anything moves.  In a tree the item's
+own subtree, which [[move_into_place]] moves first, never bounds a
+sibling's range; with several parents it can, since a child of the
+item may also be a top-level item or the child of another parent.  So
+the caller that moves the subtree takes the copy before it does, with
+[[list_before_move]], and hands it in; called on its own, the squeeze
+takes it from [[todos]] as they are.  The items are copied one by one
+because the moves change them in place, while their parents, which
+nothing here changes, are shared.
+
+<<child priority helpers>>=
+def list_before_move(todos, item, old_place):
+    """Return copies of `todos` as they are, with `item` at
+    `old_place`, its `(priority, parents)`, or left out
+    when `old_place` is `None` (a new item)."""
+    before = [copy.copy(t) for t in todos if t is not item]
+    if old_place is not None:
+        stand_in = copy.copy(item)
+        stand_in.priority, stand_in.parents = old_place
+        before.append(stand_in)
+    return before
+@
+
+The placed item and the subtree ranked under it are not compressed
+with the sibling's.  In a tree they cannot be among the sibling's
+descendants, but an item with several parents can be below its own
+sibling, through another parent (\cref{sec:ranking-context}): X at
+the top level and also under a child of the sibling S it is placed
+under.  Its new number then lies in S's old range, and the compression
+would move it a second time, away from the place just chosen for it,
+together with the subtree that has just been moved under it.  The
+subtree kept is the one ranked under X, whose ranking line passes
+through X, and not all of X's descendants: one of them may be ranked
+under S, and that one must be compressed with S's.
 
 <<rebuild the list as it was before [[item]] moved>>=
-before = [t for t in todos if t is not item]
-if old_place is not None:
-    stand_in = copy.copy(item)
-    stand_in.priority, stand_in.parents = old_place
-    before.append(stand_in)
+if before is None:
+    before = list_before_move(todos, item, old_place)
+placed = keep
+if placed is None:
+    placed = {item.id} | ranked_subtree_ids(todos, item)
 @
 
 Every command that gives an item a place calls one helper, so that
@@ -4495,7 +4537,8 @@ moves may have taken it, or a shared item below it, under the range of
 one of them; [[keep_highest_places]] lifts such items back
 (\cref{sec:ranking-context}).  Last, the helper checks whether the
 numbers it touched still have room around them
-(\cref{sec:renumber-priorities}).
+(\cref{sec:renumber-priorities}), and, when some item has several
+parents, whether the ranges still nest, renumbering in either case.
 
 <<child priority helpers>>=
 def settle_placement(
@@ -4507,17 +4550,26 @@ def settle_placement(
     """Move the subtrees whose ranges `item`'s new place
     changed: its own, and its new upper sibling's.  Lift
     shared items that fell below one of their places, and
-    renumber everything if that left too little room.
+    renumber everything if that left too little room or,
+    with shared items, ranges that do not nest.
 
     `old_range` is `item`'s child range before the
     change and `old_place` its `(priority, parents)`;
     both are `None` for an item that is new.
     """
+    shared = any(len(parents_of(t)) > 1 for t in todos) or (
+        old_place is not None and len(old_place[1]) > 1
+    )
     touched = move_into_place(todos, item, old_range, old_place)
     touched += keep_highest_places(todos)
-    if gaps_too_narrow(todos, touched):
-        renumber_priorities(todos)
-        keep_highest_places(todos)
+    if gaps_too_narrow(todos, touched) or (
+        shared and not ranking_is_consistent(todos)
+    ):
+        for _ in range(RANKING_REPAIRS):
+            renumber_priorities(todos)
+            keep_highest_places(todos)
+            if not shared or ranking_is_consistent(todos):
+                break
 
 
 def move_into_place(
@@ -4529,14 +4581,45 @@ def move_into_place(
     """Lift `item` to its highest place if it fell below
     one, then move its subtree and squeeze the sibling
     above it; return the items whose numbers changed."""
-    lift_to_highest_place(todos, item)
+    before = list_before_move(todos, item, old_place)
+    in_transit = (
+        ranked_subtree_ids(before, item)
+        if old_place is not None else set()
+    )
+    landed = [t for t in todos if t.id not in in_transit]
+    lift_to_highest_place(landed, item)
     touched = [item]
     touched += move_subtree_priorities(
         todos, item, old_range,
-        child_priority_range_or_none(todos, item),
+        child_priority_range_or_none(landed, item),
     )
-    touched += squeeze_sibling_above(todos, item, old_place)
+    touched += squeeze_sibling_above(
+        todos, item, old_place, before,
+        keep={item.id} | in_transit,
+    )
     return touched
+@
+
+While the item moves, the subtree ranked under it is in transit: it
+still carries the numbers of the old range while the item already has
+its new one.  In a tree that does not matter, since those numbers are
+read only as the subtree's own.  With several parents it does: a shared
+child whose parent has just dropped below it suddenly looks ranked
+under another of its parents, and as a sibling there it would cut the
+range the item's subtree is about to be moved into.  So the new range,
+and the lift before it, are computed as if the subtree in transit were
+not there; it lands inside the new range, where it bounds nothing
+outside.  The subtree is the one whose ranking line passes through the
+item, read from the list as it was before the move.
+
+<<child priority helpers>>=
+def ranked_subtree_ids(todos, item):
+    """Return the ids of the descendants of `item` that are
+    ranked under it, directly or further down."""
+    return {
+        d.id for d in descendants_of(todos, item.id)
+        if item.id in {a.id for a in ranking_path(todos, d)}
+    }
 @
 
 Let's verify the squeeze on the example: B's children end up between
@@ -5161,6 +5244,124 @@ def keep_highest_places(
         )
 @
 
+\paragraph{A net under the moves.}
+Each move above is made to keep the ranges nested, and with one parent
+per item they do: the tree code is the argument of
+\cref{sec:subtree-follows-parent,sec:sibling-above-squeezed}, and
+nothing in it reads a ranking context, which with one parent cannot
+change.  With several parents a move can change contexts it does not
+touch.  A parent that moves past a shared child it is not ranking
+changes which of the child's ranges holds the child's number, so the
+child is suddenly ranked under the parent, at a number the parent's
+subtree was not laid out around.  The moves cannot see that coming,
+since they decide what to move by the contexts as they find them.
+
+Rather than chase every such case in the moves, [[settle_placement]]
+checks the result, and when it is not consistent it lays the ranked
+items out again with [[renumber_priorities]], which builds nested
+ranges from whatever ranking contexts the numbers give, and lifts the
+shared items once more.  The check is the invariant itself: every
+ranked, not-done item lies strictly inside the range of its ranking
+context and above the floor of each of its other ranked parents, and
+the items ranked under an item, at any depth, follow it directly in the
+flat order.  Renumbering keeps every family's order, so the user's
+ranking survives; only the numbers change, which is what renumbering
+is for (\cref{sec:renumber-priorities}).  A list without shared items
+skips the check, which keeps the tree code exactly as it was; a list
+counts as one with shared items if it has any before or after the
+placement, since an item that just lost its second parent may have
+moved by the rules for shared items.  The
+repair is tried a few times, since lifting after a renumbering can in
+principle disturb the layout again; the fuzzing that found the cases
+above never needed a second round.
+
+<<child priority helpers>>=
+def ranking_is_consistent(todos: list[TodoItem]) -> bool:
+    """Tell whether the ranked, not-done items nest.
+
+    Each lies inside its ranking context's child range and
+    above the floor of its other ranked parents, and the
+    items ranked under each follow it directly in the flat
+    order.
+    """
+    by_id = {t.id: t for t in todos}
+    live = [
+        t for t in todos
+        if t.status != "done" and t.priority is not None
+    ]
+    contexts = {
+        t.id: ranking_context(todos, t, by_id) for t in live
+    }
+    ranges = {}
+
+    def range_of(parent):
+        if parent.id not in ranges:
+            ranges[parent.id] = compute_child_priority_range(
+                todos, parent
+            )
+        return ranges[parent.id]
+    <<check that each item sits inside its places>>
+    <<check that each ranked subtree follows its root>>
+    return True
+<<constants>>=
+RANKING_REPAIRS = 3
+@
+
+<<check that each item sits inside its places>>=
+for item in live:
+    for parent_id in real_parents_of(item):
+        parent = by_id.get(parent_id)
+        if parent is None or parent.priority is None:
+            continue
+        high, low = range_of(parent)
+        if item.priority <= low:
+            return False
+        if parent_id == contexts[item.id] and item.priority >= high:
+            return False
+@
+
+The subtree check counts rather than walks.  In the flat order the
+items ranked under an item, at any depth, must take exactly the
+positions right after it; they do if all of them come after it and the
+last of them is as far from it as there are items in the subtree.
+
+<<check that each ranked subtree follows its root>>=
+order = sort_siblings_by_stored_priority(live)
+position = {t.id: i for i, t in enumerate(order)}
+below = {}
+for item in live:
+    seen = {item.id}
+    parent_id = contexts[item.id]
+    while parent_id in contexts and parent_id not in seen:
+        seen.add(parent_id)
+        below.setdefault(parent_id, []).append(position[item.id])
+        parent_id = contexts[parent_id]
+for parent_id, places in below.items():
+    if (
+        min(places) <= position[parent_id]
+        or max(places) != position[parent_id] + len(places)
+    ):
+        return False
+@
+
+Let's verify the check on the example, consistent as it is, and on the
+two ways it can fail: a shared item below the floor of its other
+parent, and an unrelated item inside a subtree.
+
+<<test functions>>=
+def test_ranking_is_consistent_tells_nested_from_not():
+  """The check finds an item below a place and a foreign
+  item inside a subtree."""
+  todos = a_d_and_shared_b(4.5)
+  assert ranking_is_consistent(todos)
+  todos[2].priority = -8.0
+  assert not ranking_is_consistent(todos)
+  todos[2].priority = 4.5
+  todos.append(TodoItem(id=5, title="A1", priority=4.0, parents=[1]))
+  todos.append(TodoItem(id=6, title="Top", priority=4.25))
+  assert not ranking_is_consistent(todos)
+@
+
 Let's verify the demotion: A at~5.0, D at~3.0 and C at~2.0, with B
 under A and D at~4.5, ranked under A, and B's child at~4.25.  Demoting
 D moves nothing of B, since B is not ranked there.  Demoting A below C
@@ -5187,6 +5388,128 @@ def test_shared_child_moves_only_with_its_ranking_parent():
   assert todos[3].priority == 2.5
   assert ranking_context(todos, todos[3]) == 2
   assert 2.0 < todos[4].priority < 2.5
+@
+
+These cases come from fuzzing the commands with shared items, each the
+smallest state we found for its problem.  X is top-level and also under
+\#11, which is under~\#8; ranked below~\#8 at the top level, X is below
+its own sibling.  It cuts \#8's range like any lower sibling, \#11 is
+compressed above it, and X itself, the placed item, is not compressed
+with \#11 although it lies in \#8's old range.  It ends ranked under
+\#11, the higher of its places now.
+
+<<test functions>>=
+def test_placing_below_an_own_ancestor_keeps_the_place(
+  temp_todo_dir,
+):
+  """The placed item is not compressed with its sibling."""
+  save_todos(13, [
+    ranked_child(12, None, 6.0),
+    ranked_child(8, None, 4.0),
+    ranked_child(11, 8, -1.0),
+  ])
+  _, todos = load_todos()
+  todos[0].parents = [ROOT_ID, 11]
+  save_todos(13, todos)
+
+  result = runner.invoke(cli, ["reprioritize", "12", "--below", "8"])
+
+  assert result.exit_code == 0, result.output
+  assert [stored_priority(n) for n in (8, 11, 12)] == [4.0, 3.5, 3.0]
+@
+
+A parent that drops below a shared child it ranks must take the child
+along, although for a moment the child looks ranked elsewhere: Y is
+under~A and under~X, ranked under X, and X, the only child of~C, moves
+to the middle of C's range, below~Y.
+
+<<test functions>>=
+def test_a_dropped_parent_takes_its_shared_child_along(
+  temp_todo_dir,
+):
+  """The subtree in transit does not bound its new range."""
+  save_todos(7, [
+    ranked_child(1, None, 1.0),
+    ranked_child(2, 1, 0.75),
+    ranked_child(3, 2, 0.625),
+    ranked_child(4, None, 0.0),
+    TodoItem(
+      id=5, title="Y", parents=[1, 3], priority=0.5,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+  ])
+
+  result = runner.invoke(cli, ["reprioritize", "3", "--top"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(3) == 0.375
+  assert stored_priority(5) == pytest.approx(0.3)
+@
+
+The net under the moves is needed for a state like the following, the
+smallest the fuzzing found: \#17 is top-level and also under~\#15, deep
+in \#12's subtree, and \#20 is top-level and under~\#17.  Raising \#12
+to the top takes \#15 above \#17, whose old range is then gone before
+\#17 can be lifted with its subtree; the moves leave \#26, \#17's child,
+behind, and only renumbering puts it back under its parent.
+
+<<test functions>>=
+def test_raising_a_parent_past_shared_items_keeps_ranges_nested(
+  temp_todo_dir,
+):
+  """The repair renumbers what the moves left inconsistent."""
+  save_todos(27, [
+    TodoItem(
+      id=n, title=f"T{n}", priority=p, parents=ps,
+      created="2026-02-20T10:00:00", who=default_username,
+    )
+    for n, p, ps in [
+      (20, 4.0, [ROOT_ID, 17]), (17, 2.0, [ROOT_ID, 15]),
+      (22, 1.75, [17]), (19, 1.5, [17, 13]),
+      (24, 1.25, [ROOT_ID, 19]), (26, 0.75, [17]),
+      (12, 0.0, [ROOT_ID]), (13, -0.05, [ROOT_ID, 12]),
+      (11, -0.0625, [13]), (15, -0.0671875, [11, 13, 12]),
+      (23, -0.29921875, [11]), (25, -1.0, [ROOT_ID]),
+    ]
+  ])
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
+
+  result = runner.invoke(cli, ["edit", "12", "--prio", "5"])
+
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
+  assert stored_priority(12) == 5.0
+@
+
+The squeeze must compare with the list as it was before \emph{anything}
+moved.  Removing~\#18 puts \#16 at the bottom of the top level, right
+under~\#11, and takes \#16's child \#21 along; \#21 is top-level too, so
+had the squeeze read \#11's old range from the list after \#21 moved,
+it would have seen \#21 as the floor and left \#11's child behind.
+
+<<test functions>>=
+def test_squeeze_reads_the_range_before_the_subtree_moved(
+  temp_todo_dir,
+):
+  """#11's child is compressed above #16's new place."""
+  save_todos(22, [
+    TodoItem(
+      id=n, title=f"T{n}", priority=p, parents=ps,
+      created="2026-02-20T10:00:00", who=default_username,
+    )
+    for n, p, ps in [
+      (11, 5.0, [ROOT_ID]), (14, 2.0, [11]), (18, -1.0, [ROOT_ID]),
+      (16, -1.1, [ROOT_ID, 18]), (21, -2.0, [ROOT_ID, 16]),
+    ]
+  ])
+
+  result = runner.invoke(cli, ["rm", "18", "--force"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(16) == 4.0
+  assert stored_priority(14) == pytest.approx(4.0 + 4.0 / 7.0)
 @
 
 Renumbering gives a shared item one number, in the family it is
@@ -23735,7 +24058,10 @@ parents, and one that lost its ranking context is given the bottom of
 the place it is now ranked in, through the same placement helper as
 [[edit]] (\cref{todo:placement}), and settled like any placed item
 (\cref{sec:sibling-above-squeezed}).  A place whose parent is unranked
-leaves it unranked, as [[edit]] does.
+leaves it unranked, as [[edit]] does.  To its new family such an item
+is new: its old place was in a family that no longer exists, so it is
+settled without one, and the sibling it lands under is compared with
+the family as it was without it.
 
 <<detach the items that keep another parent>>=
 doomed = {todo_id} | {d.id for d in descendants}
@@ -23756,6 +24082,7 @@ for d in detached:
         d.priority = place_existing_item(todos, d, PLACE_BOTTOM)
         if d.priority is not None:
             moved.append(d)
+        old_place = None
     settle_placement(todos, d, old_range, old_place)
 @
 
@@ -23967,6 +24294,35 @@ def test_rm_places_a_detached_item_at_the_bottom(temp_todo_dir):
   )
   assert "#3 is now last under #2" in result.output
   assert stored_priority(3) == -2.5
+@
+
+A detached item that is placed again comes new to its family, and the
+sibling it lands under is squeezed as for a new item.  Removing~\#9
+detaches \#13, ranked under~\#9, to the bottom of~\#8's family, under
+\#11, whose child~\#14 must then move above it.
+
+<<test functions>>=
+def test_rm_squeezes_the_sibling_above_a_replaced_item(
+  temp_todo_dir,
+):
+  """#14 is compressed above #13's new place under #8."""
+  save_todos(16, [
+    TodoItem(
+      id=n, title=f"T{n}", priority=p, parents=ps,
+      created="2026-02-20T10:00:00", who=default_username,
+    )
+    for n, p, ps in [
+      (7, 1.0, [ROOT_ID]), (8, 0.5, [7]), (11, 0.25, [8]),
+      (9, 0.1875, [ROOT_ID, 11]), (13, 0.15625, [8, 9]),
+      (15, -3.2734375, [9]), (14, -6.703125, [11]),
+    ]
+  ])
+
+  result = runner.invoke(cli, ["rm", "9", "--force"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(13) == -4.375
+  assert stored_priority(14) == pytest.approx(-3.2265625)
 @
 
 Let's verify both the explicit and active-stack forms of [[rm]]:
@@ -32103,6 +32459,7 @@ from nytid.cli.todo import (
     ranking_context,
     ranking_path,
     ranked_under,
+    ranking_is_consistent,
     context_path,
     get_children,
     get_descendants,
