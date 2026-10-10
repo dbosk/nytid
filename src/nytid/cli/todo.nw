@@ -4567,18 +4567,23 @@ def settle_placement(
     shared = any(len(parents_of(t)) > 1 for t in todos) or (
         old_place is not None and len(old_place[1]) > 1
     )
+    was_nested = shared and ranking_is_consistent(
+        list_before_move(todos, item, old_place)
+    )
     touched = move_into_place(todos, item, old_range, old_place)
     touched += keep_highest_places(todos)
-    if gaps_too_narrow(todos, touched) or (
-        shared and not ranking_is_consistent(todos)
-    ):
-        for _ in range(RANKING_REPAIRS):
-            renumber_priorities(todos)
-            lifted = keep_highest_places(todos)
-            if not gaps_too_narrow(todos, lifted) and (
-                not shared or ranking_is_consistent(todos)
-            ):
-                break
+
+    def broken():
+        return was_nested and not ranking_is_consistent(todos)
+    if not gaps_too_narrow(todos, touched) and not broken():
+        return
+    for _ in range(RANKING_REPAIRS):
+        renumber_priorities(todos)
+        lifted = keep_highest_places(todos)
+        if not gaps_too_narrow(todos, lifted) and not broken():
+            return
+    if broken():
+        report_unnested_ranking(item)
 
 
 def move_into_place(
@@ -5303,14 +5308,104 @@ is for (\cref{sec:renumber-priorities}).  The check is confined to
 what renumbering can repair: the items it lays out, those ranked under
 live, ranked items all the way up.  A child of a done or an unranked
 item is never moved by renumbering, so a check that counted it could
-fail again after every repair.  A list without shared items
-skips the check, which keeps the tree code exactly as it was; a list
-counts as one with shared items if it has any before or after the
-placement, since an item that just lost its second parent may have
-moved by the rules for shared items.  The
-repair is tried a few times, since lifting after a renumbering can
+fail again after every repair.
+
+The net repairs only what the placement broke.  The check runs on the
+list as it was before the move and again after it, and renumbering
+happens only when the ranges nested before and do not any more.  A list
+whose ranges did not nest to begin with is left as the tree code leaves
+it: a child placed outside its parent's range by hand, or before ranges
+existed, stays where it is (\cref{sec:subtree-follows-parent}), even
+when some unrelated item elsewhere in the list has several parents.
+Renumbering the whole list for the sake of an old number nobody asked
+about would change numbers the user may have chosen.  A list without
+shared items skips both checks; it counts as one with shared items if it
+has any before or after the placement, since an item that just lost its
+second parent may have moved by the rules for shared items.
+
+The repair is tried a few times, since lifting after a renumbering can
 disturb the layout again, or leave too little room around the lifted
 items: each lift takes the bottom of a range, half of what is left.
+If the ranges still do not nest after that, something in the rules is
+wrong.  The listings still work, they only show some sub-items away
+from their parents, so the command does not fail; it says so on
+standard error, naming the item it was placing, so that the case can be
+reported and reproduced.  The tests and the fuzzers set
+[[STRICT_RANKING]], which turns the warning into an exception, so that
+a silent give-up cannot pass for success there.
+
+<<constants>>=
+STRICT_RANKING = False
+<<child priority helpers>>=
+class RankingNotNested(RuntimeError):
+    """The ranges did not nest after the repairs."""
+
+
+def report_unnested_ranking(item: TodoItem) -> None:
+    """Warn that placing `item` left ranges that do not
+    nest, or raise `RankingNotNested` under
+    `STRICT_RANKING`."""
+    message = (
+        f"placing #{item.id} left priorities that do not nest; "
+        "some sub-items may list away from their parents"
+    )
+    if STRICT_RANKING:
+        raise RankingNotNested(message)
+    typer.echo(f"Warning: {message}", err=True)
+@
+
+The tests run strict, and two tests pin the gate and the give-up.  A
+legacy child of A below~B, beside an unrelated shared item, keeps its
+number when a new item is added; and a repair that never succeeds,
+forced by a check that answers \enquote{nested} only for the state
+before the move, warns, or raises in strict mode.
+
+<<test functions>>=
+@pytest.fixture(autouse=True)
+def strict_ranking(monkeypatch):
+  """Turn a give-up of the ranking repair into an error."""
+  monkeypatch.setattr("nytid.cli.todo.STRICT_RANKING", True)
+
+
+def test_net_leaves_legacy_numbers_alone(temp_todo_dir):
+  """An inconsistent list is not renumbered by a placement."""
+  save_todos(12, [
+    ranked_child(1, None, 5.0), ranked_child(2, None, 4.0),
+    ranked_child(3, 1, 3.0), ranked_child(4, 2, 2.0),
+    ranked_child(10, None, 1.0),
+    TodoItem(
+      id=11, title="Shared", parents=[ROOT_ID, 10], priority=0.5,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+  ])
+  result = runner.invoke(cli, ["add", "-t", "New", "--top-level", "--top"])
+  assert result.exit_code == 0, result.output
+  assert stored_priority(3) == 3.0
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_net_says_when_it_gives_up(
+  temp_todo_dir, monkeypatch, capsys, strict,
+):
+  """A repair that cannot nest the ranges warns or raises."""
+  monkeypatch.setattr("nytid.cli.todo.STRICT_RANKING", strict)
+  todos = a_d_and_shared_b(4.5)
+  new = TodoItem(id=9, title="New", priority=6.0)
+  todos.append(new)
+  answers = iter([True])
+  with patch(
+    "nytid.cli.todo.ranking_is_consistent",
+    side_effect=lambda _: next(answers, False),
+  ):
+    if strict:
+      with pytest.raises(RankingNotNested, match="placing #9"):
+        settle_placement(todos, new)
+    else:
+      settle_placement(todos, new)
+      assert "Warning: placing #9 left priorities" in (
+        capsys.readouterr().err
+      )
+@
 
 \paragraph{Every range at once.}%
 \label{sec:ranking-index}
@@ -32653,6 +32748,7 @@ from nytid.cli.todo import (
     ranked_under,
     ranking_is_consistent,
     RankingIndex,
+    RankingNotNested,
     place_fallen_below,
     context_path,
     get_children,
