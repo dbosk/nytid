@@ -3799,15 +3799,18 @@ def blocker_links(todos, by_id=None):
     return links
 
 
-def blockers_index(todos, done=None, links=None):
+def blockers_index(todos, done=None, links=None, by_id=None,
+                   children=None):
     """Return the `Blockers` of `todos`.
 
     An item is closed when it is done, or, if `done` is
     given, when its id is in `done`.  `links` may pass
     `blocker_links(todos)`, which does not depend on the
-    status.
+    status, and `by_id` and `children` the maps from id to
+    item and from parent id to children.
     """
-    by_id = {t.id: t for t in todos}
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
     if done is None:
         done = {t.id for t in todos if t.status == "done"}
     if links is None:
@@ -3827,7 +3830,8 @@ An item already in [[clear]] is not visited again, which ends the walk
 on a diamond and on a cycle alike.
 
 <<find the items nothing blocks>>=
-children = children_by_parent(todos)
+if children is None:
+    children = children_by_parent(todos)
 clear = set()
 frontier = [
     t for t in todos
@@ -4049,12 +4053,28 @@ The simulation decides on the blocker rules that [[is_unblocked]]
 applies, not on [[is_ready]], because readiness also asks for the
 pending status, which the simulation has no use for.
 
-Each round costs one pass over the items, and the number of rounds is
-the length of the longest chain of waiting, a handful in practice and
-never more than the number of items.  At nytid's scale, hundreds to a
-few thousand items, that is well inside the time a command spends
-reading the file, and the check runs only on commands that change
-links.
+\paragraph{One completion at a time}
+Played in rounds, each of which rebuilds the blockers index and
+completes what it then can, the simulation needs as many rounds as the
+longest chain of waiting is long, and a chain of a thousand blockers,
+or a path a thousand levels deep, made it take seconds to tens of
+seconds.  So it keeps count instead, and handles one completion at a
+time.  Each open item knows how many of its blockers are still open,
+and each parent that completes by rollup how many of its children are;
+a completion lowers the counts of the items that waited for it, and an
+item whose count reaches zero is looked at again.  [[clear]], the set
+of items nothing blocks, only ever grows, so it is extended from the
+items that change rather than recomputed: an item joins when nothing
+of its own blocks it any more and one of its parents is the top level,
+missing, or clear, and then its children are looked at in turn.  A leaf
+that joins is complete; so is a parent whose count of open children
+reaches zero.  Every item and every link is then handled a bounded
+number of times, which makes the whole check about linear in the size
+of the list.  On four thousand items, realistically shaped, it takes a
+few hundredths of a second, and about a tenth when hundreds of them are
+stuck and have to be explained (below); a chain of four thousand
+blockers, a circle of four thousand, or a path two thousand levels
+deep, stays under two tenths.
 
 <<sub-item helpers>>=
 def simulate_completion(todos):
@@ -4064,27 +4084,86 @@ def simulate_completion(todos):
     Items with an open child complete by rollup, every other
     item once nothing blocks it, until nothing changes.
     """
-    links = blocker_links(todos)
+    by_id = {t.id: t for t in todos}
+    links = blocker_links(todos, by_id)
     children = children_by_parent(todos)
     done = {t.id for t in todos if t.status == "done"}
-    by_rollup = {
-        parent_id for parent_id, kids in children.items()
-        if any(c.id not in done for c in kids)
-    }
-    while True:
-        blockers = blockers_index(todos, done, links)
-        completed = {
-            t.id for t in todos
-            if t.id not in done
-            and (
-                all(c.id in done for c in children[t.id])
-                if t.id in by_rollup
-                else is_unblocked(t, blockers)
-            )
-        }
-        if not completed:
-            return done, blockers
-        done |= completed
+    <<count what each open item waits for>>
+    <<complete one item at a time>>
+    return done, blockers_index(todos, done, links, by_id, children)
+@
+
+The counts start from the state as stored.  A blocker that is done
+already counts for nothing, and a parent with no open child does not
+complete by rollup at all; [[waiters]] is the reverse of the blocker
+links, the items each blocker holds up.
+
+<<count what each open item waits for>>=
+waiting = {
+    item_id: sum(1 for b in blocker_ids if b not in done)
+    for item_id, blocker_ids in links.items()
+}
+waiters = {}
+for item_id, blocker_ids in links.items():
+    for blocker_id in blocker_ids:
+        waiters.setdefault(blocker_id, []).append(item_id)
+open_children = {
+    parent_id: sum(1 for c in kids if c.id not in done)
+    for parent_id, kids in children.items()
+}
+by_rollup = {p for p, count in open_children.items() if count}
+@
+
+[[join_clear]] is the walk of [[<<find the items nothing blocks>>]]
+started from one item, and completes the leaves it lets in.  The
+completed items wait in [[finished]] until their consequences have been
+drawn: the item itself no longer waits for anything, the items it
+blocked wait for one blocker fewer, and each rollup parent above it
+for one child fewer.
+
+<<complete one item at a time>>=
+clear = set()
+finished = []
+
+
+def complete(item_id):
+    done.add(item_id)
+    finished.append(item_id)
+
+
+def join_clear(start):
+    stack = [start]
+    while stack:
+        item = stack.pop()
+        if item.id in clear or (
+            item.id not in done and waiting.get(item.id, 0)
+        ):
+            continue
+        if not any(
+            p == ROOT_ID or p not in by_id or p in clear
+            for p in parents_of(item)
+        ):
+            continue
+        clear.add(item.id)
+        if item.id not in done and item.id not in by_rollup:
+            complete(item.id)
+        stack.extend(children.get(item.id, []))
+
+
+for item in todos:
+    join_clear(item)
+while finished:
+    item_id = finished.pop()
+    join_clear(by_id[item_id])
+    for waiter_id in waiters.get(item_id, []):
+        waiting[waiter_id] -= 1
+        if not waiting[waiter_id]:
+            join_clear(by_id[waiter_id])
+    for parent_id in real_parents_of(by_id[item_id]):
+        if parent_id in by_rollup and parent_id not in done:
+            open_children[parent_id] -= 1
+            if not open_children[parent_id]:
+                complete(parent_id)
 @
 
 What is left is the stuck items, and each of them waits for something
@@ -4095,6 +4174,16 @@ it walks is the explanation the user needs, as in \enquote{\#4 is
 blocked by \#2; \#2 waits for its sub-item \#4}.  The one exception is
 an item that a parent cycle cuts off from the top level, which no
 command can make and whose explanation says so.
+
+A circle can be long, and spelling it out in full for each of its items
+would cost the square of its length, in time and in text: a circle of a
+thousand blockers took seconds and printed a million steps.  The
+explanation therefore stops after [[STUCK_REASON_STEPS]] steps, with an
+ellipsis.  That is enough to see where an item is caught and which
+link to look at, and keeps the cost linear.
+
+<<constants>>=
+STUCK_REASON_STEPS = 10
 
 <<sub-item helpers>>=
 def find_stuck_items(todos):
@@ -4135,6 +4224,9 @@ def find_stuck_items(todos):
             continue
         steps, seen, current = [], set(), item.id
         while current is not None and current not in seen:
+            if len(steps) == STUCK_REASON_STEPS:
+                steps.append("...")
+                break
             seen.add(current)
             step, current = waits_for(current)
             steps.append(step)
@@ -4276,6 +4368,71 @@ def test_parent_with_done_children_waits_like_a_leaf(temp_todo_dir):
   result = runner.invoke(cli, ["edit", "1", "--add-blocker", "3"])
   assert result.exit_code == 1, result.output
   assert "#1 is blocked by #3; #3 is blocked by #1" in result.output
+@
+
+The counting is an optimization of the rounds, and must agree with
+them.  The test plays the rounds the plain way, rebuilding the index
+each round, and compares on random lists with several parents, parent
+cycles, done items and blockers anywhere:
+
+<<test functions>>=
+def stuck_by_rounds(todos):
+  """The open ids the round-by-round simulation leaves."""
+  children = children_by_parent(todos)
+  done = {t.id for t in todos if t.status == "done"}
+  by_rollup = {
+    p for p, kids in children.items()
+    if any(c.id not in done for c in kids)
+  }
+  while True:
+    blockers = blockers_index(todos, done)
+    completed = {
+      t.id for t in todos if t.id not in done and (
+        all(c.id in done for c in children[t.id])
+        if t.id in by_rollup else is_unblocked(t, blockers)
+      )
+    }
+    if not completed:
+      return {t.id for t in todos} - done
+    done |= completed
+
+
+def test_counting_simulation_agrees_with_rounds():
+  """The worklist leaves exactly what the rounds leave."""
+  import random
+  rng = random.Random(8)
+  for _ in range(300):
+    n = rng.randint(1, 12)
+    todos = [
+      TodoItem(
+        id=i, title=f"#{i}",
+        parents=rng.sample([ROOT_ID, *range(1, n + 1)],
+                           rng.randint(1, 2)),
+        status=rng.choice(["pending", "pending", "done"]),
+      )
+      for i in range(1, n + 1)
+    ]
+    for item in todos:
+      if rng.random() < 0.4:
+        item.blocked_by = rng.sample(range(1, n + 2), 1)
+    assert set(find_stuck_items(todos)) == stuck_by_rounds(todos)
+@
+
+A long circle is explained to [[STUCK_REASON_STEPS]] steps and no
+further:
+
+<<test functions>>=
+def test_long_circle_explanation_is_cut_short():
+  """Fifteen items in a circle: ten steps and an ellipsis."""
+  todos = [
+    TodoItem(id=i, title=f"#{i}", blocked_by=[i % 15 + 1])
+    for i in range(1, 16)
+  ]
+  reason = find_stuck_items(todos)[1]
+  steps = reason.split("; ")
+  assert len(steps) == STUCK_REASON_STEPS + 1
+  assert steps[0] == "#1 is blocked by #2"
+  assert steps[-1] == "..."
 @
 
 \subsection{Context-Aware Child Priorities}%
@@ -35669,6 +35826,7 @@ from nytid.cli.todo import (
     simulate_completion,
     find_stuck_items,
     refuse_new_stuck_items,
+    STUCK_REASON_STEPS,
     todo_path,
     format_todo_path,
     assign_priority_at_position,
