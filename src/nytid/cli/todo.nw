@@ -497,9 +497,16 @@ completing every part completes the whole; the item an agent stumbled
 on while fixing something else is usually not part of that fix at all,
 and filing it there would hold the fix open until the stray item was
 done.  [[discovered_from]] keeps the context without that consequence
-(\cref{sec:todo-discovered-from}).  It is the newest stored field and
-so comes last, after [[context_claim]], in the dataclass and in
-[[ls]]'s records alike.
+(\cref{sec:todo-discovered-from}).  It follows [[context_claim]], in
+the dataclass and in [[ls]]'s records alike.
+
+The [[blocked_by]] field is the third link between items, beside the
+parents and the provenance: the IDs of the todos that have to be done
+before this one can be started (\cref{sec:todo-blocked-by-field}).
+Unlike a parent, a blocker says nothing about what the item is part
+of, and unlike the provenance it changes what happens: an item with an
+open blocker is not ready (\cref{sec:todo-blockers}).  It is the newest
+stored field and so comes last, after [[discovered_from]].
 
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
@@ -562,6 +569,7 @@ class TodoItem:
     claimed_by: str | None = None
     context_claim: bool = False
     discovered_from: int | None = None
+    blocked_by: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert explicit values to a JSON-serializable dict.
@@ -691,11 +699,13 @@ matches the [[track]] command.
 
 <<normalize labels on assignment>>=
 def __setattr__(self, name, value):
-    """Keep `labels` a sorted, duplicate-free list and
-    `parents` an ordered one (see `normalize_parents`)."""
+    """Keep `labels` a sorted, duplicate-free list,
+    `parents` an ordered one (see `normalize_parents`) and
+    `blocked_by` a sorted one (see `normalize_blockers`)."""
     if name == "labels" and value is not None:
         value = sorted(set(value))
     <<normalize [[parents]] on assignment>>
+    <<normalize [[blocked_by]] on assignment>>
     object.__setattr__(self, name, value)
 @
 
@@ -965,6 +975,112 @@ def test_old_todo_file_round_trips(temp_todo_dir):
   assert [(t["parents"], t["parent_id"]) for t in stored] == [
     ([ROOT_ID], None), ([1], 1),
   ]
+@
+
+\subsection{What an Item Waits For}%
+\label{sec:todo-blocked-by-field}
+
+An item lists its blockers in [[blocked_by]], a list of ids, empty by
+default.  The link is stored on the blocked item and not on the
+blocker for the reason [[parents]] is stored on the child: the question
+every command asks is \enquote{can this item start?}, and the answer
+should be in the item it is asked about.  The other direction,
+\enquote{what does this item hold up?}, is a scan of the list, which
+[[view]] makes (\cref{sec:todo-view-blockers}).
+
+Like the labels, and unlike the parents, the list is a set: being
+blocked by \#4 twice means what being blocked by it once means, and the
+order the blockers were added in says nothing, whereas the first parent
+decides an item's line (\cref{sec:todo-parents-field}).  So the list is sorted
+and repeats are dropped, on every assignment, by the same
+[[__setattr__]].  An item never waits for itself, and that entry is
+dropped as well: it could never be satisfied, and would make the item
+stuck for good (\cref{sec:todo-stuck}).  The item's own id is known
+when [[blocked_by]] is assigned, because the dataclass assigns [[id]]
+first.
+
+A blocker that does not exist is kept, and counts as closed.  The
+blocker may have been removed with [[rm]], and removing a todo has never
+had to visit the items that point at it, as with [[discovered_from]];
+work that waited for something which no longer exists has nothing left
+to wait for.  What is refused is a value that is not an id at all, for
+the reasons and in the way [[parents]] refuses one
+(\cref{sec:todo-refused-files}): the exception is a kind of
+[[InvalidParentsError]], so the file reader stops on it, naming the item,
+instead of reading an empty list.  Zero is refused too, since it is the
+top level's id and not a todo's.
+
+<<helpers>>=
+class InvalidBlockersError(InvalidParentsError):
+    """A blocked_by value that is not a list of todo ids."""
+
+
+def normalize_blockers(blockers, own_id=None):
+    """Return `blockers` as a sorted list of todo ids.
+
+    Repeats and `own_id` are dropped, and `None` or a single
+    id is read as a list.  Raises `InvalidBlockersError` for
+    anything that is not the id of a todo.
+    """
+    if blockers is None:
+        return []
+    if is_parent_id(blockers):
+        blockers = [blockers]
+    if not isinstance(blockers, (list, tuple)):
+        raise InvalidBlockersError(
+            f"blocked_by {blockers!r}, which is not a list of ids"
+        )
+    for blocker in blockers:
+        if not is_parent_id(blocker) or blocker == ROOT_ID:
+            raise InvalidBlockersError(
+                f"blocker {blocker!r}, which is not a todo id"
+            )
+    return sorted({b for b in blockers if b != own_id})
+<<normalize [[blocked_by]] on assignment>>=
+if name == "blocked_by":
+    value = normalize_blockers(value, self.__dict__.get("id"))
+@
+
+Let's verify the normalization, the refusals, and that a file holding
+a bad blocker is refused like one holding a bad parent:
+
+<<test functions>>=
+def test_blocked_by_is_a_sorted_set_without_self():
+  """Repeats and the item itself go; the rest is sorted."""
+  assert TodoItem(id=1, title="T").blocked_by == []
+  item = TodoItem(id=5, title="T", blocked_by=[9, 2, 9, 5])
+  assert item.blocked_by == [2, 9]
+  item.blocked_by = 7
+  assert item.blocked_by == [7]
+  assert TodoItem.from_dict(
+    {"id": 3, "title": "T", "blocked_by": [4, 3]}
+  ).blocked_by == [4]
+
+
+@pytest.mark.parametrize("blocked_by", [
+  "12", [0], [1.0], [True], [-1], ["1"], {"id": 1},
+])
+def test_blocked_by_refuses_what_is_not_a_todo_id(blocked_by):
+  """Zero, strings, floats and booleans are not blockers."""
+  with pytest.raises(InvalidBlockersError):
+    TodoItem(id=1, title="T", blocked_by=blocked_by)
+
+
+def test_todo_with_bad_blocker_is_refused(temp_todo_dir):
+  """A string blocker stops the commands; the file stays."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "One"},
+      {"id": 2, "title": "Two", "blocked_by": ["1"]},
+    ],
+  }))
+  stored = get_todo_file().read_text()
+  result = runner.invoke(cli, ["ls", "--who", ""])
+  assert result.exit_code == 1
+  assert "holds todo #2 with blocker '1'" in result.output
+  assert get_todo_file().read_text() == stored
 @
 
 \subsection{Estimates Are Numbers, Not Strings}
@@ -15784,8 +15900,9 @@ in [[FIELDS_AFTER_COMPUTED]] and moved behind the computed values, in
 the order of the list.  The list only grows: a later field is appended
 to it, after the ones already there, which keeps each of their
 positions too.  [[closed]] came first; [[claimed_by]] and
-[[context_claim]] (\cref{sec:todo-claim}) followed it, and
-[[discovered_from]] (\cref{sec:todo-discovered-from}) followed them.
+[[context_claim]] (\cref{sec:todo-claim}) followed it,
+[[discovered_from]] (\cref{sec:todo-discovered-from}) followed them,
+and the last two are described below.
 
 A listing that extends [[ls]]'s record with computed columns of its
 own, as [[ready]] does (\cref{sec:todo-ready}), meets the same problem
@@ -15805,10 +15922,20 @@ the meaning it always had, and [[parents]] is the fifth field to move
 behind the computed values.  The headerless rows thus grow by one
 column at the end and lose none.
 
+[[blocked_by]] (\cref{sec:todo-blocked-by-field}) is the sixth, after
+[[parents]].  Whether the item is blocked \emph{now} is deliberately not
+a computed column of its own.  The answer depends on other items, and
+on more than the stored list, since a block can come from an ancestor
+(\cref{sec:todo-blockers}); a script that wants it asks [[ready]], whose
+records carry the verdict, or [[ls --blocked]], which selects the
+blocked items (\cref{sec:todo-ls-blocked}).  A column added here would
+also have to go somewhere: in front of the late stored fields, as
+[[ready]]'s go, it would move every one of them in the pipe form.
+
 <<constants>>=
 FIELDS_AFTER_COMPUTED = (
     "closed", "claimed_by", "context_claim", "discovered_from",
-    "parents",
+    "parents", "blocked_by",
 )
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio, computed=None):
@@ -16490,7 +16617,8 @@ Labels are a list, joined here with semicolons rather than commas so
 that the value stays one word to a reader that splits on the delimiter
 even after the quoting has been stripped away.  The parents are a list
 of ids and are joined the same way, the top level included as~[[0]]
-(\cref{sec:todo-parents-field}).  The GitHub link is a
+(\cref{sec:todo-parents-field}), and so are the blockers
+(\cref{sec:todo-blocked-by-field}).  The GitHub link is a
 dictionary of repository, type and number, rendered as [[repo#number]]:
 the spelling [[gh]] itself accepts and the one a reader would write in
 a commit message.  Flattening it drops the issue-versus-pull-request
@@ -16514,14 +16642,14 @@ CSV_OMITTED_FIELDS = ("env",)
 def csv_cell(name, value):
     """Return `value` rendered as the CSV cell of column `name`.
 
-    Labels and parents are joined with semicolons, a GitHub
+    Labels, parents and blockers are joined with semicolons, a GitHub
     link becomes `repo#number`, a path becomes its titles, and
     `None` becomes the empty string.  Every other value is rendered with `str`,
     matching what JSON would show.
     """
     if name == "labels":
         return ";".join(value or [])
-    if name == "parents":
+    if name in ("parents", "blocked_by"):
         return ";".join(str(p) for p in value or [])
     if name == "path":
         return format_todo_path(value)
@@ -16672,7 +16800,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: twenty-two tab-separated fields, no header,
+Let's verify the pipe form: twenty-three tab-separated fields, no header,
 and the flattened cells in their record positions, with the tracked
 hours still in the seventeenth.
 
@@ -16694,7 +16822,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 22
+  assert len(fields) == 23
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
   assert fields[16] == "0"
@@ -16734,13 +16862,14 @@ def test_ls_piped_keeps_computed_columns_in_place(temp_todo_dir):
   assert fields[21] == "7"
 @
 
-The parents are the latest of those fields.  The derived [[parent_id]]
-keeps the tenth column, holding one id as it always has, and the list
-comes last, after [[discovered_from]]:
+The parents and the blockers are the latest of those fields.  The
+derived [[parent_id]] keeps the tenth column, holding one id as it
+always has, the list of parents follows [[discovered_from]], and the
+blockers come last, joined like the parents:
 
 <<test functions>>=
 def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
-  """parent_id keeps column ten; parents is appended last."""
+  """parent_id keeps column ten; parents and blocked_by come last."""
   save_todos(5, [
     TodoItem(
       id=4, title="Parent", created="2026-02-20T10:00:00",
@@ -16748,11 +16877,11 @@ def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
     ),
     TodoItem(
       id=1, title="Shared", created="2026-02-20T10:00:00",
-      who="me", parents=[ROOT_ID, 4],
+      who="me", parents=[ROOT_ID, 4], blocked_by=[3, 2],
     ),
   ])
 
-  for flags, last in (([], 21), (["--prio"], 22)):
+  for flags, last in (([], 22), (["--prio"], 23)):
     result = runner.invoke(cli, ["ls", "--who", "", *flags])
     assert result.exit_code == 0, result.output
     row = next(
@@ -16761,7 +16890,8 @@ def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
     )
     assert len(row) == last + 1
     assert row[9] == "4"
-    assert row[last] == "0;4"
+    assert row[last - 1] == "0;4"
+    assert row[last] == "2;3"
 @
 
 Free text is the case that rule exists for.  A note that spans two
@@ -16786,7 +16916,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 22
+  assert len(fields) == 23
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -16883,7 +17013,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
         "claimed_by", "context_claim", "discovered_from",
-        "parents",
+        "parents", "blocked_by",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -17536,13 +17666,13 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-8:] == [
+  assert list(rows[3])[-9:] == [
     "tracked_hours", "path", "ready",
     *FIELDS_AFTER_COMPUTED,
   ]
   assert FIELDS_AFTER_COMPUTED == (
     "closed", "claimed_by", "context_claim", "discovered_from",
-    "parents",
+    "parents", "blocked_by",
   )
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -33812,6 +33942,7 @@ from nytid.cli.todo import (
     push_active,
     normalize_parents,
     InvalidParentsError,
+    InvalidBlockersError,
     parents_of,
     real_parents_of,
     children_of,
