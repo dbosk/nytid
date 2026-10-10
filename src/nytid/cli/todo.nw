@@ -3969,6 +3969,258 @@ def test_blocker_below_the_item_does_not_count():
   assert all(is_unblocked(t, blockers) for t in todos)
 @
 
+\subsection{Work That Can Never Start}%
+\label{sec:todo-stuck}
+
+Blocks and parents together can wait for each other in a circle, and
+then nothing in the circle ever becomes ready.  The plainest case is an
+ancestor that blocks its own descendant: the descendant waits for the
+ancestor to be done, and the ancestor, completing by rollup, waits for
+the descendant.  Two items blocking each other are the same circle
+without the parents, and the circle may also run through an inherited
+block: A blocked by B, and B blocked by A's own child.  No command
+would ever report such items as ready again, and nothing would say why;
+they would just drop out of [[ready]] and [[next]] for good.  So the
+commands that add a blocker or a parent refuse a change that would leave
+work in such a circle, and say which circle.
+
+\paragraph{Why not look for cycles}
+The obvious check is a cycle search in one graph that combines the two
+kinds of link: an edge from each blocked item to its blocker, from each
+parent to its children, and from each item to its ancestors' blockers.
+It gets two cases wrong.  An item waiting for its own child is harmless
+(\cref{sec:todo-blockers}), but the inherited edge from the child to
+its parent's blocker, the child itself, is a cycle of one.  And with
+several parents a cycle may run through one of an item's places while
+another place is clear, so that the item is not held up at all.  The
+graph does not express that a parent waits for \emph{all} its children
+but an item needs only \emph{one} clear path: an \enquote{and} and an
+\enquote{or}, which a cycle search treats alike.
+
+\paragraph{Simulating the work instead}
+We therefore ask the question directly: if every piece of work that
+could be done were done, what would be left?  [[find_stuck_items]] plays
+the list forward.  An item with open children can only complete by
+rollup, when all of them have, and each of its parents rolls up on its
+own.  Any other item completes as soon as nothing blocks it, by the
+very rules readiness uses, its several paths included.  Each round
+completes everything it can; completions unblock other items and close
+families, and the rounds go on until one completes nothing.  The open
+items left over are stuck, and nothing else is: every other item has a
+sequence of completions that reaches it.  Which item becomes ready
+first does not matter, since a completion never makes another item less
+ready, and so the leftover is the same in whatever order the work is
+done.  The status of an item in progress is ignored, since it may be
+completed like a pending one.
+
+The simulation decides on the blocker rules that [[is_unblocked]]
+applies, not on [[is_ready]], because readiness also asks for the
+pending status, which the simulation has no use for.
+
+Each round costs one pass over the items, and the number of rounds is
+the length of the longest chain of waiting, a handful in practice and
+never more than the number of items.  At nytid's scale, hundreds to a
+few thousand items, that is well inside the time a command spends
+reading the file, and the check runs only on commands that change
+links.
+
+<<sub-item helpers>>=
+def simulate_completion(todos):
+    """Return the ids that could be completed, and the
+    `Blockers` of the state in which nothing more can.
+
+    Items with open children complete by rollup, every other
+    item once nothing blocks it, until nothing changes.
+    """
+    links = blocker_links(todos)
+    children = children_by_parent(todos)
+    done = {t.id for t in todos if t.status == "done"}
+    while True:
+        blockers = blockers_index(todos, done, links)
+        completed = {
+            t.id for t in todos
+            if t.id not in done
+            and (
+                all(c.id in done for c in children[t.id])
+                if t.id in children
+                else is_unblocked(t, blockers)
+            )
+        }
+        if not completed:
+            return done, blockers
+        done |= completed
+@
+
+What is left is the stuck items, and each of them waits for something
+that is stuck as well: an item with open children for one of them, any
+other item for a blocker of its own or of an ancestor.  Following those
+steps from a stuck item must therefore come back round, and the circle
+it walks is the explanation the user needs, as in \enquote{\#4 is
+blocked by \#2; \#2 waits for its sub-item \#4}.  The one exception is
+an item that a parent cycle cuts off from the top level, which no
+command can make and whose explanation says so.
+
+<<sub-item helpers>>=
+def find_stuck_items(todos):
+    """Return the open items of `todos` that can never be
+    completed, as a map from id to why.
+
+    The reason is the circle of waiting the item is in, such
+    as `#4 is blocked by #2; #2 waits for its sub-item #4`.
+    """
+    done, blockers = simulate_completion(todos)
+    children = children_by_parent(todos)
+
+    def waits_for(item_id):
+        open_children = [
+            c.id for c in children.get(item_id, [])
+            if c.id not in done
+        ]
+        if open_children:
+            return (
+                f"#{item_id} waits for its sub-item "
+                f"#{open_children[0]}",
+                open_children[0],
+            )
+        for blocker_id, via in blocking_reasons(
+            blockers.by_id[item_id], blockers
+        ):
+            return (
+                f"#{item_id} is blocked by #{blocker_id}"
+                if via is None else
+                f"#{item_id} is blocked via #{via} by #{blocker_id}",
+                blocker_id,
+            )
+        return f"#{item_id} is cut off from the top level", None
+
+    stuck = {}
+    for item in todos:
+        if item.id in done:
+            continue
+        steps, seen, current = [], set(), item.id
+        while current is not None and current not in seen:
+            seen.add(current)
+            step, current = waits_for(current)
+            steps.append(step)
+        stuck[item.id] = "; ".join(steps)
+    return stuck
+@
+
+The commands use the check as a comparison.  Items that are stuck
+already, perhaps since a hand edit, are not the change's fault, and
+refusing every change until the user had repaired them would make the
+repair itself impossible; [[ls --blocked]] reports them
+(\cref{sec:todo-ls-blocked}).  What is refused is a change that makes
+\emph{new} stuck items.  The caller finds the stuck items before the
+change, makes it on the state inside its locked callback, and asks this
+helper, whose exit abandons the write (\cref{sec:todo-read-modify-write}).
+
+<<sub-item helpers>>=
+def refuse_new_stuck_items(todos, stuck_before):
+    """Exit with an error if `todos` holds stuck items that
+    are not among the ids in `stuck_before`."""
+    new = {
+        item_id: reason
+        for item_id, reason in find_stuck_items(todos).items()
+        if item_id not in stuck_before
+    }
+    if not new:
+        return
+    typer.echo(
+        "Error: refused, since "
+        + ", ".join(f"#{i}" for i in sorted(new))
+        + " could never be done:",
+        err=True,
+    )
+    for item_id in sorted(new):
+        typer.echo(f"  {new[item_id]}", err=True)
+    raise typer.Exit(1)
+@
+
+Let's verify the patterns the check exists for.  An ancestor blocking
+its own descendant, two items blocking each other, and a circle through
+an inherited block are all stuck, and say why:
+
+<<test functions>>=
+def test_find_stuck_items_finds_the_circles():
+  """Ancestor-descendant, blocker cycles and inherited cycles."""
+  ancestor = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="A1", parents=[1]),
+    TodoItem(id=3, title="A11", parents=[2], blocked_by=[1]),
+  ]
+  assert find_stuck_items(ancestor) == {
+    1: "#1 waits for its sub-item #2; #2 waits for its sub-item #3; "
+       "#3 is blocked by #1",
+    2: "#2 waits for its sub-item #3; #3 is blocked by #1; "
+       "#1 waits for its sub-item #2",
+    3: "#3 is blocked by #1; #1 waits for its sub-item #2; "
+       "#2 waits for its sub-item #3",
+  }
+
+  mutual = [
+    TodoItem(id=1, title="X", blocked_by=[2]),
+    TodoItem(id=2, title="Y", blocked_by=[1]),
+    TodoItem(id=3, title="Z", blocked_by=[2]),
+  ]
+  assert find_stuck_items(mutual)[3] == (
+    "#3 is blocked by #2; #2 is blocked by #1; #1 is blocked by #2"
+  )
+
+  inherited = [
+    TodoItem(id=1, title="A", blocked_by=[3]),
+    TodoItem(id=2, title="A1", parents=[1]),
+    TodoItem(id=3, title="B", blocked_by=[2]),
+  ]
+  assert find_stuck_items(inherited)[2] == (
+    "#2 is blocked via #1 by #3; #3 is blocked by #2"
+  )
+@
+
+The rest of the graph is not stuck: work outside the circle, a child
+blocking its own parent, and the shared items whose other path is
+clear.  In the last case, D waits for A, and the item under both A and
+D can start through A; finishing it completes A, which unblocks D, and
+D then rolls up on its own.  An item that is also top-level breaks a
+circle through its other parent in the same way.
+
+<<test functions>>=
+def test_find_stuck_items_lets_harmless_shapes_through():
+  """Redundant blocks and one clear path do not deadlock."""
+  assert find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="C", parents=[1]),
+  ]) == {}
+  assert find_stuck_items([
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="D", blocked_by=[1]),
+    TodoItem(id=3, title="Shared", parents=[1, 2]),
+  ]) == {}
+  assert find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="B", blocked_by=[3]),
+    TodoItem(id=3, title="Top and under A", parents=[ROOT_ID, 1]),
+  ]) == {}
+  assert set(find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="B", blocked_by=[3]),
+    TodoItem(id=3, title="Only under A", parents=[1]),
+    TodoItem(id=4, title="Bystander"),
+  ])) == {1, 2, 3}
+@
+
+A done blocker frees what it blocked, and a done item is never stuck,
+whatever it points at:
+
+<<test functions>>=
+def test_find_stuck_items_ignores_done_work():
+  """Done items neither block nor get stuck."""
+  assert find_stuck_items([
+    TodoItem(id=1, title="X", blocked_by=[2], status="done"),
+    TodoItem(id=2, title="Y", blocked_by=[1]),
+  ]) == {}
+@
+
 \subsection{Context-Aware Child Priorities}%
 \label{sec:child-priority-helpers}
 
@@ -34370,6 +34622,9 @@ from nytid.cli.todo import (
     is_unblocked,
     blocking_ancestors,
     blocking_reasons,
+    simulate_completion,
+    find_stuck_items,
+    refuse_new_stuck_items,
     todo_path,
     format_todo_path,
     assign_priority_at_position,
