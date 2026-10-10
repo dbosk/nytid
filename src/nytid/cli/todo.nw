@@ -5998,15 +5998,17 @@ if holder is not None:
     item.who = who
 @
 
-Two gaps remain.  Two sessions acting as the \emph{same} worker, two
+A takeover also has to survive the previous owner's run, if one is
+still going: when that process exits, its ending must not stop or
+reset an item that is no longer its own.  The run's ending checks
+for that itself (\cref{sec:todo-run-taken-over}).
+
+One gap remains.  Two sessions acting as the \emph{same} worker, two
 agent runs as [[dan-claude]] for instance, can still both start one
 item: the claim tells workers apart, not sessions, and for the
 acting worker an active item of its own is simply a restart.
 Closing that needs an identity per session, which the store does not
-have.  And a takeover does not reach a process that the previous
-owner launched and that is still running: when it exits, its
-post-run handling stops the item by ID, which now means the new
-owner's session.  Both are left for follow-up work.
+have, and is left for follow-up work.
 
 Let's verify the rule and the three cases it leaves alone, starting
 with the refusal itself.  The item stays the previous owner's, and
@@ -6273,9 +6275,18 @@ implicit active todo.  Second, it still resolves against the authoritative
 locked state, so we do not reintroduce the race that motivated
 [[mutate_todo_state]] in the first place.
 
+A run that ends stops its item through here too, and passes the worker
+that launched it as [[launched_by]].  If the item was taken over
+meanwhile, the stop must not happen at all; that check is explained
+with the rest of the run's ending (\cref{sec:todo-run-taken-over}).
+
 <<helpers>>=
-def stop_todo_state(todo_id, who=None):
-    """Remove a todo from the authoritative active stack."""
+def stop_todo_state(todo_id, who=None, launched_by=None):
+    """Remove a todo from the authoritative active stack.
+
+    Raises `RunTakenOver` instead when `launched_by` is
+    given and the item is no longer that worker's.
+    """
 
     def update(next_id, todos, stack):
         resolved_id = resolve_todo_id(
@@ -6292,6 +6303,7 @@ def stop_todo_state(todo_id, who=None):
                 err=True,
             )
             raise typer.Exit(1)
+        <<refuse to stop a run that was taken over>>
         stack = [sid for sid in stack if sid != resolved_id]
         return next_id, todos, stack, resolved_id, item
 
@@ -17235,15 +17247,17 @@ on, read after the stop; the decision itself is stored by
 this snapshot back, since a prompt may stand between the two.
 
 <<helpers>>=
-def stop_todo_hierarchy(todo_id, who=None):
+def stop_todo_hierarchy(todo_id, who=None, launched_by=None):
     """Stop a todo and all active descendants.
 
     Reuses the same hierarchy-unwinding order as
     ``todo stop`` and returns the refreshed todo
     state after descendants have been deactivated.
+    Raises `RunTakenOver`, having stopped nothing, when
+    `launched_by` is given and no longer owns the item.
     """
     resolved_id, item, _, todos, _ = stop_todo_state(
-        todo_id, who=who
+        todo_id, who=who, launched_by=launched_by,
     )
     resolved_who = who
     if resolved_who is None and item is not None:
@@ -18859,20 +18873,22 @@ Posting a note to GitHub is network I/O and stays outside the lock:
 callers post with [[post_note_comment]] first and pass the same text
 here to be mirrored locally.
 
-The notes are signed by the worker the item belongs to, not by
-whoever launched the run (\cref{sec:todo-note-headers}).  The output
-and exit code are what that worker's agent produced, and it is the
-same worker [[stop_todo_hierarchy]] derives to close the tracking
-session.  They are appended before the item is handed to
-[[reassign_to]], so a failed run is still signed by the agent that
-failed, not by the human who receives the task.  [[item.who]] can be
-[[None]] on an old item, and [[append_note_to_item]] then falls back to
-[[default_username]], the same rule the stop uses.
+The notes are signed by the worker that launched the run,
+[[launched_by]] (\cref{sec:todo-note-headers}), not by whoever owns
+the item when they are stored.  The output and exit code are what
+that worker's agent produced, and after a takeover
+(\cref{sec:todo-run-taken-over}) the new owner did not write them.
+They are appended before the item is handed to [[reassign_to]], so a
+failed run is still signed by the agent that failed, not by the human
+who receives the task.  A run started by an older version records no
+launcher; its notes fall back to [[item.who]], and
+[[append_note_to_item]] in turn to [[default_username]].
 
 <<helpers>>=
 def record_run_outcome(
     todo_id, descendant_ids, *,
     notes=(), done=False, reassign_to=None,
+    launched_by=None,
 ):
     """Store how a run of `todo_id` ended.
 
@@ -18880,8 +18896,11 @@ def record_run_outcome(
     done, marks it done if `done`, otherwise resets it to
     pending and assigns it to `reassign_to` if given.
     Descendants in `descendant_ids` that are not done
-    are reset to pending.  Returns the stored item (or
-    `None` if it no longer exists) and the stored todos.
+    are reset to pending.  If the item is no longer
+    `launched_by`'s, only the notes and a line saying
+    who took it over are stored.  Returns the stored item
+    (or `None` if it no longer exists) and the stored
+    todos.
     """
     def update(next_id, todos, stack):
         item = next(
@@ -18895,7 +18914,10 @@ def record_run_outcome(
             )
             return next_id, todos, stack, None
         for note_text in notes:
-            append_note_to_item(item, note_text, who=item.who)
+            append_note_to_item(
+                item, note_text, who=launched_by or item.who,
+            )
+        <<only note a run whose item was taken over>>
         if item.status != "done":
             if done:
                 set_status(item, "done")
@@ -18915,28 +18937,154 @@ def record_run_outcome(
     return item, todos
 @
 
+\paragraph{Runs that outlive their claim}%
+\label{sec:todo-run-taken-over}
+A run can outlast its claim on the item.  An agent's session is
+still running when the user takes the item over with
+[[start --force]] (\cref{sec:todo-claim}); the takeover stops the
+agent's tracking and makes the user the owner, but the agent's
+process carries on until it exits.  Left to itself, its ending would
+undo the takeover: the stop would remove the item from the stack and
+close the tracking of the item's \emph{current} owner, the new one,
+and the outcome would reset the item to pending, hand it to the
+[[--reassign-to]] worker, or, after a \enquote{yes} at the prompt,
+mark it done under the new owner's hands.
+
+What the run's ending may change is what the run still owns.  Every
+run therefore remembers the worker that launched it, and the ending
+compares that worker with the item's owner.  If they differ, the
+item belongs to somebody else now: it stays active for them, their
+tracking and the descendants are left alone, and the run neither
+asks whether the item is done nor stores done or pending.  All the
+run still does is end its launcher's own tracking of the item and
+leave its record: the run's note, if it has one, and a line saying
+who took the item over.
+
+Ownership is the right test because only a forced takeover rewrites
+[[who]] on an active item (\cref{sec:todo-claim}); a restart by the
+same worker, the case the claim allows, leaves the run alone, as it
+always did.  Runs started before this check existed carry no
+launcher, and [[None]] keeps their old behaviour.
+
+<<helpers>>=
+def run_taken_over_by(item, launched_by):
+    """Return the worker who took `item` from a run.
+
+    `launched_by` is the worker that launched the run.
+    Returns `None` while that worker still owns the item,
+    and when `launched_by` is `None` (an older run that
+    did not record its launcher).
+    """
+    if launched_by is None:
+        return None
+    owner = item.who or default_username
+    return owner if owner != launched_by else None
+@
+
+The comparison is made twice, both times under the lock, because the
+run's ending takes two steps with a prompt between them.  The stop is
+the first, and it must not happen at all for a run that was taken
+over: [[stop_todo_state]] raises instead of writing.  An exception
+fits because every caller that passes [[launched_by]] must handle the
+case, and an exception cannot be ignored the way a flag in a return
+tuple can; raising inside the callback is also what abandons the
+write (\cref{sec:todo-read-modify-write}).
+
+<<helpers>>=
+class RunTakenOver(Exception):
+    """A run ended after another worker took its item."""
+
+    def __init__(self, todo_id, item, owner):
+        super().__init__(
+            f"todo #{todo_id} was taken over by {owner}"
+        )
+        self.todo_id = todo_id
+        self.item = item
+        self.owner = owner
+<<refuse to stop a run that was taken over>>=
+owner = run_taken_over_by(item, launched_by)
+if owner is not None:
+    raise RunTakenOver(resolved_id, item, owner)
+@
+
+The second is the commit of the outcome.  A takeover can also land
+while the prompt is open, so [[record_run_outcome]] looks again and,
+if the item has changed hands, stores only the run's notes and the
+line about the takeover.
+
+<<only note a run whose item was taken over>>=
+owner = run_taken_over_by(item, launched_by)
+if owner is not None:
+    append_note_to_item(
+        item,
+        f"Run by {launched_by} ended after {owner} "
+        "took the item over; its outcome was not applied.",
+        who=launched_by,
+    )
+    return next_id, todos, stack, item
+@
+
+Both exit paths, the blocking one and the detached finalizer, stop a
+run the same way, so the handling of a taken-over stop lives in one
+function.  The launcher's tracking is stopped from a copy of the
+item that names the launcher, the same device the takeover itself
+uses (\cref{sec:todo-claim}), since [[stop_todo_tracking]] takes the
+worker from the item it is handed.  Usually the takeover has already
+stopped those labels and this stop finds nothing to do; it matters
+when the launcher has started them again since, by hand or through
+auto-suspend.
+
+<<helpers>>=
+def stop_run(todo_id, launched_by=None):
+    """Stop what a run of `todo_id` was tracking.
+
+    Returns the resolved ID, the item (`None` if it is
+    gone) and the descendants that were stopped.  If the
+    item was taken over during the run, only
+    `launched_by`'s own tracking of it is stopped and no
+    descendants are touched.
+    """
+    try:
+        (
+            todo_id, item, _, _, _, descendants,
+        ) = stop_todo_hierarchy(
+            todo_id, launched_by=launched_by,
+        )
+    except RunTakenOver as taken:
+        launchers_view = copy.copy(taken.item)
+        launchers_view.who = launched_by
+        _, todos = load_todos()
+        stop_todo_tracking(
+            taken.todo_id, launchers_view, todos,
+        )
+        typer.echo(
+            f"  #{taken.todo_id} was taken over by "
+            f"{taken.owner}; leaving it active"
+        )
+        return taken.todo_id, taken.item, []
+    return todo_id, item, descendants
+@
+
 The detached helper uses it directly: it has no prompt, only the exit
 code, so its decision is made at once from that.
 
 <<helpers>>=
 def finalize_detached_todo(
     todo_id, exit_code=1, exit_code_file=None,
-    reassign_to=None,
+    reassign_to=None, launched_by=None,
 ):
-    """Finish a non-blocking tmux-backed todo run."""
+    """Finish a non-blocking tmux-backed todo run.
+
+    `launched_by` is the worker that launched the run;
+    see `stop_run` for what happens when the item has
+    been taken over since.
+    """
     if exit_code_file is not None:
         exit_code = read_detached_exit_code(
             exit_code_file
         )
-    (
-        todo_id,
-        item,
-        _,
-        _,
-        _,
-        descendants,
-    ) = stop_todo_hierarchy(
-        todo_id
+    todo_id, item, descendants = stop_run(
+        todo_id, launched_by
     )
     if item is None:
         return
@@ -18950,6 +19098,7 @@ def finalize_detached_todo(
         reassign_to=(
             reassign_to if exit_code != 0 else None
         ),
+        launched_by=launched_by,
     )
 
 
@@ -18970,7 +19119,7 @@ def read_detached_exit_code(exit_code_file):
 
 def build_detached_todo_finalize_command(
     todo_id, proc_wd, exit_code_file,
-    reassign_to=None,
+    reassign_to=None, launched_by=None,
 ):
     """Return shell command to finalize a detached todo run."""
     pythonpath = os.path.abspath(
@@ -18982,13 +19131,17 @@ def build_detached_todo_finalize_command(
         f" --reassign-to {shlex.quote(reassign_to)}"
         if reassign_to else ""
     )
+    launcher_arg = (
+        f" --launched-by {shlex.quote(launched_by)}"
+        if launched_by else ""
+    )
     return (
         f"PYTHONPATH={shlex.quote(pythonpath)} "
         f"{shlex.quote(sys.executable)} "
         "-c 'from nytid.cli.todo import cli; cli()' "
         f"_finalize-detached {todo_id} "
         f"--exit-code-file {shlex.quote(exit_code_file)}"
-        f"{reassign_arg}"
+        f"{reassign_arg}{launcher_arg}"
         f"; rm -f {shlex.quote(exit_code_file)}"
     )
 @
@@ -18999,7 +19152,9 @@ the [[start]] invocation that knew about [[--reassign-to]] has exited.
 It is a user-supplied name interpolated into a command line, so it goes
 through [[shlex.quote]] like every other value here; omitting the flag
 entirely when there is no reassignee keeps the common case identical to
-what tmux ran before.
+what tmux ran before.  The launching worker travels the same way and
+for the same reason: the finalizer must know whose run it is ending
+(\cref{sec:todo-run-taken-over}).
 
 <<argument and option definitions>>=
 finalize_id_arg = typer.Argument(
@@ -19012,6 +19167,9 @@ finalize_file_opt = typer.Option(
 finalize_reassign_opt = typer.Option(
     "--reassign-to",
     help="Worker to receive the todo if the run failed")
+finalize_launcher_opt = typer.Option(
+    "--launched-by",
+    help="Worker that launched the run")
 @
 
 <<detached finalize command>>=
@@ -19024,11 +19182,13 @@ def finalize_detached_cmd(
                               finalize_file_opt] = None,
     reassign_to: Annotated[
         str | None, finalize_reassign_opt] = None,
+    launched_by: Annotated[
+        str | None, finalize_launcher_opt] = None,
 ):
     """Finalize a detached tmux-backed todo run."""
     finalize_detached_todo(
         todo_id, exit_code, exit_code_file,
-        reassign_to,
+        reassign_to, launched_by,
     )
 @
 
@@ -20265,6 +20425,15 @@ default here.  Without one, the shared exit handler would raise
 timed_out = False
 @
 
+The run also has to know whose it is when it ends, which is the
+item's owner now, at launch (\cref{sec:todo-run-taken-over}).  After
+a forced takeover that is already the new owner, since
+[[activate_todo_state]] rewrote [[who]] before we got here.
+
+<<initialize run outcome>>=
+launched_by = item.who or default_username
+@
+
 Todo launches now follow the same context-building path as track launches.
 We compute the textual todo context once and reuse it both as the prompt
 marker (seeded when we build the shell) and as the tmux window name.  That
@@ -20601,7 +20770,7 @@ try:
         os.close(exit_fd)
         finalize_cmd = build_detached_todo_finalize_command(
             todo_id, proc_wd, exit_code_file,
-            reassign_to,
+            reassign_to, launched_by,
         )
         if worktree_dir:
             finalize_cmd += \
@@ -21146,6 +21315,78 @@ def test_detached_finalize_command_carries_reassignee():
     assert "--reassign-to" not in plain
 
 
+def test_detached_finalize_command_carries_launcher():
+    """The tmux hook tells the finalizer whose run it was."""
+    cmd = build_detached_todo_finalize_command(
+        7, "/tmp/project", "/tmp/status",
+        launched_by="alice",
+    )
+    assert "--launched-by alice" in cmd
+
+
+def test_start_window_hook_names_the_launcher(temp_todo_dir):
+    """A detached start tells its finalizer who launched it."""
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Review PR",
+            created="2026-02-20T10:00:00",
+            wd="/tmp/project", command="true",
+            who="alice",
+        ),
+    ])
+    with patch.dict(os.environ, {"TMUX": "session"}, clear=True):
+        with patch(
+            "nytid.cli.todo.run_todo_tmux_command",
+            return_value=0,
+        ) as mock_run:
+            result = runner.invoke(
+                cli, ["start", "1", "--window", "--who", "alice"]
+            )
+    assert result.exit_code == 0, result.output
+    on_exit = mock_run.call_args.kwargs["on_exit_shell"]
+    assert "--launched-by alice" in on_exit
+@
+
+A detached run that ends after its item was taken over leaves the
+item to its new owner (\cref{sec:todo-run-taken-over}).  Here alice
+starts the item, the user takes it over, and then alice's detached
+run fails, which would otherwise have reset the item and handed it
+to the teacher:
+
+<<test functions>>=
+def test_detached_finalize_leaves_taken_over_item(
+  temp_todo_dir,
+):
+  """A taken-over item survives the old owner's finalizer."""
+  from nytid.cli.track import load_active_session
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Shared task",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+  ])
+  runner.invoke(cli, ["start", "1", "--who", "alice"])
+  taken = runner.invoke(cli, ["start", "1", "--force"])
+  assert taken.exit_code == 0, taken.output
+
+  finalize_detached_todo(
+    1, 1, reassign_to="teacher", launched_by="alice",
+  )
+
+  assert load_active_stack() == [1]
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+  assert " alice]\nExit code: 1" in todos[0].notes
+  assert " alice]\nRun by alice ended after" in todos[0].notes
+  mine = load_active_session(
+    default_username
+  ).get_active_labels()
+  assert "todo:1" in mine
+  alice = load_active_session("alice").get_active_labels()
+  assert "todo:1" not in alice
+
+
 def test_finalize_detached_todo_reads_status_file(
     temp_todo_dir,
 ):
@@ -21501,7 +21742,11 @@ done was completed by someone---quite possibly by the agent itself,
 just before the timeout killed it---and a timeout is no reason to
 reopen it.  This is the check [[record_run_outcome]] makes too
 (\cref{sec:todo-run-outcome}), and the note is signed the way its
-notes are, by the worker the item belongs to.
+notes are, by the worker that launched the run.  A takeover during
+the run needs no check here: the item is still on the stack, so the
+stored status stays \enquote{in-progress} whatever we write, and
+whether it really goes back to pending is decided by the exit
+handler below, which does check (\cref{sec:todo-run-taken-over}).
 
 <<handle subprocess timeout>>=
 timed_out = True
@@ -21530,7 +21775,7 @@ if item is not None:
             None,
         )
         if timed is not None:
-            append_note_to_item(timed, note, who=timed.who)
+            append_note_to_item(timed, note, who=launched_by)
             if timed.status != "done":
                 set_status(timed, "pending")
         return next_id, todos, stack
@@ -21543,9 +21788,10 @@ typer.echo(
 @
 
 After the subprocess exits, we stop the todo through the same shared
-hierarchy helper used by manual [[todo stop]] and detached tmux cleanup,
-then prompt the user about completion status.  The prompt is the
-reason this handler only \emph{decides} on the snapshot and leaves the
+hierarchy helper used by manual [[todo stop]] and detached tmux cleanup
+(by way of [[stop_run]], which leaves an item that was taken over
+during the run alone, \cref{sec:todo-run-taken-over}), then prompt
+the user about completion status.  The prompt is the reason this handler only \emph{decides} on the snapshot and leaves the
 storing to [[record_run_outcome]] (\cref{sec:todo-run-outcome}): the
 question can stay open for hours, and a note the agent's session adds
 in that time must not be erased by the answer.  In headless mode we skip
@@ -21559,16 +21805,7 @@ the teacher can review what the agent did, even if the task
 failed or was reset.
 
 <<handle subprocess exit>>=
-(
-    todo_id,
-    item,
-    _,
-    _,
-    _,
-    descendants,
-) = stop_todo_hierarchy(
-    todo_id
-)
+todo_id, item, descendants = stop_run(todo_id, launched_by)
 if item is None:
     return
 run_notes = []
@@ -21576,7 +21813,10 @@ run_notes = []
 
 mark_done = False
 hand_to = None
-if item.status == "done":
+if (
+    item.status == "done"
+    or run_taken_over_by(item, launched_by)
+):
     pass
 elif timed_out:
     <<handle timeout exit status>>
@@ -21593,6 +21833,7 @@ item, todos = record_run_outcome(
     notes=run_notes,
     done=mark_done,
     reassign_to=hand_to,
+    launched_by=launched_by,
 )
 if item is not None and item.status == "done":
     auto_complete_parent(item, todos)
@@ -21726,6 +21967,94 @@ def test_start_no_keeps_completion_made_meanwhile(
   assert result.exit_code == 0, result.stdout
   _, todos = load_todos()
   assert todos[0].status == "done"
+@
+
+The same goes for a blocking run whose item is taken over while it
+runs (\cref{sec:todo-run-taken-over}).  The takeover happens inside
+the faked subprocess, the way it would happen from another terminal.
+Neither the prompt's \enquote{yes} nor a failed headless run may
+touch the item afterwards: it stays active for the user who took it,
+with the user's tracking running, and the run only leaves its note.
+
+<<test functions>>=
+@pytest.fixture
+def run_taken_over_midway(temp_todo_dir):
+  """Run `start 1 --who alice` whose run sees a takeover."""
+  from nytid.cli.todo import start
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Shared task",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+  ])
+  taken = []
+
+  def run_and_take_over(cmd, *args, **kwargs):
+    if not taken:
+      taken.append(True)
+      start(None, todo_id=1, force=True)
+    return subprocess.CompletedProcess(
+      cmd, 1, stdout="half done",
+    )
+
+  def run(extra_args):
+    with patch(
+      "nytid.cli.todo.subprocess.run",
+      side_effect=run_and_take_over,
+    ), patch(
+      "nytid.cli.todo.typer.confirm",
+      return_value=True,
+    ) as confirm:
+      result = runner.invoke(
+        cli,
+        ["start", "1", "--who", "alice",
+         "--command", "true", *extra_args],
+      )
+    return result, confirm
+
+  return run
+
+
+def assert_kept_by_new_owner():
+  """The item is still the user's, active and tracked."""
+  from nytid.cli.track import load_active_session
+  assert load_active_stack() == [1]
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+  assert todos[0].status == "in-progress"
+  assert " alice]\nRun by alice ended after" in todos[0].notes
+  mine = load_active_session(
+    default_username
+  ).get_active_labels()
+  assert "todo:1" in mine
+  alice = load_active_session("alice").get_active_labels()
+  assert "todo:1" not in alice
+
+
+def test_start_yes_after_takeover_leaves_item(
+  run_taken_over_midway,
+):
+  """The old owner's 'mark done?' is not even asked."""
+  result, confirm = run_taken_over_midway([])
+
+  assert result.exit_code == 0, result.output
+  confirm.assert_not_called()
+  assert_kept_by_new_owner()
+
+
+def test_start_headless_after_takeover_leaves_item(
+  run_taken_over_midway,
+):
+  """A failed headless run does not reassign a taken item."""
+  result, _ = run_taken_over_midway(
+    ["--headless", "--reassign-to", "teacher"]
+  )
+
+  assert result.exit_code == 0, result.output
+  assert_kept_by_new_owner()
+  _, todos = load_todos()
+  assert " alice]\nExit code: 1" in todos[0].notes
 @
 
 Let's verify that [[append_note_to_item]] changes the item it is
@@ -22167,6 +22496,7 @@ if arm_finalize:
     finalize_cmd = (
         build_detached_todo_finalize_command(
             todo_id, os.getcwd(), exit_code_file,
+            launched_by=worker,
         )
     )
     hook_command = build_tmux_hook_command(
@@ -22295,6 +22625,7 @@ def test_adopt_arms_finalize_for_hookless_pane(
     pane_id, hook_command = install_mock.call_args.args
     assert pane_id == "%3"
     assert "_finalize-detached 1 " in hook_command
+    assert f"--launched-by {default_username}" in hook_command
 
 def test_adopt_skips_finalize_for_launched_pane(
     temp_todo_dir,
