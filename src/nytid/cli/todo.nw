@@ -3482,30 +3482,46 @@ def check_parent_completion(
 @
 
 The [[next]] command and the cron script both need to find the
-highest-priority pending task, optionally scoped to a specific
-parent.  Extracting this into a function (rather than a reusable
-chunk) makes the dependency on [[todos]] and [[who]] explicit
+highest-priority pending task that is ready, optionally scoped to a
+specific parent.  Extracting this into a function (rather than a
+reusable chunk) makes the dependency on [[todos]] and [[who]] explicit
 through parameters.  The worker filter follows the same backward-
 compatibility rule as the active stack: older items with [[who=None]]
 still count as belonging to [[default_username]].
+
+Readiness is [[is_ready]]'s (\cref{sec:todo-ready}), with two
+adjustments for the way [[next]] works.  [[next]] starts parents as
+well as leaves, and descends into a parent's children on the next
+call, so open children do not disqualify an item.  And with a parent
+given, only the path through that parent counts as the item's way out
+of a block: that is the line the user is working in
+(\cref{sec:todo-next-ready}).
 
 <<sub-item helpers>>=
 def find_pending_by_priority(
     todos: list[TodoItem],
     who: str | None = None,
     parent_id: int | None = None,
+    blockers: "Blockers | None" = None,
 ) -> TodoItem | None:
-    """Find highest-priority pending task.
+    """Find highest-priority pending task that is ready.
 
-    Optionally filtered by assignee regex and parent.
-    Treats ``who=None`` as ``default_username``.
-    Returns None if no matching task is found.
+    Optionally filtered by assignee regex and parent; with a
+    parent, the item must be unblocked along that parent.
+    Treats ``who=None`` as ``default_username``.  `blockers`
+    may pass the `blockers_index` of `todos`.  Returns None
+    if no matching task is found.
     """
+    if blockers is None:
+        blockers = blockers_index(todos)
     candidates = [
         t for t in todos
-        if t.status == "pending"
-        and (parent_id is None
-             or parent_id in parents_of(t))
+        if (parent_id is None
+            or parent_id in parents_of(t))
+        and is_ready(
+            todos, t, allow_open_children=True,
+            blockers=blockers, via=parent_id,
+        )
     ]
     if who:
         candidates = [
@@ -3670,7 +3686,8 @@ coding agents, keeps this as a link of its own, \enquote{blocks}, beside
 parent and child, and builds its most used question on it: [[bd ready]]
 lists the open issues with no open blocker.  We take both the link,
 [[blocked_by]] (\cref{sec:todo-blocked-by-field}), and the question,
-[[is_ready]] (\cref{sec:todo-ready}), which [[ready]] asks.
+[[is_ready]] (\cref{sec:todo-ready}), which [[ready]] and [[next]]
+ask.
 
 A blocks link may join any two items, wherever they sit: a top-level
 item may block a sub-item of an unrelated project, and the other way
@@ -10428,9 +10445,11 @@ def apply_todo_mutation(callback):
 The next two helpers are read-only policy operations. One picks the
 best top-level candidate when [[todo next]] has no active parent; the
 other renders the active stack as a forest based on real parent
-relationships rather than raw stack position.  We apply the same
-legacy-worker rule here too, so older top-level items without an
-explicit [[who]] remain visible to the default user.
+relationships rather than raw stack position.  The first is
+[[find_pending_by_priority]] with the top level as the parent, so the
+two agree on readiness and on the legacy-worker rule, under which
+older top-level items without an explicit [[who]] remain visible to
+the default user.
 
 Each active item is drawn once, under the parent its line runs
 through, with the stack itself as the context
@@ -10442,28 +10461,16 @@ forest.
 def get_top_level_pending_by_priority(
     todos: list[TodoItem],
     who: str | None = None,
+    blockers: "Blockers | None" = None,
 ) -> TodoItem | None:
-    """Return the highest-priority pending top-level todo.
+    """Return the highest-priority ready top-level todo.
 
-    Treats ``who=None`` as ``default_username``.
+    Treats ``who=None`` as ``default_username``.  `blockers`
+    may pass the `blockers_index` of `todos`.
     """
-    candidates = [
-        item for item in todos
-        if ROOT_ID in parents_of(item)
-        and item.status == "pending"
-    ]
-    if who:
-        candidates = [
-            item for item in candidates
-            if re.search(
-                who, item.who or default_username
-            )
-        ]
-    now = datetime.datetime.now()
-    candidates.sort(
-        key=lambda item: todo_display_sort_key(item, now)
+    return find_pending_by_priority(
+        todos, who=who, parent_id=ROOT_ID, blockers=blockers,
     )
-    return candidates[0] if candidates else None
 
 
 def render_active_todo_forest(
@@ -18057,11 +18064,11 @@ agent, and an owner who wants to see what is waiting asks for
 [[--all]].
 
 Readiness is decided in one function, [[is_ready]], rather than in
-the command.  [[ready]] is the first caller, but not the only
-candidate: [[next]] and the schedule both pick pending items to work
-on, and a condition added to readiness, such as the blockers, has to
-reach every caller at once, which it does only if there is one
-definition to add it to.
+the command.  [[ready]] is the first caller, and [[next]]
+(\cref{sec:todo-next-ready}) the second; the schedule, too, picks
+pending items to work on.  A condition added to readiness, such as the
+blockers, has to reach every caller at once, which it does only if
+there is one definition to add it to.
 
 [[--all]] widens the listing without changing the definition: it also
 lists pending items whose children are open, for the user who wants
@@ -27456,7 +27463,9 @@ def next_cmd(
 
     If the current context has an active task, start its
     next pending child. Otherwise start the highest-
-    priority pending top-level task.
+    priority pending top-level task.  Items that something
+    blocks are skipped; if only those are left, say what
+    blocks them and fail.
     """
     _, todos = load_todos()
     active = get_current_context_todo(todos, who=who)
@@ -27487,15 +27496,167 @@ def next_cmd(
     )
 @
 
+\paragraph{Only ready work}%
+\label{sec:todo-next-ready}
+
+[[next]] starts only what is ready (\cref{sec:todo-ready}): an item
+that waits for an open blocker is skipped, however high it ranks, and
+the next one down is started instead.  It is readiness with two
+adjustments, which [[find_pending_by_priority]] makes
+(\cref{todo:sub-item-helpers}).  A parent counts, since [[next]]
+descends into its children on the following call.  And in an active
+context, an item is held up by a block on the context, even if it is
+also a top-level item that is clear there.  [[ready]] lists such an
+item, since one of its places is clear, but [[next]] is drilling into
+the context, and the line it works in runs through the blocked item;
+starting the shared item there would put work under a parent that may
+not start.  At the top level, the shared item is found as a top-level
+item and started.
+
+When everything left in the place [[next]] looks is blocked, it says
+so and by what, instead of the bare \enquote{nothing found}: the user
+then knows that the work exists and which item to finish or unblock
+first.  It does not move on to another context.  The active context is
+what the user is working in, and quietly starting something elsewhere
+would hide the fact that the context is stuck.  The exit status is the
+failure of the other case, so that automation stops either way.
+
 <<find next task to start>>=
+blockers = blockers_index(todos)
 if active is not None:
     target = find_pending_by_priority(
-        todos, who=who, parent_id=active.id
+        todos, who=who, parent_id=active.id, blockers=blockers,
     )
 else:
     target = get_top_level_pending_by_priority(
-        todos, who=who
+        todos, who=who, blockers=blockers,
     )
+<<say what blocks the work that is left>>
+@
+
+<<say what blocks the work that is left>>=
+if target is None:
+    place = ROOT_ID if active is None else active.id
+    holding = blockers_holding_up(todos, blockers, who, place)
+    if holding:
+        logging.warning(
+            (
+                "All top-level todos" if active is None
+                else f"All children of #{active.id}"
+            )
+            + " are blocked by "
+            + ", ".join(f"#{b}" for b in holding)
+        )
+        raise typer.Exit(1)
+<<helpers>>=
+def blockers_holding_up(todos, blockers, who, parent_id):
+    """Return the open blockers that hold up the pending
+    children of `parent_id` whose worker matches `who`.
+
+    Blocks are counted along `parent_id` only, as `next`
+    counts them; `blockers` is the `blockers_index`.
+    """
+    holding = set()
+    for child in children_of(todos, parent_id):
+        if child.status != "pending" or (
+            who and not re.search(who, child.who or default_username)
+        ):
+            continue
+        holding.update(
+            b for b, _ in blocking_reasons(child, blockers, parent_id)
+        )
+    return sorted(holding)
+@
+
+Let's verify the skip and the message.  In the active context \#1,
+the higher child waits for \#9 and is skipped; with \#1 itself blocked,
+every child is held up, the shared one included, and [[next]] says by
+what; when nothing is active, the shared item is started from the top
+level.
+
+<<test functions>>=
+def save_next_blocked_fixture(parent_blocked):
+  """#1 active, children #2 (blocked by #9) and #3, shared #4."""
+  save_todos(10, [
+    TodoItem(
+      id=1, title="Context", priority=1.0, status="in-progress",
+      blocked_by=[9] if parent_blocked else [],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Waits", parents=[1], priority=0.9, blocked_by=[9],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Free", parents=[1], priority=0.5,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=4, title="Shared", parents=[ROOT_ID, 1], priority=5.0,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=9, title="Blocker", priority=0.1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  save_active_stack([1])
+
+
+def test_next_skips_blocked_children(temp_todo_dir):
+  """A blocked child is skipped for the next one down."""
+  save_next_blocked_fixture(parent_blocked=False)
+  _, todos = load_todos()
+  todos[3].blocked_by = [9]
+  save_todos(10, todos)
+  with patch("nytid.cli.todo.start") as mock_start:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 0, result.output
+  assert mock_start.call_args.kwargs["todo_id"] == 3
+
+
+def test_next_names_what_blocks_the_context(temp_todo_dir):
+  """A blocked context blocks every child; next says by what."""
+  save_next_blocked_fixture(parent_blocked=True)
+  with patch("nytid.cli.todo.start") as mock_start, patch(
+    "nytid.cli.todo.logging.warning"
+  ) as mock_warning:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 1
+  mock_start.assert_not_called()
+  mock_warning.assert_called_once_with(
+    "All children of #1 are blocked by #9"
+  )
+
+  save_active_stack([])
+  with patch("nytid.cli.todo.start") as mock_start:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 0, result.output
+  assert mock_start.call_args.kwargs["todo_id"] == 4
+@
+
+At the top level the message names what the worker's own top-level
+work waits for:
+
+<<test functions>>=
+def test_next_names_what_blocks_the_top_level(temp_todo_dir):
+  """With only blocked top-level work, next says by what."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Mine", priority=5.0, who="me", blocked_by=[2],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Theirs", priority=1.0, who="other",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  with patch("nytid.cli.todo.logging.warning") as mock_warning:
+    result = runner.invoke(cli, ["next", "--who", "^me$"])
+  assert result.exit_code == 1
+  mock_warning.assert_called_once_with(
+    "All top-level todos are blocked by #2"
+  )
 @
 
 Let's verify the [[next]] command picks the right task:
