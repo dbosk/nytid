@@ -4553,6 +4553,7 @@ def settle_placement(
     item: TodoItem,
     old_range: tuple | None = None,
     old_place: tuple | None = None,
+    was_nested: bool | None = None,
 ) -> None:
     """Move the subtrees whose ranges `item`'s new place
     changed: its own, and its new upper sibling's.  Lift
@@ -4562,17 +4563,33 @@ def settle_placement(
 
     `old_range` is `item`'s child range before the
     change and `old_place` its `(priority, parents)`;
-    both are `None` for an item that is new.
+    both are `None` for an item that is new.  `was_nested`
+    says whether the ranges nested before; by default it
+    is checked on the list as it was before the move.
     """
-    shared = any(len(parents_of(t)) > 1 for t in todos) or (
-        old_place is not None and len(old_place[1]) > 1
-    )
-    was_nested = shared and ranking_is_consistent(
-        list_before_move(todos, item, old_place)
-    )
+    if was_nested is None:
+        was_nested = list_has_shared_items(todos, old_place) and (
+            ranking_is_consistent(
+                list_before_move(todos, item, old_place)
+            )
+        )
     touched = move_into_place(todos, item, old_range, old_place)
     touched += keep_highest_places(todos)
+    restore_nesting(todos, item, touched, was_nested)
 
+
+def list_has_shared_items(todos, old_place=None):
+    """Tell whether an item in `todos` has several parents,
+    or had before a move from `old_place`."""
+    return any(len(parents_of(t)) > 1 for t in todos) or (
+        old_place is not None and len(old_place[1]) > 1
+    )
+
+
+def restore_nesting(todos, item, touched, was_nested):
+    """Renumber if the numbers in `touched` lack room, or if
+    the ranges nested before (`was_nested`) and do not any
+    more; warn about `item` if that does not help."""
     def broken():
         return was_nested and not ranking_is_consistent(todos)
     if not gaps_too_narrow(todos, touched) and not broken():
@@ -5013,9 +5030,12 @@ def close_item(todos, item, closed_at=None):
         and len(parents_of(child)) > 1
         and ranking_context(todos, child, by_id) == item.id
     ]
+    was_nested = bool(moved) and ranking_is_consistent(todos)
     set_status(item, "done", closed_at)
     for child, old_range in moved:
-        settle_placement(todos, child, old_range)
+        settle_placement(todos, child, old_range, was_nested=False)
+    if moved:
+        restore_nesting(todos, moved[0][0], [], was_nested)
 @
 
 <<child priority helpers>>=
@@ -5356,7 +5376,13 @@ fail again after every repair.
 
 The net repairs only what the placement broke.  The check runs on the
 list as it was before the move and again after it, and renumbering
-happens only when the ranges nested before and do not any more.  A list
+happens only when the ranges nested before and do not any more.  A
+command that places several items in one go, as [[rm]] does with the
+items it detaches and [[close_item]] with the children it moves, checks
+the list once before it starts and repairs once after the last
+placement ([[restore_nesting]]): checked before each placement, the
+list would still hold the items not yet placed at their old numbers,
+which need not nest, and the gate would stay shut.  A list
 whose ranges did not nest to begin with is left as the tree code leaves
 it: a child placed outside its parent's range by hand, or before ranges
 existed, stays where it is (\cref{sec:subtree-follows-parent}), even
@@ -24685,10 +24711,14 @@ parents, and one that lost its ranking context is given the bottom of
 the highest place it keeps, through the same helper as [[edit]]
 (\cref{sec:place-in-places}), and settled like any placed item
 (\cref{sec:sibling-above-squeezed}).  A place whose parent is unranked
-leaves it unranked, as [[edit]] does.  To its new family such an item
-is new: its old place was in a family that no longer exists, so it is
-settled without one, and the sibling it lands under is compared with
-the family as it was without it.
+leaves it unranked, as [[edit]] does.  All detached items drop their
+removed parents before the first is placed, so that none is placed
+next to another that still refers to a parent that is gone; and the
+ranges are checked once, before the removal, and repaired once, after
+the last placement (\cref{sec:ranking-context}).  To its new family
+such an item is new: its old place was in a family that no longer
+exists, so it is settled without one, and the sibling it lands under is
+compared with the family as it was without it.
 
 <<detach the items that keep another parent>>=
 doomed = {todo_id} | {d.id for d in descendants}
@@ -24700,10 +24730,14 @@ before = {
     )
     for d in detached
 }
+was_nested = bool(detached) and list_has_shared_items(todos) and (
+    ranking_is_consistent(todos)
+)
 todos = [t for t in todos if t.id not in doomed]
-moved = []
 for d in detached:
     d.parents = [p for p in d.parents if p not in doomed]
+moved = []
+for d in detached:
     old_range, old_place, lost_rank = before[d.id]
     if lost_rank and d.priority is not None:
         d.priority = place_in_places(
@@ -24712,7 +24746,11 @@ for d in detached:
         if d.priority is not None:
             moved.append(d)
         old_place = None
-    settle_placement(todos, d, old_range, old_place)
+    settle_placement(
+        todos, d, old_range, old_place, was_nested=False,
+    )
+if detached:
+    restore_nesting(todos, detached[0], [], was_nested)
 @
 
 The usual report is a bare count.  When the user confirmed a
@@ -24955,6 +24993,41 @@ def test_rm_squeezes_the_sibling_above_a_replaced_item(
   assert result.exit_code == 0, result.output
   assert stored_priority(13) == -4.375
   assert stored_priority(14) == pytest.approx(-2.875)
+@
+
+Detaching several items is checked and repaired as one placement.  A
+at~3.0 holds X at~2.75 and Y at~2.5, both ranked under it; X is also
+under Y, and Y under Z at~1.0.  Removing A places X under Y and Y under
+Z.  While X is placed, Y still has its old number, above Z's range, so
+a check of the list at that moment would find it not nested and leave
+whatever the placement did; the check made before the removal finds it
+nested, and the result is repaired where it needs to be.
+
+<<test functions>>=
+def test_rm_detaching_several_items_keeps_ranges_nested(
+  temp_todo_dir,
+):
+  """The removal is checked once before and repaired after."""
+  save_todos(5, [
+    ranked_child(1, None, 3.0),
+    TodoItem(
+      id=2, title="X", parents=[3, 1], priority=2.75,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    TodoItem(
+      id=3, title="Y", parents=[4, 1], priority=2.5,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    ranked_child(4, None, 1.0),
+  ])
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
+
+  result = runner.invoke(cli, ["rm", "1", "--force"])
+
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
 @
 
 Let's verify both the explicit and active-stack forms of [[rm]]:
