@@ -3214,16 +3214,19 @@ do this inside their locked callback
 (\cref{sec:todo-read-modify-write}).  An unranked item has no range,
 and [[compute_child_priority_range]] refuses one, so we ask through a
 helper that answers [[None]] instead; that is the [[None]] that
-[[move_subtree_priorities]] treats as nothing to move.
+[[move_subtree_priorities]] treats as nothing to move.  It answers
+[[None]] for a missing parent too, which is how placement asks for the
+range a level is bounded by: the top level has no parent and no range
+(\cref{todo:binary-search}).
 
 <<child priority helpers>>=
 def child_priority_range_or_none(
     todos: list[TodoItem],
-    parent: TodoItem,
+    parent: TodoItem | None,
 ) -> tuple | None:
     """Return `parent`'s child range, or `None` when
-    `parent` is unranked."""
-    if parent.priority is None:
+    `parent` is unranked or `None` (the top level)."""
+    if parent is None or parent.priority is None:
         return None
     return compute_child_priority_range(todos, parent)
 
@@ -5102,6 +5105,7 @@ def assign_priority_at_position(
     sorted_items: list[TodoItem],
     position: int,
     priority_of=require_effective_priority,
+    bounds: tuple | None = None,
 ) -> float:
     """Compute a priority value at the given insertion
     position in a sorted (descending) list.
@@ -5111,17 +5115,24 @@ def assign_priority_at_position(
     the number to interpolate between; the binary search
     compares what the user sees, so it keeps the default
     effective priority, while the non-interactive
-    placement flags pass the stored one.
+    placement flags pass the stored one.  `bounds` is
+    the `(high, low)` child range of the items' parent,
+    if they have one: an edge with room left inside it
+    takes the midpoint to the range's end instead.
     """
     if not sorted_items:
         return 1.0
 
     if position == 0:
         top = priority_of(sorted_items[0])
+        if bounds is not None and top < bounds[0]:
+            return (top + bounds[0]) / 2.0
         return top + 1.0
 
     if position >= len(sorted_items):
         bottom = priority_of(sorted_items[-1])
+        if bounds is not None and bottom > bounds[1]:
+            return (bottom + bounds[1]) / 2.0
         return bottom - 1.0
 
     above = priority_of(sorted_items[position - 1])
@@ -5137,9 +5148,31 @@ arise naturally when many items are appended sequentially at the
 bottom.  If the numbers drift far from zero a future renumbering
 pass can normalize them.
 
+The fixed offset is right only where nothing bounds the list, which is
+the top level.  Among the children of a ranked parent the ends are
+bounded by the parent's child range (\cref{sec:child-priority-helpers}),
+and a step of~1.0 can leave it.  Children of a parent at~5.0 whose
+lower sibling is at~3.0 live in $(3.0, 5.0)$; with one child at~4.5, a
+new child at the top would get~5.5, above its own parent, and one at
+the bottom of a child at~3.5 would get~2.5, below the parent's
+sibling.  So when the items have a parent we split the room left at
+that end instead: the top takes the midpoint between the highest child
+and the parent's number, the bottom the midpoint between the lowest
+child and the low end of the range.  This is the same \enquote{leave
+room for midpoints} rule as everywhere else, now with the range's ends
+as the outer neighbours.  An end sibling that already sits outside the
+range (data placed before ranges existed) leaves no room to split; we
+step past it by~1.0 as before rather than put the new item on the
+wrong side of it.  The top level keeps the plain step, since it has no
+range: [[child_priority_range_or_none]] answers [[None]] there.
+
 <<compute midpoint priority>>=
 new_priority = assign_priority_at_position(
-    sorted_items, low
+    sorted_items, low,
+    bounds=(
+        child_priority_range_or_none(todos, parent)
+        if todos is not None else None
+    ),
 )
 @
 
@@ -5336,7 +5369,8 @@ With a position and an ordering, placement is one call.  The empty
 comparison set is the only case needing separate treatment, and it
 gets the rule the interactive path already uses
 (\cref{sec:child-priority-helpers}) rather than a second opinion of
-its own.
+its own.  The ends of a child level are bounded by the parent's range,
+exactly as in the interactive search (\cref{todo:binary-search}).
 
 <<placement helpers>>=
 def place_among_siblings(
@@ -5365,6 +5399,10 @@ def place_among_siblings(
             ordered, placement, target
         ),
         priority_of=require_stored_priority,
+        bounds=(
+            child_priority_range_or_none(todos, parent)
+            if todos is not None else None
+        ),
     )
 @
 
@@ -5458,6 +5496,69 @@ def test_place_among_siblings_without_siblings():
         [], PLACE_TOP, parent=parent, todos=[parent]
     ) == 0.0
     assert place_among_siblings([], PLACE_BOTTOM) == 1.0
+@
+
+Among children the ends stay inside the parent's range, while a child
+already outside the range is stepped past as before.  The interactive
+search shares the rule: answering \enquote{yes} to the only comparison
+puts the candidate at the top, halfway to the parent.
+
+<<test functions>>=
+def parent_with_children(*priorities):
+    """A at 5 and B at 3, with A's children at
+    `priorities`."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+    ]
+    todos += [
+        TodoItem(
+            id=10 + i, title=f"A{i}", priority=p,
+            parent_id=1,
+        )
+        for i, p in enumerate(priorities)
+    ]
+    return todos
+
+
+def test_place_among_children_stays_in_range():
+    """--top and --bottom split the room left in the
+    parent's range."""
+    todos = parent_with_children(4.5, 3.5)
+    children = todos[2:]
+    for placement, expected in [
+        (PLACE_TOP, 4.75), (PLACE_BOTTOM, 3.25),
+    ]:
+        assert place_among_siblings(
+            children, placement,
+            parent=todos[0], todos=todos,
+        ) == expected
+
+
+def test_place_among_children_outside_range_steps():
+    """A child outside the range is stepped past."""
+    todos = parent_with_children(6.0, 2.0)
+    children = todos[2:]
+    for placement, expected in [
+        (PLACE_TOP, 7.0), (PLACE_BOTTOM, 1.0),
+    ]:
+        assert place_among_siblings(
+            children, placement,
+            parent=todos[0], todos=todos,
+        ) == expected
+
+
+def test_binary_search_top_stays_in_range():
+    """The interactive top end is bounded too."""
+    todos = parent_with_children(4.5)
+    with patch(
+        "nytid.cli.todo.typer.prompt", return_value="y"
+    ):
+        priority = binary_search_priority(
+            todos[2:], TodoItem(id=99, title="New"),
+            parent=todos[0], todos=todos,
+        )
+    assert priority == 4.75
 @
 
 \subsection{Re-ranking an Item That Already Exists}
@@ -15758,7 +15859,9 @@ def test_edit_parent_bottom(two_parents):
     cli, ["edit", "4", "--parent", "2", "--bottom"],
   )
   assert result.exit_code == 0
-  assert stored_priority(4) == 7.0
+  # Halfway from the child at 8.0 down to the floor of
+  # B's range (6.0, -4.0), not one step below the child.
+  assert stored_priority(4) == 2.0
 
 
 def test_edit_keep_prio_alone_is_a_no_op(
@@ -27586,7 +27689,9 @@ def test_add_append_under_parent(temp_todo_dir):
     _, todos = load_todos()
     appended = next(t for t in todos if t.id == 4)
     assert appended.parent_id == 1
-    assert appended.priority == 2.0
+    # Halfway from the lowest child down to the floor of
+    # the parent's range (-5.0, 5.0).
+    assert appended.priority == -1.0
 
 
 def test_add_under_unranked_parent_skips_binary_search(
