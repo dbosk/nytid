@@ -431,7 +431,8 @@ def test_get_todo_dir_reads_config_once(
 
 Each todo item carries an integer ID, a title, labels that connect to
 the track system, an optional numeric priority, a
-status, timestamps, an optional deadline, an estimated duration in
+status, timestamps for when it was created and when it was closed
+(\cref{sec:todo-closed}), an optional deadline, an estimated duration in
 hours, a longer description, an optional parent ID for sub-items, and
 an optional worker assignment.
 
@@ -499,6 +500,7 @@ class TodoItem:
     priority: float | None = 0.0
     status: str = "pending"
     created: str = ""
+    closed: str | None = None
     deadline: str | None = None
     estimated: float | None = None
     description: str = ""
@@ -680,6 +682,97 @@ def test_from_dict_drops_unreadable_estimate():
     "id": 1, "title": "Test", "estimated": "soon",
   })
   assert item.estimated is None
+@
+
+\subsection{When an Item Was Closed}%
+\label{sec:todo-closed}
+
+[[created]] says when a piece of work entered the list; [[closed]] says
+when it left.  It holds the moment the item last became done, in the
+same local ISO~8601 form that [[created]] uses, so the two parse and
+compare alike.  It is [[None]] for every item that is not done---and
+also for an item that was completed before the field existed.  Nobody
+recorded when that happened, and an invented time would look exactly
+like a real one.
+
+Keeping [[closed]] in step with [[status]] looks like a job for
+[[__setattr__]], which already normalizes [[labels]].  It is the wrong
+place, because [[from_dict]] builds a loaded item by handing every
+stored field to the constructor, and the constructor assigns them
+through [[__setattr__]] too.  A hook that stamped the time whenever
+[[status]] became [[done]] would fire on every load of every done item.
+Each one would get a closing time of whenever it was last read, and the
+next save would write that time to disk.  Normalizing labels on every
+assignment is safe because sorting a set twice changes nothing.
+Stamping a time is not: it records an event, and the event is a status
+\emph{change}, which a load is not.
+
+So the change goes through a function instead, and every command that
+completes or reopens an item calls [[set_status]] rather than assigning
+[[status]].  That is [[done]] and its forced completion of descendants,
+the automatic completion of a parent, the outcome of a run, and a
+[[sync]] or [[import]] that finds an issue closed on GitHub.  The
+status cache that the active stack rewrites on every save
+(\cref{sec:todo-active-stack}) uses it too, which keeps [[closed]]
+empty on every item that is not done.
+
+Becoming done stamps the current time; any other status clears it, so a
+reopened item does not carry the time of a completion that no longer
+holds.  An item that is already done keeps its stamp.  Running
+[[todo done]] twice, or a [[sync]] that meets a closed issue long after
+the item was completed locally, says nothing new about when the work
+finished.
+
+<<data model>>=
+def set_status(item, status):
+    """Set `item.status` and keep `item.closed` in step.
+
+    Becoming `done` stamps `closed` with the current local
+    time, unless the item was done already; any other
+    status clears it.
+    """
+    if status != "done":
+        item.closed = None
+    elif item.status != "done":
+        item.closed = datetime.datetime.now().isoformat()
+    item.status = status
+@
+
+Let's verify the three transitions, and that loading an old done item
+does not stamp it:
+
+<<test functions>>=
+def test_set_status_stamps_and_clears_closed():
+  """Done stamps closed once; reopening clears it."""
+  item = TodoItem(id=1, title="Task")
+  before = datetime.datetime.now()
+  set_status(item, "done")
+  assert item.status == "done"
+  stamp = item.closed
+  assert datetime.datetime.fromisoformat(stamp) >= before
+
+  set_status(item, "done")
+  assert item.closed == stamp
+
+  set_status(item, "pending")
+  assert item.status == "pending"
+  assert item.closed is None
+
+
+def test_legacy_done_item_loads_without_closed():
+  """A done item stored without `closed` stays unstamped."""
+  item = TodoItem.from_dict({
+    "id": 1, "title": "Old", "status": "done",
+  })
+  assert item.status == "done"
+  assert item.closed is None
+  assert item.to_dict()["closed"] is None
+
+  stamped = TodoItem.from_dict({
+    "id": 2, "title": "New", "status": "done",
+    "closed": "2026-10-08T14:03:00",
+  })
+  assert stamped.closed == "2026-10-08T14:03:00"
 @
 
 \subsection{Testing the Data Model}
@@ -1427,7 +1520,8 @@ def test_save_does_not_persist_worker_defaults(
     assert stored["env"] is None
 @
 
-\section{Active Task Stack}
+\section{Active Task Stack}%
+\label{sec:todo-active-stack}
 
 The todo system supports nested work: start a parent task, decompose
 it into sub-tasks, work on children one at a time.  To track
@@ -1506,16 +1600,34 @@ def synchronize_todo_statuses(
         if item.status == "done":
             continue
         if item.id in active_ids:
-            item.status = "in-progress"
+            set_status(item, "in-progress")
         else:
-            item.status = "pending"
+            set_status(item, "pending")
 @
 
 
 The stored [[status]] field is now a cache of stack membership rather
 than an independent authority.  We preserve [[done]] exactly as written,
 but every non-done item is reclassified from the active stack before the
-rest of the CLI sees it.
+rest of the CLI sees it.  The reclassification goes through
+[[set_status]] (\cref{sec:todo-closed}), so an item that is not done
+never keeps a closing time, whatever the file said.  Let's verify that
+with a pending item whose file still carries a stamp:
+
+<<test functions>>=
+def test_pending_item_loses_stray_closed(temp_todo_dir):
+  """An item that is not done is stored without `closed`."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Reopened by hand",
+      created="2026-02-20T10:00:00",
+      closed="2026-10-08T14:03:00",
+    ),
+  ])
+  _, todos = load_todos()
+  assert todos[0].status == "pending"
+  assert todos[0].closed is None
+@
 
 <<active stack helpers>>=
 def load_todos_raw() -> tuple:
@@ -6004,7 +6116,7 @@ def complete_todo_state(todo_id, who=None):
         resolved_id, item = resolve_done_target(
             todo_id, todos, who=who
         )
-        item.status = "done"
+        set_status(item, "done")
         stack = [sid for sid in stack if sid != resolved_id]
         return next_id, todos, stack, resolved_id, item
 
@@ -6058,7 +6170,7 @@ def auto_complete_parent(item, todos, who=None):
             None,
         )
         if parent and parent.status != "done":
-            parent.status = "done"
+            set_status(parent, "done")
             typer.echo(
                 f"  Parent #{parent.id} "
                 f"auto-completed: {parent.title}"
@@ -6066,6 +6178,35 @@ def auto_complete_parent(item, todos, who=None):
         return next_id, todos, stack
 
     mutate_todo_state(mark_parent)
+@
+
+Both completions go through [[set_status]] (\cref{sec:todo-closed}).
+Let's verify that the item completed by hand and the parent completed
+with it both carry a closing time:
+
+<<test functions>>=
+def test_done_stamps_closed_on_item_and_parent(temp_todo_dir):
+    """`done` stamps the child and the auto-completed parent."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    before = datetime.datetime.now()
+
+    result = runner.invoke(cli, ["done", "2"])
+
+    assert result.exit_code == 0, result.output
+    assert "auto-completed" in result.output
+    _, todos = load_todos()
+    for item in todos:
+        assert item.status == "done"
+        assert datetime.datetime.fromisoformat(item.closed) >= before
 @
 
 \subsubsection{Auto-activating Ancestors}
@@ -9856,6 +9997,31 @@ def ls_record(item, now, tracked_times, show_prio):
     return record
 @
 
+Because the record starts from [[to_dict()]], a stored field needs no
+work here to reach scripts.  The closing time
+(\cref{sec:todo-closed}) is one such field:
+
+<<test functions>>=
+def test_ls_json_includes_closed(temp_todo_dir):
+  """`ls --format json` carries the closing time."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Finished",
+      created="2026-02-20T10:00:00",
+      status="done", who="me",
+      closed="2026-10-08T14:03:00",
+    ),
+  ])
+  result = runner.invoke(
+    cli,
+    ["ls", "--format", "json", "--who", "",
+     "--status", "done"],
+  )
+  assert result.exit_code == 0, result.output
+  records = json.loads(result.stdout)
+  assert records[0]["closed"] == "2026-10-08T14:03:00"
+@
+
 JSON output uses the shared display order and respects the [[-n]] limit
 just like the rich and CSV paths.  We sort here because JSON consumers
 (scripts, agents) should receive items in the same priority order the
@@ -10441,7 +10607,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: seventeen tab-separated fields, no header,
+Let's verify the pipe form: eighteen tab-separated fields, no header,
 and the flattened cells in their record positions.
 
 <<test functions>>=
@@ -10462,7 +10628,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 17
+  assert len(fields) == 18
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
 @
@@ -10489,9 +10655,9 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 17
+  assert len(fields) == 18
   assert fields[1] == "Tabbed\\ttitle"
-  assert fields[11] == "one\\ntwo"
+  assert fields[12] == "one\\ntwo"
 
   named = runner.invoke(
     cli, ["ls", "--format", "csv", "--who", ""]
@@ -10582,7 +10748,8 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
     rows = list(csv.DictReader(io.StringIO(result.stdout)))
     assert list(rows[0]) == [
         "id", "title", "labels", "priority", "status",
-        "created", "deadline", "estimated", "description",
+        "created", "closed", "deadline", "estimated",
+        "description",
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours",
     ]
@@ -11537,8 +11704,25 @@ says so explicitly, because a missing priority is the usual reason an
 item sorts unexpectedly and the user should not have to infer it from
 an absent line.
 
+A done item also says when it was closed (\cref{sec:todo-closed}).
+The field comes first, so that the rich grid puts it right under the
+title line, which has just said that the item is done; the plain
+renderer gives it a line of its own after the two shared ones.  The time
+is shown to the minute, like the note headers
+(\cref{sec:todo-note-headers}): the stored seconds and microseconds are
+there for sorting, not for reading.  A value that does not parse, which
+only a hand-edited file can hold, is shown as written rather than
+hidden.
+
 <<collect metadata fields>>=
 fields = []
+if item.closed:
+    closed_at = naive_local_datetime(item.closed)
+    fields.append((
+        "Closed",
+        closed_at.strftime(NOTE_TIME_FORMAT)
+        if closed_at else str(item.closed),
+    ))
 if item.priority is not None:
     fields.append(("Priority", f"{item.priority:.1f}"))
 else:
@@ -11563,6 +11747,35 @@ if item.github:
         "GitHub",
         f"{gh['repo']}#{gh['number']} ({gh.get('type', 'issue')})",
     ))
+@
+
+Let's verify the line on a done item, and its absence on an open one:
+
+<<test functions>>=
+def test_view_shows_closed_time(temp_todo_dir):
+  """A done item shows when it was closed, to the minute."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Finished",
+      created="2026-02-20T10:00:00",
+      status="done",
+      closed="2026-10-08T14:03:59.123456",
+    ),
+    TodoItem(
+      id=2, title="Open",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  done = runner.invoke(cli, ["view", "1", "--format", "plain"])
+  assert done.exit_code == 0, done.output
+  assert "  Closed: 2026-10-08 14:03\n" in done.output
+
+  still_open = runner.invoke(
+    cli, ["view", "2", "--format", "plain"]
+  )
+  assert still_open.exit_code == 0, still_open.output
+  assert "Closed" not in still_open.output
 @
 
 For GitHub-linked items, we fetch the issue body and comments
@@ -16584,7 +16797,7 @@ def force_complete_descendants(
                 None,
             )
             if child and child.status != "done":
-                child.status = "done"
+                set_status(child, "done")
                 typer.echo(
                     f"  Force-completed: "
                     f"#{child.id} {child.title}"
@@ -16596,6 +16809,35 @@ def force_complete_descendants(
         return next_id, todos, stack
 
     mutate_todo_state(mark_done)
+@
+
+A force-completed descendant is completed like any other item, so it
+gets a closing time too:
+
+<<test functions>>=
+def test_done_force_stamps_closed_on_descendants(temp_todo_dir):
+    """`done --force` stamps the active child it completes."""
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent",
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    save_active_stack([1, 2])
+
+    result = runner.invoke(cli, ["done", "1", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert "Force-completed" in result.output
+    _, todos = load_todos()
+    by_id = {t.id: t for t in todos}
+    assert by_id[2].status == "done"
+    assert by_id[2].closed is not None
+    assert by_id[1].closed is not None
 @
 
 The guard chunk checks for active descendants before completing.  Without
@@ -17959,17 +18201,17 @@ def record_run_outcome(
             append_note_to_item(item, note_text, who=item.who)
         if item.status != "done":
             if done:
-                item.status = "done"
+                set_status(item, "done")
             else:
                 if reassign_to:
                     item.who = reassign_to
-                item.status = "pending"
+                set_status(item, "pending")
         for child in todos:
             if (
                 child.id in descendant_ids
                 and child.status != "done"
             ):
-                child.status = "pending"
+                set_status(child, "pending")
         return next_id, todos, stack, item
 
     _, todos, _, item = mutate_todo_state(update)
@@ -20573,7 +20815,7 @@ if item is not None:
         if timed is not None:
             append_note_to_item(timed, note, who=timed.who)
             if timed.status != "done":
-                timed.status = "pending"
+                set_status(timed, "pending")
         return next_id, todos, stack
 
     mutate_todo_state(record_timeout)
@@ -20748,6 +20990,7 @@ def test_start_confirm_keeps_note_added_meanwhile(
   assert result.exit_code == 0, result.stdout
   _, todos = load_todos()
   assert todos[0].status == "done"
+  assert todos[0].closed is not None
   assert without_note_headers(todos[0].notes) == "Agent"
 
 
@@ -21977,6 +22220,15 @@ task list, so they are only included when [[--github-labels]]
 is passed. Any additional labels supplied via [[--label]] on
 the command line are appended last.
 
+An issue that is already closed on GitHub is imported as done, and it
+gets its status through [[set_status]] like any other completion
+(\cref{sec:todo-closed}).  Its [[closed]] stamp is therefore the time
+of the import, not the time GitHub closed the issue: neither
+[[gh_list_issues]] nor the single-item fetches ask [[gh]] for
+[[closedAt]].  The stamp still answers the question it answers
+everywhere else, when the item became done in this list, and that is
+also what [[sync]] records when it finds an issue closed later.
+
 <<create todos from github items>>=
 if skip_priority and new_items:
     <<compute age-based priorities>>
@@ -22035,7 +22287,6 @@ for gh_item in new_items:
         title=gh_item["title"],
         labels=gh_labels,
         priority=priority,
-        status=status,
         who=who,
         created=(
             datetime.datetime.now().isoformat()
@@ -22057,6 +22308,7 @@ for gh_item in new_items:
             "number": str(gh_item["number"]),
         },
     )
+    set_status(item, status)
     todos.append(item)
     next_id += 1
     imported.append(item)
@@ -22506,6 +22758,39 @@ def test_import_single_issue(temp_todo_dir):
             if "view" in c[0][0]
         ]
         assert len(view_calls) >= 1
+@
+
+An issue that is already closed comes in done, and its closing time is
+the time of the import:
+
+<<test functions>>=
+def test_import_closed_issue_is_stamped(temp_todo_dir):
+    """A closed issue is imported done, with `closed` set."""
+    save_todos(1, [])
+    mock_result = MagicMock(returncode=0)
+    mock_result.stdout = json.dumps({
+        "title": "Fixed bug", "body": "",
+        "state": "CLOSED", "comments": [], "labels": [],
+    })
+    before = datetime.datetime.now()
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=mock_result,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--number", "7",
+                "--type", "issue",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    assert todos[0].status == "done"
+    assert datetime.datetime.fromisoformat(
+        todos[0].closed
+    ) >= before
 @
 
 Import should carry the same task-context metadata as [[todo add]].
@@ -23256,7 +23541,7 @@ if (
     gh_state in ("CLOSED", "MERGED")
     and item.status != "done"
 ):
-    item.status = "done"
+    set_status(item, "done")
     changes += 1
     typer.echo(
         f"  #{item.id} marked done "
@@ -23356,6 +23641,7 @@ def test_sync_marks_done_from_github(
         assert "marked done" in result.output
         _, todos = load_todos()
         assert todos[0].status == "done"
+        assert todos[0].closed is not None
 @
 
 \subsection{The [[note]] Command}
@@ -23943,6 +24229,7 @@ from nytid.cli.todo import (
     cli,
     TODO_DIR_CONFIG,
     TodoItem,
+    set_status,
     ParsedItem,
     ParsedTodo,
     canonicalize_wd,
