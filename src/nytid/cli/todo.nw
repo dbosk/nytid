@@ -1710,7 +1710,7 @@ def save_todos(next_id: int, todos: list[TodoItem]):
     def update(_next_id, _todos, stack):
         return next_id, todos, stack
 
-    mutate_todo_state(update)
+    mutate_todo_state(update, nest=False)
 @
 
 \subsection{Testing Storage}
@@ -2099,9 +2099,15 @@ job belongs to [[load_todo_state]], which combines them into one coherent
 view before handing data to command logic.
 
 <<active stack helpers>>=
-def load_todo_state() -> tuple:
-    """Load todos and active stack with synchronized status."""
+def load_todo_state(nest=True) -> tuple:
+    """Load todos and active stack with synchronized status.
+
+    With `nest`, priorities that do not nest are shown as
+    the next write will store them (`nest_stored_priorities`).
+    """
     next_id, todos = load_todos_raw()
+    if nest:
+        nest_stored_priorities(todos, report=False)
     stack = normalize_active_stack(
         todos, load_active_stack_raw()
     )
@@ -2326,15 +2332,28 @@ later writer would erase the earlier one.  [[mutate_todo_state]] solves
 that by acquiring an exclusive lock around the entire read-modify-write
 cycle.
 
+Every write is also where old priorities are brought into nested
+ranges, before the callback sees the list
+(\cref{sec:normalise-priorities}); every read shows them as that write
+will store them.  [[save_todos]], which replaces the
+whole list with one the caller built, asks for no such step: the list
+it replaces is thrown away anyway.
+
 <<active stack helpers>>=
-def mutate_todo_state(callback):
-    """Mutate todos and active stack under one lock."""
+def mutate_todo_state(callback, nest=True):
+    """Mutate todos and active stack under one lock.
+
+    With `nest`, the stored priorities are first brought
+    into nested ranges (`nest_stored_priorities`).
+    """
     ensure_todo_dir()
     lock_file = get_todo_lock_file()
     with open(lock_file, "w") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         try:
-            next_id, todos, stack = load_todo_state()
+            next_id, todos, stack = load_todo_state(nest=False)
+            if nest:
+                nest_stored_priorities(todos)
             callback_result = callback(next_id, todos, stack)
             if callback_result is None:
                 updated_next_id = next_id
@@ -2623,8 +2642,8 @@ def run_with_shared_snapshot(*commands):
     barrier = threading.Barrier(len(commands), timeout=10)
     held = set()
 
-    def load_then_wait():
-        state = real_load()
+    def load_then_wait(*args, **kwargs):
+        state = real_load(*args, **kwargs)
         me = threading.get_ident()
         if me not in held:
             held.add(me)
@@ -5383,13 +5402,16 @@ items it detaches and [[close_item]] with the children it moves, checks
 the list once before it starts and repairs once after the last
 placement ([[restore_nesting]]): checked before each placement, the
 list would still hold the items not yet placed at their old numbers,
-which need not nest, and the gate would stay shut.  A list
-whose ranges did not nest to begin with is left as the tree code leaves
-it: a child placed outside its parent's range by hand, or before ranges
-existed, stays where it is (\cref{sec:subtree-follows-parent}), even
-when some unrelated item elsewhere in the list has several parents.
-Renumbering the whole list for the sake of an old number nobody asked
-about would change numbers the user may have chosen.  A list without
+which need not nest, and the gate would stay shut.
+
+The gate does not leave old numbers in place for good, though.  A list
+whose ranges do not nest, because it was written before children were
+placed by range, is normalised on the first write, before the command's
+placement runs (\cref{sec:normalise-priorities}), so a placement
+normally starts from a nested list and the gate is open.  It stays
+closed only for what the normalisation could not nest, or for a hand
+edit that lands while a command runs; there the net does not renumber
+for the sake of numbers the command did not touch.  A list without
 shared items skips both checks; it counts as one with shared items if it
 has any before or after the placement, since an item that just lost its
 second parent may have moved by the rules for shared items.
@@ -5425,11 +5447,12 @@ def report_unnested_ranking(item: TodoItem) -> None:
     typer.echo(f"Warning: {message}", err=True)
 @
 
-The tests run strict, and two tests pin the gate and the give-up.  A
-legacy child of A below~B, beside an unrelated shared item, keeps its
-number when a new item is added; and a repair that never succeeds,
-forced by a check that answers \enquote{nested} only for the state
-before the move, warns, or raises in strict mode.
+The tests run strict, through a fixture that applies to every test of
+the module, and two tests pin the gate and the give-up.  A legacy child
+of A below~B, beside an unrelated shared item, is moved into A's range
+by the first write, before the new item is placed; and a repair that
+never succeeds, forced by a check that answers \enquote{nested} only
+for the state before the move, warns, or raises in strict mode.
 
 <<test functions>>=
 @pytest.fixture(autouse=True)
@@ -5438,8 +5461,10 @@ def strict_ranking(monkeypatch):
   monkeypatch.setattr("nytid.cli.todo.STRICT_RANKING", True)
 
 
-def test_net_leaves_legacy_numbers_alone(temp_todo_dir):
-  """An inconsistent list is not renumbered by a placement."""
+def test_legacy_numbers_are_nested_before_the_placement(
+  temp_todo_dir,
+):
+  """A legacy child is moved into its parent's range first."""
   save_todos(12, [
     ranked_child(1, None, 5.0), ranked_child(2, None, 4.0),
     ranked_child(3, 1, 3.0), ranked_child(4, 2, 2.0),
@@ -5451,7 +5476,11 @@ def test_net_leaves_legacy_numbers_alone(temp_todo_dir):
   ])
   result = runner.invoke(cli, ["add", "-t", "New", "--top-level", "--top"])
   assert result.exit_code == 0, result.output
-  assert stored_priority(3) == 3.0
+  assert "Renumbered" in result.stderr
+  assert stored_priority(1) > stored_priority(3) > stored_priority(2)
+  assert stored_priority(12) > stored_priority(1)
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -5476,6 +5505,212 @@ def test_net_says_when_it_gives_up(
       assert "Warning: placing #9 left priorities" in (
         capsys.readouterr().err
       )
+@
+
+\paragraph{Old numbers are normalised on the first write.}%
+\label{sec:normalise-priorities}
+The net above repairs only what a placement broke, and only in a list
+whose ranges nested to begin with.  A list written before children were
+placed by range does not nest, and stays that way: in a real list of
+460 items, 266 of 318 open sub-items sat outside their parent's range.
+There the gate would keep the net off for good, and every placement
+would have to make do with ranges that contradict each other.
+
+So the old numbers are normalised, automatically, the first time a
+command writes the list.  [[mutate_todo_state]] checks the stored list
+before it hands it to the command's callback, and when the ranges do
+not nest, lays the ranked items out again with
+[[renumber_priorities]] and lifts the shared ones
+([[normalise_priorities]]).  Doing it \emph{before} the command is
+what lets the command's own placement start from a nested list, with
+the net armed; done after it, the command would place its item among
+old numbers and the result would depend on them.  Renumbering keeps
+every family's order, so what the user ranked stays ranked the same
+way; but the flat order changes where a child sat outside its parent's
+range, since it now sorts below its parent instead of among unrelated
+items.  That is the intended change, accepted for single-parent lists
+too.  Done and unranked items, and the items below them, are not laid
+out and keep their numbers.  Commands that only read---[[ls]],
+[[view]], [[ready]], and [[next]] until it starts something---never
+write the file.
+
+A command decides on a snapshot it read without the lock and commits
+under the lock (\cref{sec:todo-read-modify-write}), so the snapshot
+must show the numbers the commit will find, or a placement chosen
+among old numbers would be stored among new ones: a child kept at its
+number while it moves would land above its new parent.  So every read
+normalises the list in memory, in the same deterministic way, without
+a word and without writing; the reading commands show the order the
+next write will store, and the commands that write decide on it.
+
+The step is never silent.  When it changed numbers it says how many,
+on standard error, once.  One pass of renumbering and lifting nests
+any list the commands can produce, a few rounds at most where lifts
+disturb the layout.  If a list still does not nest after that, the
+step leaves the numbers as they were, rather than rewrite them on every
+write without ever getting anywhere, and warns, once per process, or
+raises under [[STRICT_RANKING]]; such a list is a bug to report.
+
+<<child priority helpers>>=
+def normalise_priorities(todos: list[TodoItem]) -> int:
+    """Renumber `todos` into nested ranges, keeping each
+    family's order, and return how many numbers changed.
+
+    Done and unranked items, and those below them, keep
+    their numbers.  The list may still not nest afterwards,
+    which `ranking_is_consistent` tells.
+    """
+    before = {t.id: t.priority for t in todos}
+    for _ in range(RANKING_REPAIRS):
+        renumber_priorities(todos)
+        keep_highest_places(todos)
+        if ranking_is_consistent(todos):
+            break
+    return sum(1 for t in todos if t.priority != before[t.id])
+
+
+def nest_stored_priorities(
+    todos: list[TodoItem], report: bool = True,
+) -> int:
+    """Normalise the priorities of a stored list that does
+    not nest and return how many changed; with `report`,
+    say so on standard error."""
+    if ranking_is_consistent(todos):
+        return 0
+    before = {t.id: t.priority for t in todos}
+    changed = normalise_priorities(todos)
+    if not ranking_is_consistent(todos):
+        for t in todos:
+            t.priority = before[t.id]
+        if report:
+            report_unnestable_list()
+        return 0
+    if changed and report:
+        typer.echo(
+            f"Renumbered {changed} priorities so sub-items rank "
+            "below their parents",
+            err=True,
+        )
+    return changed
+
+
+def report_unnestable_list() -> None:
+    """Warn, once per process, that the stored priorities
+    cannot be nested, or raise under `STRICT_RANKING`."""
+    global UNNESTABLE_WARNED
+    message = (
+        "the stored priorities could not be made to nest; "
+        "they were left as they are"
+    )
+    if STRICT_RANKING:
+        raise RankingNotNested(message)
+    if not UNNESTABLE_WARNED:
+        UNNESTABLE_WARNED = True
+        typer.echo(f"Warning: {message}", err=True)
+<<constants>>=
+UNNESTABLE_WARNED = False
+@
+
+Let's verify the step on a list written before ranges: A's child below
+B, B's child above B itself, a tie at the top level, and an unranked
+parent and a done parent each with a ranked child.  The first write
+renumbers and says so, keeping the order within each family and
+putting each child below its parent; the children of the unranked and
+the done parent keep their numbers; a second write changes nothing and
+says nothing; and the read-only commands do not write at all.
+
+<<test functions>>=
+def save_legacy_list():
+  """Numbers from before ranges, as an old file has them."""
+  save_todos(10, [
+    ranked_child(1, None, 5.0), ranked_child(2, None, 4.0),
+    ranked_child(3, 1, 3.0), ranked_child(4, 1, 1.0),
+    ranked_child(5, 2, 9.0), ranked_child(6, None, 4.0),
+    TodoItem(
+      id=7, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    ranked_child(8, 7, 0.5),
+    TodoItem(
+      id=9, title="Done", priority=0.25, status="done",
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    ranked_child(10, 9, 7.0),
+  ])
+
+
+def test_legacy_numbers_are_normalised_on_first_write(
+  temp_todo_dir,
+):
+  """The first write nests the list and says so; once."""
+  save_legacy_list()
+  assert not ranking_is_consistent(load_todos_raw()[1])
+
+  result = runner.invoke(cli, ["note", "8", "-m", "first write"])
+
+  assert result.exit_code == 0, result.output
+  assert "Renumbered 6 priorities so sub-items rank below their " \
+    "parents" in result.stderr
+  _, todos = load_todos()
+  assert ranking_is_consistent(todos)
+  number = {t.id: t.priority for t in todos}
+  flat = [
+    t.id for t in sort_siblings_by_stored_priority(
+      [t for t in todos if t.status != "done"]
+    )
+  ]
+  assert flat == [10, 1, 3, 4, 2, 5, 6, 8]
+  assert number[3] > number[4] and number[8] == 0.5
+  assert number[10] == 7.0 and number[9] == 0.25
+
+  again = runner.invoke(cli, ["note", "8", "-m", "second write"])
+  assert again.exit_code == 0, again.output
+  assert "Renumbered" not in again.stderr
+  _, after = load_todos()
+  assert {t.id: t.priority for t in after} == number
+
+
+@pytest.mark.parametrize("args", [
+  ["ls", "-r"], ["view", "1"], ["ready"],
+  ["ls", "--format", "json"],
+])
+def test_reading_commands_do_not_normalise(temp_todo_dir, args):
+  """Commands that only read leave the file as it is."""
+  save_legacy_list()
+  before = get_todo_file().read_text()
+  result = runner.invoke(cli, args)
+  assert result.exit_code == 0, result.output
+  assert "Renumbered" not in result.stderr
+  assert get_todo_file().read_text() == before
+@
+
+A list that one pass cannot nest is left as it was, with one warning
+however often it is written in the same process, or an error in strict
+mode.  The test forces such a list by a check that never accepts.
+
+<<test functions>>=
+@pytest.mark.parametrize("strict", [False, True])
+def test_unnestable_list_is_left_and_warned_once(
+  temp_todo_dir, monkeypatch, strict,
+):
+  """No renumbering without success, one warning."""
+  monkeypatch.setattr("nytid.cli.todo.STRICT_RANKING", strict)
+  monkeypatch.setattr("nytid.cli.todo.UNNESTABLE_WARNED", False)
+  save_legacy_list()
+  _, stored = load_todos_raw()
+  with patch(
+    "nytid.cli.todo.ranking_is_consistent", return_value=False,
+  ):
+    first = runner.invoke(cli, ["note", "8", "-m", "one"])
+    second = runner.invoke(cli, ["note", "8", "-m", "two"])
+  if strict:
+    assert isinstance(first.exception, RankingNotNested)
+    return
+  assert first.exit_code == 0 and second.exit_code == 0
+  warnings = first.stderr + second.stderr
+  assert warnings.count("could not be made to nest") == 1
+  _, todos = load_todos_raw()
+  assert [t.priority for t in todos] == [t.priority for t in stored]
 @
 
 \paragraph{Every range at once.}%
@@ -20649,12 +20884,18 @@ A move is where the flags earn their place.  Without one, the item is
 re-ranked among its new siblings by the interactive search; with
 [[--keep-prio]] it arrives carrying the number it had, which is the
 behaviour this command had before; and with [[--top]] or [[--bottom]]
-it arrives at a known end of the new list.  The fixture's child of B
-sits at~[[8.0]], above B itself, as data written before children were
-placed by range can.  [[--top]] therefore steps past it to~[[9.0]],
-since there is no room above it inside B's range to split, while
-[[--bottom]] takes the midpoint between it and the floor of B's range
-$(-4.0, 6.0)$, which is~[[2.0]] (\cref{todo:binary-search}):
+it arrives at a known end of the new list.  The fixture holds numbers
+written before children were placed by range: B's child at~[[8.0]],
+above B itself, and the mover at~[[1.0]], below its parent's range.
+The first write normalises them (\cref{sec:normalise-priorities}):
+B's child goes to the middle of B's range $(-4.0, 6.0)$, [[1.0]], and
+the mover to the middle of A's, [[8.0]].  Then [[--top]], like a
+\enquote{yes} to the search's only question, puts the mover halfway
+between B's child and B, [[3.5]], and [[--bottom]] halfway between the
+child and the floor of B's range, [[-1.5]]
+(\cref{todo:binary-search}).  With [[--keep-prio]] the mover keeps
+[[8.0]], which only the top level accepts: as a number in A's range it
+lies above B.
 
 <<test functions>>=
 @pytest.fixture
@@ -20694,17 +20935,17 @@ def test_edit_parent_runs_the_search(two_parents):
   )
   assert result.exit_code == 0
   assert "Is this correct?" in result.output
-  assert stored_priority(4) == 9.0
+  assert stored_priority(4) == 3.5
 
 
 def test_edit_parent_keep_prio(two_parents):
   """--keep-prio moves without asking or re-ranking."""
   result = runner.invoke(
-    cli, ["edit", "4", "--parent", "2", "--keep-prio"],
+    cli, ["edit", "4", "--parent", "0", "--keep-prio"],
   )
   assert result.exit_code == 0
   assert "Is this correct?" not in result.output
-  assert stored_priority(4) == 1.0
+  assert stored_priority(4) == 8.0
 
 
 def test_edit_parent_keep_prio_outside_range(
@@ -20790,7 +21031,7 @@ def test_edit_parent_top(two_parents):
     cli, ["edit", "4", "--parent", "2", "--top"],
   )
   assert result.exit_code == 0
-  assert stored_priority(4) == 9.0
+  assert stored_priority(4) == 3.5
 
 
 def test_edit_parent_bottom(two_parents):
@@ -20799,7 +21040,7 @@ def test_edit_parent_bottom(two_parents):
     cli, ["edit", "4", "--parent", "2", "--bottom"],
   )
   assert result.exit_code == 0
-  assert stored_priority(4) == 2.0
+  assert stored_priority(4) == -1.5
 
 
 def test_edit_keep_prio_alone_is_a_no_op(
@@ -22022,9 +22263,10 @@ def test_edit_reparent_to_other(temp_todo_dir):
     assert child.parents == [2]
     # First child of B: the middle of B's child range,
     # asked for without a single question.  A and B both
-    # took the default priority of 0.0, so that range is
-    # the unit-wide fallback (0.0, -1.0).
-    assert child.priority == -0.5
+    # took the default priority of 0.0, a tie that the
+    # first write normalises to A at 2.0 and B at 1.0, so
+    # that range is B's (-9.0, 1.0).
+    assert child.priority == -4.0
 
 def test_edit_parent_names_the_places_left(temp_todo_dir):
     """--parent replaces every parent and says which it dropped."""
@@ -24908,8 +25150,10 @@ An item with several parents is removed only with all of them.  Below
 item~1, item~4 sits under both~2 and~3, a diamond, and goes with
 them; item~5 is under~2 and also top-level, and item~6 under~3 and the
 unrelated~7, and both stay, detached from what was removed, with their
-own children.  All items have the default priority, so item~6 ranks
-under~3, its first parent, and goes last under~7.
+own children.  All items have the default priority, a tie that the
+first write normalises (\cref{sec:normalise-priorities}); after that,
+item~5 ranks under~2 and goes last at the top level, and item~6 ranks
+under~3 and goes last under~7.
 
 <<test functions>>=
 def test_rm_removes_shared_items_only_with_every_parent(
@@ -24932,7 +25176,8 @@ def test_rm_removes_shared_items_only_with_every_parent(
   assert result.exit_code == 0, result.output
   assert (
     "(3 sub-items; 2 kept under their other parents; "
-    "#6 to the bottom under #7)" in result.output
+    "#5 to the bottom at the top level; #6 to the bottom "
+    "under #7)" in result.output
   )
   assert "Also removed 3 sub-items" in result.output
   assert "Kept 2 sub-items under their other parents" in (
@@ -33184,6 +33429,7 @@ from nytid.cli.todo import (
     ranking_path,
     ranked_under,
     ranking_is_consistent,
+    load_todos_raw,
     RankingIndex,
     RankingNotNested,
     place_fallen_below,
