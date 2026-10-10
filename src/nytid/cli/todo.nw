@@ -5850,12 +5850,22 @@ state that follows from it. This keeps the command bodies declarative:
 [[start]] activates, [[stop]] pauses, and [[done]] completes.
 
 Activation resolves the ID (falling back to the current worker/tmux
-context when [[who]] is given), verifies the item exists, and pushes it
-onto the shared stack.
+context when [[who]] is given), verifies the item exists, claims it
+for the acting worker (\cref{sec:todo-claim}), and pushes it onto the
+shared stack.  Besides the usual state it returns the item as it was
+before a forced takeover, or [[None]] when nothing was taken over;
+the caller needs that copy to stop the previous owner's tracking.
 
 <<helpers>>=
-def activate_todo_state(todo_id, who=None):
-    """Push ``todo_id`` onto the authoritative active stack."""
+def activate_todo_state(todo_id, who=None, force=False):
+    """Push ``todo_id`` onto the authoritative active stack.
+
+    Refuses an item that is active for a worker other
+    than ``who``; with ``force`` the item is handed to
+    ``who`` instead.  Returns the resolved ID, the item,
+    the new state, and a copy of the item as it was
+    before a takeover (``None`` if there was none).
+    """
 
     def update(next_id, todos, stack):
         resolved_id = resolve_todo_id(
@@ -5872,12 +5882,222 @@ def activate_todo_state(todo_id, who=None):
                 err=True,
             )
             raise typer.Exit(1)
+        <<claim [[item]] for [[who]]>>
         if resolved_id not in stack:
             stack.append(resolved_id)
-        return next_id, todos, stack, resolved_id, item
+        return (
+            next_id, todos, stack,
+            resolved_id, item, displaced,
+        )
 
-    next_id, todos, stack, resolved_id, item = apply_todo_mutation(update)
-    return resolved_id, item, next_id, todos, stack
+    (
+        next_id, todos, stack,
+        resolved_id, item, displaced,
+    ) = apply_todo_mutation(update)
+    return resolved_id, item, next_id, todos, stack, displaced
+@
+
+\paragraph{Claiming an item}%
+\label{sec:todo-claim}
+An item on the active stack is being worked on, and the worker doing
+it is its owner, [[item.who]] (the default user when unset).  The
+stack is shared, though, and by itself it does not keep a second
+worker from starting an item that another worker already has active.  Both
+would then track time on it, and each one's [[stop]] or [[done]]
+would cut the other's work short.  With agents taking work from the
+same list as the user, that is not an exotic accident.
+
+Starting an item is therefore also a claim on it, and the first claim
+wins.  Activation refuses an item that is active for a worker other
+than the acting one (\cref{sec:todo-acting-worker}) and says whose it
+is, with the two ways forward: act as that worker with [[--who]], or
+take the item over with [[start --force]].
+
+The check runs inside the locked callback, on the stack as it is when
+the item is pushed (\cref{sec:todo-read-modify-write}).  A check on a
+snapshot alone would leave the race open, since two [[start]]s could
+both see the item idle and then both push it.
+
+Three cases look similar but are deliberately left alone.
+\begin{description}
+\item[Ancestors] Only the item that was asked for is checked, never
+  the ancestors that [[ensure_ancestors_active]] activates along with
+  it.  A parent is typically shared: the user keeps a course's parent
+  item active while an agent works through its children.  Starting
+  a child must not be refused because its parent is somebody else's,
+  and the parent is not taken from them either, since an ancestor
+  that is already active is left exactly as it is.
+\item[Another worker's pending item] An item that is assigned to
+  another worker but not active can still be started by explicit ID,
+  as before.  Assignment says whose queue an item is in, not who is
+  working on it, and picking a task from a colleague's queue is the
+  ordinary way to help out.  Such a start does not change [[who]]
+  either: only a forced takeover rewrites the owner.
+\item[A restart] An item that is already active for the acting worker
+  may be started again, which is what resuming after a stopped
+  tracking session looks like.
+\end{description}
+
+[[claim_holder]] answers the one question both the locked check and
+the early one in [[start]] ask: who, if anyone, stands in the acting
+worker's way.  [[refuse_claim]] gives the refusal one wording for
+both [[start]] and [[adopt]], so it names both remedies.
+
+<<helpers>>=
+def claim_holder(item, stack, who):
+    """Return the worker whose claim on `item` bars `who`.
+
+    `item` is claimed while it is on the active `stack`,
+    by `item.who` or the default user when that is unset.
+    Returns `None` when nothing bars `who`: `who` is
+    `None`, the item is not active, or `who` holds it.
+    """
+    if who is None or item.id not in stack:
+        return None
+    holder = item.who or default_username
+    return holder if holder != who else None
+
+
+def refuse_claim(todo_id, holder):
+    """Exit because `holder` has `todo_id` active."""
+    typer.echo(
+        f"Error: todo #{todo_id} is active for {holder}. "
+        f"Pass --who {holder} to act as {holder}, or "
+        f"take it over with: todo start {todo_id} --force",
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+A forced takeover writes the new owner inside the same callback, so
+the claim changes hands atomically.  It also keeps a copy of the item
+as it was: the previous owner's tracking session still runs the
+item's labels and must be stopped, but once [[who]] has changed
+nothing else would ever stop it.  The previous owner's ID-less
+[[stop]] no longer finds the item, because it is no longer theirs,
+and the new owner's [[stop]] or [[done]] closes the new owner's
+session.  The time would go on accruing to a worker who had stopped
+working on the task.
+
+The stop itself is tracking I/O and runs after the lock is released,
+in the caller.  That order is safe because [[stop_todo_tracking]]
+takes the worker from the item it is handed rather than reloading
+it, and the copy still names the previous owner.  Stopping first,
+on a decision taken from a snapshot, would be the riskier order: the
+commit can still fail, for instance when the item was removed
+meanwhile, and the previous owner would then have lost the session
+for a takeover that never happened.
+
+<<claim [[item]] for [[who]]>>=
+displaced = None
+holder = claim_holder(item, stack, who)
+if holder is not None:
+    if not force:
+        refuse_claim(resolved_id, holder)
+    displaced = copy.copy(item)
+    item.who = who
+@
+
+Two gaps remain.  Two sessions acting as the \emph{same} worker, two
+agent runs as [[dan-claude]] for instance, can still both start one
+item: the claim tells workers apart, not sessions, and for the
+acting worker an active item of its own is simply a restart.
+Closing that needs an identity per session, which the store does not
+have.  And a takeover does not reach a process that the previous
+owner launched and that is still running: when it exits, its
+post-run handling stops the item by ID, which now means the new
+owner's session.  Both are left for follow-up work.
+
+Let's verify the rule and the three cases it leaves alone, starting
+with the refusal itself.  The item stays the previous owner's, and
+the error names that owner:
+
+<<test functions>>=
+def test_start_refuses_item_active_for_another_worker(
+  temp_todo_dir,
+):
+  """start refuses an item another worker has active."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Alice's task",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+  ])
+  save_active_stack([1])
+
+  result = runner.invoke(cli, ["start", "1"])
+
+  assert result.exit_code == 1
+  assert "todo #1 is active for alice" in result.output
+  assert "--force" in result.output
+  _, todos = load_todos()
+  assert todos[0].who == "alice"
+  assert load_active_stack() == [1]
+
+  result = runner.invoke(cli, ["start", "1", "--who", "alice"])
+  assert result.exit_code == 0, result.output
+@
+
+Starting a child whose parent another worker has active is allowed,
+and the parent stays that worker's:
+
+<<test functions>>=
+def test_start_child_ignores_claim_on_active_parent(
+  temp_todo_dir,
+):
+  """The claim check covers the target, not its ancestors."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Shared parent",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+    TodoItem(
+      id=2, title="My child",
+      created="2026-02-20T10:00:00",
+      parent_id=1,
+    ),
+  ])
+  save_active_stack([1])
+
+  result = runner.invoke(cli, ["start", "2"])
+
+  assert result.exit_code == 0, result.output
+  assert load_active_stack() == [1, 2]
+  _, todos = load_todos()
+  assert todos[0].who == "alice"
+@
+
+Starting another worker's pending item by explicit ID still works,
+here together with the parent it activates, and neither owner is
+rewritten:
+
+<<test functions>>=
+def test_start_other_workers_pending_item_keeps_owner(
+  temp_todo_dir,
+):
+  """Starting another worker's pending item leaves who alone."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Parent",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+    TodoItem(
+      id=2, title="Alice's queued task",
+      created="2026-02-20T10:00:00",
+      parent_id=1,
+      who="alice",
+    ),
+  ])
+
+  result = runner.invoke(cli, ["start", "2"])
+
+  assert result.exit_code == 0, result.output
+  assert load_active_stack() == [1, 2]
+  _, todos = load_todos()
+  assert [t.who for t in todos] == ["alice", "alice"]
 @
 
 Let's verify that the tmux context resolution picks the right todo when
@@ -7433,11 +7653,14 @@ who_filter_opt = typer.Option(
 \paragraph{Acting as a worker}%
 \label{sec:todo-acting-worker}
 A third role is the worker a command acts \emph{as}.  [[start]],
-[[stop]], [[view]], [[note]] and [[rm]] neither assign work nor
-filter a list; they operate on one item.  Without an ID, the worker
-decides which item that is: the worker's current active todo, since
-[[resolve_todo_id]] narrows the shared stack to the worker's own
-entries.
+[[stop]], [[view]], [[note]], [[rm]] and [[adopt]] neither assign
+work nor filter a list; they operate on one item, and the worker
+decides two things about it.  Without an ID, it decides which item
+that is: the worker's current active todo, since [[resolve_todo_id]]
+narrows the shared stack to the worker's own entries.  And when
+[[start]] or [[adopt]] activates an item, the worker is the one
+claiming it, which another worker's claim can refuse
+(\cref{sec:todo-claim}).
 
 The default is the logged-in user, as everywhere else, which is
 exactly wrong for an agent that runs as [[dan-claude]] under the
@@ -7445,8 +7668,9 @@ user's login.  Before these commands took [[--who]], such an agent
 could not follow the rule \enquote{always say who you are}: its
 [[todo stop]] stopped the user's active item rather than its own, and
 its [[todo note]] annotated whatever the user was working on.  An
-explicit ID still means that item, whoever owns it; [[--who]] here
-chooses the actor, not a filter that hides other workers' items.
+explicit ID still means that item, whoever owns it, apart from the
+claim; [[--who]] here chooses the actor, not a filter that hides
+other workers' items.
 
 [[done]] keeps its own option (\cref{sec:todo-done}): there the
 worker is also an ownership check on explicit IDs, and its help text
@@ -18357,6 +18581,9 @@ def start(
 
     If no ID given, starts the current active task.
 
+    Refuses a todo that another worker has active; --force
+    takes it over, stopping that worker's tracking of it.
+
     If the todo has a working directory, spawns a
     shell or command in that directory with tracking.
 
@@ -18372,10 +18599,13 @@ def start(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
     <<reject a command together with [[--no-command]]>>
+    <<peek at the todo to start>>
+    <<refuse another worker's active todo early>>
     <<resolve worktree for todo start>>
-    todo_id, item, next_id, todos, stack = activate_todo_state(
-        todo_id, who=who
-    )
+    (
+        todo_id, item, next_id, todos, stack, displaced,
+    ) = activate_todo_state(todo_id, who=who, force=force)
+    <<stop the displaced owner's tracking>>
 
     <<resolve tmux context sync policy>>
     <<auto-activate ancestors>>
@@ -18431,16 +18661,18 @@ launch lands in the matching subdirectory of the worktree
 existing worktree, restarting the todo lands in the same checkout with
 whatever was left there.
 
-<<resolve worktree for todo start>>=
-worktree_dir = None
-worktree_launch = None
-_, peek_todos = load_todos()
+<<peek at the todo to start>>=
+_, peek_todos, peek_stack = load_todo_state()
 peek_id = resolve_todo_id(
-    todo_id, "start", who=who, todos=peek_todos,
+    todo_id, "start", who=who,
+    todos=peek_todos, stack=peek_stack,
 )
 peek_item = next(
     (t for t in peek_todos if t.id == peek_id), None,
 )
+<<resolve worktree for todo start>>=
+worktree_dir = None
+worktree_launch = None
 worktree_name = worktree or (
     peek_item.worktree if peek_item else None
 )
@@ -18455,6 +18687,122 @@ if worktree_name:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
     worktree_launch = worktree_launch_dir(base_dir, worktree_dir)
+@
+
+The claim (\cref{sec:todo-claim}) is the other check that must come
+before the worktree.  [[activate_todo_state]] makes the binding one
+under the lock, but by then a refused start would already have
+created a checkout for an item it may not work on.  The peek has
+the stack at hand, so we ask the same question of it first.  If the
+peek is stale, nothing worse follows than a refusal that a retry
+would not get, or a claim made after the peek, which the locked
+check still refuses a moment later.
+
+<<refuse another worker's active todo early>>=
+if peek_item is not None and not force:
+    holder = claim_holder(peek_item, peek_stack, who)
+    if holder is not None:
+        refuse_claim(peek_id, holder)
+@
+
+A refused start leaves no trace, not even a worktree:
+
+<<test functions>>=
+def test_start_refuses_claim_before_worktree(temp_todo_dir):
+  """A refused start does not create the item's worktree."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Alice's task",
+      created="2026-02-20T10:00:00",
+      who="alice", worktree="alice-wt",
+    ),
+  ])
+  save_active_stack([1])
+
+  with patch(
+    "nytid.cli.todo.ensure_worktree",
+  ) as mock_worktree:
+    result = runner.invoke(cli, ["start", "1"])
+
+  assert result.exit_code == 1
+  assert "todo #1 is active for alice" in result.output
+  mock_worktree.assert_not_called()
+@
+
+[[--force]] takes the item over instead of refusing.  It is a
+separate, command-qualified option for the same reason as [[done]]'s
+and [[rm]]'s (\cref{sec:todo-done}): each [[--force]] promises
+something different.  This one writes the acting worker as the
+item's owner, which is why the help says \enquote{take over} rather
+than just \enquote{force}.
+
+<<argument and option definitions>>=
+start_force_opt = typer.Option(
+    "--force", "-f",
+    help="Take the todo over if another worker "
+         "has it active")
+@
+
+<<start command options>>=
+force: Annotated[bool, start_force_opt] = False,
+@
+
+After a takeover the previous owner's session still runs the item's
+labels.  We stop them from the copy [[activate_todo_state]] kept,
+which still names that owner, before the new owner's tracking starts
+(\cref{sec:todo-claim}).  Labels that the previous owner's other
+active items share stay protected, as in every other stop.
+
+<<stop the displaced owner's tracking>>=
+if displaced is not None:
+    typer.echo(
+        f"Took over #{todo_id} from "
+        f"{displaced.who or default_username}"
+    )
+    stop_todo_tracking(todo_id, displaced, todos)
+@
+
+Let's verify a takeover end to end with real tracking sessions: the
+item changes owner, the previous owner's session no longer runs its
+labels, and the new owner's does.
+
+<<test functions>>=
+def test_start_force_takes_over_active_item(temp_todo_dir):
+  """start --force hands the item over and moves tracking."""
+  from nytid.cli.track import (
+    ActiveSession,
+    load_active_session,
+    save_active_session,
+  )
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Alice's task",
+      created="2026-02-20T10:00:00",
+      who="alice", labels=["DD1310"],
+    ),
+  ])
+  save_active_stack([1])
+  session = ActiveSession()
+  session.start_labels(
+    ["DD1310", "todo:1"],
+    datetime.datetime(2026, 2, 20, 10, 0),
+  )
+  save_active_session(session, "alice")
+
+  result = runner.invoke(cli, ["start", "1", "--force"])
+
+  assert result.exit_code == 0, result.output
+  assert "Took over #1 from alice" in result.output
+  _, todos = load_todos()
+  assert todos[0].who == default_username
+  assert load_active_stack() == [1]
+  alice = load_active_session("alice").get_active_labels()
+  assert "todo:1" not in alice
+  assert "DD1310" not in alice
+  mine = load_active_session(
+    default_username
+  ).get_active_labels()
+  assert "todo:1" in mine
 @
 
 Detached tmux cleanup happens after the pane process exits, so it cannot
@@ -21616,6 +21964,7 @@ def adopt(
         bool | None, auto_suspend_opt
     ] = None,
     rename: Annotated[bool, adopt_rename_opt] = False,
+    who: Annotated[str, acting_who_opt] = default_username,
 ):
     """Adopt the current tmux window as work on a todo.
 
@@ -21732,16 +22081,20 @@ if arm_finalize is None:
 Activation precedes publication, mirroring [[todo start]]: the
 stack must name the task before any window state points at it.
 [[activate_todo_state]] tolerates an already active task (no
-duplicate stack entry), so adopting mid-recovery is idempotent.
+duplicate stack entry), so adopting mid-recovery is idempotent---as
+long as the task is active for the worker adopting it.  A task that
+another worker has active is refused by the claim
+(\cref{sec:todo-claim}), and recovering that worker's window means
+adopting as that worker, with [[--who]].  [[adopt]] has no
+[[--force]]: it repairs a window, and taking a task from someone is
+a decision for [[start --force]].
 Ancestor activation keeps parents' time running, exactly as a
 fresh [[start]] would; window publication below carries only the
 task's own labels, again exactly as [[todo start --window]] does.
 
 <<activate adopted todo and ancestors>>=
-todo_id, item, next_id, todos, stack = (
-    activate_todo_state(
-        todo_id, who=default_username,
-    )
+todo_id, item, next_id, todos, stack, _ = (
+    activate_todo_state(todo_id, who=who)
 )
 ensure_ancestors_active(
     item, todos, stack,
@@ -21970,6 +22323,44 @@ def test_adopt_skips_finalize_for_launched_pane(
 
     assert result.exit_code == 0
     install_mock.assert_not_called()
+@
+
+Adoption is subject to the claim like any activation: another
+worker's active task is refused before any window state changes, and
+adopting as that worker is allowed.
+
+<<test functions>>=
+def test_adopt_respects_claim(temp_todo_dir):
+  """adopt refuses another worker's active todo unless --who."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Alice's task",
+      created="2026-02-20T10:00:00",
+      who="alice",
+    ),
+  ])
+  save_active_stack([1])
+  with patch.dict(
+    os.environ,
+    {"TMUX": "session", "TMUX_PANE": "%3"},
+    clear=True,
+  ), patch(
+    "nytid.cli.todo.pane_has_exit_hooks",
+    return_value=True,
+  ), patch(
+    "nytid.cli.track.adopt_current_window",
+    return_value=dict(ADOPTED_WINDOW),
+  ) as adopt_mock:
+    refused = runner.invoke(cli, ["adopt", "1"])
+    assert adopt_mock.call_count == 0
+    adopted = runner.invoke(
+      cli, ["adopt", "1", "--who", "alice"]
+    )
+
+  assert refused.exit_code == 1
+  assert "todo #1 is active for alice" in refused.output
+  assert adopted.exit_code == 0, adopted.output
+  assert adopt_mock.call_count == 1
 @
 
 \subsection{The [[stop]] Command}
