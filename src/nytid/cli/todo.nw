@@ -10940,12 +10940,24 @@ from nytid.cli import get_default_username
 default_username = get_default_username()
 @
 
-Parent-related options control hierarchy placement:
+Parent-related options control hierarchy placement.  An item may
+belong to several parents at once (\cref{sec:todo-parents}), so
+[[add]]'s [[--parent]] can be repeated, and [[--top-level]] together
+with it puts the item at the top level as well: [[--top-level
+--parent 12]] gives the parents [[[0, 12] ]].  On its own
+[[--top-level]] keeps meaning what it always did, the top level instead
+of the active todo.  [[import]] still takes one parent, so it keeps the
+single-valued [[parent_opt]] with its own help text.
 
 <<argument and option definitions>>=
 parent_opt = typer.Option(
     "--parent", "-p",
     help="Parent todo ID",
+    autocompletion=complete_todo_ids)
+parents_opt = typer.Option(
+    "--parent", "-p",
+    help="Parent todo ID (repeatable for several parents; "
+         "0 = top level)",
     autocompletion=complete_todo_ids)
 top_level_opt = typer.Option(
     "--top-level",
@@ -11045,8 +11057,8 @@ three places that need one---the sibling set to compare against, the
 [[who:]] line the buffer opens with, and the item finally stored.
 
 <<add command options>>=
-parent: Annotated[int | None,
-                  parent_opt] = None,
+parent: Annotated[list[int] | None,
+                  parents_opt] = None,
 top_level: Annotated[bool, top_level_opt] = False,
 who: Annotated[str | None, who_opt] = None,
 @
@@ -11176,50 +11188,129 @@ priority_title = title
 <<create and save new todo>>
 @
 
-Auto-parenting: if no explicit parent is given and we're not forcing
-top-level, reuse the current active todo for the current tmux context:
+The parents are resolved into [[resolved_parents]], the list the new
+item will store, with [[ROOT_ID]] for the top level.  The parents named
+with [[--parent]] come first, in the order given, after the top level
+if [[--top-level]] asks for it too; a [[--parent 0]] is the top level
+as well, as in [[edit]].  Without either, auto-parenting applies: the
+current active todo for the current tmux context becomes the one
+parent, as it always did.
 
 When tmux is active but the current pane/window has no tracked todo,
 that means there is no local parent to inherit, so the new item stays
 top-level.
 
 <<resolve parent id>>=
-resolved_parent = parent
-if parent is None and not top_level:
-    active = get_current_context_todo(todos)
-    if active is not None:
-        resolved_parent = active.id
-        typer.echo(
-            f"Auto-parenting under: "
-            f"#{active.id} {active.title}"
-        )
+if parent:
+    resolved_parents = normalize_parents(
+        ([ROOT_ID] if top_level else []) + list(parent)
+    )
+else:
+    resolved_parents = [ROOT_ID]
+    if not top_level:
+        active = get_current_context_todo(todos)
+        if active is not None:
+            resolved_parents = [active.id]
+            typer.echo(
+                f"Auto-parenting under: "
+                f"#{active.id} {active.title}"
+            )
 @
 
 When a parent is set, inherit its deadline and labels unless the user
-explicitly provided overrides.  This chunk is shared by [[add]] and
-[[import]], which makes it the single place where a command-line
+explicitly provided overrides.  This chunk is shared by both paths of
+[[add]], which makes it the single place where a command-line
 [[--deadline]] becomes stored data---so it is also where that string
 has to be validated.  An inherited parent deadline needs no check: it
-was normalized when the parent was written.
+was normalized when the parent was written.  Every parent named must
+exist, and [[parent_items]] keeps them by id for the priority
+resolution below.
 
 <<inherit from parent>>=
 inherited_labels = list(label) if label else []
 inherited_deadline = normalize_deadline(deadline)
-if resolved_parent is not None:
-    parent_item = next(
-        (t for t in todos if t.id == resolved_parent),
+parent_items = {}
+for parent_id in resolved_parents:
+    if parent_id == ROOT_ID:
+        continue
+    parent_items[parent_id] = next(
+        (t for t in todos if t.id == parent_id),
         None,
     )
-    if parent_item is None:
+    if parent_items[parent_id] is None:
         typer.echo(
-            f"Error: parent #{resolved_parent} not found",
+            f"Error: parent #{parent_id} not found",
             err=True,
         )
         raise typer.Exit(1)
-    if not label and parent_item.labels:
-        inherited_labels = list(parent_item.labels)
-    if deadline is None and parent_item.deadline:
-        inherited_deadline = parent_item.deadline
+from_labels, from_deadline = inherit_from_parents(
+    parent_items.values()
+)
+if not label and from_labels:
+    inherited_labels = from_labels
+if deadline is None and from_deadline:
+    inherited_deadline = from_deadline
+@
+
+A child of several parents belongs to all of their contexts, so it
+takes the union of their labels: a task shared by two courses is
+tracked under both.  Of their deadlines it takes the earliest, since
+the item has to be done by the time the first parent that contains it
+is due.  A deadline that does not parse, which only a hand-edited
+file holds, loses to any that does, and is taken only when no other is
+there.  [[import]] inherits from its one parent through the same
+helper, so the two commands agree on what a parent passes on.
+
+<<helpers>>=
+def inherit_from_parents(parents):
+    """Return the labels and deadline a new child inherits.
+
+    The labels are the union of the `parents`' labels and the
+    deadline is the earliest of their deadlines, or `None`.
+    """
+    parents = list(parents)
+    labels = sorted({
+        label for parent in parents for label in parent.labels
+    })
+    deadlines = [p.deadline for p in parents if p.deadline]
+    if not deadlines:
+        return labels, None
+
+    def earliest_first(deadline):
+        parsed = naive_local_datetime(deadline)
+        return (parsed is None, parsed or datetime.datetime.max)
+    return labels, min(deadlines, key=earliest_first)
+@
+
+Let's verify the union and the earliest deadline:
+
+<<test functions>>=
+def test_add_with_several_parents_inherits_from_all(
+  temp_todo_dir,
+):
+  """Labels are united, the earliest deadline wins."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Course", labels=["course", "prep"],
+      deadline="2026-12-01T00:00:00", priority=5.0,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Review", labels=["review"],
+      deadline="2026-11-01T00:00:00", priority=3.0,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+  ])
+  result = runner.invoke(cli, [
+    "add", "-t", "Shared", "--parent", "1", "--parent", "2",
+    "--top-level", "--bottom",
+  ])
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  shared = todos[-1]
+  assert shared.parents == [ROOT_ID, 1, 2]
+  assert shared.labels == ["course", "prep", "review"]
+  assert shared.deadline == "2026-11-01T00:00:00"
 @
 
 Let's verify the two halves of the deadline contract end to end.  A
@@ -11390,17 +11481,21 @@ item came from, or there is none; a second link to the parent would
 say the same thing twice, and the lookup reads the tmux state, which
 costs a few [[tmux]] calls.  An explicit source is taken as given, and
 the default is announced the way auto-parenting announces its parent,
-since it is a decision the user did not spell out.
+since it is a decision the user did not spell out.  An item added under
+several parents was kept out of the active todo only if that todo is
+none of them: [[--parent 1 --parent 2]] with \#1 active files the item
+under \#1 among other places, which says where it came from as well as
+auto-parenting would.
 
 <<resolve [[discovered_from]] for new todo>>=
 resolved_discovered_from = discovered_from
 if (
     discovered_from is None
     and not no_discovered_from
-    and (parent is not None or top_level)
+    and (parent or top_level)
 ):
     source = discovered_while_working_on(
-        todos, normalize_parents([resolved_parent])
+        todos, resolved_parents
     )
     if source is not None:
         resolved_discovered_from = source.id
@@ -11453,6 +11548,27 @@ def test_add_records_active_todo_when_placed_elsewhere(
   assert found.discovered_from == source
   announced = "Discovered from: #1 Fix the parser" in result.output
   assert announced == (source is not None)
+@
+
+With several parents the rule asks whether the active todo is among
+them:
+
+<<test functions>>=
+@pytest.mark.parametrize("placement,source", [
+  (["--parent", "1", "--parent", "2"], None),
+  (["--top-level", "--parent", "2"], 1),
+])
+def test_add_under_several_parents_records_source(
+  temp_todo_dir, placement, source,
+):
+  """The source is recorded unless it is one of the parents."""
+  save_active_and_other()
+  result = runner.invoke(
+    cli, ["add", "-t", "Found it", "--bottom", *placement],
+  )
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert todos[-1].discovered_from == source
 @
 
 Scripts and agents read the link from [[ls]]'s JSON, where it is the
@@ -11594,13 +11710,68 @@ once: zero is [[ROOT_ID]], the top level among parent ids
 every top-level item as its child wherever its children are asked
 for.
 
+An item added under several parents is placed in each of its places
+and keeps the highest number, the rule of
+\cref{sec:ranking-context}.  The places are visited from the highest
+down: the top level first, since it has no upper bound, then the
+parents in the order of their own numbers.  A place whose parent ranks
+at or below the number already found cannot raise it, since everything
+in its range lies below the parent, so it is skipped without a
+question.  Each place gets its own candidate, whose only parent is
+that place, so that the sibling lookup and the search ask about
+exactly the siblings ranked there.  An unranked parent offers no place
+to rank in; only when every place is unranked does the item stay
+unranked, as a child of an unranked parent always has.
+
+A number given with [[--prio]] has to fit one of the places: it must
+lie in the range of one of the parents, unless the top level is among
+them, which takes any number.  With one parent this is the check
+[[add]] has always made.
+
 <<constants>>=
 CANDIDATE_ID = -1
 <<resolve priority for new todo>>=
+ranked_places = [
+    place for place in resolved_parents
+    if place == ROOT_ID or parent_items[place].priority is not None
+]
+if not ranked_places or skip_priority:
+    priority = None
+elif explicit_priority is not None:
+    refuse_number_outside_places(
+        todos,
+        [parent_items.get(place) for place in ranked_places],
+        explicit_priority,
+        f"--prio {explicit_priority:g}", "--top or --bottom",
+    )
+    priority = explicit_priority
+else:
+    priority = None
+    ranked_places.sort(
+        key=lambda place: (
+            place != ROOT_ID,
+            -(parent_items[place].priority if place != ROOT_ID
+              else 0.0),
+        )
+    )
+    for place in ranked_places:
+        parent_ctx = parent_items.get(place)
+        if (
+            priority is not None and parent_ctx is not None
+            and parent_ctx.priority <= priority
+        ):
+            continue
+        <<place the candidate under [[place]]>>
+        priority = (
+            number if priority is None else max(priority, number)
+        )
+@
+
+<<place the candidate under [[place]]>>=
 candidate = TodoItem(
     id=CANDIDATE_ID,
     title=priority_title,
-    parents=[resolved_parent],
+    parents=[place],
     labels=inherited_labels,
     deadline=inherited_deadline,
     estimated=(
@@ -11612,22 +11783,8 @@ siblings = get_active_siblings(
     who=who or default_username,
     ranked_only=True,
 )
-parent_ctx = (
-    parent_item if resolved_parent is not None
-    else None
-)
-if parent_ctx is not None and parent_ctx.priority is None:
-    priority = None
-elif skip_priority:
-    priority = None
-elif explicit_priority is not None:
-    refuse_number_outside_range(
-        todos, parent_ctx, explicit_priority,
-        f"--prio {explicit_priority:g}", "--top or --bottom",
-    )
-    priority = explicit_priority
-elif top or bottom:
-    priority = place_among_siblings(
+if top or bottom:
+    number = place_among_siblings(
         siblings,
         PLACE_TOP if top else PLACE_BOTTOM,
         parent=parent_ctx,
@@ -11635,11 +11792,90 @@ elif top or bottom:
         candidate=candidate,
     )
 else:
-    priority = binary_search_priority(
+    number = binary_search_priority(
         siblings,
         candidate,
         parent=parent_ctx, todos=todos,
     )
+@
+
+The check for [[--prio]] reuses the single-parent one: the number
+passes if one of the places holds it, and is otherwise refused with the
+message for the first place.
+
+<<child priority helpers>>=
+def refuse_number_outside_places(
+    todos: list[TodoItem],
+    parents: list[TodoItem | None],
+    number: float,
+    subject: str,
+    alternatives: str,
+) -> None:
+    """Exit with an error unless `number` lies inside the
+    child range of one of `parents`.
+
+    `None` stands for the top level, which takes any
+    number, as does an unranked parent.
+    """
+    for parent in parents:
+        bounds = child_priority_range_or_none(todos, parent)
+        if bounds is None or bounds[1] < number < bounds[0]:
+            return
+    refuse_number_outside_range(
+        todos, parents[0], number, subject, alternatives,
+    )
+@
+
+Let's verify the places on top-level A at~5.0 and D at~3.0, each with
+a child.  Under both, the item is asked about in A only: D's range lies
+below whatever A gives it, so D's question would not change the
+number.  At the top level as well, the top level is asked first, and A
+only if the answer left the item below~A.
+
+<<test functions>>=
+def a_and_d_with_children():
+  """A at 5 and D at 3, each with one child."""
+  save_todos(5, [
+    ranked_child(1, None, 5.0),
+    ranked_child(2, None, 3.0),
+    ranked_child(3, 1, 4.0),
+    ranked_child(4, 2, 2.0),
+  ])
+
+
+def test_add_asks_only_where_the_number_can_rise(temp_todo_dir):
+  """D ranks below A's answer, so D's question is skipped."""
+  a_and_d_with_children()
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Shared", "--parent", "2", "--parent", "1"],
+    input="y\n",
+  )
+  assert result.exit_code == 0, result.output
+  assert result.output.count("Is this correct?") == 1
+  assert "Lower:  Child 3" in result.output
+  _, todos = load_todos()
+  shared = todos[-1]
+  assert shared.parents == [2, 1]
+  assert shared.priority == 4.5
+  assert ranking_context(todos, shared) == 1
+
+
+def test_add_top_level_and_under_a_parent(temp_todo_dir):
+  """--top-level --parent asks at the top level, then under
+  the parent only if that is higher."""
+  a_and_d_with_children()
+  result = runner.invoke(
+    cli,
+    ["add", "-t", "Shared", "--top-level", "--parent", "1",
+     "--bottom"],
+  )
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  shared = todos[-1]
+  assert shared.parents == [ROOT_ID, 1]
+  assert shared.priority == 3.5
+  assert ranking_context(todos, shared) == 1
 @
 
 Let's verify that the two ends are mirror images: with siblings at
@@ -11917,6 +12153,10 @@ the second may be stored.  An item is always assigned to somebody: an
 ownerless one would be invisible to [[ls]] and [[next]], which filter
 by worker.
 
+An item added in several places says which, in the form [[view]]
+uses (\cref{sec:todo-view-parents}), since only the first of them
+would show where it lands in [[ls]].
+
 <<create and save new todo>>=
 now = datetime.datetime.now().isoformat()
 <<resolve wd and env for new todo>>
@@ -11927,6 +12167,8 @@ estimated_hours = (
 <<append the new todo under the lock>>
 
 typer.echo(f"Added todo #{item.id}: {item.title}")
+if len(item.parents) > 1:
+    typer.echo(f"  Parents: {format_parents(todos, item.parents)}")
 if inherited_labels:
     typer.echo(f"  Labels: {', '.join(inherited_labels)}")
 if inherited_deadline:
@@ -11949,9 +12191,9 @@ answering questions for a while.  The item itself is created inside a
 locked callback (\cref{sec:todo-read-modify-write}).  Its ID has to
 come from the [[next_id]] that is current when the item is written:
 taking it from the snapshot is what let two overlapping [[add]]s
-hand out the same ID.  The parent chosen at the start is looked up
-again for the same reason, since it may have been removed in the
-meantime, and a child of a removed item would be promoted to the top
+hand out the same ID.  The parents chosen at the start are looked up
+again for the same reason, each of them, since one may have been
+removed in the meantime, and a child of a removed item would be promoted to the top
 level by [[get_visible_roots]] instead of being refused.  Once stored,
 the new item cuts short the range of the sibling directly above it, so
 [[settle_placement]] compresses that sibling's subtree in the same
@@ -11959,8 +12201,8 @@ callback (\cref{sec:sibling-above-squeezed}).
 
 <<append the new todo under the lock>>=
 def append_new_todo(next_id, todos, stack):
-    if resolved_parent is not None:
-        require_todo(todos, resolved_parent)
+    for parent_id in parent_items:
+        require_todo(todos, parent_id)
     item = TodoItem(
         id=next_id,
         title=title,
@@ -11971,7 +12213,7 @@ def append_new_todo(next_id, todos, stack):
         deadline=inherited_deadline,
         estimated=estimated_hours,
         description=description or "",
-        parents=[resolved_parent],
+        parents=resolved_parents,
         who=resolved_who,
         wd=resolved_wd,
         worktree=normalize_worktree_name(worktree),
@@ -12198,8 +12440,8 @@ priority_title = parsed.title
 
 
 def append_parsed_todos(next_id, todos, stack):
-    if resolved_parent is not None:
-        require_todo(todos, resolved_parent)
+    for parent_id in parent_items:
+        require_todo(todos, parent_id)
     <<create parent from parsed>>
     settle_placement(todos, parent_item)
     <<create children from parsed>>
@@ -12332,7 +12574,7 @@ parent_item = TodoItem(
     status="pending",
     created=now,
     deadline=inherited_deadline,
-    parents=[resolved_parent],
+    parents=resolved_parents,
     notes=parsed.notes,
     discovered_from=resolved_discovered_from,
 )
@@ -16126,6 +16368,64 @@ def test_view_shows_closed_time(temp_todo_dir):
   assert "Closed" not in still_open.output
 @
 
+\paragraph{Where the item belongs}%
+\label{sec:todo-view-parents}
+An item may sit in several places (\cref{sec:todo-parents}), and the
+sub-item listing of a parent shows only that the item is there, not
+where else it is.  So [[view]] names the item's parents, the top level
+among them, as \enquote{Parents: \#0 (top level), \#12 Course}: the id
+for the user to type and the title for the user to recognise.  An item
+that is only top-level has nothing to say here and gets no line, which
+also leaves the view of an ordinary top-level item as it was.  A parent
+that no longer exists is named as removed, as the provenance below
+names a removed source.
+
+<<collect metadata fields>>=
+if parents_of(item) != [ROOT_ID]:
+    fields.append(("Parents", format_parents(todos, item.parents)))
+<<helpers>>=
+def format_parents(todos, parent_ids):
+    """Return `parent_ids` as ids and titles, such as
+    `#0 (top level), #12 Course`."""
+    by_id = {t.id: t for t in todos}
+    words = []
+    for parent_id in parent_ids:
+        if parent_id == ROOT_ID:
+            words.append(f"#{ROOT_ID} (top level)")
+        elif parent_id in by_id:
+            words.append(f"#{parent_id} {by_id[parent_id].title}")
+        else:
+            words.append(f"#{parent_id} (removed)")
+    return ", ".join(words)
+@
+
+Let's verify the line for an item in two places, and that [[add]]
+reports both places when it creates such an item:
+
+<<test functions>>=
+def test_view_names_every_parent(temp_todo_dir):
+  """view lists the parents, the top level included."""
+  save_todos(3, [
+    TodoItem(id=1, title="Course", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=2, title="Shared", parents=[ROOT_ID, 1],
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  shared = runner.invoke(cli, ["view", "2", "--format", "plain"])
+  assert shared.exit_code == 0, shared.output
+  assert "  Parents: #0 (top level), #1 Course\n" in shared.output
+  top = runner.invoke(cli, ["view", "1", "--format", "plain"])
+  assert "Parents" not in top.output
+
+  added = runner.invoke(cli, [
+    "add", "-t", "Also shared", "--top-level", "--parent", "1",
+    "--skip-priority",
+  ])
+  assert added.exit_code == 0, added.output
+  assert "  Parents: #0 (top level), #1 Course\n" in added.output
+@
+
 \paragraph{Where the item came from}%
 \label{sec:todo-view-provenance}
 
@@ -19885,7 +20185,7 @@ def test_edit_editor_keeps_concurrent_work(temp_todo_dir, tail):
         note(2, message="Agent too", edit=False)
         add(
             None, title="Agent child",
-            parent=1, explicit_priority=4.5,
+            parent=[1], explicit_priority=4.5,
         )
         return text.replace("Parent", "Renamed", 1)
 
@@ -22591,7 +22891,7 @@ def test_rm_commits_against_fresh_state(temp_todo_dir):
     def confirm_meanwhile(message, **kwargs):
         add(
             None, title="Late child",
-            parent=1, explicit_priority=4.0,
+            parent=[1], explicit_priority=4.0,
         )
         note(2, message="Meanwhile", edit=False)
         return True
@@ -28249,6 +28549,10 @@ because that is how users later find all issues from one project, but a
 parent can still contribute its own labels and deadline when the user
 does not specify overrides.  This lets a parent like [[DD1310]] provide
 course context while [[owner/repo]] still marks the GitHub source.
+What a parent passes on is decided by [[add]]'s [[inherit_from_parents]]
+(\cref{sec:todo-discovered-from}), and the one parent is also given as
+the list [[resolved_parents]], which the shared discovered-from chunk
+reads.
 
 If tmux is active but the current pane/window has no tracked todo,
 imports stay top-level rather than inheriting another window's branch.
@@ -28275,14 +28579,18 @@ if resolved_parent is not None:
             err=True,
         )
         raise typer.Exit(1)
+resolved_parents = normalize_parents([resolved_parent])
 
 inherited_labels = []
 inherited_deadline = deadline
 if resolved_parent is not None:
-    if not label and parent_item.labels:
-        inherited_labels = list(parent_item.labels)
-    if deadline is None and parent_item.deadline:
-        inherited_deadline = parent_item.deadline
+    from_labels, from_deadline = inherit_from_parents(
+        [parent_item]
+    )
+    if not label and from_labels:
+        inherited_labels = from_labels
+    if deadline is None and from_deadline:
+        inherited_deadline = from_deadline
 
 <<resolve wd and env for new todo>>
 @
