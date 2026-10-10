@@ -82,6 +82,7 @@ statistics---works with todo items out of the box.
 \label{sec:todo-code-outline}
 
 <<[[todo.py]]>>=
+import bisect
 import click
 import copy
 import csv
@@ -3677,22 +3678,28 @@ for level in [parent, *reversed(ranking_path(todos, parent))]:
         break
 low = None
 for level, sibling in reversed(chain):
-    <<take the floor of [[level]] from its sibling or above>>
+    low = level_floor(level.priority, sibling, low)
 @
 
-<<take the floor of [[level]] from its sibling or above>>=
-enclosed = low is not None and low < level.priority
-if sibling is not None and sibling < level.priority:
-    low = sibling
-elif sibling is not None:
-    low = (
-        (level.priority + low) / 2.0 if enclosed
-        else level.priority - 1.0
-    )
-elif low is None:
-    low = level.priority - 10.0
-elif not enclosed:
-    low = level.priority - 1.0
+The rule for one level is a function of three numbers, so that the
+index of \cref{sec:ranking-index}, which works out every range at once,
+applies exactly the same rule.
+
+<<child priority helpers>>=
+def level_floor(priority, sibling, low):
+    """Return the floor of a level at `priority`, given its
+    closest lower sibling `sibling` and the floor `low` it
+    inherits; either may be `None`."""
+    enclosed = low is not None and low < priority
+    if sibling is not None and sibling < priority:
+        return sibling
+    if sibling is not None:
+        return (priority + low) / 2.0 if enclosed else priority - 1.0
+    if low is None:
+        return priority - 10.0
+    if not enclosed:
+        return priority - 1.0
+    return low
 @
 
 The second helper distributes [[count]] priorities evenly within a
@@ -5137,14 +5144,17 @@ fall below.
 
 <<child priority helpers>>=
 def place_fallen_below(
-    todos: list[TodoItem], item: TodoItem,
+    todos: list[TodoItem],
+    item: TodoItem,
+    index: "RankingIndex | None" = None,
 ) -> TodoItem | None:
     """Return the parent of `item` whose child range
     `item` lies below, or `None`.
 
     Of several such parents, the one with the highest
     floor is returned.  Only ranked, not-done items with
-    several parents are considered.
+    several parents are considered.  `index` may pass a
+    `RankingIndex` of `todos` to read the ranges from.
     """
     if (
         item.priority is None
@@ -5158,7 +5168,10 @@ def place_fallen_below(
         parent = by_id.get(parent_id)
         if parent is None or parent.priority is None:
             continue
-        _, low = compute_child_priority_range(todos, parent)
+        _, low = (
+            index.range_of(parent) if index is not None
+            else compute_child_priority_range(todos, parent)
+        )
         if item.priority <= low and (
             highest is None or low > highest
         ):
@@ -5217,7 +5230,9 @@ argument rests on numbers the commands wrote; a hand-edited file can
 hold ranges that contradict each other, where lifting one item pushes
 another back down.  So each item is lifted at most once per call, and
 whatever is still below a place after that is left as it is rather
-than lifted forever.
+than lifted forever.  Each round reads the ranges from a fresh
+[[RankingIndex]] (\cref{sec:ranking-index}), since the last lift
+changed them, and a list without shared items has nothing to lift.
 
 <<child priority helpers>>=
 def keep_highest_places(
@@ -5227,12 +5242,15 @@ def keep_highest_places(
     places, with its subtree; return the items moved."""
     touched = []
     lifted = set()
+    if not any(len(parents_of(t)) > 1 for t in todos):
+        return touched
     while True:
+        index = RankingIndex(todos)
         fallen = next(
             (
                 t for t in todos
                 if t.id not in lifted
-                and place_fallen_below(todos, t) is not None
+                and place_fallen_below(todos, t, index) is not None
             ),
             None,
         )
@@ -5277,6 +5295,115 @@ repair is tried a few times, since lifting after a renumbering can
 disturb the layout again, or leave too little room around the lifted
 items: each lift takes the bottom of a range, half of what is left.
 
+\paragraph{Every range at once.}%
+\label{sec:ranking-index}
+The check asks for the range of every ranked parent, and
+[[compute_child_priority_range]] answers one range by scanning the
+parent's siblings and walking its line, each scan going over the whole
+list to find ranking contexts.  Asked of every item, that is quadratic:
+seconds for a few thousand items, on every placement.  Most of the work
+is shared, though.  The floor a level inherits is the floor of the level
+above, which is that level's own range, so the ranges can be worked out
+from the top down, each from its parent's, with the contexts and the
+families computed once.  [[RankingIndex]] does that, lazily and with a
+memory of what it has worked out, and applies the same rule for a
+level, [[level_floor]].  A cycle in the ranking line, which only a
+hand-edited file has, makes a floor depend on where the walk started;
+such floors are worked out but not remembered.
+
+The closest lower sibling of a level is found by bisecting the sorted
+numbers of its family, the live, ranked items with the same ranking
+context; the level's own number is left out once, so that a sibling
+level with it still counts as a tie.
+
+<<child priority helpers>>=
+class RankingIndex:
+    """The ranking contexts and child ranges of `todos`,
+    worked out once for many questions.
+
+    `range_of(item)` answers what
+    `compute_child_priority_range` answers, for any ranked
+    item.  The index describes the list as it was built and
+    must not be used after numbers or parents change.
+    """
+
+    def __init__(self, todos):
+        self.todos = todos
+        self.by_id = {t.id: t for t in todos}
+        self.contexts = {
+            t.id: ranking_context(todos, t, self.by_id)
+            for t in todos
+        }
+        self.family = {}
+        for t in todos:
+            if t.status != "done" and t.priority is not None:
+                self.family.setdefault(
+                    self.contexts[t.id], []
+                ).append(t.priority)
+        for numbers in self.family.values():
+            numbers.sort()
+        self.lows = {}
+
+    def closest_lower(self, item):
+        """Return the closest lower sibling number of `item`."""
+        numbers = self.family.get(self.contexts[item.id], [])
+        at = bisect.bisect_right(numbers, item.priority)
+        if item.status != "done":
+            at -= 1
+        return numbers[at - 1] if at > 0 else None
+
+    def low(self, item, chain=frozenset()):
+        """Return the floor of `item`'s child range."""
+        if item.id in self.lows:
+            return self.lows[item.id]
+        sibling = self.closest_lower(item)
+        inherited, clean = None, True
+        if sibling is None or sibling >= item.priority:
+            parent = self.by_id.get(self.contexts[item.id])
+            if parent is not None and parent.priority is not None:
+                if parent.id in chain or parent.id == item.id:
+                    clean = False
+                else:
+                    inherited = self.low(parent, chain | {item.id})
+                    clean = parent.id in self.lows
+        low = level_floor(item.priority, sibling, inherited)
+        if clean:
+            self.lows[item.id] = low
+        return low
+
+    def range_of(self, item):
+        """Return `item`'s child range as `(high, low)`."""
+        return (item.priority, self.low(item))
+@
+
+Let's verify that the index answers exactly what
+[[compute_child_priority_range]] answers, on random lists that have
+everything the rule distinguishes: ties, done and unranked items,
+several parents, missing parents and cycles.
+
+<<test functions>>=
+def test_ranking_index_agrees_with_the_range_helper():
+  """Every range from the index equals the one-off answer."""
+  for seed in range(300):
+    rng = random.Random(seed)
+    n = rng.randint(1, 20)
+    todos = [
+      TodoItem(
+        id=i, title="T",
+        parents=rng.sample(range(n + 2), rng.choice([1, 1, 2, 3])),
+        priority=rng.choice([
+          None, float(rng.randint(-3, 3)), rng.uniform(-9, 9),
+        ]),
+        status=rng.choice(["pending"] * 9 + ["done"]),
+      )
+      for i in range(1, n + 1)
+    ]
+    index = RankingIndex(todos)
+    for item in todos:
+      if item.priority is not None:
+        assert index.range_of(item) == compute_child_priority_range(
+          todos, item
+        ), (seed, item.id)
 <<child priority helpers>>=
 def ranking_is_consistent(todos: list[TodoItem]) -> bool:
     """Tell whether the ranked, not-done items nest.
@@ -5286,22 +5413,12 @@ def ranking_is_consistent(todos: list[TodoItem]) -> bool:
     items ranked under each follow it directly in the flat
     order.
     """
-    by_id = {t.id: t for t in todos}
+    index = RankingIndex(todos)
+    by_id, contexts = index.by_id, index.contexts
     live = [
         t for t in todos
         if t.status != "done" and t.priority is not None
     ]
-    contexts = {
-        t.id: ranking_context(todos, t, by_id) for t in live
-    }
-    ranges = {}
-
-    def range_of(parent):
-        if parent.id not in ranges:
-            ranges[parent.id] = compute_child_priority_range(
-                todos, parent
-            )
-        return ranges[parent.id]
     <<check that each item sits inside its places>>
     <<check that each ranked subtree follows its root>>
     return True
@@ -5315,7 +5432,7 @@ for item in live:
         parent = by_id.get(parent_id)
         if parent is None or parent.priority is None:
             continue
-        high, low = range_of(parent)
+        high, low = index.range_of(parent)
         if item.priority <= low:
             return False
         if parent_id == contexts[item.id] and item.priority >= high:
@@ -5334,7 +5451,7 @@ below = {}
 for item in live:
     seen = {item.id}
     parent_id = contexts[item.id]
-    while parent_id in contexts and parent_id not in seen:
+    while parent_id in position and parent_id not in seen:
         seen.add(parent_id)
         below.setdefault(parent_id, []).append(position[item.id])
         parent_id = contexts[parent_id]
@@ -32411,6 +32528,7 @@ import io
 import json
 import os
 import pathlib
+import random
 import shlex
 import subprocess
 import tempfile
@@ -32464,6 +32582,7 @@ from nytid.cli.todo import (
     ranking_path,
     ranked_under,
     ranking_is_consistent,
+    RankingIndex,
     context_path,
     get_children,
     get_descendants,
