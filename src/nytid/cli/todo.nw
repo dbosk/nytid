@@ -7630,7 +7630,7 @@ def parse_yaml_block(text):
     matter format.
     """
     result = {}
-    lines = text.splitlines()
+    lines = buffer_lines(text)
     idx = 0
     while idx < len(lines):
         stripped = lines[idx].strip()
@@ -7844,11 +7844,9 @@ newline on the next round trip.  Finally, a string that would itself
 read as a block indicator, such as a bare [[|]], would otherwise come
 back as the start of a block that swallows the keys after it.
 
-We split with [[splitlines()]] on both sides rather than on [[\n]]
-alone: the parser sees the buffer through [[splitlines()]], which also
-breaks at form feeds and Unicode line separators, so a value containing
-one would be emitted as one physical line but read back as two, the
-second unindented and the block cut short.  Blank lines go out empty
+We split with [[buffer_lines]] on both sides, the way the parser splits
+the buffer (\cref{sec:buffer-lines}), so that a value is emitted as
+exactly the lines it will be read back as.  Blank lines go out empty
 rather than as two spaces, since many editors strip trailing whitespace
 on save and either form parses the same.  When the first content line
 starts with whitespace we emit the indentation digit, as YAML requires
@@ -7861,14 +7859,14 @@ def needs_literal_block(key, value):
         return False
     if key in LITERAL_BLOCK_KEYS:
         return True
-    if len(value.splitlines()) > 1:
+    if len(buffer_lines(value)) > 1:
         return True
     return parse_block_indicator(value.strip()) is not None
 
 
 def render_literal_block(key, value):
     """Render ``value`` as an indented literal block under ``key``."""
-    lines = value.splitlines()
+    lines = buffer_lines(value)
     first = next((line for line in lines if line.strip()), "")
     indicator = "|"
     if first[:1].isspace():
@@ -7987,6 +7985,37 @@ def test_yaml_block_round_trip():
         assert parsed["description"] == value.rstrip("\n")
 @
 
+\subsection{Lines of a Buffer}
+\label{sec:buffer-lines}
+
+A buffer is read line by line, and what counts as a line break has to
+be the same everywhere: where the parser breaks lines, where the
+escaping of notes looks for their starts (\cref{sec:note-escaping}),
+and where the front matter is split.  Python's [[splitlines()]] breaks
+at a carriage return, a form feed, a record separator and the Unicode
+line separators as well as at a newline, while notes are text that may
+hold any of those, pasted from anywhere.  A note line
+\enquote{one\textbackslash{}r\# head} would then read as two lines, the
+second a heading that, with a marker in it, takes over an existing
+item.  So the buffer breaks at newlines only, and every other character
+is part of its line.  A carriage return before a newline is dropped
+first, since an editor on another system may save the buffer with such
+line ends; it carries nothing a user typed.  A final newline ends the
+last line rather than starting an empty one, as with [[splitlines()]],
+which the front matter's literal blocks count on.
+
+<<editor infrastructure>>=
+def buffer_lines(text):
+    """Split editor text into lines at newlines only,
+    taking a carriage return before a newline as part of
+    the line end; a final newline ends the last line, as
+    with `splitlines`."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if len(lines) > 1 and lines[-1] == "":
+        lines.pop()
+    return lines
+@
+
 \subsection{Parsing Editor Content}
 
 The parser walks the document line by line, building a tree from
@@ -8016,7 +8045,7 @@ def parse_editor_content(text):
     notes and reported in ``warnings`` rather than
     discarded.
     """
-    lines = text.splitlines()
+    lines = buffer_lines(text)
     warnings = []
     <<parse title from first line>>
     <<parse optional yaml block>>
@@ -8467,27 +8496,35 @@ was written.  A line that already begins with backslashes before its
 back as it was.  The escape is in the buffer only; [[view]] and every
 other reader see the notes unchanged.
 
+A line [[---]] is the other line the parser treats specially: in a
+sub-item's section it opens or closes the front matter, so a Markdown
+rule in the notes, or a pair of them, would make the text between them
+read as keys.  It is escaped the same way, [[\---]], and so is a line
+that is [[---]] up to trailing spaces, since the parser ignores those.
+
 <<editor infrastructure>>=
 def escape_note_lines(text):
-    """Return `text` with every line that would read as a
-    heading, one starting with `#` after any backslashes,
-    behind one more backslash."""
+    """Return `text` with every line that the parser would
+    not read as a note line, one starting with `#` or being
+    `---` after any backslashes, behind one more
+    backslash."""
     return "\n".join(
-        "\\" + line if NOTE_HEADING_PATTERN.match(line) else line
-        for line in text.split("\n")
+        "\\" + line if NOTE_SPECIAL_PATTERN.match(line) else line
+        for line in buffer_lines(text)
     )
 
 
 def unescape_note_lines(text):
     """Undo `escape_note_lines`: drop one backslash from
-    every line that starts with backslashes and a `#`."""
+    every line that starts with backslashes and then a `#`
+    or is `---`."""
     return "\n".join(
-        line[1:] if ESCAPED_HEADING_PATTERN.match(line) else line
-        for line in text.split("\n")
+        line[1:] if ESCAPED_SPECIAL_PATTERN.match(line) else line
+        for line in buffer_lines(text)
     )
 <<constants>>=
-NOTE_HEADING_PATTERN = re.compile(r"\\*#")
-ESCAPED_HEADING_PATTERN = re.compile(r"\\+#")
+NOTE_SPECIAL_PATTERN = re.compile(r"\\*(#|---\s*$)")
+ESCAPED_SPECIAL_PATTERN = re.compile(r"\\+(#|---\s*$)")
 @
 
 Let's verify the round trip on lines with and without backslashes, and
@@ -8496,14 +8533,24 @@ that the escaped notes parse as notes, not as sub-items:
 <<test functions>>=
 def test_note_lines_round_trip():
   """Heading-like note lines survive the buffer."""
-  notes = "# Other {#3}\n\\# kept\n\\\\# two\nplain # not first"
+  notes = (
+    "# Other {#3}\n\\# kept\n\\\\# two\nplain # not first\n"
+    "---\nlooks: like a key\n--- \n\\---\nnot ---"
+  )
   escaped = escape_note_lines(notes)
   assert escaped.split("\n")[:3] == [
     "\\# Other {#3}", "\\\\# kept", "\\\\\\# two",
   ]
+  assert escaped.split("\n")[4:] == [
+    "\\---", "looks: like a key", "\\--- ", "\\\\---", "not ---",
+  ]
   assert unescape_note_lines(escaped) == notes
   parsed = parse_editor_content(f"Title\n\n{escaped}\n")
   assert (parsed.notes, parsed.children) == (notes, [])
+  child = parse_editor_content(
+    f"Title\n\n# Child {{#2}}\n\n{escaped}\n"
+  ).children[0]
+  assert (child.notes, child.metadata) == (notes, {})
 @
 
 \subsection{Naming Items in Headings}
@@ -24053,16 +24100,32 @@ typer.echo(f"Updated todo #{todo_id}: {item.title}")
 
 Everything above rests on the buffer reading back as it was rendered:
 every heading the renderer wrote parsed as that heading, with its
-marker, and nothing else parsed as one.  Escaping the notes
-(\cref{sec:note-escaping}) is what makes that so for the notes, but a
-title may hold a line break, written to the file by some other
-program, and the next line of it would be a heading of its own.
-Rather than trust that every such way has been thought of, we parse the
-rendered buffer, which we do anyway for the baseline, and check it: the
-headings must name exactly the items below the edited one, and every
-heading must name one.  If not, [[-E]] is refused before the editor
-opens, when nothing has been typed that could be lost, and the flags
-are named instead.
+marker, nothing else parsed as one, and every item's text read back as
+the text it has.  Splitting at newlines only (\cref{sec:buffer-lines})
+and escaping the notes (\cref{sec:note-escaping}) are what make that so
+for the notes.  A title, though, cannot be escaped: one holding a
+newline, written to the file by some other program, would have its
+second line read as a heading of its own, or, for the edited item, as
+its notes.  Rather than trust that every such way has been thought of,
+we parse the rendered buffer, which we do anyway for the baseline, and
+check it.  The headings must name exactly the items below the edited
+one, every heading must name one, and saving the untouched buffer must
+store, for every item shown, the title, the notes and the front-matter
+fields it has.  If not, [[-E]] is refused before the editor opens, when
+nothing has been typed that could be lost, with the item and the field
+named, and the flags are offered instead.
+
+The comparison is with what the item's own front matter would store
+through [[apply_metadata]], not with the stored fields themselves, and
+with the title and the notes stripped as the parser strips them, so
+that only a misreading counts, not the normalising every save does.  A
+carriage return before a newline is not a misreading either, since the
+parser drops it (\cref{sec:buffer-lines}), and nor are trailing
+newlines, which a literal block drops; the replay leaves a field alone
+that the user did not change
+(\cref{sec:todo-read-modify-write}).  A dictionary such as the
+[[github]] link is compared by its values as text, since the front
+matter writes them as text.
 
 <<refuse a buffer that would not read back>>=
 below = {d.id for d in descendants_of(todos, item.id)}
@@ -24079,7 +24142,52 @@ if (
         err=True,
     )
     raise typer.Exit(1)
+misread = misread_field(todos, shown)
+if misread is not None:
+    typer.echo(
+        f"Error: the {misread[1]} of #{misread[0]} would not read "
+        "back from the buffer as it is; edit it with flags such "
+        "as --title instead",
+        err=True,
+    )
+    raise typer.Exit(1)
 <<helpers>>=
+def misread_field(todos, shown):
+    """Return `(id, field)` for the first item in `shown`, the
+    baseline of an untouched buffer, whose title, notes or
+    front-matter field differs from what the item has, or
+    `None`."""
+    by_id = {t.id: t for t in todos}
+    fields = ["title", "notes"] + [
+        attribute for attribute, _ in METADATA_FIELDS.values()
+    ]
+    for item_id, saved in shown.items():
+        original = by_id[item_id]
+        expected = TodoItem.from_dict(item_fields(original))
+        expected.title = (original.title or "").strip()
+        expected.notes = (original.notes or "").strip()
+        apply_metadata(expected, build_item_metadata(original))
+        expected = item_fields(expected)
+        for field_name in fields:
+            if as_read_back(expected.get(field_name)) != as_read_back(
+                saved.get(field_name)
+            ):
+                return item_id, field_name
+    return None
+
+
+def as_read_back(value):
+    """Return `value` as the buffer gives it back: text with
+    newlines for carriage-return line ends and without
+    trailing newlines, and a dictionary with its values as
+    text."""
+    if isinstance(value, str):
+        return value.replace("\r\n", "\n").rstrip("\n")
+    if isinstance(value, dict):
+        return {k: str(v) for k, v in value.items()}
+    return value
+
+
 def all_sections_named(sections):
     """Tell whether every heading in `sections`, at any depth,
     names an item."""
@@ -24155,12 +24263,17 @@ each in its own place below or in \cref{sec:heading-ids}:
   renderer's marker follows it.  A heading that loses its marker is a
   new item, matched by title only among the children the buffer showed
   in full there; a lost marker next to a removed item is warned about.
-\item[Note lines starting with [[#]] ] are written with a backslash in
-  the buffer and stored without it (\cref{sec:note-escaping}), so a
-  [[\#]] typed at the start of a note line is stored as [[#]].  A title
-  with a line break cannot be escaped, and [[-E]] is refused for the
-  buffer showing it.  A line [[---]] in a sub-item's notes still opens
-  a front-matter block, as it always has.
+\item[Line breaks] Only a newline breaks a line of the buffer; a
+  carriage return, a form feed or a Unicode line separator in a title
+  or a note is part of its line (\cref{sec:buffer-lines}).
+\item[Note lines starting with [[#]] or being [[---]] ] are written
+  with a backslash in the buffer and stored without it
+  (\cref{sec:note-escaping}), so a [[\#]] or [[\---]] typed at the
+  start of a note line is stored without the backslash.
+\item[Titles with newlines] cannot be escaped, and neither can
+  anything else that would not read back as it is stored.  [[-E]] is
+  refused before the editor opens for a buffer showing one, and the
+  error names the item and the field.
 \item[IDs that name nothing] A heading naming an item that never was in
   the buffer and does not exist is a refused place.  One naming an item
   another process removed during the session is dropped if the user
@@ -25731,6 +25844,52 @@ def test_edit_editor_refuses_a_buffer_that_misreads(
     result = runner.invoke(cli, ["edit", "1", "-E"])
   assert result.exit_code == 1
   assert "would not read back" in result.output
+  editor.assert_not_called()
+@
+
+Line breaks other than a newline are part of their line
+(\cref{sec:buffer-lines}): a note with a carriage return, a form feed
+or a record separator before a heading-like text, and a title with one,
+come back from an unchanged buffer as they were, and Q keeps its title;
+so does a note with carriage-return line ends, which the save tidies
+into plain newlines.
+A Markdown rule pair in the notes of a sub-item without front matter,
+where the first rule would open one, stays notes
+(\cref{sec:note-escaping}).  The edited item's title with a newline in
+it cannot be shown, and [[-E]] says which field of which item.
+
+<<test functions>>=
+@pytest.mark.parametrize("sep", ["\r", "\x0c", "\x1e", " ", "\r\n"])
+def test_edit_editor_keeps_odd_line_breaks(temp_todo_dir, sep):
+  """Only a newline breaks a buffer line."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].notes = f"one{sep}# head {{#3}}{sep}two"
+  if "\n" not in sep:
+    todos[5].title = f"O{sep}tail"
+  todos[4].notes = "intro\n---\nmiddle: part\n---\nend"
+  todos[4].who = None
+  save_todos(next_id, todos)
+  _, before = load_todos()
+  result, _ = edit_buffer(1, lambda text: text)
+  assert result.exit_code == 0, result.output
+  _, after = load_todos()
+  assert [(t.id, t.title, t.notes, t.parents) for t in after] == [
+    (t.id, t.title, t.notes.replace("\r\n", "\n"), t.parents)
+    for t in before
+  ]
+
+
+def test_edit_editor_names_a_field_that_misreads(temp_todo_dir):
+  """A title with a newline in the edited item refuses -E."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[0].title = "E\nsecond line"
+  save_todos(next_id, todos)
+  with patch("nytid.cli.todo.open_editor") as editor:
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+  assert result.exit_code == 1
+  assert "the title of #1 would not read back" in result.output
   editor.assert_not_called()
 @
 
@@ -38458,6 +38617,7 @@ from nytid.cli.todo import (
     render_todo_markdown,
     split_heading_id,
     heading_id_marker,
+    buffer_lines,
     escape_note_lines,
     unescape_note_lines,
     parse_yaml_block,
