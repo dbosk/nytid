@@ -3203,9 +3203,9 @@ def move_subtree_priorities(
     parent: TodoItem,
     old_range: tuple | None,
     new_range: tuple | None,
-) -> None:
+) -> list[TodoItem]:
     """Carry `parent`'s descendants from its old child
-    range to its new one.
+    range to its new one, and return those it moved.
 
     The ranges are `(high, low)` pairs as returned by
     `compute_child_priority_range`, or `None` for an
@@ -3216,9 +3216,9 @@ def move_subtree_priorities(
     their numbers.
     """
     if old_range is None or new_range is None:
-        return
+        return []
     if old_range == new_range:
-        return
+        return []
     old_high, old_low = old_range
     new_high, new_low = new_range
     scale = (new_high - new_low) / (old_high - old_low)
@@ -3227,6 +3227,7 @@ def move_subtree_priorities(
         math.nextafter(new_low, new_high),
         math.nextafter(new_high, new_low),
     )
+    moved = []
     for item in descendants:
         if item.status == "done" or item.priority is None:
             continue
@@ -3235,6 +3236,8 @@ def move_subtree_priorities(
             item.priority = min(
                 max(mapped, inside[0]), inside[1]
             )
+            moved.append(item)
+    return moved
 @
 
 The walk keeps a set of the items it has seen.  [[get_descendants]]
@@ -3511,15 +3514,16 @@ def squeeze_sibling_above(
     todos: list[TodoItem],
     item: TodoItem,
     old_place: tuple | None = None,
-) -> None:
+) -> list[TodoItem]:
     """Compress the subtree of the sibling just above
-    `item`, whose child range `item` has just cut short.
+    `item`, whose child range `item` has just cut short,
+    and return the items it moved.
 
     `old_place` is `item`'s `(priority, parent_id)`
     before it moved, or `None` when `item` is new.
     """
     if item.priority is None or item.status == "done":
-        return
+        return []
     above = [
         s for s in todos
         if s.parent_id == item.parent_id
@@ -3529,9 +3533,10 @@ def squeeze_sibling_above(
         and s.priority >= item.priority
     ]
     if not above:
-        return
+        return []
     nearest = min(s.priority for s in above)
     <<rebuild the list as it was before [[item]] moved>>
+    moved = []
     for sibling in above:
         if sibling.priority != nearest:
             continue
@@ -3542,9 +3547,10 @@ def squeeze_sibling_above(
             todos, sibling
         )
         if new_range[1] > old_range[1]:
-            move_subtree_priorities(
+            moved += move_subtree_priorities(
                 todos, sibling, old_range, new_range
             )
+    return moved
 @
 
 The copy leaves every other item shared with [[todos]]: only the
@@ -3564,7 +3570,9 @@ none of them can remember the item's own subtree and forget the
 sibling above, or the other way round.  The order matters little but
 is fixed: the item's own subtree moves first, into the range under its
 new number, and then the sibling above is compressed into the range
-over it; the two ranges do not overlap.
+over it; the two ranges do not overlap.  Last, the helper checks
+whether the numbers it touched still have room around them
+(\cref{sec:renumber-priorities}).
 
 <<child priority helpers>>=
 def settle_placement(
@@ -3575,16 +3583,20 @@ def settle_placement(
 ) -> None:
     """Move the subtrees whose ranges `item`'s new place
     changed: its own, and its new upper sibling's.
+    Renumber everything if that left too little room.
 
     `old_range` is `item`'s child range before the
     change and `old_place` its `(priority, parent_id)`;
     both are `None` for an item that is new.
     """
-    move_subtree_priorities(
+    touched = [item]
+    touched += move_subtree_priorities(
         todos, item, old_range,
         child_priority_range_or_none(todos, item),
     )
-    squeeze_sibling_above(todos, item, old_place)
+    touched += squeeze_sibling_above(todos, item, old_place)
+    if gaps_too_narrow(todos, touched):
+        renumber_priorities(todos)
 @
 
 Let's verify the squeeze on the example: B's children end up between
@@ -3636,6 +3648,220 @@ def test_settle_new_item_squeezes_the_sibling_above():
     assert child_priorities(todos, 1) == [
         4.75, 4.5, 4.25
     ]
+@
+
+\subsection{Renumbering When the Room Runs Out}%
+\label{sec:renumber-priorities}
+
+Every placement takes a midpoint, and every squeeze compresses a range,
+so the room between neighbouring numbers shrinks with use.  Adding
+children at the bottom of one parent halves the gap above the floor
+each time; inserting items directly below one sibling halves its range
+each time, and its whole subtree with it.  A float has 52 bits of
+fraction, so after some fifty such steps in one place two neighbours
+round to the same number, and the order the user chose is lost.  No
+choice of midpoint avoids this; only fresh room does.
+
+The numbers themselves carry no meaning beyond their order---they are
+an implementation detail, and the user ranks items by comparing them,
+never by typing a number they have seen---so we are free to renumber.
+After a placement has settled, we look at the numbers it wrote: the
+placed item and every descendant the two subtree moves changed.  If
+any of them is closer to its neighbour in the flat order than a
+millionth of the larger magnitude (or of~1, near zero), the whole
+ranked tree is renumbered.  A relative threshold is the right kind
+because float resolution is relative; a millionth leaves some thirty
+further halvings before rounding would bite, so renumbering happens
+well before anything is lost, yet rarely, since the gaps that ordinary
+use leaves are many orders of magnitude wider.  Checking only the
+touched numbers means that an untouched tie in old data does not
+renumber the list on every unrelated command.
+
+<<child priority helpers>>=
+def gaps_too_narrow(
+    todos: list[TodoItem],
+    touched: list[TodoItem],
+) -> bool:
+    """Tell whether a touched item has too little room
+    next to its neighbours in the flat order."""
+    ranked = sort_siblings_by_stored_priority([
+        t for t in todos if t.status != "done"
+    ])
+    where = {t.id: i for i, t in enumerate(ranked)}
+    for item in touched:
+        i = where.get(item.id)
+        if i is None:
+            continue
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(ranked):
+                a, b = item.priority, ranked[j].priority
+                room = RENUMBER_MIN_GAP * max(1.0, abs(a), abs(b))
+                if abs(a - b) < room:
+                    return True
+    return False
+<<constants>>=
+RENUMBER_MIN_GAP = 1e-6
+@
+
+Renumbering keeps the order and the nesting and rebuilds the room.
+It walks the tree of ranked, not-done items from the top level down,
+one level at a time, and lays each family out again with
+[[distribute_priorities_in_range]] inside the parent's range---the
+same evenly spaced numbers the editor gives a family it creates.  The
+range of a parent is computed only once its whole level has its new
+numbers, for the reason the editor reconciliation gives
+(\cref{sec:edit-via-editor}), and the order within a family is
+the order the stored numbers had, with the ID breaking a tie.
+
+The top level is kept as it is when its neighbours are at least a whole
+unit apart, since that is room enough for everything below and its
+numbers are the ones a user may have chosen with [[--prio]].
+Otherwise it is respaced to whole numbers counting down to~1, as many
+as there are top-level items.  Done and unranked items, and anything
+below them, are not part of the ranked tree and keep their numbers.
+
+<<child priority helpers>>=
+def renumber_priorities(todos: list[TodoItem]) -> None:
+    """Renumber the ranked, not-done tree in place,
+    keeping its order and nesting and making room."""
+    def family_order(items):
+        return sorted(
+            items, key=lambda t: (-t.priority, t.id)
+        )
+    live = [
+        t for t in todos
+        if t.status != "done" and t.priority is not None
+    ]
+    children = {}
+    for t in live:
+        children.setdefault(t.parent_id, []).append(t)
+    level = family_order(children.get(None, []))
+    <<respace the top level when it is crowded>>
+    seen = {t.id for t in level}
+    while level:
+        below = []
+        for parent in level:
+            family = family_order([
+                c for c in children.get(parent.id, [])
+                if c.id not in seen
+            ])
+            if not family:
+                continue
+            high, low = compute_child_priority_range(
+                todos, parent
+            )
+            numbers = distribute_priorities_in_range(
+                len(family), high, low
+            )
+            for child, number in zip(family, numbers):
+                child.priority = number
+                seen.add(child.id)
+            below += family
+        level = below
+@
+
+<<respace the top level when it is crowded>>=
+gaps = [
+    a.priority - b.priority for a, b in zip(level, level[1:])
+]
+if gaps and min(gaps) < 1.0:
+    for i, item in enumerate(level):
+        item.priority = float(len(level) - i)
+@
+
+Let's verify that a collapsed family gets its room back without
+changing its order or nesting, and that the renumbering is triggered
+by a placement that leaves too little room.
+
+<<test functions>>=
+def test_renumber_priorities_restores_room():
+    """Order and nesting survive; the gaps are rebuilt."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="A1", priority=3.0 + 2e-9,
+            parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="A2", priority=3.0 + 1e-9,
+            parent_id=1,
+        ),
+        TodoItem(
+            id=5, title="A1a", priority=3.0 + 1.5e-9,
+            parent_id=3,
+        ),
+        TodoItem(
+            id=6, title="Done", priority=3.0 + 1e-9,
+            parent_id=1, status="done",
+        ),
+    ]
+    renumber_priorities(todos)
+    by_id = {t.id: t.priority for t in todos}
+    assert by_id[1] == 5.0 and by_id[2] == 3.0
+    assert by_id[3] == pytest.approx(5.0 - 2 / 3)
+    assert by_id[4] == pytest.approx(3.0 + 2 / 3)
+    assert by_id[4] < by_id[5] < by_id[3]
+    assert by_id[6] == 3.0 + 1e-9
+
+
+def test_renumber_respaces_a_crowded_top_level():
+    """Top-level items closer than a unit are respaced."""
+    todos = [
+        TodoItem(id=1, title="A", priority=1.5),
+        TodoItem(id=2, title="B", priority=1.25),
+        TodoItem(id=3, title="C", priority=-7.0),
+    ]
+    renumber_priorities(todos)
+    assert [t.priority for t in todos] == [3.0, 2.0, 1.0]
+
+
+def test_settle_renumbers_when_room_runs_out():
+    """A placement into a collapsed gap renumbers."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="A1", priority=3.0 + 1e-9,
+            parent_id=1,
+        ),
+    ]
+    new = TodoItem(
+        id=4, title="A2", priority=3.0 + 5e-10,
+        parent_id=1,
+    )
+    todos.append(new)
+    settle_placement(todos, new)
+    assert todos[2].priority == pytest.approx(5.0 - 2 / 3)
+    assert new.priority == pytest.approx(3.0 + 2 / 3)
+@
+
+Through the command line, the halving that motivated all this is a
+parent receiving child after child at the bottom.  Without
+renumbering, the sixtieth child would tie with its neighbour.
+
+<<test functions>>=
+def test_many_bottom_children_keep_distinct_numbers(
+    temp_todo_dir,
+):
+    """Repeated --bottom children never tie."""
+    save_todos(3, [
+        TodoItem(
+            id=n, title=t, priority=p,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        )
+        for n, t, p in [(1, "A", 5.0), (2, "B", 3.0)]
+    ])
+    for k in range(60):
+        result = runner.invoke(cli, [
+            "add", "-t", f"c{k}", "--parent", "1", "--bottom",
+        ])
+        assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    children = [t.priority for t in todos if t.parent_id == 1]
+    assert len(set(children)) == 60
+    assert all(3.0 < p < 5.0 for p in children)
 @
 
 \section{Editor Infrastructure}
@@ -5379,8 +5605,8 @@ midpoint between the neighboring items' priorities. Edge cases
 (inserting at the top or bottom) use a fixed offset of~1.0 instead.
 Priorities are unbounded floats---negative values are valid and
 arise naturally when many items are appended sequentially at the
-bottom.  If the numbers drift far from zero a future renumbering
-pass can normalize them.
+bottom.  Midpoints of midpoints eventually run out of room, which the
+renumbering in \cref{sec:renumber-priorities} restores.
 
 The fixed offset is right only where nothing bounds the list, which is
 the top level.  Among the children of a ranked parent the ends are
@@ -28121,6 +28347,7 @@ from nytid.cli.todo import (
     distribute_priorities_in_range,
     default_priority_without_siblings,
     number_at_position,
+    renumber_priorities,
     move_subtree_priorities,
     set_priority_with_subtree,
     settle_placement,
