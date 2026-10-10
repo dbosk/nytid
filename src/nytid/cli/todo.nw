@@ -8490,20 +8490,40 @@ difference is spelt out in the marker, and it does not depend on where
 the heading stands or what is written around it.  A reference cannot be
 mistaken for a new item, since it names one.
 
+The renderer puts the marker last, but the parser does not insist on
+it.  A heading is a line the user types in, and [[## O {#6} today]] or
+a stray space, [[{#6 }]], are easy to write.  Had the marker to end the
+line exactly, either would read as a new item named by all of its
+text, and item~6 would look deleted: its status, its history and its
+tracked time would go, and with it every blocker that named it.  So the
+marker may stand anywhere in the heading, with spaces inside the
+braces, and is taken out of the title with the text on both sides
+kept.  When several markers appear, the last one counts, which is the
+one the renderer wrote, since a title may itself contain one.
+
 <<editor infrastructure>>=
 def split_heading_id(text):
     """Split a heading into its title and the item it names.
 
-    Returns `(title, id, reference)`.  A heading ending in
-    `{#7}` names item 7 in full, one ending in
-    `{also #7}` refers to it; any other heading names no
-    item, `id` is `None` and the text is the title.
+    Returns `(title, id, reference)`.  A heading with a
+    `{#7}` marker names item 7 in full, one with
+    `{also #7}` refers to it; the last marker counts, and
+    the title is the text around it.  A heading without a
+    marker names no item, `id` is `None` and the text is
+    the title.
     """
-    match = HEADING_ID_PATTERN.search(text)
-    if match is None:
+    matches = list(HEADING_ID_PATTERN.finditer(text))
+    if not matches:
         return text, None, False
+    match = matches[-1]
+    title = " ".join(
+        part for part in (
+            text[:match.start()].strip(),
+            text[match.end():].strip(),
+        ) if part
+    )
     return (
-        text[:match.start()].rstrip(),
+        title,
         int(match.group(2)),
         match.group(1) is not None,
     )
@@ -8516,11 +8536,14 @@ def heading_id_marker(item_id, reference=False):
         return f"{{also #{item_id}}}"
     return f"{{#{item_id}}}"
 <<constants>>=
-HEADING_ID_PATTERN = re.compile(r"\s*\{(also\s+)?#(\d+)\}$")
+HEADING_ID_PATTERN = re.compile(
+    r"\{\s*(also\s+)?#\s*(\d+)\s*\}"
+)
 @
 
-Let's verify both forms, and that a heading whose title merely
-contains a marker keeps it: only the last marker on the line counts.
+Let's verify both forms, that a heading whose title merely contains a
+marker keeps it, since only the last marker counts, and that a marker
+with text after it or spaces inside it still names its item.
 
 <<test functions>>=
 @pytest.mark.parametrize("text,expected", [
@@ -8529,9 +8552,12 @@ contains a marker keeps it: only the last marker on the line counts.
   ("Collect", ("Collect", None, False)),
   ("Fix {#3} again {#7}", ("Fix {#3} again", 7, False)),
   ("{#7}", ("", 7, False)),
+  ("O {#6} today", ("O today", 6, False)),
+  ("O {#6 }", ("O", 6, False)),
+  ("O { also  # 6 } later", ("O later", 6, True)),
 ])
 def test_split_heading_id(text, expected):
-  """The marker at the end names the item."""
+  """The last marker names the item."""
   assert split_heading_id(text) == expected
   title, item_id, reference = expected
   if item_id is not None:
@@ -24295,6 +24321,7 @@ bounded by the siblings an item ends up with.
 <<remember where each item was>>
 <<resolve the sections to items>>
 <<change the places the buffer changed>>
+<<warn about markers that may have been lost>>
 <<remove the items the buffer left without a place>>
 <<report the changed places>>
 <<rank each family the buffer shows>>
@@ -24333,6 +24360,7 @@ families = {}
 full_sections = {edited.id: (parsed.notes, parsed.metadata)}
 resolved = {edited.id}
 created = []
+unmarked = {}
 claimed = section_ids(parsed.children)
 <<pair each section with an item>>
 resolve_sections(edited, parsed.children)
@@ -24539,6 +24567,8 @@ def create_sub_item(parent, section):
     todos.append(child)
     by_id[child.id] = child
     created.append(child.id)
+    if section.id is None:
+        unmarked.setdefault(parent.id, []).append(child)
     full_sections[child.id] = (section.notes, section.metadata)
     next_id += 1
     typer.echo(f"  Added sub-item #{child.id}: {child.title}")
@@ -24626,6 +24656,31 @@ The cycle check is [[would_make_a_cycle]], the question behind
 rather than enforced: [[--parent]] and [[--add-parent]] exit,
 abandoning the write, while the editor refuses one place and stores
 the rest.
+
+A marker is easy to lose: retyping a heading takes it along.  The
+heading then reads as a new item, and the item it named, now missing
+from under its parent, is removed with its history.  The two together,
+under one parent in one save, look more like that accident than like a
+deliberate removal and addition, so we say so, naming both.  The
+removed item may still be named elsewhere in the buffer, moved rather
+than lost, and then there is nothing to warn about.
+
+<<warn about markers that may have been lost>>=
+for parent_id, new_items in unmarked.items():
+    lost = [
+        by_id[child_id] for child_id, places in lost_places.items()
+        if parent_id in places and child_id not in resolved
+    ]
+    if lost:
+        typer.echo(
+            "Warning: "
+            + ", ".join(f"#{t.id} {t.title!r}" for t in lost)
+            + f" left #{parent_id} and "
+            + ", ".join(repr(t.title) for t in new_items)
+            + " came in new; did a {#N} marker get lost?",
+            err=True,
+        )
+@
 
 \paragraph{Removing what has no place.}
 An item left without a place is removed, and with it every item below
@@ -25265,6 +25320,33 @@ def test_edit_editor_tells_same_titles_apart(temp_todo_dir):
   assert result.exit_code == 0, result.output
   by_id = stored_by_id()
   assert (by_id[2].notes, by_id[3].notes) == ("first", "changed")
+@
+
+A marker followed by more text still names its item, which keeps its
+ID and takes the text around the marker as its title.  A heading that
+lost its marker instead reads as a new item, and the warning names both
+the item that left and the one that came:
+
+<<test functions>>=
+def test_edit_editor_marker_inside_the_heading(temp_todo_dir):
+  """Text after the marker is part of the title."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("## O {#6}", "## O {#6 } today"),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert (by_id[6].title, by_id[6].parents) == ("O today", [2])
+
+
+def test_edit_editor_warns_about_a_lost_marker(temp_todo_dir):
+  """A shown item replaced by a marker-less heading warns."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("## O {#6}", "## O again"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#6 'O' left #2 and 'O again' came in new" in result.output
 @
 
 Finally the session itself, with the overlap of
