@@ -6137,35 +6137,62 @@ def gh_add_comment(repo, number, body):
 
 \paragraph{Appending notes to items}
 Several places need to add a note to a todo item---the [[note]]
-command, headless output capture, and timeout handling.  Rather
-than duplicating the GitHub-vs-local branching logic, we extract
-a shared helper.  For GitHub-linked items we post a comment
+command, headless output capture, timeout handling and detached-run
+cleanup.  Rather than duplicating the GitHub-vs-local branching logic,
+we extract shared helpers.  For GitHub-linked items we post a comment
 \emph{and} store locally (belt-and-suspenders), because in
 headless mode there is no human to notice a failed API call.
 
-<<helpers>>=
-def append_note_to_item(item, note_text, next_id, todos):
-    """Append a note to a todo item.
+Those two halves are different kinds of work, so they are two helpers
+rather than one.  Posting the comment is network I/O, which can take
+seconds; storing the note is a change to the todo state, which must
+happen on the freshly loaded item inside the caller's
+[[mutate_todo_state]] callback.
+Doing both in one call would force a choice between holding the todo
+lock across a network round trip---stalling every other [[nytid todo]]
+command meanwhile---and appending to a stale snapshot, which is how
+concurrent notes used to get lost.  The caller therefore posts first,
+outside the lock, and then appends in its callback.
 
-    Posts to GitHub if linked, always stores locally.
+<<helpers>>=
+def post_note_comment(item, note_text):
+    """Post a note as a GitHub comment if the item is linked.
+
+    A failed post is logged rather than raised: the note
+    is still stored locally by `append_note_to_item`.
+    Call this outside the todo-state lock.
     """
-    if item.github:
-        try:
-            gh_add_comment(
-                item.github["repo"],
-                item.github["number"],
-                note_text,
-            )
-        except Exception:
-            logging.warning(
-                "Failed to post GitHub comment "
-                f"for #{item.id}"
-            )
+    if not item.github:
+        return
+    try:
+        gh_add_comment(
+            item.github["repo"],
+            item.github["number"],
+            note_text,
+        )
+    except Exception:
+        logging.warning(
+            "Failed to post GitHub comment "
+            f"for #{item.id}"
+        )
+@
+
+The local half only touches the item it is given.  It neither loads
+nor saves, so it can run on whatever item a callback has just looked
+up, and the callback's return value is what persists it.
+
+<<helpers>>=
+def append_note_to_item(item, note_text):
+    """Append `note_text` to the item's local notes.
+
+    Pure: it changes `item` and nothing else.  Run it
+    inside a `mutate_todo_state` callback so the note is
+    added to the current stored notes.
+    """
     if item.notes:
         item.notes += "\n" + note_text
     else:
         item.notes = note_text
-    save_todos(next_id, todos)
 @
 
 \paragraph{Parsing timeout durations}
@@ -16207,12 +16234,9 @@ def finalize_detached_todo(
     if item is None:
         return
 
-    append_note_to_item(
-        item,
-        f"Exit code: {exit_code} (no output)",
-        next_id,
-        todos,
-    )
+    exit_note = f"Exit code: {exit_code} (no output)"
+    post_note_comment(item, exit_note)
+    append_note_to_item(item, exit_note)
 
     if item.status != "done":
         if exit_code != 0 and reassign_to:
@@ -18764,9 +18788,8 @@ if item is not None:
             f"Partial output:\n"
             f"```\n{partial.strip()}\n```"
         )
-    append_note_to_item(
-        item, note, next_id, todos
-    )
+    post_note_comment(item, note)
+    append_note_to_item(item, note)
     item.status = "pending"
     save_todos(next_id, todos)
 typer.echo(
@@ -18839,9 +18862,8 @@ if headless and result is not None:
         )
     else:
         note = f"Exit code: {code} (no output)"
-    append_note_to_item(
-        item, note, next_id, todos
-    )
+    post_note_comment(item, note)
+    append_note_to_item(item, note)
 @
 
 This is the deferred half of the timeout handling: tracking has now
@@ -18878,42 +18900,37 @@ if (
 item.status = "pending"
 @
 
-Let's verify that [[append_note_to_item]] stores notes locally:
+Let's verify that [[append_note_to_item]] changes the item it is
+given and nothing else.  The second assertion is the one its callers
+rely on: the helper must not write the store behind their backs, since
+that write would come from outside their locked callback.
 
 <<test functions>>=
 def test_append_note_to_item_local(temp_todo_dir):
-    """append_note_to_item stores note on local item."""
+    """append_note_to_item changes the item, not the store."""
     save_todos(2, [
         TodoItem(
             id=1, title="Task",
             created="2026-02-20T10:00:00",
         ),
     ])
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     item = todos[0]
-    append_note_to_item(
-        item, "First note", next_id, todos
-    )
+    append_note_to_item(item, "First note")
+    assert item.notes == "First note"
     _, reloaded = load_todos()
-    assert reloaded[0].notes == "First note"
+    assert reloaded[0].notes == ""
 
 
 def test_append_note_to_item_appends(temp_todo_dir):
     """append_note_to_item appends to existing notes."""
-    save_todos(2, [
-        TodoItem(
-            id=1, title="Task",
-            created="2026-02-20T10:00:00",
-            notes="Existing",
-        ),
-    ])
-    next_id, todos = load_todos()
-    item = todos[0]
-    append_note_to_item(
-        item, "Second", next_id, todos
+    item = TodoItem(
+        id=1, title="Task",
+        created="2026-02-20T10:00:00",
+        notes="Existing",
     )
-    _, reloaded = load_todos()
-    assert "Existing\nSecond" == reloaded[0].notes
+    append_note_to_item(item, "Second")
+    assert "Existing\nSecond" == item.notes
 @
 
 Now let's verify headless mode captures output as a note.  We use
@@ -21312,15 +21329,18 @@ else:
 @
 
 The appending path is unchanged.  A GitHub-linked item needs a
-working [[gh]] before we promise that the comment was posted, and
-[[append_note_to_item]] both posts it and mirrors it locally.  The
+working [[gh]] before we promise that the comment was posted;
+[[post_note_comment]] posts it and [[append_note_to_item]] mirrors it
+locally.  The
 two messages name the outcome rather than the command, so a user
 who expected one path and got the other sees it immediately.
 
 <<post or append the note>>=
 if item.github:
     require_gh()
-append_note_to_item(item, note_text, next_id, todos)
+post_note_comment(item, note_text)
+append_note_to_item(item, note_text)
+save_todos(next_id, todos)
 if item.github:
     gh = item.github
     typer.echo(
