@@ -467,7 +467,11 @@ user's queue claims it without becoming its assignee, and changing
 the assignee of a running task does not change who is running it
 (\cref{sec:todo-claim}).  The field comes last, and [[ls]] lists it
 after its computed columns as well, so that the columns of the
-headerless listing format keep their positions.
+headerless listing format keep their positions.  [[context_claim]]
+follows it and says how the claim was made: [[True]] when the item
+was activated only as context for a descendant the claimant started,
+which is what lets the claim go again when that descendant stops
+(\cref{sec:todo-release-context}).
 
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
@@ -526,6 +530,7 @@ class TodoItem:
     github: dict[str, str] | None = None
     closed: str | None = None
     claimed_by: str | None = None
+    context_claim: bool = False
 
     def to_dict(self) -> dict:
         """Convert explicit values to a JSON-serializable dict."""
@@ -1678,11 +1683,12 @@ objects, and it needs to know whose tracking to stop next.
 def release_inactive_claims(
     todos: list[TodoItem], stack: list[int]
 ):
-    """Clear `claimed_by` on items not on the stack."""
+    """Clear the claim on items not on the stack."""
     active_ids = set(stack)
     for item in todos:
         if item.id not in active_ids:
             item.claimed_by = None
+            item.context_claim = False
 
 
 def stored_todo_record(item, active_ids):
@@ -1690,6 +1696,7 @@ def stored_todo_record(item, active_ids):
     record = item.to_dict()
     if item.id not in active_ids:
         record["claimed_by"] = None
+        record["context_claim"] = False
     return record
 @
 
@@ -6089,6 +6096,7 @@ if holder is not None:
     displaced = holder
 if who is not None:
     item.claimed_by = who
+    item.context_claim = False
 @
 
 The displaced claimant may also have active descendants of the item,
@@ -6833,6 +6841,15 @@ last child completed for one worker silently mark another worker's
 parent done.  We therefore thread the resolved worker context into the
 helper and stop at the boundary when the parent belongs to someone else.
 
+One parent is nobody's work although it is claimed: a context claim
+(\cref{sec:todo-release-context}) whose claimant has no active item
+below it any more.  Releasing normally clears those, but one left
+behind by an interrupted command, or written by an older version,
+would otherwise keep the parent from ever being completed by the
+worker who finished its last child.  Such a parent is completed like
+one's own, and its claimant's tracking of it stops.  A parent that
+another worker started explicitly stays theirs.
+
 <<helpers>>=
 def auto_complete_parent(item, todos, who=None):
     """Auto-complete the parent if all siblings are done.
@@ -6855,7 +6872,10 @@ def auto_complete_parent(item, todos, who=None):
     resolved_who = who
     if resolved_who is None:
         resolved_who = session_worker(item)
-    if session_worker(parent_item) != resolved_who:
+    holder = session_worker(parent_item)
+    if holder != resolved_who and not is_abandoned_context(
+        parent_item, todos, load_active_stack(),
+    ):
         return
 
     stop_todo_tracking(parent_item.id, parent_item, todos)
@@ -6875,6 +6895,21 @@ def auto_complete_parent(item, todos, who=None):
         return next_id, todos, stack
 
     mutate_todo_state(mark_parent)
+
+
+def is_abandoned_context(item, todos, stack):
+    """Tell whether `item` is a context claim nobody uses.
+
+    True when `item` is active, claimed as context, and
+    its claimant has no active item below it.
+    """
+    if item.id not in stack or not item.context_claim:
+        return False
+    return not any(
+        child.id in stack
+        and session_worker(child) == item.claimed_by
+        for child in get_descendants(todos, item.id)
+    )
 @
 
 Both completions go through [[set_status]] (\cref{sec:todo-closed}).
@@ -6978,6 +7013,7 @@ def ensure_ancestors_active(
         for fresh in todos:
             if fresh.id in pushed:
                 fresh.claimed_by = worker
+                fresh.context_claim = True
         return next_id, todos, stack, pushed
 
     _, _, _, pushed = mutate_todo_state(push_ancestors)
@@ -7207,12 +7243,12 @@ def test_ancestors_activated_meanwhile_are_not_tracked(
     TodoItem(
       id=1, title="Parent",
       created="2026-02-20T10:00:00",
-      labels=["course"], claimed_by="alice",
+      labels=["course"],
     ),
     TodoItem(
       id=2, title="Child",
       created="2026-02-20T10:00:00",
-      parent_id=1, claimed_by=default_username,
+      parent_id=1,
     ),
   ])
   save_active_stack([1, 2])
@@ -7227,6 +7263,293 @@ def test_ancestors_activated_meanwhile_are_not_tracked(
     default_username
   ).get_active_labels()
   assert "todo:1" not in mine
+@
+
+\subsubsection{Releasing Context Ancestors}%
+\label{sec:todo-release-context}
+
+Activating ancestors has a converse that we owe the worker.  An
+ancestor activated only as context for a child is claimed by the
+child's worker (\cref{sec:todo-claim}), and nothing would ever give it
+back: when an agent finishes the one child it was given, the parent
+stays on the stack in the agent's name.  The user then cannot
+[[stop]] it without [[--who]], cannot [[done]] it at all, and a cron
+[[next --who dan-claude]] keeps descending into it, looking for the
+agent's next child under a parent that was only ever context.
+
+So when an item leaves the stack---stopped, completed, removed, or
+at the end of a run---we walk up from it and look at each ancestor
+that its worker claimed as context ([[context_claim]]).  If that
+worker still has an active item below the ancestor, the context is
+still needed and stays.  Otherwise it goes: to another worker who
+has an active item below it, if any, since the ancestor is that
+worker's context now; or off the stack, if nobody works below it any
+more.  Tracking follows the claim: the old claimant's clock for the
+ancestor stops, and a new claimant's starts.
+
+We walk from the innermost ancestor outwards and decide each one on
+the stack as the previous decisions left it, so a grandparent that
+was context only for a released parent is released with it.  An
+ancestor that the worker started explicitly is not touched.  That is
+the nested workflow \enquote{[[start 5]], [[start 7]], [[done]],
+[[done]]}, in which the parent must stay active after the child is
+done, and which is why [[context_claim]] exists at all: the claimant
+alone cannot tell the two apart.
+
+The decision is made under the lock, on the stack as it is; the
+tracking changes follow outside it, like every other tracking I/O
+(\cref{sec:todo-read-modify-write}).
+
+<<helpers>>=
+def release_context_ancestors(item, worker):
+    """Release ancestors `worker` claimed as context for `item`.
+
+    `item` has just left the stack.  Each ancestor that
+    `worker` claimed only as context, and under which
+    `worker` has no active item left, is handed to the
+    worker of another active item below it, or leaves the
+    stack if there is none; tracking follows.  Returns the
+    list of `(ancestor, new claimant or None)` changes.
+    """
+    if worker is None:
+        return []
+
+    def update(next_id, todos, stack):
+        changes = []
+        for ancestor in reversed(get_ancestors(todos, item)):
+            <<decide what becomes of a context ancestor>>
+        return next_id, todos, stack, changes
+
+    _, todos, _, changes = mutate_todo_state(update)
+    <<move the tracking of released context ancestors>>
+    return changes
+@
+
+An ancestor is only ours to release if it is active, claimed as
+context, and claimed by the worker whose item left.  The heir, if
+there is one, is the worker of the latest active item below it in
+stack order: the most recently started work under that ancestor.
+
+<<decide what becomes of a context ancestor>>=
+if not (
+    ancestor.id in stack
+    and ancestor.context_claim
+    and ancestor.claimed_by == worker
+):
+    continue
+below = [
+    child for child in get_descendants(todos, ancestor.id)
+    if child.id in stack
+]
+if any(session_worker(child) == worker for child in below):
+    continue
+if below:
+    heir = max(below, key=lambda child: stack.index(child.id))
+    ancestor.claimed_by = session_worker(heir)
+    changes.append((ancestor, ancestor.claimed_by))
+else:
+    stack.remove(ancestor.id)
+    changes.append((ancestor, None))
+@
+
+The old claimant's tracking stops by name, since the claim no longer
+says it was theirs; the labels that the claimant's other active items
+carry stay protected as in every stop.
+
+<<move the tracking of released context ancestors>>=
+for ancestor, heir in changes:
+    stop_todo_tracking(
+        ancestor.id, ancestor, todos, worker=worker,
+    )
+    if heir is None:
+        typer.echo(
+            f"  Released parent: #{ancestor.id} {ancestor.title}"
+        )
+        continue
+    typer.echo(
+        f"  Handed parent #{ancestor.id} {ancestor.title} "
+        f"to {heir}"
+    )
+    try:
+        from nytid.cli.track import start_tracking_labels
+    except ImportError:
+        continue
+    start_tracking_labels(
+        todo_track_labels(ancestor, ancestor.id),
+        start_time=datetime.datetime.now(),
+        who=heir,
+        update_tmux_context=False,
+    )
+@
+
+Let's verify the three outcomes on the scenario from the review: an
+agent finishes its child of the user's course item.  Alone, the agent
+gives the parent back; and when the user then works on the other
+child and finishes it, the parent is the user's to auto-complete:
+
+<<test functions>>=
+def test_context_parent_released_when_child_done(temp_todo_dir):
+  """An agent's context parent leaves with the agent's child."""
+  from nytid.cli.track import load_active_session
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Course", labels=["course"],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="User's part", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Agent's part", parent_id=1,
+      created="2026-02-20T10:00:00", who="dan-claude",
+    ),
+  ])
+  runner.invoke(
+    cli, ["start", "3", "--who", "dan-claude", "--no-command"],
+  )
+  done = runner.invoke(cli, ["done", "--who", "dan-claude"])
+
+  assert done.exit_code == 0, done.output
+  assert "Released parent: #1 Course" in done.output
+  assert load_active_stack() == []
+  assert load_active_session(
+    "dan-claude"
+  ).get_active_labels() == []
+
+  runner.invoke(cli, ["start", "2", "--no-command"])
+  mine = runner.invoke(cli, ["done"])
+  assert mine.exit_code == 0, mine.output
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+@
+
+When the user works below the parent too, the agent's finish hands
+the parent to the user instead of popping it from under the user's
+child:
+
+<<test functions>>=
+def test_context_parent_handed_to_other_worker(temp_todo_dir):
+  """A context parent goes to whoever still works below it."""
+  from nytid.cli.track import load_active_session
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Course", labels=["course"],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="User's part", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Agent's part", parent_id=1,
+      created="2026-02-20T10:00:00", who="dan-claude",
+    ),
+  ])
+  runner.invoke(
+    cli, ["start", "3", "--who", "dan-claude", "--no-command"],
+  )
+  runner.invoke(cli, ["start", "2", "--no-command"])
+  done = runner.invoke(cli, ["done", "--who", "dan-claude"])
+
+  assert done.exit_code == 0, done.output
+  assert load_active_stack() == [1, 2]
+  _, todos = load_todos()
+  assert todos[0].claimed_by == default_username
+  assert "todo:1" in load_active_session(
+    default_username
+  ).get_active_labels()
+  assert "todo:1" not in load_active_session(
+    "dan-claude"
+  ).get_active_labels()
+@
+
+The same release happens at the end of an agent's run, which is the
+cron case: once the failed run has given the parent back, the next
+[[next --who dan-claude]] picks the agent's top-level work instead of
+looking under the user's course item:
+
+<<test functions>>=
+def test_run_end_releases_context_parent(temp_todo_dir):
+  """A cron run leaves no zombie parent behind."""
+  save_todos(5, [
+    TodoItem(
+      id=1, title="Course", labels=["course"],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Agent's part", parent_id=1,
+      created="2026-02-20T10:00:00", who="dan-claude",
+    ),
+    TodoItem(
+      id=4, title="Agent's own task",
+      created="2026-02-20T10:00:00", who="dan-claude",
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    return_value=subprocess.CompletedProcess([], 1, stdout="no"),
+  ), patch("nytid.cli.todo.post_note_comment"):
+    run = runner.invoke(
+      cli,
+      ["start", "2", "--who", "dan-claude", "--headless",
+       "--command", "claude -p",
+       "--reassign-to", default_username],
+    )
+  assert run.exit_code == 0, run.output
+  assert load_active_stack() == []
+
+  with patch("nytid.cli.todo.start") as mock_start:
+    nxt = runner.invoke(cli, ["next", "--who", "dan-claude"])
+  assert nxt.exit_code == 0, nxt.output
+  assert mock_start.call_args.kwargs["todo_id"] == 4
+@
+
+A parent the worker started explicitly is not context and stays, as
+the nested workflow needs:
+
+<<test functions>>=
+def test_explicit_parent_stays_after_child_done(temp_todo_dir):
+  """start 1, start 2, done leaves 1 active."""
+  save_todos(4, [
+    TodoItem(id=1, title="Parent", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Sibling", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  runner.invoke(cli, ["start", "1", "--no-command"])
+  runner.invoke(cli, ["start", "2", "--no-command"])
+  done = runner.invoke(cli, ["done"])
+
+  assert done.exit_code == 0, done.output
+  assert "Released parent" not in done.output
+  assert load_active_stack() == [1]
+
+
+def test_explicit_start_turns_context_into_claim(temp_todo_dir):
+  """Starting a context parent explicitly makes it stay."""
+  save_todos(4, [
+    TodoItem(id=1, title="Parent", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=2, title="Child", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Sibling", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  runner.invoke(cli, ["start", "2", "--no-command"])
+  runner.invoke(cli, ["start", "1", "--no-command"])
+  done = runner.invoke(cli, ["done", "2"])
+
+  assert done.exit_code == 0, done.output
+  assert load_active_stack() == [1]
 @
 
 Listing issues and PRs returns summaries for bulk import. We
@@ -10852,11 +11175,11 @@ one at the very end, so every stored field added since then is listed
 in [[FIELDS_AFTER_COMPUTED]] and moved behind the computed values, in
 the order of the list.  The list only grows: a later field is appended
 to it, after the ones already there, which keeps each of their
-positions too.  [[closed]] came first; [[claimed_by]]
-(\cref{sec:todo-claim}) followed it.
+positions too.  [[closed]] came first; [[claimed_by]] and
+[[context_claim]] (\cref{sec:todo-claim}) followed it.
 
 <<constants>>=
-FIELDS_AFTER_COMPUTED = ("closed", "claimed_by")
+FIELDS_AFTER_COMPUTED = ("closed", "claimed_by", "context_claim")
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio):
     """Return the dictionary `todo ls` serializes for `item`.
@@ -11488,7 +11811,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: nineteen tab-separated fields, no header,
+Let's verify the pipe form: twenty tab-separated fields, no header,
 and the flattened cells in their record positions, with the tracked
 hours still in the seventeenth.
 
@@ -11510,7 +11833,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 19
+  assert len(fields) == 20
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
   assert fields[16] == "0"
@@ -11569,7 +11892,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 19
+  assert len(fields) == 20
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -11665,7 +11988,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "created", "deadline", "estimated", "description",
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
-        "claimed_by",
+        "claimed_by", "context_claim",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -12263,8 +12586,9 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-5:] == [
-    "tracked_hours", "closed", "claimed_by", "path", "ready",
+  assert list(rows[3])[-6:] == [
+    "tracked_hours", "closed", "claimed_by", "context_claim",
+    "path", "ready",
   ]
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -16925,6 +17249,7 @@ def done(
     <<stop tracking if active>>
     <<close github issue>>
     auto_complete_parent(item, todos, who=who)
+    release_context_ancestors(item, session_worker(item))
 @
 
 Let's verify that [[done]] without an argument pops the stack
@@ -17097,6 +17422,56 @@ def test_done_other_worker_child_does_not_auto_complete_my_parent(
     child = next(t for t in todos if t.id == 2)
     assert parent.status == "in-progress"
     assert child.status == "done"
+@
+
+A parent that another worker holds only as context, with nothing of
+theirs left below it, is completed all the same, and that worker's
+clock for it stops:
+
+<<test functions>>=
+def test_done_completes_abandoned_context_parent(temp_todo_dir):
+  """A stale context claim does not block auto-completion."""
+  from nytid.cli.track import (
+    ActiveSession,
+    load_active_session,
+    save_active_session,
+  )
+  from nytid.cli.todo import mutate_todo_state
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Course", labels=["course"],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="User's part", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  save_active_stack([1, 2])
+
+  def leave_stale_claim(next_id, todos, stack):
+    todos[0].claimed_by = "dan-claude"
+    todos[0].context_claim = True
+    todos[1].claimed_by = default_username
+    return next_id, todos, stack
+
+  mutate_todo_state(leave_stale_claim)
+  session = ActiveSession()
+  session.start_labels(
+    ["course", "todo:1"],
+    datetime.datetime(2026, 2, 20, 10, 0),
+  )
+  save_active_session(session, "dan-claude")
+
+  result = runner.invoke(cli, ["done"])
+
+  assert result.exit_code == 0, result.output
+  assert "auto-completed" in result.output
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+  assert load_active_session(
+    "dan-claude"
+  ).get_active_labels() == []
 @
 
 The [[--force]] guard prevents accidental completion of a parent whose
@@ -17674,7 +18049,9 @@ Callers rarely want just one piece of that protocol.  The common
 high-level operation is
 \enquote{stop this todo the same way [[todo stop]] would}:
 remove the target from the stack, stop its own
-tracking labels, then unwind any active descendants beneath it.
+tracking labels, unwind any active descendants beneath it, and give
+back the ancestors that were context only for it
+(\cref{sec:todo-release-context}).
 
 We package that policy into [[stop_todo_hierarchy]] so manual
 [[todo stop]], blocked subprocess cleanup, and detached tmux finalization
@@ -17707,6 +18084,9 @@ def stop_todo_hierarchy(todo_id, who=None, launched_by=None):
     )
     stopped_ids = stop_active_descendants(
         resolved_id, todos, who=resolved_who
+    )
+    release_context_ancestors(
+        item, launched_by or session_worker(item),
     )
     next_id, todos, stack = load_todo_state()
     by_id = {t.id: t for t in todos}
@@ -18216,6 +18596,7 @@ def rm(
     )
 
     <<stop tracking if active>>
+    release_context_ancestors(item, session_worker(item))
 
     typer.echo(f"Removed #{todo_id}: {item.title}")
     <<report the removed sub-items>>
@@ -22480,7 +22861,45 @@ item, todos = record_run_outcome(
     launched_by=launched_by,
 )
 if item is not None and item.status == "done":
-    auto_complete_parent(item, todos)
+    auto_complete_parent(item, todos, who=launched_by)
+@
+
+The parent is auto-completed on behalf of [[launched_by]], the worker
+whose run it was.  The item handed back here was reloaded after the
+stop, which released its claim, so the worker that
+[[auto_complete_parent]] would derive from it is the assignee: when an
+agent ran a task from the user's queue, a completed run would then be
+judged as the user's, and the agent's own parent would never be
+completed.  Let's verify that case:
+
+<<test functions>>=
+def test_run_auto_completes_launchers_parent(temp_todo_dir):
+  """A run's completion completes the launcher's parent."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Agent's batch",
+      created="2026-02-20T10:00:00", who="dan-claude",
+    ),
+    TodoItem(
+      id=2, title="User's request", parent_id=1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    return_value=subprocess.CompletedProcess([], 0),
+  ), patch(
+    "nytid.cli.todo.typer.confirm", return_value=True,
+  ):
+    result = runner.invoke(
+      cli,
+      ["start", "2", "--who", "dan-claude",
+       "--command", "true"],
+    )
+
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert [t.status for t in todos] == ["done", "done"]
 @
 
 The exit code and captured output form a diagnostic record---the
