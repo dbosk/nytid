@@ -2682,10 +2682,11 @@ in a quieter form.  It does leave one degenerate outcome: the closest
 sibling can then equal the parent, and a zero-width (or, if the stored
 numbers ever invert, a backwards) interval gives
 [[distribute_priorities_in_range]] nothing to distribute over, since
-every division point would land on the bound itself.  We open a
-unit-wide range below the parent in that case, which is the same
-one-unit step [[assign_priority_at_position]] takes when it runs off
-the end of a list.
+every division point would land on the bound itself.  At the top
+level we open a unit-wide range below the parent in that case, which is
+the same one-unit step [[assign_priority_at_position]] takes when it
+runs off the end of a list; deeper down the range must also stay inside
+the enclosing one, which we return to below.
 
 <<child priority helpers>>=
 def compute_child_priority_range(
@@ -2699,8 +2700,9 @@ def compute_child_priority_range(
     sibling at or below it.  A parent with no such
     sibling inherits the low end of its own parent's
     range, up the tree; at the top level the floor is
-    ten below.  A degenerate result is widened to a
-    unit-wide range below the parent.
+    ten below.  A parent tied with its sibling gets
+    half the room left above the enclosing floor, or a
+    unit below it where nothing encloses it.
     """
     if parent.priority is None:
         raise ValueError(
@@ -2709,8 +2711,6 @@ def compute_child_priority_range(
         )
     high = parent.priority
     <<find the nearest lower bound up the ancestor chain>>
-    if low >= high:
-        low = high - 1.0
     return (high, low)
 
 
@@ -2749,11 +2749,6 @@ bounds the range if there is one; otherwise the parent's parent's
 does, and so on.  Each step is the lower end of the range the
 previous level was placed in, so whatever bound we reach is the
 tightest one that keeps the subtree inside every enclosing range.
-A level whose closest sibling sits level with it is widened to a unit
-below it, as above, because that widened interval is the range the
-level below was actually placed in.  The final check after the walk
-still matters: a parent stored below the bound it inherits (legacy
-data) would otherwise get a backwards interval.
 Only an item whose ancestors all lack a lower sibling reaches the top
 level, and there nothing bounds it; it gets the generous default of
 ten below the top-level ancestor, so that the whole subtree shares
@@ -2762,20 +2757,49 @@ and it stops at an unranked ancestor too, since a ranked item under
 an unranked one has no enclosing range to inherit.  The default floor
 is then taken from the last ranked level we saw.
 
+A level whose closest sibling sits level with it has no room of its
+own, and the unit-wide range we open below it must not leave the range
+the level itself lives in.  Two children of A tied at~4.8, where A's
+range is $(4.5, 5.0)$, would get $(3.8, 4.8)$ and spread their own
+children below A's lower sibling.  So a tie takes the midpoint between
+the level and the enclosing floor instead: $(4.65, 4.8)$.  That needs
+the enclosing floor, so the walk is in two passes.  Going up, we
+collect the levels until one has a sibling strictly below it, or the
+top is reached; that level's floor is known without looking further.
+Coming back down, each level's floor is its strict lower sibling, the
+midpoint for a tie, or the inherited floor when it has no sibling.
+Only where nothing encloses the level---at the top, or under an
+unranked ancestor---does a tie fall back to the unit step, and an
+inverted floor (a level stored below what it inherits, which only
+legacy data has) to the same step, rather than a backwards interval.
+
 <<find the nearest lower bound up the ancestor chain>>=
-low = None
-floor_base = high
+chain = []
 for level in [parent, *reversed(get_ancestors(todos, parent))]:
     if level.priority is None:
         break
-    floor_base = level.priority
-    low = closest_lower_sibling_priority(todos, level)
-    if low is not None:
-        if low >= level.priority:
-            low = level.priority - 1.0
+    sibling = closest_lower_sibling_priority(todos, level)
+    chain.append((level, sibling))
+    if sibling is not None and sibling < level.priority:
         break
-if low is None:
-    low = floor_base - 10.0
+low = None
+for level, sibling in reversed(chain):
+    <<take the floor of [[level]] from its sibling or above>>
+@
+
+<<take the floor of [[level]] from its sibling or above>>=
+enclosed = low is not None and low < level.priority
+if sibling is not None and sibling < level.priority:
+    low = sibling
+elif sibling is not None:
+    low = (
+        (level.priority + low) / 2.0 if enclosed
+        else level.priority - 1.0
+    )
+elif low is None:
+    low = level.priority - 10.0
+elif not enclosed:
+    low = level.priority - 1.0
 @
 
 The second helper distributes [[count]] priorities evenly within a
@@ -2980,6 +3004,25 @@ def test_compute_child_priority_range_level_ancestor():
     ) == (4.5, 4.0)
 
 
+def test_compute_child_priority_range_tie_stays_enclosed():
+    """Tied children open a range inside their parent's."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=4.5),
+        TodoItem(
+            id=3, title="c1", priority=4.8, parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="c2", priority=4.8, parent_id=1,
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[2]
+    )
+    assert (high, low) == (4.8, pytest.approx(4.65))
+    assert low > 4.5
+
+
 def test_compute_child_priority_range_survives_cycle():
     """A parent cycle ends the walk instead of hanging."""
     todos = [
@@ -3120,10 +3163,14 @@ Which descendants move is decided by their stored numbers, not by
 ancestry alone.
 \begin{description}
 \item[Ranked and in the old range] These move.  The range is taken as
-  closed: a descendant level with the parent, or with the lower
-  sibling, can only come from hand-set numbers, and mapping the end of
-  the old range to the end of the new one keeps exactly the tie it
-  had.
+  closed, so that a descendant level with the parent, or with the
+  lower sibling, which only hand-set numbers produce, still moves with
+  the subtree.  Its image is kept strictly inside the new range,
+  though, one floating-point step from the end it would land on: a tie
+  with the parent is exactly what the ranges exist to prevent, and
+  rounding alone can produce one when the new range is narrow---a
+  child just below the parent's old number can round onto its new
+  one.
 \item[Ranked but outside the old range] These stay.  They come from
   data written before children were placed by range (or before a lone
   child's range was bounded by its parent's), and outside the range
@@ -3163,7 +3210,8 @@ def move_subtree_priorities(
     unranked parent, in which case nothing moves.  Each
     ranked, not-done descendant whose stored priority
     lies in the closed old range is mapped linearly onto
-    the new range; the others keep their numbers.
+    the new range, strictly inside it; the others keep
+    their numbers.
     """
     if old_range is None or new_range is None:
         return
@@ -3173,12 +3221,17 @@ def move_subtree_priorities(
     new_high, new_low = new_range
     scale = (new_high - new_low) / (old_high - old_low)
     <<collect the descendants of [[parent]] once each>>
+    inside = (
+        math.nextafter(new_low, new_high),
+        math.nextafter(new_high, new_low),
+    )
     for item in descendants:
         if item.status == "done" or item.priority is None:
             continue
         if old_low <= item.priority <= old_high:
-            item.priority = (
-                new_low + (item.priority - old_low) * scale
+            mapped = new_low + (item.priority - old_low) * scale
+            item.priority = min(
+                max(mapped, inside[0]), inside[1]
             )
 @
 
@@ -3373,6 +3426,21 @@ def test_move_subtree_leaves_others_alone():
         None, 3.75, 8.0
     ]
     assert todos[3].priority == 1.75
+
+
+def test_move_subtree_stays_strictly_inside():
+    """A child at the parent's own number is moved just
+    below the parent's new one, not onto it."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(id=3, title="C", priority=1.0),
+        TodoItem(
+            id=4, title="Tied", priority=5.0, parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert 1.0 < todos[3].priority < 2.0
 
 
 def test_move_subtree_from_unranked_parent():
@@ -16029,7 +16097,12 @@ A move is where the flags earn their place.  Without one, the item is
 re-ranked among its new siblings by the interactive search; with
 [[--keep-prio]] it arrives carrying the number it had, which is the
 behaviour this command had before; and with [[--top]] or [[--bottom]]
-it arrives at a known end of the new list:
+it arrives at a known end of the new list.  The fixture's child of B
+sits at~[[8.0]], above B itself, as data written before children were
+placed by range can.  [[--top]] therefore steps past it to~[[9.0]],
+since there is no room above it inside B's range to split, while
+[[--bottom]] takes the midpoint between it and the floor of B's range
+$(-4.0, 6.0)$, which is~[[2.0]] (\cref{todo:binary-search}):
 
 <<test functions>>=
 @pytest.fixture
@@ -16097,8 +16170,6 @@ def test_edit_parent_bottom(two_parents):
     cli, ["edit", "4", "--parent", "2", "--bottom"],
   )
   assert result.exit_code == 0
-  # Halfway from the child at 8.0 down to the floor of
-  # B's range (6.0, -4.0), not one step below the child.
   assert stored_priority(4) == 2.0
 
 
@@ -27926,7 +27997,14 @@ def test_add_append_uses_bottom_priority(temp_todo_dir):
     appended = next(t for t in todos if t.id == 3)
     assert appended.priority == 2.0
 
+@
 
+Under a parent the bottom end is bounded by the parent's range
+(\cref{todo:binary-search}): the parent at~[[5.0]] has no lower
+sibling, so its range is $(-5.0, 5.0)$, and [[--append]] lands halfway
+between the lowest child at~[[3.0]] and that floor, at~[[-1.0]].
+
+<<test functions>>=
 def test_add_append_under_parent(temp_todo_dir):
     """--append works for a parent's active children too."""
     save_todos(4, [
@@ -27962,8 +28040,6 @@ def test_add_append_under_parent(temp_todo_dir):
     _, todos = load_todos()
     appended = next(t for t in todos if t.id == 4)
     assert appended.parent_id == 1
-    # Halfway from the lowest child down to the floor of
-    # the parent's range (-5.0, 5.0).
     assert appended.priority == -1.0
 
 
