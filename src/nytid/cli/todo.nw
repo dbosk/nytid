@@ -2653,7 +2653,9 @@ The first helper finds the available priority range for children of
 a given parent. We look at the parent's siblings (same
 [[parent_id]] level) to find the closest one at or below the parent.
 The range runs from the parent's priority down to that sibling's
-priority. If no such sibling exists, we use a generous default floor.
+priority. If no such sibling exists, the floor comes from further up
+the tree, and only at the top level from a generous default; we return
+to this case below.
 
 Both bounds read \emph{stored} priorities, for the reason placement
 gives (\cref{todo:placement}): a deadline boost is temporary by design
@@ -2694,9 +2696,11 @@ def compute_child_priority_range(
 
     Returns ``(high, low)`` from stored priorities: high
     is the parent's own, and low is that of the closest
-    sibling at or below it (or a default floor when no
-    sibling qualifies).  A degenerate result is widened
-    to a unit-wide range below the parent.
+    sibling at or below it.  A parent with no such
+    sibling inherits the low end of its own parent's
+    range, up the tree; at the top level the floor is
+    ten below.  A degenerate result is widened to a
+    unit-wide range below the parent.
     """
     if parent.priority is None:
         raise ValueError(
@@ -2704,27 +2708,74 @@ def compute_child_priority_range(
             "unprioritized parent"
         )
     high = parent.priority
-    siblings = [
-        t for t in todos
-        if t.parent_id == parent.parent_id
-        and t.id != parent.id
-        and t.status != "done"
-        and t.priority is not None
-    ]
-    lower = [
-        s for s in siblings
-        if require_stored_priority(s) <= high
-    ]
-    if lower:
-        closest = max(
-            lower, key=require_stored_priority
-        )
-        low = require_stored_priority(closest)
-    else:
-        low = high - 10.0
+    <<find the nearest lower bound up the ancestor chain>>
     if low >= high:
         low = high - 1.0
     return (high, low)
+
+
+def closest_lower_sibling_priority(
+    todos: list[TodoItem],
+    item: TodoItem,
+) -> float | None:
+    """Return the stored priority of the closest ranked,
+    not-done sibling at or below `item`, or `None`."""
+    return max(
+        (
+            require_stored_priority(t)
+            for t in todos
+            if t.parent_id == item.parent_id
+            and t.id != item.id
+            and t.status != "done"
+            and t.priority is not None
+            and t.priority <= item.priority
+        ),
+        default=None,
+    )
+@
+
+The floor for a parent without a lower sibling is where the ranges
+stop nesting unless we are careful.  Take top-level siblings A at~5.0
+and B at~3.0, and a single child X of~A, placed in the middle of A's
+range at~4.0.  X has no sibling at all, so a floor of [[high - 10]]
+would give X's own children the range $(-6.0, 4.0)$, and X's first
+child would start at~$-1.0$: below~B, in a flat list that is meant to
+show A's whole subtree between A and~B.  The range X's children may
+use is not X's to choose.  It is bounded by the range X itself lives
+in, which here ends at B's~3.0, so X's children get $(3.0, 4.0)$.
+
+In general we walk up the tree: the parent's closest lower sibling
+bounds the range if there is one; otherwise the parent's parent's
+does, and so on.  Each step is the lower end of the range the
+previous level was placed in, so whatever bound we reach is the
+tightest one that keeps the subtree inside every enclosing range.
+A level whose closest sibling sits level with it is widened to a unit
+below it, as above, because that widened interval is the range the
+level below was actually placed in.  The final check after the walk
+still matters: a parent stored below the bound it inherits (legacy
+data) would otherwise get a backwards interval.
+Only an item whose ancestors all lack a lower sibling reaches the top
+level, and there nothing bounds it; it gets the generous default of
+ten below the top-level ancestor, so that the whole subtree shares
+one floor.  The walk reuses [[get_ancestors]], which stops at a cycle,
+and it stops at an unranked ancestor too, since a ranked item under
+an unranked one has no enclosing range to inherit.  The default floor
+is then taken from the last ranked level we saw.
+
+<<find the nearest lower bound up the ancestor chain>>=
+low = None
+floor_base = high
+for level in [parent, *reversed(get_ancestors(todos, parent))]:
+    if level.priority is None:
+        break
+    floor_base = level.priority
+    low = closest_lower_sibling_priority(todos, level)
+    if low is not None:
+        if low >= level.priority:
+            low = level.priority - 1.0
+        break
+if low is None:
+    low = floor_base - 10.0
 @
 
 The second helper distributes [[count]] priorities evenly within a
@@ -2874,6 +2925,74 @@ def test_compute_child_priority_range_equal_sibling():
     )
     assert high == 5.0
     assert low == 4.0
+
+
+def test_compute_child_priority_range_lone_child():
+    """A lone child's range ends where its parent's does,
+    at any depth."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="X", priority=4.0, parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="Y", priority=3.5, parent_id=3,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[2]
+    ) == (4.0, 3.0)
+    assert compute_child_priority_range(
+        todos, todos[3]
+    ) == (3.5, 3.0)
+    assert default_priority_without_siblings(
+        todos[2], todos
+    ) == 3.5
+
+
+def test_compute_child_priority_range_lone_top_level():
+    """With no lower sibling anywhere, a subtree shares
+    the top-level ancestor's default floor."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(
+            id=2, title="X", priority=0.0, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[1]
+    ) == (0.0, -5.0)
+
+
+def test_compute_child_priority_range_level_ancestor():
+    """An ancestor level with its sibling passes on its
+    widened unit range."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="A2", priority=5.0),
+        TodoItem(
+            id=3, title="X", priority=4.5, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[2]
+    ) == (4.5, 4.0)
+
+
+def test_compute_child_priority_range_survives_cycle():
+    """A parent cycle ends the walk instead of hanging."""
+    todos = [
+        TodoItem(
+            id=1, title="A", priority=5.0, parent_id=2,
+        ),
+        TodoItem(
+            id=2, title="B", priority=4.0, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[1]
+    ) == (4.0, -5.0)
 
 
 def test_default_priority_without_siblings():
