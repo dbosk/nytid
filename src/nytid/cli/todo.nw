@@ -15846,6 +15846,16 @@ An omitted ID means \enquote{remove the current active todo}, which mirrors
 the way [[done]], [[note]], and [[edit]] already target the same
 context-aware default.
 
+The prompt can wait as long as the user likes, so it is asked on the
+snapshot, and the subtree is worked out again inside the locked
+callback that removes it (\cref{sec:todo-read-modify-write}).  A
+sub-item added while the question was open has to go with its parent
+for the same reason the subtree goes at all, and the report afterwards
+counts what was actually removed.  Tracking is stopped after the
+removal is stored, against the state without the removed items, which
+is what [[stop_todo_tracking]] needs to see in order not to protect
+their labels.
+
 Here [[--force]] only waives the confirmation prompt; the removal it
 skips asking about is the same one either way.  That is a different
 promise from [[done --force]], which changes what the command
@@ -15869,7 +15879,7 @@ def rm(
 
     If no ID given, removes the current active task.
     """
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "remove",
         who=default_username, todos=todos,
@@ -15893,18 +15903,66 @@ def rm(
             typer.echo("Cancelled.")
             raise typer.Exit(0)
 
-    ids_to_remove = {todo_id}
-    ids_to_remove.update(d.id for d in descendants)
-    todos = [t for t in todos if t.id not in ids_to_remove]
+    def remove_subtree(next_id, todos, stack):
+        require_todo(todos, todo_id)
+        descendants = get_descendants(todos, todo_id)
+        ids_to_remove = {todo_id}
+        ids_to_remove.update(d.id for d in descendants)
+        todos = [t for t in todos if t.id not in ids_to_remove]
+        return next_id, todos, stack, descendants
+
+    _, todos, _, descendants = mutate_todo_state(
+        remove_subtree
+    )
 
     <<stop tracking if active>>
 
-    save_todos(next_id, todos)
     typer.echo(f"Removed #{todo_id}: {item.title}")
     if descendants:
         typer.echo(
             f"  Also removed {len(descendants)} sub-items"
         )
+@
+
+Let's verify both halves of the commit by doing work while the
+confirmation prompt is open: a sub-item added under the doomed item
+must go with it, and a note on an unrelated item must stay.
+
+<<test functions>>=
+def test_rm_commits_against_fresh_state(temp_todo_dir):
+    """rm removes a late child and keeps unrelated work."""
+    from nytid.cli.todo import add, note
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Doomed", priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Bystander",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def confirm_meanwhile(message, **kwargs):
+        add(
+            None, title="Late child",
+            parent=1, explicit_priority=4.0,
+        )
+        note(2, message="Meanwhile", edit=False)
+        return True
+
+    with patch(
+        "nytid.cli.todo.typer.confirm",
+        side_effect=confirm_meanwhile,
+    ):
+        result = runner.invoke(cli, ["rm", "1"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Also removed 1 sub-items" in result.output
+    _, todos = load_todos()
+    assert [(t.title, t.notes) for t in todos] == [
+        ("Bystander", "Meanwhile"),
+    ]
 @
 
 Let's pin the separation down, since a name collision in a bucket chunk
@@ -20357,8 +20415,8 @@ def import_github(
     <<fetch github items>>
     <<filter already imported>>
     <<create todos from github items>>
-
-    save_todos(next_id, todos)
+    <<commit the imported todos under the lock>>
+    <<report imported todos>>
     <<report skipped duplicates>>
     typer.echo(f"Imported {imported_count} items.")
 @
@@ -20507,15 +20565,9 @@ each skipped GitHub item collided with, so that the command can report
 the collision below instead of swallowing it.
 
 <<filter already imported>>=
-existing = {}
-for t in todos:
-    if t.github:
-        key = (
-            t.github["repo"],
-            t.github.get("type", "issue"),
-            t.github["number"],
-        )
-        existing[key] = t
+existing = {
+    github_key(t): t for t in todos if t.github
+}
 
 new_items = []
 skipped_items = []
@@ -20529,6 +20581,19 @@ for gh_item in gh_items:
         skipped_items.append((gh_item, existing[key]))
     else:
         new_items.append(gh_item)
+@
+
+The identity is needed twice, here and again when the import is
+committed, so it is a function rather than an inline tuple.
+
+<<helpers>>=
+def github_key(item):
+    """Return the (repo, type, number) a todo is linked to."""
+    return (
+        item.github["repo"],
+        item.github.get("type", "issue"),
+        item.github["number"],
+    )
 @
 
 The age-based priority heuristic scales creation timestamps
@@ -20552,8 +20617,7 @@ if skip_priority and new_items:
 else:
     priorities = {}
 
-imported_count = 0
-imported_rows = []
+imported = []
 for gh_item in new_items:
     gh_labels = list(inherited_labels)
     if repo not in gh_labels:
@@ -20629,15 +20693,128 @@ for gh_item in new_items:
     )
     todos.append(item)
     next_id += 1
-    imported_count += 1
-    imported_rows.append((
-        f"#{item.id}",
-        item.title,
-        gh_item["_type"],
-        f"#{gh_item['number']}",
-    ))
+    imported.append(item)
+@
 
-print_rows(["ID", "Title", "Type", "GH #"], imported_rows)
+The items above are built on the snapshot, and each is appended to it
+so that the next item's binary search compares against the ones
+imported before it.  Their IDs are therefore provisional: they come
+from the snapshot's [[next_id]], which another command may have used
+meanwhile.  The commit gives each item its real ID from the fresh
+state (\cref{sec:todo-read-modify-write}), re-checks the parent as
+[[add]] does, and runs the duplicate check once more, since the
+fetching and the questions leave ample time for an overlapping
+[[import]] of the same repository.  An item that turns out to be
+stored already is reported and left out, which is what the check above
+would have done had it seen it.
+
+<<commit the imported todos under the lock>>=
+def append_imported(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    stored = {
+        github_key(t): t for t in todos if t.github
+    }
+    committed = []
+    for item in imported:
+        local = stored.get(github_key(item))
+        if local is not None:
+            typer.echo(
+                f"  Skipped {item.title}: imported "
+                f"meanwhile as #{local.id}"
+            )
+            continue
+        item.id = next_id
+        next_id += 1
+        todos.append(item)
+        committed.append(item)
+    return next_id, todos, stack, committed
+
+
+*_, committed = mutate_todo_state(append_imported)
+imported_count = len(committed)
+@
+
+Let's verify the commit against an import that overlaps with an
+[[add]] and with a second import of one of the same issues, both
+happening while the first import is still fetching.  The added item
+must survive, the shared issue must be stored once, and the remaining
+issue must get the next free ID rather than the one its snapshot
+promised.
+
+<<test functions>>=
+def test_import_commits_against_fresh_state(temp_todo_dir):
+    """Overlapping add and import are kept, not duplicated."""
+    from nytid.cli.todo import add, import_github
+    save_todos(1, [])
+    issues = [
+        {
+            "number": n, "title": f"Issue {n}",
+            "state": "OPEN", "labels": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+        }
+        for n in (5, 6)
+    ]
+
+    def list_meanwhile(repo):
+        add(
+            None, title="Added meanwhile",
+            top_level=True, explicit_priority=1.0,
+        )
+        import_github(
+            "owner/repo", number=5,
+            item_type=ImportType.issue,
+            skip_priority=True, top_level=True,
+        )
+        return [dict(issue) for issue in issues]
+
+    gh_ok = MagicMock(returncode=0)
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=gh_ok,
+    ), patch(
+        "nytid.cli.todo.gh_list_issues",
+        side_effect=list_meanwhile,
+    ), patch(
+        "nytid.cli.todo.gh_fetch_issue",
+        side_effect=lambda repo, n: dict(issues[0]),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority", "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    assert "imported meanwhile as #2" in result.output
+    assert "Imported 1 items." in result.output
+    _, todos = load_todos()
+    assert [(t.id, t.title) for t in todos] == [
+        (1, "Added meanwhile"),
+        (2, "Issue 5"),
+        (3, "Issue 6"),
+    ]
+@
+
+Only now are the IDs final, so the receipt is printed from what the
+commit stored.
+
+<<report imported todos>>=
+print_rows(
+    ["ID", "Title", "Type", "GH #"],
+    [
+        (
+            f"#{item.id}",
+            item.title,
+            item.github["type"],
+            f"#{item.github['number']}",
+        )
+        for item in committed
+    ],
+)
 @
 
 The receipt this prints used to be a line of prose per item,
@@ -20659,7 +20836,7 @@ of the wrappers we ship parse it.
 
 The footer stays a plain [[typer.echo]].
 It is a sentence rather than a row, and it must still appear when
-[[imported_rows]] is empty, whereas [[print_rows]] deliberately prints
+[[committed]] is empty, whereas [[print_rows]] deliberately prints
 nothing at all when there is nothing to report.
 
 The skipped items collected by [[<<filter already imported>>]] get the
@@ -21577,8 +21754,9 @@ def sync(
 ):
     """Sync todo items with GitHub issues/PRs."""
     require_gh()
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     changes = 0
+    touched = []
 
     for item in todos:
         if not item.github:
@@ -21586,6 +21764,7 @@ def sync(
         if repo and item.github["repo"] != repo:
             continue
 
+        touched.append((item_fields(item), item))
         gh = item.github
         item_type = gh.get("type", "issue")
         try:
@@ -21610,8 +21789,83 @@ def sync(
         <<sync state to github>>
         <<sync title from github>>
 
-    save_todos(next_id, todos)
+    <<store the synced fields under the lock>>
     typer.echo(f"Sync complete. {changes} changes.")
+@
+
+A sync makes one network round trip per linked item, so it can run
+for a while, and it works on the snapshot throughout.  Each item it
+looks at is remembered as it was read, and the commit replays only
+what the sync changed---a status or a title---onto the stored items
+(\cref{sec:todo-read-modify-write}).  A note added to an item during
+the sync therefore stays.  An item removed meanwhile is skipped with a
+warning, as [[reprioritize]] does, rather than failing the whole
+sync.
+
+<<store the synced fields under the lock>>=
+def store_synced(next_id, todos, stack):
+    by_id = {t.id: t for t in todos}
+    for before, item in touched:
+        if item.id in by_id:
+            replay_item_edits(by_id[item.id], before, item)
+        elif item.to_dict() != before:
+            typer.echo(
+                f"  Warning: #{item.id} no longer exists; "
+                "its sync changes were not stored",
+                err=True,
+            )
+    return next_id, todos, stack
+
+
+mutate_todo_state(store_synced)
+@
+
+Let's verify that a sync keeps a note added while it was fetching.
+The note arrives through the mocked [[gh issue view]] call, which is
+where a real sync spends its time.
+
+<<test functions>>=
+def test_sync_keeps_note_added_meanwhile(temp_todo_dir):
+    """Sync stores its changes without erasing a new note."""
+    from nytid.cli.todo import note
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Old title",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "10",
+            },
+        ),
+        TodoItem(
+            id=2, title="Local task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    view_result = MagicMock(returncode=0)
+    view_result.stdout = json.dumps({
+        "title": "New title", "body": "",
+        "state": "CLOSED", "comments": [], "labels": [],
+    })
+
+    def view_meanwhile(cmd, **kwargs):
+        if "view" in cmd:
+            note(2, message="Meanwhile", edit=False)
+        return view_result
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        side_effect=view_meanwhile,
+    ):
+        result = runner.invoke(cli, ["sync"])
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    by_id = {t.id: t for t in todos}
+    assert by_id[1].title == "New title"
+    assert by_id[1].status == "done"
+    assert by_id[2].notes == "Meanwhile"
 @
 
 GitHub is the authoritative source for issue state: a
