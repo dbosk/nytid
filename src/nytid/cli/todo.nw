@@ -55,6 +55,16 @@ records the todo it came from in a separate, purely informative link,
 [[discovered_from]], which [[todo add]] fills in when the user keeps a
 new item out of the active todo (\cref{sec:todo-discovered-from}).
 
+Items can also wait for each other.  [[add --blocked-by]] and
+[[edit --add-blocker]] record that an item cannot start before another
+is done, wherever the two sit in the graph.  A blocked item, and what
+lies below it, is not ready: [[todo ready]], [[todo next]] and the
+schedule pass it by until its blocker is done, unless it is in
+progress already, which keeps its time in the schedule
+(\cref{sec:todo-blockers}), and [[ls --blocked]] lists it with the
+reason.  A link that would make work wait for itself in a circle is
+refused (\cref{sec:todo-stuck}).
+
 Both listings stop at one level by default: [[todo ls]] shows
 top-level items, and [[ls --all]] or [[todo view]] add the direct
 children.  [[--recursive]] lists every depth in either command, and
@@ -497,9 +507,16 @@ completing every part completes the whole; the item an agent stumbled
 on while fixing something else is usually not part of that fix at all,
 and filing it there would hold the fix open until the stray item was
 done.  [[discovered_from]] keeps the context without that consequence
-(\cref{sec:todo-discovered-from}).  It is the newest stored field and
-so comes last, after [[context_claim]], in the dataclass and in
-[[ls]]'s records alike.
+(\cref{sec:todo-discovered-from}).  It follows [[context_claim]], in
+the dataclass and in [[ls]]'s records alike.
+
+The [[blocked_by]] field is the third link between items, beside the
+parents and the provenance: the IDs of the todos that have to be done
+before this one can be started (\cref{sec:todo-blocked-by-field}).
+Unlike a parent, a blocker says nothing about what the item is part
+of, and unlike the provenance it changes what happens: an item with an
+open blocker is not ready (\cref{sec:todo-blockers}).  It is the newest
+stored field and so comes last, after [[discovered_from]].
 
 We use a dataclass rather than a plain class because the fields are
 pure data with no complex invariants---unlike [[ActiveSession]] in
@@ -562,6 +579,7 @@ class TodoItem:
     claimed_by: str | None = None
     context_claim: bool = False
     discovered_from: int | None = None
+    blocked_by: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert explicit values to a JSON-serializable dict.
@@ -691,11 +709,13 @@ matches the [[track]] command.
 
 <<normalize labels on assignment>>=
 def __setattr__(self, name, value):
-    """Keep `labels` a sorted, duplicate-free list and
-    `parents` an ordered one (see `normalize_parents`)."""
+    """Keep `labels` a sorted, duplicate-free list,
+    `parents` an ordered one (see `normalize_parents`) and
+    `blocked_by` a sorted one (see `normalize_blockers`)."""
     if name == "labels" and value is not None:
         value = sorted(set(value))
     <<normalize [[parents]] on assignment>>
+    <<normalize [[blocked_by]] on assignment>>
     object.__setattr__(self, name, value)
 @
 
@@ -965,6 +985,117 @@ def test_old_todo_file_round_trips(temp_todo_dir):
   assert [(t["parents"], t["parent_id"]) for t in stored] == [
     ([ROOT_ID], None), ([1], 1),
   ]
+@
+
+\subsection{What an Item Waits For}%
+\label{sec:todo-blocked-by-field}
+
+An item lists its blockers in [[blocked_by]], a list of ids, empty by
+default.  The link is stored on the blocked item and not on the
+blocker for the reason [[parents]] is stored on the child: the question
+every command asks is \enquote{can this item start?}, and the answer
+should be in the item it is asked about.  The other direction,
+\enquote{what does this item hold up?}, is a scan of the list, which
+[[view]] makes (\cref{sec:todo-view-blockers}).
+
+Like the labels, and unlike the parents, the list is a set: being
+blocked by \#4 twice means what being blocked by it once means, and the
+order the blockers were added in says nothing, whereas the first parent
+decides an item's line (\cref{sec:todo-parents-field}).  So the list is sorted
+and repeats are dropped, on every assignment, by the same
+[[__setattr__]].  An item never waits for itself, and that entry is
+dropped as well: it could never be satisfied, and would make the item
+stuck for good (\cref{sec:todo-stuck}).  The item's own id is known
+when [[blocked_by]] is assigned, because the dataclass assigns [[id]]
+first.
+
+A blocker that does not exist is kept, and counts as closed.  The
+blocker may have been removed with [[rm]], and removing a todo has never
+had to visit the items that point at it, as with [[discovered_from]];
+work that waited for something which no longer exists has nothing left
+to wait for.  That is safe only because ids are never reused: the next
+id is stored with the list, and loading raises it above every stored id
+(\cref{sec:todo-refused-files}), so no new item can take a removed
+blocker's id.  A [[next_id]] lowered by hand below that id is the one
+way to break it: the next item added would get the id, and the stale
+link would make it a blocker.  What is refused is a value that is not
+an id at all, for the reasons and in the way [[parents]] refuses one
+(\cref{sec:todo-refused-files}): the exception is a kind of
+[[InvalidParentsError]], so the file reader stops on it, naming the item,
+instead of reading an empty list.  Zero is refused too, since it is the
+top level's id and not a todo's.
+
+<<helpers>>=
+class InvalidBlockersError(InvalidParentsError):
+    """A blocked_by value that is not a list of todo ids."""
+
+
+def normalize_blockers(blockers, own_id=None):
+    """Return `blockers` as a sorted list of todo ids.
+
+    Repeats and `own_id` are dropped, and `None` or a single
+    id is read as a list.  Raises `InvalidBlockersError` for
+    anything that is not the id of a todo.
+    """
+    if blockers is None:
+        return []
+    if is_parent_id(blockers):
+        blockers = [blockers]
+    if not isinstance(blockers, (list, tuple)):
+        raise InvalidBlockersError(
+            f"blocked_by {blockers!r}, which is not a list of ids"
+        )
+    for blocker in blockers:
+        if not is_parent_id(blocker) or blocker == ROOT_ID:
+            raise InvalidBlockersError(
+                f"blocker {blocker!r}, which is not a todo id"
+            )
+    return sorted({b for b in blockers if b != own_id})
+<<normalize [[blocked_by]] on assignment>>=
+if name == "blocked_by":
+    value = normalize_blockers(value, self.__dict__.get("id"))
+@
+
+Let's verify the normalization, the refusals, and that a file holding
+a bad blocker is refused like one holding a bad parent:
+
+<<test functions>>=
+def test_blocked_by_is_a_sorted_set_without_self():
+  """Repeats and the item itself go; the rest is sorted."""
+  assert TodoItem(id=1, title="T").blocked_by == []
+  item = TodoItem(id=5, title="T", blocked_by=[9, 2, 9, 5])
+  assert item.blocked_by == [2, 9]
+  item.blocked_by = 7
+  assert item.blocked_by == [7]
+  assert TodoItem.from_dict(
+    {"id": 3, "title": "T", "blocked_by": [4, 3]}
+  ).blocked_by == [4]
+
+
+@pytest.mark.parametrize("blocked_by", [
+  "12", [0], [1.0], [True], [-1], ["1"], {"id": 1},
+])
+def test_blocked_by_refuses_what_is_not_a_todo_id(blocked_by):
+  """Zero, strings, floats and booleans are not blockers."""
+  with pytest.raises(InvalidBlockersError):
+    TodoItem(id=1, title="T", blocked_by=blocked_by)
+
+
+def test_todo_with_bad_blocker_is_refused(temp_todo_dir):
+  """A string blocker stops the commands; the file stays."""
+  get_todo_file().parent.mkdir(parents=True, exist_ok=True)
+  get_todo_file().write_text(json.dumps({
+    "next_id": 3,
+    "todos": [
+      {"id": 1, "title": "One"},
+      {"id": 2, "title": "Two", "blocked_by": ["1"]},
+    ],
+  }))
+  stored = get_todo_file().read_text()
+  result = runner.invoke(cli, ["ls", "--who", ""])
+  assert result.exit_code == 1
+  assert "holds todo #2 with blocker '1'" in result.output
+  assert get_todo_file().read_text() == stored
 @
 
 \subsection{Estimates Are Numbers, Not Strings}
@@ -3366,30 +3497,46 @@ def check_parent_completion(
 @
 
 The [[next]] command and the cron script both need to find the
-highest-priority pending task, optionally scoped to a specific
-parent.  Extracting this into a function (rather than a reusable
-chunk) makes the dependency on [[todos]] and [[who]] explicit
+highest-priority pending task that is ready, optionally scoped to a
+specific parent.  Extracting this into a function (rather than a
+reusable chunk) makes the dependency on [[todos]] and [[who]] explicit
 through parameters.  The worker filter follows the same backward-
 compatibility rule as the active stack: older items with [[who=None]]
 still count as belonging to [[default_username]].
+
+Readiness is [[is_ready]]'s (\cref{sec:todo-ready}), with two
+adjustments for the way [[next]] works.  [[next]] starts parents as
+well as leaves, and descends into a parent's children on the next
+call, so open children do not disqualify an item.  And with a parent
+given, only the path through that parent counts as the item's way out
+of a block: that is the line the user is working in
+(\cref{sec:todo-next-ready}).
 
 <<sub-item helpers>>=
 def find_pending_by_priority(
     todos: list[TodoItem],
     who: str | None = None,
     parent_id: int | None = None,
+    blockers: "Blockers | None" = None,
 ) -> TodoItem | None:
-    """Find highest-priority pending task.
+    """Find highest-priority pending task that is ready.
 
-    Optionally filtered by assignee regex and parent.
-    Treats ``who=None`` as ``default_username``.
-    Returns None if no matching task is found.
+    Optionally filtered by assignee regex and parent; with a
+    parent, the item must be unblocked along that parent.
+    Treats ``who=None`` as ``default_username``.  `blockers`
+    may pass the `blockers_index` of `todos`.  Returns None
+    if no matching task is found.
     """
+    if blockers is None:
+        blockers = blockers_index(todos)
     candidates = [
         t for t in todos
-        if t.status == "pending"
-        and (parent_id is None
-             or parent_id in parents_of(t))
+        if (parent_id is None
+            or parent_id in parents_of(t))
+        and is_ready(
+            todos, t, allow_open_children=True,
+            blockers=blockers, via=parent_id,
+        )
     ]
     if who:
         candidates = [
@@ -3541,6 +3688,904 @@ def test_get_ancestors_stops_at_orphan_and_cycle():
     assert [
         t.id for t in get_ancestors(cycle, cycle[0])
     ] == [2]
+@
+
+\subsection{Blocking Dependencies}%
+\label{sec:todo-blockers}
+
+Parents say what an item is part of; they do not say what has to
+happen first.  Grading a lab needs the submissions to be in, and
+writing the exam needs the course plan settled, but the submissions
+are not part of the grading.  The issue tracker beads, written for
+coding agents, keeps this as a link of its own, \enquote{blocks}, beside
+parent and child, and builds its most used question on it: [[bd ready]]
+lists the open issues with no open blocker.  We take both the link,
+[[blocked_by]] (\cref{sec:todo-blocked-by-field}), and the question,
+[[is_ready]] (\cref{sec:todo-ready}), which [[ready]], [[next]] and
+the schedule all ask.
+
+A blocks link may join any two items, wherever they sit: a top-level
+item may block a sub-item of an unrelated project, and the other way
+round.  What is not obvious is how a block meets the parents, and three
+rules settle it.
+
+\begin{description}
+\item[An item waits for its own blockers] An item is blocked while one
+  of its blockers is open, that is, exists and is not done.  A blocker
+  that was removed counts as closed (\cref{sec:todo-blocked-by-field}).
+\item[A blocked parent holds up its children] Working on a parent means
+  working on its children, since a parent completes when its last
+  child does.  If the parent may not start, its parts may not either,
+  so a block on an item reaches everything below it.
+\item[One clear path is enough] An item with several parents is blocked
+  through them only if \emph{every} path from the top level to it
+  passes a blocked ancestor.  The top level itself is never blocked, so
+  an item that is also top-level is never blocked through its other
+  parents.
+\end{description}
+
+The third rule is the one a tree never needed, and it follows from what
+a second place means.  An item under A and under D is a piece of work
+in both, and completes a parent in each, independently: finishing it
+counts towards A whether or not D is blocked.  Rollup is an
+\enquote{or} over the places, and so is readiness; the item is held up
+only if it is held up everywhere.  The same reasoning makes the top
+level count as a clear path.  Making an item top-level says that it can
+be taken up on its own, and a block on one project it also belongs to
+should not take that back.
+
+One kind of blocker is ignored: one that lies below the blocked item.
+\enquote{A waits for its own sub-item C} says nothing that rollup does
+not already say, since A completes only after C.  Taken at its word,
+the second rule would turn it into a deadlock instead: A is blocked, so
+C is blocked through A, and C would wait for itself.  So a blocker
+below the item counts neither for the item nor for what is below it;
+it is stored, but it holds nothing up.  Since a user who adds one
+presumably meant something by it, [[add]] and [[edit]] warn when they
+store one, and [[view]] marks it as having no effect
+(\cref{sec:todo-view-blockers}).
+
+Whether an item lies below another is a question about the item's
+ancestors, along every parent, which [[ancestors_of]] answers
+(\cref{sec:todo-parents}).  The warning is worded once, for both
+commands.
+
+<<sub-item helpers>>=
+def lies_below(todos, item, other_id, by_id=None):
+    """Return whether `item` lies below the item `other_id`,
+    along any of its parents.  `by_id` may pass a prebuilt
+    map from id to item."""
+    return other_id in {
+        a.id for a in ancestors_of(todos, item, by_id)
+    }
+
+
+def warn_blocker_below(blocked_id, blocker_id):
+    """Warn that `blocker_id`, below `blocked_id`, holds
+    nothing up."""
+    typer.echo(
+        f"Warning: #{blocker_id} lies below #{blocked_id}; "
+        "this blocker holds nothing up",
+        err=True,
+    )
+@
+
+\paragraph{Computing it once}
+Whether an item is blocked depends on the whole graph above it, and the
+callers ask it of every item.  We therefore compute the answer for all
+items at once, in a [[Blockers]] index, as [[children_by_parent]] does
+for the children.  The index holds two things.  [[own]] maps each item
+to the open blockers that count against it.  [[clear]] holds the items
+that are not blocked at all: those without an open blocker of their own
+that can be reached from the top level through such items.  That is the
+three rules turned into a walk: start from the items that have the top
+level among their parents, go down through children, and do not pass
+an item that waits for a blocker of its own.  A parent missing from the
+list ends a path as the top level does, the rule [[get_visible_roots]]
+applies to the same orphans, since a parent that no longer exists
+blocks nothing.  An item that a parent cycle cuts off from the top
+level, which only a hand edit can make, has no clear path and is
+therefore blocked.
+
+The cost is one pass over the items and their parent links, plus a
+walk up from each blocker to see whether it lies below the item it
+blocks.  At a few thousand items that is far below what loading the
+file costs.
+
+A done item blocks nothing, and neither do its own blockers: its work is
+finished, so there is nothing for them to hold up.  The caller may say
+which items to treat as done, which the deadlock check needs to try out
+completions that have not happened (\cref{sec:todo-stuck}); and it may
+pass the links, which do not depend on the status, so that it computes
+them once for many such tries.
+
+<<sub-item helpers>>=
+@dataclass
+class Blockers:
+    """Which items are blocked, in one state of the todos.
+
+    `own` maps an item's id to its open blockers that count
+    against it, and `clear` holds the ids of the items that
+    nothing blocks.  Build it with `blockers_index`.
+    """
+    by_id: dict[int, TodoItem]
+    own: dict[int, list[int]]
+    clear: set[int]
+
+
+def blocker_links(todos, by_id=None):
+    """Return each item's blockers that can hold it up.
+
+    Those are the blockers in `todos` that do not lie below
+    the item; a map from item id to a list of ids.
+    """
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
+    links = {}
+    for item in todos:
+        for blocker_id in item.blocked_by:
+            blocker = by_id.get(blocker_id)
+            if blocker is None or lies_below(
+                todos, blocker, item.id, by_id
+            ):
+                continue
+            links.setdefault(item.id, []).append(blocker_id)
+    return links
+
+
+def blockers_index(todos, done=None, links=None, by_id=None,
+                   children=None):
+    """Return the `Blockers` of `todos`.
+
+    An item is closed when it is done, or, if `done` is
+    given, when its id is in `done`.  `links` may pass
+    `blocker_links(todos)`, which does not depend on the
+    status, and `by_id` and `children` the maps from id to
+    item and from parent id to children.
+    """
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
+    if done is None:
+        done = {t.id for t in todos if t.status == "done"}
+    if links is None:
+        links = blocker_links(todos, by_id)
+    own = {}
+    for item_id, blocker_ids in links.items():
+        waiting = [b for b in blocker_ids if b not in done]
+        if waiting and item_id not in done:
+            own[item_id] = waiting
+    <<find the items nothing blocks>>
+    return Blockers(by_id, own, clear)
+@
+
+The walk starts from every item with an unblocked parent of the kind
+that needs no walk, the top level or a missing parent, and descends.
+An item already in [[clear]] is not visited again, which ends the walk
+on a diamond and on a cycle alike.
+
+<<find the items nothing blocks>>=
+if children is None:
+    children = children_by_parent(todos)
+clear = set()
+frontier = [
+    t for t in todos
+    if any(p == ROOT_ID or p not in by_id for p in parents_of(t))
+]
+while frontier:
+    item = frontier.pop()
+    if item.id in clear or item.id in own:
+        continue
+    clear.add(item.id)
+    frontier.extend(children.get(item.id, []))
+@
+
+The question the callers ask is whether one item is unblocked, and they
+ask it in two forms.  [[ready]] and the schedule ask it of the item as
+such: any clear path will do, which for an item without blockers of
+its own is membership in [[clear]].  [[next]], drilling into the active
+item's children, asks it along one parent only, the one it is drilling
+into: a child that is also top-level is still held up there if the
+active item is blocked, because the line the user is working in runs
+through it.  [[via]] names that parent.
+
+<<sub-item helpers>>=
+def is_unblocked(item, blockers, via=None):
+    """Return whether nothing blocks `item`.
+
+    Its own open blockers must be none, and one of its
+    parents, or `via` alone if given, must be the top level,
+    missing, or itself unblocked.  `blockers` is the
+    `blockers_index` of the todos.
+    """
+    if item.id in blockers.own:
+        return False
+    parents = parents_of(item) if via is None else [via]
+    return any(
+        p == ROOT_ID or p not in blockers.by_id
+        or p in blockers.clear
+        for p in parents
+    )
+@
+
+A person, though, wants to know \emph{why} an item is blocked, and an
+inherited block is the confusing kind: the item's own list is empty.
+[[blocking_reasons]] names each open blocker together with the
+ancestor it acts through, if any.  The ancestors are the nearest blocked
+one on each path up; nothing further up adds to the answer, since the
+path is closed already.  When some path is clear there is no inherited
+block, however many other paths are closed, and no ancestor is named.
+
+<<sub-item helpers>>=
+def blocking_ancestors(item, blockers):
+    """Return the ids of the nearest blocked ancestors of
+    `item` on its paths up, or `[]` if one path is clear."""
+    by_id = blockers.by_id
+    if any(
+        p == ROOT_ID or p not in by_id or p in blockers.clear
+        for p in parents_of(item)
+    ):
+        return []
+    found = []
+    seen = {item.id}
+    frontier = list(real_parents_of(item))
+    while frontier:
+        parent_id = frontier.pop(0)
+        if parent_id in seen or parent_id not in by_id:
+            continue
+        seen.add(parent_id)
+        if parent_id in blockers.own:
+            found.append(parent_id)
+        else:
+            frontier.extend(real_parents_of(by_id[parent_id]))
+    return found
+
+
+def blocking_reasons(item, blockers, via=None):
+    """Return what blocks `item` as (blocker, ancestor) pairs.
+
+    The ancestor is `None` for the item's own blockers and
+    the blocked ancestor the block comes through otherwise.
+    With `via`, only the path through that parent counts.
+    """
+    reasons = [(b, None) for b in blockers.own.get(item.id, [])]
+    if via is None:
+        ancestors = blocking_ancestors(item, blockers)
+    elif via in blockers.by_id and via not in blockers.clear:
+        ancestors = [via] if via in blockers.own else (
+            blocking_ancestors(blockers.by_id[via], blockers)
+        )
+    else:
+        ancestors = []
+    for ancestor_id in ancestors:
+        reasons.extend(
+            (b, ancestor_id) for b in blockers.own[ancestor_id]
+        )
+    return reasons
+@
+
+Let's verify the three rules on a small graph.  Course A has a lab
+A1; project B, unrelated, has a part B1, and A1 waits for B1.  A
+blocker removed from the list counts as closed, and a done one too:
+
+<<test functions>>=
+def test_blocker_in_another_subtree_blocks_until_done():
+  """A1 waits for B1, in another project, until B1 is done."""
+  todos = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="A1", parents=[1], blocked_by=[4]),
+    TodoItem(id=3, title="B"),
+    TodoItem(id=4, title="B1", parents=[3]),
+    TodoItem(id=5, title="Waits for a removed item", blocked_by=[99]),
+  ]
+  by_id = {t.id: t for t in todos}
+  blockers = blockers_index(todos)
+  assert not is_unblocked(by_id[2], blockers)
+  assert blocking_reasons(by_id[2], blockers) == [(4, None)]
+  assert is_unblocked(by_id[4], blockers)
+  assert is_unblocked(by_id[5], blockers)
+
+  by_id[4].status = "done"
+  assert is_unblocked(by_id[2], blockers_index(todos))
+@
+
+A block on a parent reaches its children and grandchildren, which name
+the parent as the way it reaches them; an item that is also top-level
+escapes it, except along the blocked parent:
+
+<<test functions>>=
+def test_blocked_parent_holds_up_what_is_below_it():
+  """Inherited through every path; one clear path is enough."""
+  todos = [
+    TodoItem(id=1, title="A", blocked_by=[9]),
+    TodoItem(id=2, title="A1", parents=[1]),
+    TodoItem(id=3, title="A11", parents=[2]),
+    TodoItem(id=4, title="Also top-level", parents=[ROOT_ID, 1]),
+    TodoItem(id=5, title="D"),
+    TodoItem(id=6, title="Under A and D", parents=[1, 5]),
+    TodoItem(id=9, title="X"),
+  ]
+  by_id = {t.id: t for t in todos}
+  blockers = blockers_index(todos)
+  assert not is_unblocked(by_id[2], blockers)
+  assert not is_unblocked(by_id[3], blockers)
+  assert blocking_reasons(by_id[3], blockers) == [(9, 1)]
+  assert is_unblocked(by_id[4], blockers)
+  assert blocking_reasons(by_id[4], blockers) == []
+  assert not is_unblocked(by_id[4], blockers, via=1)
+  assert blocking_reasons(by_id[4], blockers, via=1) == [(9, 1)]
+  assert is_unblocked(by_id[6], blockers)
+  assert is_unblocked(by_id[6], blockers, via=5)
+@
+
+A blocker below the item is redundant and holds nothing up, neither
+the item nor the sub-item it names:
+
+<<test functions>>=
+def test_blocker_below_the_item_does_not_count():
+  """A waiting for its own child C blocks neither A nor C."""
+  todos = [
+    TodoItem(id=1, title="A", blocked_by=[3]),
+    TodoItem(id=2, title="B", parents=[1]),
+    TodoItem(id=3, title="C", parents=[2]),
+  ]
+  blockers = blockers_index(todos)
+  assert blockers.own == {}
+  assert all(is_unblocked(t, blockers) for t in todos)
+@
+
+A missing parent ends a path as the top level does, so an orphan is
+unblocked unless it waits for something itself, and so is what lies
+below it; an item that a parent cycle cuts off from the top level is
+blocked, with no blocker to name:
+
+<<test functions>>=
+def test_orphans_are_clear_and_cut_off_items_blocked():
+  """A missing parent is a clear path; a parent cycle is none."""
+  todos = [
+    TodoItem(id=1, title="Orphan", parents=[99]),
+    TodoItem(id=2, title="Under the orphan", parents=[1]),
+    TodoItem(id=3, title="Waiting orphan", parents=[99],
+             blocked_by=[1]),
+    TodoItem(id=4, title="Cycle A", parents=[5]),
+    TodoItem(id=5, title="Cycle B", parents=[4]),
+  ]
+  by_id = {t.id: t for t in todos}
+  blockers = blockers_index(todos)
+  assert is_unblocked(by_id[1], blockers)
+  assert is_ready(todos, by_id[2], blockers=blockers)
+  assert not is_unblocked(by_id[3], blockers)
+  assert not is_unblocked(by_id[4], blockers)
+  assert blocking_reasons(by_id[4], blockers) == []
+@
+
+\subsection{Work That Can Never Start}%
+\label{sec:todo-stuck}
+
+Blocks and parents together can wait for each other in a circle, and
+then nothing in the circle ever becomes ready.  The plainest case is an
+ancestor that blocks its own descendant: the descendant waits for the
+ancestor to be done, and the ancestor, completing by rollup, waits for
+the descendant.  Two items blocking each other are the same circle
+without the parents, and the circle may also run through an inherited
+block: A blocked by B, and B blocked by A's own child.  No command
+would ever report such items as ready again, and nothing would say why;
+they would just drop out of [[ready]] and [[next]] for good.  So the
+commands that add a blocker or a parent refuse a change that would leave
+work in such a circle, and say which circle.
+
+\paragraph{Why not look for cycles}
+The obvious check is a cycle search in one graph that combines the two
+kinds of link: an edge from each blocked item to its blocker, from each
+parent to its children, and from each item to its ancestors' blockers.
+It gets two cases wrong.  An item waiting for its own child is harmless
+(\cref{sec:todo-blockers}), but the inherited edge from the child to
+its parent's blocker, the child itself, is a cycle of one.  And with
+several parents a cycle may run through one of an item's places while
+another place is clear, so that the item is not held up at all.  The
+graph does not express that a parent waits for \emph{all} its children
+but an item needs only \emph{one} clear path: an \enquote{and} and an
+\enquote{or}, which a cycle search treats alike.
+
+\paragraph{Simulating the work instead}
+We therefore ask the question directly: if every piece of work that
+could be done were done, what would be left?  [[find_stuck_items]] plays
+the list forward.  An item with open children can only complete by
+rollup, when all of them have, and each of its parents rolls up on its
+own.  Any other item completes as soon as nothing blocks it, by the
+very rules readiness uses, its several paths included.  That includes a
+pending parent whose children are all done already.  Rollup fires only
+when the last child becomes done, and not at all when that child
+belongs to another worker, so such a parent is an ordinary state, and
+it waits like a leaf: [[ready]] lists it only when nothing blocks it,
+and so must the simulation.  Which items complete by rollup is
+therefore fixed at the start, as the ones with an open child.  Each round
+completes everything it can; completions unblock other items and close
+families, and the rounds go on until one completes nothing.  The open
+items left over are stuck, and nothing else is: every other item has a
+sequence of completions that reaches it.  Which item becomes ready
+first does not matter, since a completion never makes another item less
+ready, and so the leftover is the same in whatever order the work is
+done.  The status of an item in progress is ignored, since it may be
+completed like a pending one.
+
+The simulation decides on the blocker rules that [[is_unblocked]]
+applies, not on [[is_ready]], because readiness also asks for the
+pending status, which the simulation has no use for.
+
+\paragraph{One completion at a time}
+Played in rounds, each of which rebuilds the blockers index and
+completes what it then can, the simulation needs as many rounds as the
+longest chain of waiting is long, and a chain of a thousand blockers,
+or a path a thousand levels deep, made it take seconds to tens of
+seconds.  So it keeps count instead, and handles one completion at a
+time.  Each open item knows how many of its blockers are still open,
+and each parent that completes by rollup how many of its children are;
+a completion lowers the counts of the items that waited for it, and an
+item whose count reaches zero is looked at again.  [[clear]], the set
+of items nothing blocks, only ever grows, so it is extended from the
+items that change rather than recomputed: an item joins when nothing
+of its own blocks it any more and one of its parents is the top level,
+missing, or clear, and then its children are looked at in turn.  A leaf
+that joins is complete; so is a parent whose count of open children
+reaches zero.  Every item and every link is then handled a bounded
+number of times, which makes the whole check about linear in the size
+of the list.  On four thousand items, realistically shaped, it takes a
+few hundredths of a second, and about a tenth when hundreds of them are
+stuck and have to be explained (below); a chain of four thousand
+blockers, a circle of four thousand, or a path two thousand levels
+deep, stays under two tenths.
+
+<<sub-item helpers>>=
+def simulate_completion(todos):
+    """Return the ids that could be completed, and the
+    `Blockers` of the state in which nothing more can.
+
+    Items with an open child complete by rollup, every other
+    item once nothing blocks it, until nothing changes.
+    """
+    by_id = {t.id: t for t in todos}
+    links = blocker_links(todos, by_id)
+    children = children_by_parent(todos)
+    done = {t.id for t in todos if t.status == "done"}
+    <<count what each open item waits for>>
+    <<complete one item at a time>>
+    return done, blockers_index(todos, done, links, by_id, children)
+@
+
+The counts start from the state as stored.  A blocker that is done
+already counts for nothing, and a parent with no open child does not
+complete by rollup at all; nor does a parent that is not in the list,
+since there is nothing to complete: an orphan's missing parent is only
+a key of the children map.  [[waiters]] is the reverse of the blocker
+links, the items each blocker holds up.
+
+<<count what each open item waits for>>=
+waiting = {
+    item_id: sum(1 for b in blocker_ids if b not in done)
+    for item_id, blocker_ids in links.items()
+}
+waiters = {}
+for item_id, blocker_ids in links.items():
+    for blocker_id in blocker_ids:
+        waiters.setdefault(blocker_id, []).append(item_id)
+open_children = {
+    parent_id: sum(1 for c in kids if c.id not in done)
+    for parent_id, kids in children.items()
+}
+by_rollup = {
+    p for p, count in open_children.items() if count and p in by_id
+}
+@
+
+[[join_clear]] is the walk of [[<<find the items nothing blocks>>]]
+started from one item, and completes the leaves it lets in.  The
+completed items wait in [[finished]] until their consequences have been
+drawn: the item itself no longer waits for anything, the items it
+blocked wait for one blocker fewer, and each rollup parent above it
+for one child fewer.  The first of these matters for a blocked parent
+that completes by rollup: while it was blocked, it kept everything
+below it out of [[clear]], a child that is done already included, and
+the open items below such a child can start only once the parent
+joins.
+
+<<complete one item at a time>>=
+clear = set()
+finished = []
+
+
+def complete(item_id):
+    done.add(item_id)
+    finished.append(item_id)
+
+
+def join_clear(start):
+    stack = [start]
+    while stack:
+        item = stack.pop()
+        if item.id in clear or (
+            item.id not in done and waiting.get(item.id, 0)
+        ):
+            continue
+        if not any(
+            p == ROOT_ID or p not in by_id or p in clear
+            for p in parents_of(item)
+        ):
+            continue
+        clear.add(item.id)
+        if item.id not in done and item.id not in by_rollup:
+            complete(item.id)
+        stack.extend(children.get(item.id, []))
+
+
+for item in todos:
+    join_clear(item)
+while finished:
+    item_id = finished.pop()
+    join_clear(by_id[item_id])
+    for waiter_id in waiters.get(item_id, []):
+        waiting[waiter_id] -= 1
+        if not waiting[waiter_id]:
+            join_clear(by_id[waiter_id])
+    for parent_id in real_parents_of(by_id[item_id]):
+        if parent_id in by_rollup and parent_id not in done:
+            open_children[parent_id] -= 1
+            if not open_children[parent_id]:
+                complete(parent_id)
+@
+
+What is left is the stuck items, and each of them waits for something
+that is stuck as well: an item with open children for one of them, any
+other item for a blocker of its own or of an ancestor.  Following those
+steps from a stuck item must therefore come back round, and the circle
+it walks is the explanation the user needs, as in \enquote{\#4 is
+blocked by \#2; \#2 waits for its sub-item \#4}.  The one exception is
+an item that a parent cycle cuts off from the top level, which no
+command can make and whose explanation says so.
+
+A circle can be long, and spelling it out in full for each of its items
+would cost the square of its length, in time and in text: a circle of a
+thousand blockers took seconds and printed a million steps.  The
+explanation therefore stops after [[STUCK_REASON_STEPS]] steps, with an
+ellipsis.  That is enough to see where an item is caught and which
+link to look at, and keeps the cost linear.
+
+<<constants>>=
+STUCK_REASON_STEPS = 10
+
+<<sub-item helpers>>=
+def find_stuck_items(todos):
+    """Return the open items of `todos` that can never be
+    completed, as a map from id to why.
+
+    The reason is the circle of waiting the item is in, such
+    as `#4 is blocked by #2; #2 waits for its sub-item #4`.
+    """
+    done, blockers = simulate_completion(todos)
+    children = children_by_parent(todos)
+
+    def waits_for(item_id):
+        open_children = [
+            c.id for c in children.get(item_id, [])
+            if c.id not in done
+        ]
+        if open_children:
+            return (
+                f"#{item_id} waits for its sub-item "
+                f"#{open_children[0]}",
+                open_children[0],
+            )
+        for blocker_id, via in blocking_reasons(
+            blockers.by_id[item_id], blockers
+        ):
+            return (
+                f"#{item_id} is blocked by #{blocker_id}"
+                if via is None else
+                f"#{item_id} is blocked via #{via} by #{blocker_id}",
+                blocker_id,
+            )
+        return f"#{item_id} is cut off from the top level", None
+
+    stuck = {}
+    for item in todos:
+        if item.id in done:
+            continue
+        steps, seen, current = [], set(), item.id
+        while current is not None and current not in seen:
+            if len(steps) == STUCK_REASON_STEPS:
+                steps.append("...")
+                break
+            seen.add(current)
+            step, current = waits_for(current)
+            steps.append(step)
+        stuck[item.id] = "; ".join(steps)
+    return stuck
+@
+
+The commands use the check as a comparison.  Items that are stuck
+already, perhaps since a hand edit, are not the change's fault, and
+refusing every change until the user had repaired them would make the
+repair itself impossible; [[ls --blocked]] reports them
+(\cref{sec:todo-ls-blocked}).  What is refused is a change that makes
+\emph{new} stuck items.  The caller finds the stuck items before the
+change, makes it on the state inside its locked callback, and asks this
+helper, whose exit abandons the write (\cref{sec:todo-read-modify-write}).
+
+Every path that adds links or reopens items has to run the check.  A
+new blocker or a new place can close a circle, and so can a removed
+place, which may have been an item's one clear path; and so can a done
+item made pending again, since a done blocker holds nothing up and an
+open one may.  [[add]] and [[edit]] check their links here; an editor
+that can reopen items or change places checks in its commit in the same
+way.  [[rm]] is the one exception: it reports the circles it leaves
+rather than refusing, since a removal that was asked for should not
+fail on what it leaves behind (\cref{sec:todo-rm-stuck}).  The
+comparison and the wording are therefore separate helpers, so that the
+reporting command and the refusing ones say the same thing.
+
+<<sub-item helpers>>=
+def new_stuck_items(todos, stuck_before):
+    """Return the stuck items of `todos`, as `find_stuck_items`
+    does, whose ids are not in `stuck_before`."""
+    return {
+        item_id: reason
+        for item_id, reason in find_stuck_items(todos).items()
+        if item_id not in stuck_before
+    }
+
+
+def stuck_report(stuck):
+    """Return the lines naming the items of `stuck`, a map
+    from id to reason, and their circles."""
+    return [
+        ", ".join(f"#{i}" for i in sorted(stuck))
+        + " could never be done:"
+    ] + [f"  {stuck[i]}" for i in sorted(stuck)]
+
+
+def refuse_new_stuck_items(todos, stuck_before):
+    """Exit with an error if `todos` holds stuck items that
+    are not among the ids in `stuck_before`."""
+    new = new_stuck_items(todos, stuck_before)
+    if not new:
+        return
+    first, *rest = stuck_report(new)
+    typer.echo(f"Error: refused, since {first}", err=True)
+    for line in rest:
+        typer.echo(line, err=True)
+    raise typer.Exit(1)
+@
+
+Let's verify the patterns the check exists for.  An ancestor blocking
+its own descendant, two items blocking each other, and a circle through
+an inherited block are all stuck, and say why:
+
+<<test functions>>=
+def test_find_stuck_items_finds_the_circles():
+  """Ancestor-descendant, blocker cycles and inherited cycles."""
+  ancestor = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="A1", parents=[1]),
+    TodoItem(id=3, title="A11", parents=[2], blocked_by=[1]),
+  ]
+  assert find_stuck_items(ancestor) == {
+    1: "#1 waits for its sub-item #2; #2 waits for its sub-item #3; "
+       "#3 is blocked by #1",
+    2: "#2 waits for its sub-item #3; #3 is blocked by #1; "
+       "#1 waits for its sub-item #2",
+    3: "#3 is blocked by #1; #1 waits for its sub-item #2; "
+       "#2 waits for its sub-item #3",
+  }
+
+  mutual = [
+    TodoItem(id=1, title="X", blocked_by=[2]),
+    TodoItem(id=2, title="Y", blocked_by=[1]),
+    TodoItem(id=3, title="Z", blocked_by=[2]),
+  ]
+  assert find_stuck_items(mutual)[3] == (
+    "#3 is blocked by #2; #2 is blocked by #1; #1 is blocked by #2"
+  )
+
+  inherited = [
+    TodoItem(id=1, title="A", blocked_by=[3]),
+    TodoItem(id=2, title="A1", parents=[1]),
+    TodoItem(id=3, title="B", blocked_by=[2]),
+  ]
+  assert find_stuck_items(inherited)[2] == (
+    "#2 is blocked via #1 by #3; #3 is blocked by #2"
+  )
+@
+
+The rest of the graph is not stuck: work outside the circle, a child
+blocking its own parent, and the shared items whose other path is
+clear.  In the last case, D waits for A, and the item under both A and
+D can start through A; finishing it completes A, which unblocks D, and
+D then rolls up on its own.  An item that is also top-level breaks a
+circle through its other parent in the same way.
+
+<<test functions>>=
+def test_find_stuck_items_lets_harmless_shapes_through():
+  """Redundant blocks and one clear path do not deadlock."""
+  assert find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="C", parents=[1]),
+  ]) == {}
+  assert find_stuck_items([
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="D", blocked_by=[1]),
+    TodoItem(id=3, title="Shared", parents=[1, 2]),
+  ]) == {}
+  assert find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="B", blocked_by=[3]),
+    TodoItem(id=3, title="Top and under A", parents=[ROOT_ID, 1]),
+  ]) == {}
+  assert set(find_stuck_items([
+    TodoItem(id=1, title="A", blocked_by=[2]),
+    TodoItem(id=2, title="B", blocked_by=[3]),
+    TodoItem(id=3, title="Only under A", parents=[1]),
+    TodoItem(id=4, title="Bystander"),
+  ])) == {1, 2, 3}
+@
+
+A done blocker frees what it blocked, and a done item is never stuck,
+whatever it points at:
+
+<<test functions>>=
+def test_find_stuck_items_ignores_done_work():
+  """Done items neither block nor get stuck."""
+  assert find_stuck_items([
+    TodoItem(id=1, title="X", blocked_by=[2], status="done"),
+    TodoItem(id=2, title="Y", blocked_by=[1]),
+  ]) == {}
+@
+
+A pending parent whose children are all done waits like a leaf, so a
+circle through its blocker is a circle, and [[edit]] refuses to close
+it:
+
+<<test functions>>=
+def test_parent_with_done_children_waits_like_a_leaf(temp_todo_dir):
+  """No rollup is coming; the parent's blockers hold it."""
+  todos = [
+    TodoItem(id=1, title="A", blocked_by=[3]),
+    TodoItem(id=2, title="Done child", parents=[1], status="done"),
+    TodoItem(id=3, title="B", blocked_by=[1]),
+  ]
+  assert set(find_stuck_items(todos)) == {1, 3}
+
+  todos[0].blocked_by = []
+  save_todos(4, todos)
+  result = runner.invoke(cli, ["edit", "1", "--add-blocker", "3"])
+  assert result.exit_code == 1, result.output
+  assert "#1 is blocked by #3; #3 is blocked by #1" in result.output
+@
+
+The counting is an optimization of the rounds, and must agree with
+them.  The test plays the rounds the plain way, rebuilding the index
+each round, and compares on random lists with several parents, parent
+cycles, done items and blockers anywhere:
+
+<<test functions>>=
+def stuck_by_rounds(todos):
+  """The open ids the round-by-round simulation leaves."""
+  children = children_by_parent(todos)
+  done = {t.id for t in todos if t.status == "done"}
+  by_rollup = {
+    p for p, kids in children.items()
+    if any(c.id not in done for c in kids)
+  }
+  while True:
+    blockers = blockers_index(todos, done)
+    completed = {
+      t.id for t in todos if t.id not in done and (
+        all(c.id in done for c in children[t.id])
+        if t.id in by_rollup else is_unblocked(t, blockers)
+      )
+    }
+    if not completed:
+      return {t.id for t in todos} - done
+    done |= completed
+
+
+def test_counting_simulation_agrees_with_rounds():
+  """The worklist leaves exactly what the rounds leave."""
+  import random
+  rng = random.Random(8)
+  for _ in range(300):
+    n = rng.randint(1, 12)
+    todos = [
+      TodoItem(
+        id=i, title=f"#{i}",
+        parents=rng.sample([ROOT_ID, *range(1, n + 3)],
+                           rng.randint(1, 2)),
+        status=rng.choice(["pending", "pending", "done"]),
+      )
+      for i in range(1, n + 1)
+    ]
+    for item in todos:
+      if rng.random() < 0.4:
+        item.blocked_by = rng.sample(range(1, n + 2), 1)
+    assert set(find_stuck_items(todos)) == stuck_by_rounds(todos)
+@
+
+Two shapes deserve a test of their own.  An orphan, whose parent is
+missing, is a key of the children map but no item, and completing the
+orphan must not try to roll that parent up.  And a blocked parent that
+completes by rollup has to join [[clear]] itself: P waits for X, its
+child C1 can start through the top level and completes P, and only
+then can G, below P's done child C2, start and free X.
+
+<<test functions>>=
+def test_simulation_handles_orphans_and_late_parents():
+  """Missing parents roll nothing up; a rolled-up parent clears."""
+  for parents in ([99], [ROOT_ID, 99]):
+    assert find_stuck_items(
+      [TodoItem(id=1, title="Orphan", parents=parents)]
+    ) == {}
+  assert find_stuck_items([
+    TodoItem(id=1, title="P", blocked_by=[5]),
+    TodoItem(id=2, title="C1", parents=[ROOT_ID, 1]),
+    TodoItem(id=3, title="C2", parents=[1], status="done"),
+    TodoItem(id=4, title="G", parents=[3]),
+    TodoItem(id=5, title="X", blocked_by=[4]),
+  ]) == {}
+@
+
+Rollup completes a parent whatever blocks it, here as in the real
+[[done]], which completes the parent when its last child is done.  So
+A, blocked by B, which waits for A, is not stuck when A's child can be
+done on its own: the child completes A, and A frees B.
+
+<<test functions>>=
+def test_rollup_completes_a_blocked_parent(temp_todo_dir):
+  """A parent's own blockers do not stop its rollup."""
+  todos = [
+    TodoItem(id=1, title="A", blocked_by=[2], who=default_username,
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="B", blocked_by=[1], who=default_username,
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=3, title="Child", parents=[ROOT_ID, 1],
+             who=default_username, created="2026-02-20T10:00:00"),
+  ]
+  assert find_stuck_items(todos) == {}
+
+  save_todos(4, todos)
+  result = runner.invoke(cli, ["done", "3"])
+  assert result.exit_code == 0, result.output
+  _, todos = load_todos()
+  assert {t.id: t.status for t in todos}[1] == "done"
+@
+
+Items that a parent cycle cuts off from the top level are stuck too,
+and a leaf below the cycle says why:
+
+<<test functions>>=
+def test_cut_off_items_are_stuck():
+  """A parent cycle with no way to the top level is stuck."""
+  stuck = find_stuck_items([
+    TodoItem(id=1, title="A", parents=[2]),
+    TodoItem(id=2, title="B", parents=[1]),
+    TodoItem(id=3, title="Leaf", parents=[1]),
+  ])
+  assert set(stuck) == {1, 2, 3}
+  assert stuck[3] == "#3 is cut off from the top level"
+@
+
+A long circle is explained to [[STUCK_REASON_STEPS]] steps and no
+further:
+
+<<test functions>>=
+def test_long_circle_explanation_is_cut_short():
+  """Fifteen items in a circle: ten steps and an ellipsis."""
+  todos = [
+    TodoItem(id=i, title=f"#{i}", blocked_by=[i % 15 + 1])
+    for i in range(1, 16)
+  ]
+  reason = find_stuck_items(todos)[1]
+  steps = reason.split("; ")
+  assert len(steps) == STUCK_REASON_STEPS + 1
+  assert steps[0] == "#1 is blocked by #2"
+  assert steps[-1] == "..."
 @
 
 \subsection{Context-Aware Child Priorities}%
@@ -9750,9 +10795,11 @@ def apply_todo_mutation(callback):
 The next two helpers are read-only policy operations. One picks the
 best top-level candidate when [[todo next]] has no active parent; the
 other renders the active stack as a forest based on real parent
-relationships rather than raw stack position.  We apply the same
-legacy-worker rule here too, so older top-level items without an
-explicit [[who]] remain visible to the default user.
+relationships rather than raw stack position.  The first is
+[[find_pending_by_priority]] with the top level as the parent, so the
+two agree on readiness and on the legacy-worker rule, under which
+older top-level items without an explicit [[who]] remain visible to
+the default user.
 
 Each active item is drawn once, under the parent its line runs
 through, with the stack itself as the context
@@ -9764,28 +10811,16 @@ forest.
 def get_top_level_pending_by_priority(
     todos: list[TodoItem],
     who: str | None = None,
+    blockers: "Blockers | None" = None,
 ) -> TodoItem | None:
-    """Return the highest-priority pending top-level todo.
+    """Return the highest-priority ready top-level todo.
 
-    Treats ``who=None`` as ``default_username``.
+    Treats ``who=None`` as ``default_username``.  `blockers`
+    may pass the `blockers_index` of `todos`.
     """
-    candidates = [
-        item for item in todos
-        if ROOT_ID in parents_of(item)
-        and item.status == "pending"
-    ]
-    if who:
-        candidates = [
-            item for item in candidates
-            if re.search(
-                who, item.who or default_username
-            )
-        ]
-    now = datetime.datetime.now()
-    candidates.sort(
-        key=lambda item: todo_display_sort_key(item, now)
+    return find_pending_by_priority(
+        todos, who=who, parent_id=ROOT_ID, blockers=blockers,
     )
-    return candidates[0] if candidates else None
 
 
 def render_active_todo_forest(
@@ -13081,6 +14116,204 @@ def test_add_refuses_bad_discovered_from(
   assert len(todos) == 2
 @
 
+\paragraph{What the new item waits for}%
+\label{sec:todo-add-blockers}
+
+An item is often added because of what it depends on or what depends
+on it: the grading that has to wait for the submissions, or the
+prerequisite that turned up while planning a lecture.  [[--blocked-by]]
+names the todos the new item waits for, and [[--blocks]] the todos that
+wait for it (\cref{sec:todo-blockers}); both can be repeated.  Saying
+it at once saves a second command, and an agent that files a
+prerequisite should not leave the dependent work looking ready in the
+meantime.
+
+[[--blocks]] changes other items, since the link is stored on the
+blocked one (\cref{sec:todo-blocked-by-field}), so it is applied inside
+the locked callback, to the items as they are stored then, like
+[[--add-label]] in [[edit]].  Each id given has to exist, which is
+checked with the other flags, before the editor opens or a question is
+asked.  An item to be blocked is looked up again under the lock, since
+the link has to be stored on it; a blocker removed in the meantime
+counts as closed and does no harm.
+
+<<argument and option definitions>>=
+blocked_by_opt = typer.Option(
+    "--blocked-by",
+    help="ID of a todo this one waits for (repeatable)",
+    autocompletion=complete_todo_ids)
+blocks_opt = typer.Option(
+    "--blocks",
+    help="ID of a todo that waits for this one (repeatable)",
+    autocompletion=complete_todo_ids)
+<<add command options>>=
+blocked_by: Annotated[list[int] | None, blocked_by_opt] = None,
+blocks: Annotated[list[int] | None, blocks_opt] = None,
+<<validate add options>>=
+require_existing_todos(todos, blocked_by, "--blocked-by")
+require_existing_todos(todos, blocks, "--blocks")
+<<helpers>>=
+def require_existing_todos(todos, todo_ids, flag):
+    """Exit with an error unless every id in `todo_ids` names
+    a todo in `todos`; `flag` names the option in the error."""
+    known = {t.id for t in todos}
+    for todo_id in todo_ids or []:
+        if todo_id not in known:
+            typer.echo(
+                f"Error: {flag} #{todo_id} not found", err=True,
+            )
+            raise typer.Exit(1)
+@
+
+A new item can make work stuck (\cref{sec:todo-stuck}), but only
+through its links: [[add --parent 7 --blocked-by 7]] makes the new item
+wait for its own parent, which waits for it.  The callback therefore
+notes which items were stuck before it adds anything, when there are
+links at all, and refuses the add if the links leave new ones.  An add
+without links adds a leaf that nothing waits for, which cannot close a
+circle, and skips the simulation.  Both ways of adding share the
+linking, as a function of the fresh state and the new item.  It warns
+when the new item blocks an item it lies below, a link that holds
+nothing up (\cref{sec:todo-blockers}).
+
+<<note what was stuck before linking>>=
+stuck_before = (
+    find_stuck_items(todos) if blocked_by or blocks else {}
+)
+<<helpers>>=
+def link_new_todo(todos, item, blocked_by, blocks, stuck_before):
+    """Store the blocks links of the newly added `item`.
+
+    `item` waits for the ids in `blocked_by`, and the items in
+    `blocks`, which must exist in `todos`, wait for `item`;
+    one that `item` lies below is warned about.  Exits if
+    that leaves stuck items that are not in `stuck_before`.
+    """
+    if not (blocked_by or blocks):
+        return
+    item.blocked_by = list(blocked_by or [])
+    for blocked_id in blocks or []:
+        blocked = require_todo(todos, blocked_id)
+        blocked.blocked_by = blocked.blocked_by + [item.id]
+        if lies_below(todos, item, blocked_id):
+            warn_blocker_below(blocked_id, item.id)
+    refuse_new_stuck_items(todos, stuck_before)
+@
+
+The command reports the links with the other properties of the new
+item, by id and title as [[view]] names parents
+(\cref{sec:todo-view-parents}), so that a mistyped id shows up as the
+wrong title at once.  Both ways of adding report them the same way:
+the flag path with the other properties after the commit, the editor
+path inside the callback, right after its own \enquote{Added} line.
+
+<<report the new todo's blocker links>>=
+if item.blocked_by:
+    typer.echo(
+        f"  Blocked by: {format_todo_refs(todos, item.blocked_by)}"
+    )
+if blocks:
+    typer.echo(f"  Blocks: {format_todo_refs(todos, blocks)}")
+
+<<helpers>>=
+def format_todo_refs(todos, todo_ids):
+    """Return `todo_ids` as ids and titles, such as
+    `#3 Submissions, #9 (removed)`."""
+    by_id = {t.id: t for t in todos}
+    return ", ".join(
+        f"#{i} {by_id[i].title}" if i in by_id else f"#{i} (removed)"
+        for i in todo_ids
+    )
+@
+
+Let's verify both directions and that the links reach the store:
+
+<<test functions>>=
+def test_add_links_blockers_both_ways(temp_todo_dir):
+  """--blocked-by is stored on the new item, --blocks on others."""
+  save_todos(3, [
+    TodoItem(id=1, title="Submissions", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Report", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, [
+    "add", "-t", "Grade", "--top-level", "--bottom",
+    "--blocked-by", "1", "--blocks", "2",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "  Blocked by: #1 Submissions" in result.output
+  assert "  Blocks: #2 Report" in result.output
+  _, todos = load_todos()
+  by_id = {t.id: t for t in todos}
+  assert by_id[3].blocked_by == [1]
+  assert by_id[2].blocked_by == [3]
+@
+
+The editor path links, and reports, the same way:
+
+<<test functions>>=
+def test_add_via_editor_links_blockers(temp_todo_dir):
+  """add --edit stores --blocked-by and --blocks too."""
+  save_todos(3, [
+    TodoItem(id=1, title="Submissions", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Report", created="2026-02-20T10:00:00"),
+  ])
+  with patch("nytid.cli.todo.open_editor", return_value="Grade\n"):
+    result = runner.invoke(cli, [
+      "add", "--edit", "--top-level", "--bottom",
+      "--blocked-by", "1", "--blocks", "2",
+    ])
+  assert result.exit_code == 0, result.output
+  assert "  Blocked by: #1 Submissions" in result.output
+  assert "  Blocks: #2 Report" in result.output
+  _, todos = load_todos()
+  by_id = {t.id: t for t in todos}
+  assert by_id[3].blocked_by == [1]
+  assert by_id[2].blocked_by == [3]
+@
+
+An unknown id is refused before anything is stored, and so is a new
+item that would wait for its own parent; a new child that blocks its
+parent is harmless and allowed, with a warning that the link holds
+nothing up:
+
+<<test functions>>=
+@pytest.mark.parametrize("args,message", [
+  (["--top-level", "--blocked-by", "9"], "--blocked-by #9 not found"),
+  (["--top-level", "--blocks", "9"], "--blocks #9 not found"),
+  (["--parent", "1", "--blocked-by", "1"],
+   "Error: refused, since #1, #2 could never be done:\n"
+   "  #1 waits for its sub-item #2; #2 is blocked by #1\n"),
+])
+def test_add_refuses_bad_blocker_links(temp_todo_dir, args, message):
+  """Unknown ids and new circles are refused; nothing is stored."""
+  save_todos(2, [
+    TodoItem(id=1, title="Lab", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, ["add", "-t", "New", "--bottom", *args])
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1]
+  assert todos[0].blocked_by == []
+
+
+def test_add_child_may_block_its_parent(temp_todo_dir):
+  """A child blocking its own parent is redundant, not refused."""
+  save_todos(2, [
+    TodoItem(id=1, title="Lab", created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, [
+    "add", "-t", "Part", "--parent", "1", "--bottom", "--blocks", "1",
+  ])
+  assert result.exit_code == 0, result.output
+  assert (
+    "Warning: #2 lies below #1; this blocker holds nothing up"
+    in result.output
+  )
+  _, todos = load_todos()
+  assert todos[0].blocked_by == [2]
+@
+
 Priority selection has three modes. [[--prio]] bypasses all inference.
 [[--top]] and [[--bottom]] keep the operation non-interactive by placing
 the item at one end of the current sibling list. Otherwise we fall back
@@ -13576,6 +14809,7 @@ estimated_hours = (
 typer.echo(f"Added todo #{item.id}: {item.title}")
 if len(item.parents) > 1:
     typer.echo(f"  Parents: {format_parents(todos, item.parents)}")
+<<report the new todo's blocker links>>
 if inherited_labels:
     typer.echo(f"  Labels: {', '.join(inherited_labels)}")
 if inherited_deadline:
@@ -13609,6 +14843,7 @@ sibling's subtree in the same callback
 
 <<append the new todo under the lock>>=
 def append_new_todo(next_id, todos, stack):
+    <<note what was stuck before linking>>
     for parent_id in parent_items:
         require_todo(todos, parent_id)
     item = TodoItem(
@@ -13633,6 +14868,7 @@ def append_new_todo(next_id, todos, stack):
         append_note_to_item(item, paragraph)
     todos.append(item)
     settle_placement(todos, item)
+    link_new_todo(todos, item, blocked_by, blocks, stuck_before)
     return next_id + 1, todos, stack, item
 
 *_, item = mutate_todo_state(append_new_todo)
@@ -13848,11 +15084,17 @@ priority_title = parsed.title
 
 
 def append_parsed_todos(next_id, todos, stack):
+    <<note what was stuck before linking>>
     for parent_id in parent_items:
         require_todo(todos, parent_id)
     <<create parent from parsed>>
     settle_placement(todos, parent_item)
     <<create children from parsed>>
+    link_new_todo(
+        todos, parent_item, blocked_by, blocks, stuck_before,
+    )
+    item = parent_item
+    <<report the new todo's blocker links>>
     return next_id, todos, stack
 
 
@@ -14901,6 +16143,7 @@ def ls(
     show_prio: Annotated[bool, ls_prio_opt] = False,
     output: Annotated[str | None,
                       ls_output_opt] = None,
+    blocked_only: Annotated[bool, ls_blocked_opt] = False,
 ):
     """List todo items in display order.
 
@@ -14918,11 +16161,16 @@ def ls(
     terminal: a rich table when stdout is a TTY, and headerless
     tab-separated rows in a pipe. `--format csv` adds a header row
     and commas; `--format json` gives structure.
+
+    `--blocked` lists only the open items that something blocks,
+    and those that can never start; the rich table marks blocked
+    items in every listing.
     """
     _, todos = load_todos()
 
     <<treat [[-n 0]] as unlimited>>
     <<filter todos>>
+    <<find what blocks the listed items>>
     <<restrict [[filtered]] to the requested depth>>
     <<query tracked time>>
 
@@ -15138,6 +16386,248 @@ def test_ls_status_filter(temp_todo_dir):
     )
     assert "Active task" in result.output
     assert "Pending task" not in result.output
+@
+
+\paragraph{Blocked work}%
+\label{sec:todo-ls-blocked}
+
+[[ready]] answers what can be started (\cref{sec:todo-ready}); the
+complementary question is what cannot, and why.  [[--blocked]] keeps
+the open items that something blocks (\cref{sec:todo-blockers}),
+through a blocker of their own or through their ancestors, and
+renders them as [[ls]] renders anything else, tree or flat, in every
+format.  A blocked item whose blocked parent is listed too sits under
+it in the tree, which shows where an inherited block comes from.
+
+It also keeps the items that can never be done
+(\cref{sec:todo-stuck}).  The commands refuse to make new ones, but a
+hand edit, or a file written before the check existed, may hold some,
+and this listing is where they are reported rather than refused: it
+is the user's way of finding them, to remove the link that closes the
+circle.  The simulation runs only for this listing, since the plain
+one never shows the result.
+
+Both questions are asked of all the todos, not of the filtered ones,
+for the reason readiness is (\cref{sec:todo-ready}): a block may come
+from an item that the filters hide.
+
+<<argument and option definitions>>=
+ls_blocked_opt = typer.Option(
+    "--blocked",
+    help="Show only open items that something blocks, "
+         "and work that can never start")
+<<find what blocks the listed items>>=
+blockers = blockers_index(todos)
+stuck = find_stuck_items(todos) if blocked_only else {}
+if blocked_only:
+    filtered = [
+        t for t in filtered
+        if t.status != "done"
+        and (not is_unblocked(t, blockers) or t.id in stuck)
+    ]
+@
+
+In the rich table, every listing marks a blocked item after its title,
+so that one does not need [[--blocked]] or [[view]] to see why a high
+item is not being worked on: [[[blocked: #12,#40] ]] names the open
+blockers of its own, and [[[blocked via #3] ]] the blocked ancestors a
+block comes through.  An item that can never be done is marked
+[[[stuck] ]], which only [[--blocked]] works out.  The marker is
+commentary, like the place notes of the tree, and so it stays out of
+the data formats, whose title column holds the title and nothing else.
+An item that a parent cycle cuts off from the top level is blocked
+without a blocker to name, and is marked as plainly blocked.
+
+<<helpers>>=
+def blocked_marker(item, blockers, stuck=()):
+    """Return the title marker of what blocks `item`, or "".
+
+    Names its own open blockers, the blocked ancestors a block
+    comes through, and `[stuck]` if its id is in `stuck`.
+    """
+    if item.status == "done":
+        return ""
+    reasons = blocking_reasons(item, blockers)
+    own = [b for b, via in reasons if via is None]
+    via = list(dict.fromkeys(v for _, v in reasons if v is not None))
+    parts = []
+    if own:
+        parts.append(
+            "[blocked: " + ",".join(f"#{b}" for b in own) + "]"
+        )
+    if via:
+        parts.append(
+            "[blocked via " + ",".join(f"#{a}" for a in via) + "]"
+        )
+    if not parts and not is_unblocked(item, blockers):
+        parts.append("[blocked]")
+    if item.id in stuck:
+        parts.append("[stuck]")
+    return " ".join(parts)
+@
+
+Below a rich table that lists stuck items, each one's circle is spelled
+out, as the refusals spell it out (\cref{sec:todo-stuck}), since a
+marker alone does not say which link to remove.
+
+<<explain the stuck items below the table>>=
+listed = {t.id for t in filtered}
+for item_id, reason in sorted(stuck.items()):
+    if item_id in listed:
+        console.print(Text(f"Stuck: {reason}", style="dim"))
+@
+
+Let's verify the markers: a blocker of the item's own, one inherited
+through a parent, an item that a top-level place keeps clear, and a
+done item, which says nothing:
+
+<<test functions>>=
+def save_blocked_fixture():
+  """Store #4 waiting for #1, its parent #2 waiting for #1 too."""
+  save_todos(7, [
+    TodoItem(
+      id=1, title="Blocker", priority=9.0,
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=2, title="Blocked parent", priority=8.0, blocked_by=[1],
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=3, title="Inherits", parents=[2], priority=7.5,
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=4, title="Waits", priority=7.0, blocked_by=[1, 6],
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=5, title="Escapes", parents=[ROOT_ID, 2], priority=6.0,
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=6, title="Done blocker", priority=5.0, status="done",
+      created="2026-02-20T10:00:00", who="me",
+    ),
+  ])
+
+
+def test_ls_marks_blocked_items(temp_todo_dir):
+  """The rich title says what blocks an item, and how."""
+  save_blocked_fixture()
+  result = runner.invoke(
+    cli, ["ls", "-r", "--flat", "--format", "rich", "--who", ""],
+    env={"COLUMNS": "200"},
+  )
+  assert result.exit_code == 0, result.output
+  lines = {
+    title: next(l for l in result.output.splitlines() if title in l)
+    for title in ("Blocker", "Blocked parent", "Inherits", "Waits",
+                  "Escapes")
+  }
+  assert "[blocked" not in lines["Blocker"]
+  assert "Blocked parent [blocked: #1]" in lines["Blocked parent"]
+  assert "Inherits [blocked via #2]" in lines["Inherits"]
+  assert "Waits [blocked: #1]" in lines["Waits"]
+  assert "[blocked" not in lines["Escapes"]
+@
+
+[[--blocked]] lists exactly the blocked items, in every format, with
+the inherited block as well:
+
+<<test functions>>=
+def test_ls_blocked_lists_only_blocked_items(temp_todo_dir):
+  """--blocked keeps own and inherited blocks, nothing else."""
+  save_blocked_fixture()
+  result = runner.invoke(cli, [
+    "ls", "--blocked", "-r", "--format", "json", "--who", "",
+  ])
+  assert result.exit_code == 0, result.output
+  assert sorted(r["id"] for r in json.loads(result.stdout)) == [2, 3, 4]
+  plain = runner.invoke(cli, ["ls", "--blocked", "--who", ""])
+  assert plain.exit_code == 0, plain.output
+  assert [l.split("\t")[0] for l in plain.output.splitlines()] == [
+    "2", "4",
+  ]
+@
+
+Work that is stuck already is listed and explained, not refused: the
+listing is how the user finds it.
+
+<<test functions>>=
+def test_ls_blocked_reports_stuck_items(temp_todo_dir):
+  """Stuck items are marked, and their circle explained."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Lab", created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=2, title="Part", parents=[1], blocked_by=[1],
+      created="2026-02-20T10:00:00", who="me",
+    ),
+    TodoItem(
+      id=3, title="Free", created="2026-02-20T10:00:00", who="me",
+    ),
+  ])
+  result = runner.invoke(cli, [
+    "ls", "--blocked", "-r", "--format", "rich", "--who", "",
+  ], env={"COLUMNS": "200"})
+  assert result.exit_code == 0, result.output
+  assert "Lab [stuck]" in result.output
+  assert "Part [blocked: #1] [stuck]" in result.output
+  assert "Free" not in result.output
+  assert (
+    "Stuck: #2 is blocked by #1; #1 waits for its sub-item #2"
+    in result.output
+  )
+@
+
+Items that a parent cycle cuts off from the top level are reported the
+same way.  They are no item's visible root, so it takes a listing of
+every depth to show them, as it does in a plain [[ls]]:
+
+<<test functions>>=
+def test_ls_blocked_reports_cut_off_items(temp_todo_dir):
+  """Cut-off items are listed as blocked and stuck."""
+  save_todos(4, [
+    TodoItem(id=1, title="A", parents=[2], who="me",
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="B", parents=[1], who="me",
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=3, title="Leaf", parents=[1], who="me",
+             created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, [
+    "ls", "--blocked", "-r", "--flat", "--format", "rich",
+    "--who", "",
+  ], env={"COLUMNS": "200"})
+  assert result.exit_code == 0, result.output
+  assert "Leaf [blocked] [stuck]" in result.output
+  assert "Stuck: #3 is cut off from the top level" in result.output
+@
+
+The blocks are worked out on all the todos, so a filter that hides the
+blocker does not hide the block, nor its marker:
+
+<<test functions>>=
+def test_ls_blocked_sees_blockers_the_filter_hides(temp_todo_dir):
+  """Another worker's blocker still blocks my item."""
+  save_todos(3, [
+    TodoItem(id=1, title="Theirs", who="other",
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Mine", who="me", blocked_by=[1],
+             created="2026-02-20T10:00:00"),
+  ])
+  listed = runner.invoke(cli, [
+    "ls", "--blocked", "--format", "json", "--who", "^me$",
+  ])
+  assert listed.exit_code == 0, listed.output
+  assert [r["id"] for r in json.loads(listed.stdout)] == [2]
+  rich = runner.invoke(cli, [
+    "ls", "--format", "rich", "--who", "^me$",
+  ], env={"COLUMNS": "200"})
+  assert "Mine [blocked: #1]" in rich.output
+  assert "Theirs" not in rich.output
 @
 
 Filters such as [[--who]] narrow [[filtered]] to a subset without
@@ -15784,8 +17274,9 @@ in [[FIELDS_AFTER_COMPUTED]] and moved behind the computed values, in
 the order of the list.  The list only grows: a later field is appended
 to it, after the ones already there, which keeps each of their
 positions too.  [[closed]] came first; [[claimed_by]] and
-[[context_claim]] (\cref{sec:todo-claim}) followed it, and
-[[discovered_from]] (\cref{sec:todo-discovered-from}) followed them.
+[[context_claim]] (\cref{sec:todo-claim}) followed it,
+[[discovered_from]] (\cref{sec:todo-discovered-from}) followed them,
+and the last two are described below.
 
 A listing that extends [[ls]]'s record with computed columns of its
 own, as [[ready]] does (\cref{sec:todo-ready}), meets the same problem
@@ -15805,10 +17296,20 @@ the meaning it always had, and [[parents]] is the fifth field to move
 behind the computed values.  The headerless rows thus grow by one
 column at the end and lose none.
 
+[[blocked_by]] (\cref{sec:todo-blocked-by-field}) is the sixth, after
+[[parents]].  Whether the item is blocked \emph{now} is deliberately not
+a computed column of its own.  The answer depends on other items, and
+on more than the stored list, since a block can come from an ancestor
+(\cref{sec:todo-blockers}); a script that wants it asks [[ready]], whose
+records carry the verdict, or [[ls --blocked]], which selects the
+blocked items (\cref{sec:todo-ls-blocked}).  A column added here would
+also have to go somewhere: in front of the late stored fields, as
+[[ready]]'s go, it would move every one of them in the pipe form.
+
 <<constants>>=
 FIELDS_AFTER_COMPUTED = (
     "closed", "claimed_by", "context_claim", "discovered_from",
-    "parents",
+    "parents", "blocked_by",
 )
 <<helpers>>=
 def ls_record(item, now, tracked_times, show_prio, computed=None):
@@ -15930,6 +17431,7 @@ else:
 
 console.print(table)
 <<show the truncation hint below the table>>
+<<explain the stuck items below the table>>
 @
 
 \paragraph{Saying so when the cap cut the listing}%
@@ -16423,13 +17925,15 @@ the same reason.
 <<helpers>>=
 def ls_row_cells(
     item, now, tracked_times, show_prio, depth=0, place="",
+    marker="",
 ):
     """Return the rich-table cells `todo ls` shows for `item`.
 
     The cells match the columns of the `todo ls` table: the
     priority cell is present only when `show_prio` is true, and the
-    title is indented `depth` levels and followed by `place`, the
-    tree's note on where else the item is, dimmed.
+    title is indented `depth` levels and followed by `marker`, what
+    blocks the item, and `place`, the tree's note on where else the
+    item is, dimmed.
     """
     from rich.padding import Padding
     from rich.text import Text
@@ -16460,6 +17964,7 @@ def ls_row_cells(
         ] if show_prio else []),
         Padding(
             Text(("\u2514\u2500 " if depth else "") + item.title)
+            + Text(f" {marker}" if marker else "", style="yellow")
             + Text(f" {place}" if place else "", style="dim"),
             (0, 0, 0, 2 * depth),
         ),
@@ -16478,6 +17983,7 @@ their walk reached.
 table.add_row(
     *ls_row_cells(
         item, now, tracked_times, show_prio, depth, place,
+        blocked_marker(item, blockers, stuck),
     )
 )
 @
@@ -16490,7 +17996,8 @@ Labels are a list, joined here with semicolons rather than commas so
 that the value stays one word to a reader that splits on the delimiter
 even after the quoting has been stripped away.  The parents are a list
 of ids and are joined the same way, the top level included as~[[0]]
-(\cref{sec:todo-parents-field}).  The GitHub link is a
+(\cref{sec:todo-parents-field}), and so are the blockers
+(\cref{sec:todo-blocked-by-field}).  The GitHub link is a
 dictionary of repository, type and number, rendered as [[repo#number]]:
 the spelling [[gh]] itself accepts and the one a reader would write in
 a commit message.  Flattening it drops the issue-versus-pull-request
@@ -16514,14 +18021,14 @@ CSV_OMITTED_FIELDS = ("env",)
 def csv_cell(name, value):
     """Return `value` rendered as the CSV cell of column `name`.
 
-    Labels and parents are joined with semicolons, a GitHub
+    Labels, parents and blockers are joined with semicolons, a GitHub
     link becomes `repo#number`, a path becomes its titles, and
     `None` becomes the empty string.  Every other value is rendered with `str`,
     matching what JSON would show.
     """
     if name == "labels":
         return ";".join(value or [])
-    if name == "parents":
+    if name in ("parents", "blocked_by"):
         return ";".join(str(p) for p in value or [])
     if name == "path":
         return format_todo_path(value)
@@ -16672,7 +18179,7 @@ else:
     typer.echo(buffer.getvalue(), nl=False)
 @
 
-Let's verify the pipe form: twenty-two tab-separated fields, no header,
+Let's verify the pipe form: twenty-three tab-separated fields, no header,
 and the flattened cells in their record positions, with the tracked
 hours still in the seventeenth.
 
@@ -16694,7 +18201,7 @@ def test_ls_piped_default_is_headerless_tsv(temp_todo_dir):
   lines = result.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 22
+  assert len(fields) == 23
   assert fields[1] == "Labelled task"
   assert fields[2] == "a;b"
   assert fields[16] == "0"
@@ -16734,13 +18241,14 @@ def test_ls_piped_keeps_computed_columns_in_place(temp_todo_dir):
   assert fields[21] == "7"
 @
 
-The parents are the latest of those fields.  The derived [[parent_id]]
-keeps the tenth column, holding one id as it always has, and the list
-comes last, after [[discovered_from]]:
+The parents and the blockers are the latest of those fields.  The
+derived [[parent_id]] keeps the tenth column, holding one id as it
+always has, the list of parents follows [[discovered_from]], and the
+blockers come last, joined like the parents:
 
 <<test functions>>=
 def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
-  """parent_id keeps column ten; parents is appended last."""
+  """parent_id keeps column ten; parents and blocked_by come last."""
   save_todos(5, [
     TodoItem(
       id=4, title="Parent", created="2026-02-20T10:00:00",
@@ -16748,11 +18256,11 @@ def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
     ),
     TodoItem(
       id=1, title="Shared", created="2026-02-20T10:00:00",
-      who="me", parents=[ROOT_ID, 4],
+      who="me", parents=[ROOT_ID, 4], blocked_by=[3, 2],
     ),
   ])
 
-  for flags, last in (([], 21), (["--prio"], 22)):
+  for flags, last in (([], 22), (["--prio"], 23)):
     result = runner.invoke(cli, ["ls", "--who", "", *flags])
     assert result.exit_code == 0, result.output
     row = next(
@@ -16761,7 +18269,8 @@ def test_ls_piped_keeps_parent_id_column(temp_todo_dir):
     )
     assert len(row) == last + 1
     assert row[9] == "4"
-    assert row[last] == "0;4"
+    assert row[last - 1] == "0;4"
+    assert row[last] == "2;3"
 @
 
 Free text is the case that rule exists for.  A note that spans two
@@ -16786,7 +18295,7 @@ def test_ls_piped_default_escapes_line_breaks(temp_todo_dir):
   lines = piped.output.splitlines()
   assert len(lines) == 1
   fields = lines[0].split("\t")
-  assert len(fields) == 22
+  assert len(fields) == 23
   assert fields[1] == "Tabbed\\ttitle"
   assert fields[11] == "one\\ntwo"
 
@@ -16883,7 +18392,7 @@ def test_ls_csv_header_matches_json_fields(temp_todo_dir):
         "parent_id", "who", "notes", "wd", "worktree",
         "command", "github", "tracked_hours", "closed",
         "claimed_by", "context_claim", "discovered_from",
-        "parents",
+        "parents", "blocked_by",
     ]
     assert rows[0]["labels"] == "a;b"
     assert rows[0]["notes"] == "first line\nsecond line"
@@ -16952,12 +18461,15 @@ one wants when choosing what to switch to.
 
 \paragraph{What ready means}
 
-An item is ready when it is pending and none of its children is
-still open.  The status condition is plain: a done item needs no work
-and an in-progress item already has a worker.  The condition on
-children is what makes the list a list of things one can actually
-do.  A parent is marked done by rollup when its last child is done,
-so working on a parent \emph{means} working on one of its children,
+An item is ready when it is pending, nothing blocks it, and none of
+its children is still open.  The status condition is plain: a done
+item needs no work and an in-progress item already has a worker.  The
+blocks are the ones \cref{sec:todo-blockers} defines: an open blocker
+of the item's own, or one of an ancestor on every path down to it.
+The condition on children is what makes the list a list of things one
+can actually do.  A parent is marked done by rollup when its last
+child is done, so working on a parent \emph{means} working on one of
+its children,
 and listing the parent as well would offer the same work twice.  The
 children counted are all of them, whoever they are assigned to: a
 parent whose remaining child belongs to an agent is not ready for its
@@ -16968,22 +18480,27 @@ agent, and an owner who wants to see what is waiting asks for
 [[--all]].
 
 Readiness is decided in one function, [[is_ready]], rather than in
-the command.  [[ready]] is the first caller, but not the only
-candidate: [[next]] and the schedule both pick pending items to work
-on, and a condition added to readiness---for instance an item that
-waits for another---has to reach every caller at once, which it does
-only if there is one definition to add it to.
+the command.  [[ready]] is the first caller, [[next]]
+(\cref{sec:todo-next-ready}) the second, and the schedule
+(\cref{cli.schedule}), which gives time only to work that can be
+started, the third.  A condition added to readiness, such as the
+blockers, has to reach every caller at once, which it does only if
+there is one definition to add it to.
 
 [[--all]] widens the listing without changing the definition: it also
 lists pending items whose children are open, for the user who wants
 to see the projects that are waiting.  The flag is a parameter of
 [[is_ready]] rather than a second test in the command, so that
-whatever else readiness comes to require still applies to those rows.
+whatever else readiness requires, the blockers included, still applies
+to those rows.  [[via]] restricts the paths that may be clear to the
+one through that parent, for a caller that asks about the children of
+the item it is working in (\cref{sec:todo-blockers}).
 
 A caller that asks about every item, as [[ready]] does, would pay for
 [[children_of]]'s scan of the whole list once per item, which is
-quadratic in the number of items.  Such a caller builds a map from
-parent to children once and passes it along.  The map is optional,
+quadratic in the number of items, and for building the blockers index
+once per item too.  Such a caller builds a map from parent to children
+and the blockers index once and passes them along.  Both are optional,
 and only a faster way to answer the same question, so the definition
 stays one function that a caller with a single item can use as is.
 
@@ -16997,17 +18514,25 @@ def children_by_parent(todos):
     return index
 
 
-def is_ready(todos, item, allow_open_children=False, children=None):
+def is_ready(todos, item, allow_open_children=False, children=None,
+             blockers=None, via=None):
     """Return whether `item` is ready to be worked on.
 
-    An item is ready when it is pending and none of its children in
-    `todos` is open (not done).  With `allow_open_children`, a
-    pending item with open children counts as well.  `children` may
-    pass `children_by_parent(todos)` to avoid scanning `todos`.
-    This is the single definition of readiness; callers should not
-    test the conditions themselves.
+    An item is ready when it is pending, nothing blocks it (see
+    `is_unblocked`), and none of its children in `todos` is open
+    (not done).  With `allow_open_children`, a pending, unblocked
+    item with open children counts as well; with `via`, only the
+    path through that parent may be clear.  `children` may pass
+    `children_by_parent(todos)` and `blockers` the
+    `blockers_index(todos)` to avoid scanning `todos`.  This is
+    the single definition of readiness; callers should not test
+    the conditions themselves.
     """
     if item.status != "pending":
+        return False
+    if blockers is None:
+        blockers = blockers_index(todos)
+    if not is_unblocked(item, blockers, via):
         return False
     if allow_open_children:
         return True
@@ -17056,6 +18581,43 @@ def test_is_ready_counts_children_of_every_worker():
     TodoItem(id=2, title="Child", parents=[1], who="dan-claude"),
   ]
   assert not is_ready(todos, todos[0])
+@
+
+A blocked item is not ready, with or without [[allow_open_children]],
+whether the block is its own or comes through its only parent; the
+index gives the same answers as building it on each call, and [[via]]
+holds back a child that is also top-level when the parent it is asked
+through is blocked:
+
+<<test functions>>=
+def test_is_ready_requires_nothing_to_block_the_item():
+  """Own and inherited blocks make an item unready."""
+  todos = [
+    TodoItem(id=1, title="Blocker"),
+    TodoItem(id=2, title="Waits", blocked_by=[1]),
+    TodoItem(id=3, title="Blocked parent", blocked_by=[1]),
+    TodoItem(id=4, title="Its child", parents=[3]),
+    TodoItem(id=5, title="Also top-level", parents=[ROOT_ID, 3]),
+  ]
+  by_id = {t.id: t for t in todos}
+  assert is_ready(todos, by_id[1])
+  assert not is_ready(todos, by_id[2])
+  assert not is_ready(todos, by_id[3], allow_open_children=True)
+  assert not is_ready(todos, by_id[4])
+  assert is_ready(todos, by_id[5])
+  assert not is_ready(todos, by_id[5], via=3)
+
+  blockers = blockers_index(todos)
+  for item in todos:
+    assert is_ready(todos, item, blockers=blockers) == is_ready(
+      todos, item
+    )
+
+  by_id[1].status = "done"
+  assert all(
+    is_ready(todos, by_id[i], allow_open_children=True)
+    for i in (2, 3, 4)
+  )
 @
 
 \paragraph{Where a row belongs}
@@ -17170,20 +18732,23 @@ from the items it can start.
 
 <<helpers>>=
 def ready_record(todos, item, now, tracked_times, show_prio,
-                 by_id=None, children=None):
+                 by_id=None, children=None, blockers=None):
     """Return the dictionary `todo ready` serializes for `item`.
 
     This is the `todo ls` record with `path`, the item's ancestors
     as `{id, title}` dicts, and `ready`, whether the item is ready
     by `is_ready`, among its computed columns, ahead of the stored
-    fields `ls` lists last.  `by_id` and `children` may pass
-    prebuilt maps from id to item and from parent id to children.
+    fields `ls` lists last.  `by_id`, `children` and `blockers` may
+    pass prebuilt maps from id to item and from parent id to
+    children, and the `blockers_index`.
     """
     return ls_record(
         item, now, tracked_times, show_prio,
         computed={
             "path": todo_path(todos, item, by_id),
-            "ready": is_ready(todos, item, children=children),
+            "ready": is_ready(
+                todos, item, children=children, blockers=blockers,
+            ),
         },
     )
 @
@@ -17243,9 +18808,10 @@ def ready(
 ):
     """List the items that are ready to work on, by priority.
 
-    An item is ready when it is pending and has no open sub-items.
-    Every depth is listed flat, in the order `todo ls` uses, with
-    the path of each item's ancestors.  Pass `--all` to also list
+    An item is ready when it is pending, no open item blocks it,
+    and it has no open sub-items.  Every depth is listed flat, in
+    the order `todo ls` uses, with the path of each item's
+    ancestors.  Pass `--all` to also list
     pending items whose sub-items are open.
 
     Labels, `--who` (default $USER, `''` for all), `-n` (`0` for
@@ -17256,6 +18822,7 @@ def ready(
     _, todos = load_todos()
     by_id = {t.id: t for t in todos}
     children = children_by_parent(todos)
+    blockers = blockers_index(todos)
 
     <<treat [[-n 0]] as unlimited>>
     <<select the ready items>>
@@ -17275,9 +18842,10 @@ def ready(
 @
 
 The two maps built first, from id to item and from parent to
-children, are what keeps the command linear: readiness is asked of
-every item and the path of every row, and both would otherwise scan
-the whole list each time.
+children, and the blockers index (\cref{sec:todo-blockers}) are what
+keeps the command linear: readiness is asked of every item and the
+path of every row, and both would otherwise scan the whole list each
+time.
 
 The selection is readiness first, then [[ls]]'s filters.  The order
 matters for correctness and not only for speed: readiness looks at
@@ -17289,7 +18857,7 @@ filtered = filter_by_labels_and_who(
     [
         t for t in todos
         if is_ready(todos, t, allow_open_children=include_parents,
-                    children=children)
+                    children=children, blockers=blockers)
     ],
     label_filter,
     who_filter,
@@ -17308,7 +18876,7 @@ import json as json_mod
 print(json_mod.dumps(
     [
         ready_record(todos, t, now, tracked_times, show_prio,
-                     by_id, children)
+                     by_id, children, blockers)
         for t in shown
     ],
     indent=2,
@@ -17318,7 +18886,7 @@ if not shown:
     return
 records = [
     ready_record(todos, item, now, tracked_times, show_prio,
-                 by_id, children)
+                 by_id, children, blockers)
     for item in shown
 ]
 <<choose the csv dialect>>
@@ -17439,6 +19007,28 @@ def test_ready_lists_leaves_by_default(temp_todo_dir):
   assert ready_ids("--who", "", "--all") == [1, 2, 3, 5, 6]
 @
 
+A blocked item drops out until its blocker is done, while the blocker
+itself is listed:
+
+<<test functions>>=
+def test_ready_leaves_out_blocked_items(temp_todo_dir):
+  """A blocked item is listed only once its blocker is done."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Collect submissions", priority=4.0,
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Grade", priority=5.0, blocked_by=[1],
+      created="2026-02-20T10:00:00", who=default_username,
+    ),
+  ])
+  assert ready_ids("--who", "") == [1]
+  done = runner.invoke(cli, ["done", "1"])
+  assert done.exit_code == 0, done.output
+  assert ready_ids("--who", "") == [2]
+@
+
 A parent whose only open child belongs to another worker waits on
 that worker: it leaves its owner's list, and the child appears in the
 other worker's.
@@ -17536,13 +19126,13 @@ def test_ready_json_carries_path_and_ready(temp_todo_dir):
   )
   assert result.exit_code == 0
   rows = {r["id"]: r for r in json.loads(result.stdout)}
-  assert list(rows[3])[-8:] == [
+  assert list(rows[3])[-9:] == [
     "tracked_hours", "path", "ready",
     *FIELDS_AFTER_COMPUTED,
   ]
   assert FIELDS_AFTER_COMPUTED == (
     "closed", "claimed_by", "context_claim", "discovered_from",
-    "parents",
+    "parents", "blocked_by",
   )
   assert rows[3]["path"] == [
     {"id": 1, "title": "Course X"},
@@ -18151,6 +19741,131 @@ def test_view_shows_where_an_item_came_from(temp_todo_dir):
   )
   assert rich.exit_code == 0, rich.output
   assert "#1 Fix the parser" in rich.output
+@
+
+\paragraph{What the item waits for}%
+\label{sec:todo-view-blockers}
+
+[[view]] is where a user goes to learn why an item is not offered, so
+it names every blocker, one line each, as \enquote{Blocked by: \#B
+title (status)}.  The status is shown because the list holds closed
+blockers too: a done blocker no longer holds anything up, and the line
+says so instead of leaving the reader to look it up.  A blocker that was
+removed is named as removed, as the provenance names a removed source,
+and one that lies below the item says that it has no effect
+(\cref{sec:todo-blockers}).
+
+The item's own list is not the whole answer, though.  A block may come
+through an ancestor (\cref{sec:todo-blockers}), and then the item's
+list is empty while it is still held up.  Such a block gets the same
+line with \enquote{via \#A} added, naming the blocked ancestor, for each
+open blocker that holds the item up that way.  An item that some path
+keeps clear has no such line, since nothing is inherited then.
+
+The link is read the other way as well, like [[discovered_from]]:
+\enquote{Blocks} lists the items that wait for this one, which are the
+work its completion frees.
+
+<<collect metadata fields>>=
+by_id = {t.id: t for t in todos}
+for blocker_id in item.blocked_by:
+    fields.append((
+        "Blocked by", describe_blocker(todos, by_id, blocker_id, item),
+    ))
+if item.status != "done":
+    for blocker_id, via in blocking_reasons(
+        item, blockers_index(todos)
+    ):
+        if via is not None:
+            fields.append((
+                "Blocked by",
+                f"{describe_blocker(todos, by_id, blocker_id)} "
+                f"via #{via}",
+            ))
+waiting = [t for t in todos if item.id in t.blocked_by]
+if waiting:
+    fields.append(("Blocks", format_todo_refs(todos, [
+        t.id for t in waiting
+    ])))
+<<helpers>>=
+def describe_blocker(todos, by_id, blocker_id, item=None):
+    """Return a blocker as `#3 Title (status)`, or as
+    `#3 (removed)` if `by_id` does not have it.
+
+    If the blocker lies below `item`, which it then cannot
+    hold up, `(below #N, no effect)` is added.
+    """
+    blocker = by_id.get(blocker_id)
+    if blocker is None:
+        return f"#{blocker_id} (removed)"
+    words = f"#{blocker_id} {blocker.title} ({blocker.status})"
+    if item is not None and lies_below(todos, blocker, item.id, by_id):
+        words += f" (below #{item.id}, no effect)"
+    return words
+@
+
+Let's verify the lines: an own blocker that is done, one that was
+removed, an inherited one, and the reverse list on the blocker:
+
+<<test functions>>=
+def test_view_shows_blockers_both_ways(temp_todo_dir):
+  """view names own and inherited blockers, and what it blocks."""
+  save_todos(5, [
+    TodoItem(id=1, title="Submissions", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=2, title="Lab", blocked_by=[1],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Grade", parents=[2], blocked_by=[4, 9],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=4, title="Rubric", status="done",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  grade = runner.invoke(cli, ["view", "3", "--format", "plain"])
+  assert grade.exit_code == 0, grade.output
+  assert "  Blocked by: #4 Rubric (done)\n" in grade.output
+  assert "  Blocked by: #9 (removed)\n" in grade.output
+  assert (
+    "  Blocked by: #1 Submissions (pending) via #2\n" in grade.output
+  )
+  assert "Blocks" not in grade.output
+
+  submissions = runner.invoke(cli, ["view", "1", "--format", "plain"])
+  assert "  Blocks: #2 Lab\n" in submissions.output
+  assert "Blocked by" not in submissions.output
+
+  rich = runner.invoke(
+    cli, ["view", "3", "--format", "rich"], env={"COLUMNS": "200"},
+  )
+  assert rich.exit_code == 0, rich.output
+  assert "#1 Submissions (pending) via #2" in rich.output
+@
+
+A blocker below the item is shown with the note that it has no effect:
+
+<<test functions>>=
+def test_view_marks_a_blocker_below_the_item(temp_todo_dir):
+  """A child blocking its parent is shown as having no effect."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Lab", blocked_by=[2],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Part", parents=[1],
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  result = runner.invoke(cli, ["view", "1", "--format", "plain"])
+  assert result.exit_code == 0, result.output
+  assert (
+    "  Blocked by: #2 Part (pending) (below #1, no effect)\n"
+    in result.output
+  )
 @
 
 For GitHub-linked items, we fetch the issue body and comments
@@ -19857,6 +21572,11 @@ def edit(
     keep_prio: Annotated[bool, keep_prio_opt] = False,
     discovered_from: Annotated[int | None,
                                edit_discovered_from_opt] = None,
+    add_blocker: Annotated[list[int] | None,
+                           add_blocker_opt] = None,
+    remove_blocker: Annotated[list[int] | None,
+                              remove_blocker_opt] = None,
+    blocks: Annotated[list[int] | None, blocks_opt] = None,
 ):
     """Edit an existing todo item.
 
@@ -19949,6 +21669,7 @@ if clear_command:
 elif run_command is not None:
     item.command = run_command
 <<set the edited item's [[discovered_from]]>>
+<<check the blocker edits>>
 @
 
 Clearing must leave the JSON with [[None]], not [[""]], and we check
@@ -20406,7 +22127,9 @@ list should be, so combining them is refused; and an id both added and
 removed is refused as well.  Adding a place the item already has, or
 removing one it does not have, is a no-op that warns, as for labels.
 Each added parent must exist and must not lie below the item, the
-check [[--parent]] makes (\cref{sec:todo-edit-parent}).  The ranking
+check [[--parent]] makes (\cref{sec:todo-edit-parent}), and a change
+of places that leaves work waiting in a circle with the blockers is
+refused under the lock (\cref{sec:todo-stuck}).  The ranking
 context the item had before the change is kept, since the priority
 below depends on whether the change took it away.
 
@@ -20963,6 +22686,231 @@ def test_edit_refuses_bad_discovered_from(
   assert todos[1].discovered_from == 1
 @
 
+\paragraph{Adding and removing blockers}%
+\label{sec:todo-edit-blockers}
+
+Blockers are found after the fact more often than parents are: work
+turns out to need something only once it has started.
+[[--add-blocker]] and [[--remove-blocker]] change the item's
+[[blocked_by]] relative to what it holds, and can be repeated, as
+[[--add-label]] and [[--remove-label]] do for the labels; there is no
+flag that replaces the whole list, since one rarely knows all of an
+item's blockers at once.  [[--blocks]] is [[add]]'s option
+(\cref{sec:todo-add-blockers}): it makes other items wait for this
+one.  An id added and removed at once is refused, and so is the item
+itself, which cannot wait for itself
+(\cref{sec:todo-blocked-by-field}).  Adding a blocker the item already
+has, or removing one it does not have, is a no-op that warns.  An added
+blocker and an item to be blocked must exist; a removed one need not,
+since removing what is no longer there is how a stale link is cleaned
+up.
+
+The check runs on the snapshot, before anything is stored; the edit
+itself happens under the lock (below).  It also warns about a blocker
+that lies below the item it would block, either way round, since that
+link holds nothing up (\cref{sec:todo-blockers}).
+
+<<argument and option definitions>>=
+add_blocker_opt = typer.Option(
+    "--add-blocker",
+    help="Make the item wait for this todo ID (repeatable)",
+    autocompletion=complete_todo_ids)
+remove_blocker_opt = typer.Option(
+    "--remove-blocker",
+    help="Stop the item waiting for this todo ID (repeatable)",
+    autocompletion=complete_todo_ids)
+<<check the blocker edits>>=
+for flag, ids in [("--add-blocker", add_blocker), ("--blocks", blocks)]:
+    require_existing_todos(todos, ids, flag)
+    if item.id in (ids or []):
+        typer.echo(f"Error: #{item.id} cannot block itself", err=True)
+        raise typer.Exit(1)
+<<warn about blockers below what they block>>
+try:
+    _, warnings = apply_blocker_edits(
+        item.blocked_by, add_blocker or [], remove_blocker or [],
+    )
+except ValueError as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(1)
+for warning in warnings:
+    typer.echo(f"Warning: {warning}", err=True)
+@
+
+The edit is a function of the list, so that the commit can apply it
+again to the list as it is stored then, as [[apply_parent_edits]] does
+for the parents.
+
+<<warn about blockers below what they block>>=
+for blocker_id in add_blocker or []:
+    if lies_below(todos, require_todo(todos, blocker_id), item.id):
+        warn_blocker_below(item.id, blocker_id)
+for blocked_id in blocks or []:
+    if lies_below(todos, item, blocked_id):
+        warn_blocker_below(blocked_id, item.id)
+<<helpers>>=
+def apply_blocker_edits(blocked_by, add, remove):
+    """Return `blocked_by` with `add` added and `remove`
+    removed, and the warnings for no-op edits.
+
+    Raises `ValueError` when an id is both added and removed.
+    """
+    both = sorted(set(add) & set(remove))
+    if both:
+        raise ValueError(
+            f"#{both[0]} cannot be both added and removed"
+        )
+    warnings = [
+        f"already blocked by #{b}" for b in add if b in blocked_by
+    ] + [
+        f"not blocked by #{b}" for b in remove if b not in blocked_by
+    ]
+    return sorted((set(blocked_by) - set(remove)) | set(add)), warnings
+@
+
+Let's verify the three flags and what the command says about them:
+
+<<test functions>>=
+def save_three_items():
+  """Store three top-level items, #3 waiting for #1."""
+  save_todos(4, [
+    TodoItem(id=1, title="One", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Two", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=3, title="Three", created="2026-02-20T10:00:00",
+      blocked_by=[1],
+    ),
+  ])
+
+
+def test_edit_adds_and_removes_blockers(temp_todo_dir):
+  """--add-blocker, --remove-blocker and --blocks change the links."""
+  save_three_items()
+  result = runner.invoke(cli, [
+    "edit", "3", "--add-blocker", "2", "--remove-blocker", "1",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "#3 now waits for #2 Two" in result.output
+  assert "#3 no longer waits for #1 One" in result.output
+  result = runner.invoke(cli, ["edit", "1", "--blocks", "2"])
+  assert result.exit_code == 0, result.output
+  assert "Now waiting for #1: #2 Two" in result.output
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos] == [[], [1], [2]]
+@
+
+Contradictions, the item itself and unknown ids are refused, and a
+no-op only warns:
+
+<<test functions>>=
+@pytest.mark.parametrize("args,message", [
+  (["--add-blocker", "2", "--remove-blocker", "2"],
+   "#2 cannot be both added and removed"),
+  (["--add-blocker", "3"], "#3 cannot block itself"),
+  (["--blocks", "3"], "#3 cannot block itself"),
+  (["--add-blocker", "9"], "--add-blocker #9 not found"),
+  (["--blocks", "9"], "--blocks #9 not found"),
+])
+def test_edit_refuses_bad_blocker_edits(temp_todo_dir, args, message):
+  """Bad blocker edits change nothing."""
+  save_three_items()
+  result = runner.invoke(cli, ["edit", "3", *args])
+  assert result.exit_code == 1
+  assert message in result.output
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos] == [[], [], [1]]
+
+
+def test_edit_blocker_no_op_warns(temp_todo_dir):
+  """A blocker already there, or one not there, only warns."""
+  save_three_items()
+  result = runner.invoke(cli, [
+    "edit", "3", "--add-blocker", "1", "--remove-blocker", "2",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "Warning: already blocked by #1" in result.output
+  assert "Warning: not blocked by #2" in result.output
+@
+
+A blocker below the item is stored with a warning, whichever item the
+edit is run on:
+
+<<test functions>>=
+@pytest.mark.parametrize("args", [
+  ["2", "--add-blocker", "4"],
+  ["4", "--blocks", "2"],
+])
+def test_edit_warns_about_a_blocker_below(temp_todo_dir, args):
+  """A parent waiting for its child is stored, with a warning."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(5, todos + [TodoItem(id=4, title="Four", parents=[2])])
+  result = runner.invoke(cli, ["edit", *args])
+  assert result.exit_code == 0, result.output
+  assert (
+    "Warning: #4 lies below #2; this blocker holds nothing up"
+    in result.output
+  )
+  _, todos = load_todos()
+  assert todos[1].blocked_by == [4]
+@
+
+A link can also become redundant without being touched.  Moving an
+item with [[--parent]], or giving it a place with [[--add-parent]],
+puts the item and everything below it under new ancestors, and an
+ancestor that was waiting for one of them now waits for something
+below it, which holds nothing up.  The edit warns about those links as
+well: the ones that lie below what they block after the move and did
+not before.  Both states are the snapshot's, the earlier one with a
+stand-in that has the item's old places.
+
+<<edit via cli flags>>=
+if item.parents != before["parents"]:
+    stand_in = copy.copy(item)
+    stand_in.parents = before["parents"]
+    earlier = [stand_in if t.id == item.id else t for t in todos]
+    for blocked_id, blocker_id in sorted(
+        blockers_below(todos) - blockers_below(earlier)
+    ):
+        warn_blocker_below(blocked_id, blocker_id)
+<<helpers>>=
+def blockers_below(todos):
+    """Return the (blocked, blocker) id pairs in `todos` whose
+    blocker lies below the item it blocks."""
+    by_id = {t.id: t for t in todos}
+    return {
+        (item.id, blocker_id)
+        for item in todos for blocker_id in item.blocked_by
+        if blocker_id in by_id
+        and lies_below(todos, by_id[blocker_id], item.id, by_id)
+    }
+@
+
+Let's verify it on a move and on an added place: \#2 waits for \#3,
+and \#3 is put under \#2.
+
+<<test functions>>=
+@pytest.mark.parametrize("args", [
+  ["--parent", "2", "--top"],
+  ["--add-parent", "2", "--top"],
+])
+def test_edit_warns_when_a_move_makes_a_blocker_below(
+  temp_todo_dir, args,
+):
+  """A move that puts a blocker below what it blocks warns."""
+  save_three_items()
+  _, todos = load_todos()
+  todos[1].blocked_by = [3]
+  todos[2].blocked_by = []
+  save_todos(4, todos)
+  result = runner.invoke(cli, ["edit", "3", *args])
+  assert result.exit_code == 0, result.output
+  assert (
+    "Warning: #3 lies below #2; this blocker holds nothing up"
+    in result.output
+  )
+@
+
 A priority is a position in one list, not a property of the item.  The
 number~[[5.0]] means \enquote{above the [[4.5]] next to me}; carried
 into a different set of siblings it means whatever those siblings
@@ -21018,6 +22966,7 @@ if added_places:
     typer.echo(
         f"#{todo_id} is now also {describe_places(added_places)}"
     )
+<<report the blocker edits>>
 @
 
 A kept number is only a position if it falls inside the new parent's
@@ -21097,6 +23046,7 @@ leaves every range as it was, and nothing moves.
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
     fresh = require_todo(todos, todo_id)
+    <<note what was stuck before the edit>>
     relative_parents = bool(add_parent or remove_parent)
     if relative_parents:
         new_parents, _ = apply_parent_edits(
@@ -21127,10 +23077,172 @@ def commit_flag_edits(next_id, todos, stack):
         )
     fresh.parents = new_parents
     settle_placement(todos, fresh, old_range, old_place)
+    <<apply the blocker edits to the fresh state>>
     return next_id, todos, stack, fresh.priority
 
 
 *_, kept_priority = mutate_todo_state(commit_flag_edits)
+@
+
+The blocker edits are relative too, and since no flag sets
+[[blocked_by]] outright, the snapshot's list is never changed and the
+replay leaves the stored list alone.  The edits are applied to the
+fresh list instead, so that a blocker another process added meanwhile
+survives, and [[--blocks]] is applied to the items to be blocked as
+they are stored now; each of them must still exist, since the link is
+stored on it.
+
+A move, a new place and a new blocker can each close a circle of
+waiting (\cref{sec:todo-stuck}): [[--add-blocker]] of the item's own
+ancestor, or [[--add-parent]] under an item it already waits for, as
+well as two items blocking each other.  So whenever an edit changes
+links of either kind, the callback notes the stuck items first and
+refuses the edit if it leaves new ones.  Doing it here, on the fresh
+state, is what makes two edits from one snapshot safe: each closes
+only half the circle, and the one that commits second sees the first.
+Removing a link is checked as well, since removing a place can close
+a circle too: an item that is top-level and under A escapes a circle
+through A only as long as it stays top-level.
+
+<<note what was stuck before the edit>>=
+links_edited = bool(
+    parent is not None or add_parent or remove_parent
+    or add_blocker or remove_blocker or blocks
+)
+stuck_before = find_stuck_items(todos) if links_edited else {}
+<<apply the blocker edits to the fresh state>>=
+fresh.blocked_by, _ = apply_blocker_edits(
+    fresh.blocked_by, add_blocker or [], remove_blocker or [],
+)
+for blocked_id in blocks or []:
+    blocked = require_todo(todos, blocked_id)
+    blocked.blocked_by = blocked.blocked_by + [todo_id]
+if links_edited:
+    refuse_new_stuck_items(todos, stuck_before)
+@
+
+The command reports the links it changed, by id and title, after the
+places:
+
+<<report the blocker edits>>=
+for verb, ids in (
+    ("now waits for", add_blocker),
+    ("no longer waits for", remove_blocker),
+):
+    if ids:
+        typer.echo(
+            f"#{todo_id} {verb} {format_todo_refs(todos, ids)}"
+        )
+if blocks:
+    typer.echo(
+        f"Now waiting for #{todo_id}: {format_todo_refs(todos, blocks)}"
+    )
+@
+
+Let's verify that every way of closing a circle is refused and leaves
+the file as it was: an ancestor made the blocker of its descendant, two
+items made to block each other, a circle through an inherited block,
+and an item put under the very item it waits for, as an added place or
+by a move.  Each fixture starts from the same three top-level items,
+\#3 waiting for \#1, with whatever else the case needs.
+
+<<test functions>>=
+@pytest.mark.parametrize("extra,args", [
+  ([TodoItem(id=4, title="Four", parents=[2])],
+   ["4", "--add-blocker", "2"]),
+  ([], ["1", "--add-blocker", "3"]),
+  ([TodoItem(id=4, title="Four", parents=[1])],
+   ["2", "--blocks", "1", "--add-blocker", "4"]),
+  ([], ["3", "--add-parent", "1", "--top"]),
+  ([], ["3", "--parent", "1", "--top"]),
+])
+def test_edit_refuses_a_circle_of_waiting(temp_todo_dir, extra, args):
+  """Edits that leave work stuck are refused; the file stays."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + extra)
+  stored = get_todo_file().read_text()
+  result = runner.invoke(cli, ["edit", *args])
+  assert result.exit_code == 1, result.output
+  assert "could never be done" in result.output
+  assert get_todo_file().read_text() == stored
+@
+
+A removed place can close a circle as well.  \#4 is under \#3, which
+waits for \#1, and is also top-level; \#1 may then wait for \#4, which
+can start through the top level, but taking \#4 off the top level
+would close the circle:
+
+<<test functions>>=
+def test_edit_refuses_removing_the_way_out(temp_todo_dir):
+  """Dropping the clear place of a shared item can deadlock."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + [
+    TodoItem(id=4, title="Four", parents=[ROOT_ID, 3]),
+  ])
+  result = runner.invoke(cli, ["edit", "1", "--add-blocker", "4"])
+  assert result.exit_code == 0, result.output
+  result = runner.invoke(
+    cli, ["edit", "4", "--remove-parent", "0", "--top"],
+  )
+  assert result.exit_code == 1, result.output
+  assert (
+    "#4 is blocked via #3 by #1; #1 is blocked by #4" in result.output
+  )
+@
+
+A child blocking its own parent is no circle, and is allowed; and work
+that is stuck already, say since a hand edit, does not keep the user
+from editing other items, or from repairing it:
+
+<<test functions>>=
+def test_edit_allows_harmless_and_repairing_edits(temp_todo_dir):
+  """Child-blocks-parent passes; old circles do not block edits."""
+  save_three_items()
+  _, todos = load_todos()
+  save_todos(6, todos + [
+    TodoItem(id=4, title="Four", parents=[2]),
+    TodoItem(id=5, title="Stuck", blocked_by=[6]),
+    TodoItem(id=6, title="Stuck too", blocked_by=[5]),
+  ])
+  for args in (
+    ["2", "--add-blocker", "4"],
+    ["3", "--add-blocker", "2"],
+    ["5", "--remove-blocker", "6"],
+  ):
+    result = runner.invoke(cli, ["edit", *args])
+    assert result.exit_code == 0, (args, result.output)
+  _, todos = load_todos()
+  assert {t.id: t.blocked_by for t in todos}[5] == []
+@
+
+The check holds under the lock: two edits from one snapshot, each
+making one item wait for the other, cannot both be stored.  And the
+relative edits are applied to the stored list: a blocker removed by
+one edit and another added through [[--blocks]] by a second, from the
+same snapshot, both take effect.
+
+<<test functions>>=
+def test_overlapping_blocker_edits(temp_todo_dir):
+  """A circle split over two edits is refused; adds both survive."""
+  from nytid.cli.todo import edit
+  save_three_items()
+  with pytest.raises(typer.Exit):
+    run_with_shared_snapshot(
+      lambda: edit(None, todo_id=1, add_blocker=[2]),
+      lambda: edit(None, todo_id=2, add_blocker=[1]),
+    )
+  _, todos = load_todos()
+  assert [t.blocked_by for t in todos[:2]] in ([[2], []], [[], [1]])
+
+  save_three_items()
+  run_with_shared_snapshot(
+    lambda: edit(None, todo_id=3, remove_blocker=[1]),
+    lambda: edit(None, todo_id=2, blocks=[3]),
+  )
+  _, todos = load_todos()
+  assert todos[2].blocked_by == [2]
 @
 
 Let's verify the replay with the overlap harness from
@@ -25276,19 +27388,24 @@ def rm(
 
     def remove_subtree(next_id, todos, stack):
         require_todo(todos, todo_id)
+        stuck_before = find_stuck_items(todos)
         descendants, detached = removal_plan(todos, todo_id)
         <<detach the items that keep another parent>>
-        return next_id, todos, stack, descendants, detached, moved
+        return (
+            next_id, todos, stack, descendants, detached, moved,
+            new_stuck_items(todos, stuck_before),
+        )
 
-    _, todos, _, descendants, detached, moved = mutate_todo_state(
-        remove_subtree
-    )
+    (
+        _, todos, _, descendants, detached, moved, newly_stuck,
+    ) = mutate_todo_state(remove_subtree)
 
     <<stop tracking if active>>
     release_context_ancestors(item, session_worker(item))
 
     typer.echo(f"Removed #{todo_id}: {item.title}")
     <<report the removed sub-items>>
+    <<warn about the work the removal left stuck>>
 @
 
 The prompt names the two counts, and each detached item that loses
@@ -25337,6 +27454,7 @@ for d_id, place in last_in.items():
     )
 if counts:
     msg += f" ({'; '.join(counts)})"
+<<name the work the removal would leave stuck>>
 if not typer.confirm(msg):
     typer.echo("Cancelled.")
     raise typer.Exit(0)
@@ -25419,6 +27537,126 @@ for d in moved:
         f"{describe_places([ranking_context(todos, d)])}"
     )
 @
+\paragraph{Work the removal leaves stuck}%
+\label{sec:todo-rm-stuck}
+Removing an item can leave other work waiting in a circle
+(\cref{sec:todo-stuck}).  A detached item loses the removed parent, and
+that parent may have been its one clear path: an item under the removed
+\#9 and under a blocked \#1 could start through \#9, and is held up
+through \#1 once \#9 is gone.  If \#1 waits, through another item,
+for that very item, the three of them can never be done.
+
+[[rm]] does not refuse that, unlike [[add]] and [[edit]].  The user
+asked to remove something, and refusing would leave the item they no
+longer want, with no way to remove it short of first untangling links
+they may not know about.  But it says so: the confirmation names the
+items that would be left stuck and their circles, so that the user can
+answer no, and after the removal the same lines are printed as a
+warning, also when [[--force]] skipped the question.  The prompt's
+answer is worked out on a copy of the snapshot with the removal
+applied; the warning compares the stuck items before and after the
+removal inside the callback, on the state that was actually changed.
+
+<<sub-item helpers>>=
+def stuck_after_removal(todos, todo_id):
+    """Return the items that removing `todo_id` would leave
+    stuck and that are not stuck now, as a map from id to
+    reason.  `todos` is not changed."""
+    descendants, _ = removal_plan(todos, todo_id)
+    doomed = {todo_id} | {d.id for d in descendants}
+    remaining = []
+    for item in todos:
+        if item.id in doomed:
+            continue
+        if any(p in doomed for p in item.parents):
+            item = copy.copy(item)
+            item.parents = [p for p in item.parents if p not in doomed]
+        remaining.append(item)
+    return new_stuck_items(remaining, find_stuck_items(todos))
+<<name the work the removal would leave stuck>>=
+would_stick = stuck_after_removal(todos, todo_id)
+if would_stick:
+    first, *rest = stuck_report(would_stick)
+    msg = "\n".join([f"Warning: then {first}", *rest, msg])
+<<warn about the work the removal left stuck>>=
+if newly_stuck:
+    first, *rest = stuck_report(newly_stuck)
+    typer.echo(f"Warning: {first}", err=True)
+    for line in rest:
+        typer.echo(line, err=True)
+@
+
+Let's verify the example, with and without the question: the removal
+goes ahead, the prompt names the circle, and the warning follows.
+
+<<test functions>>=
+def save_rm_circle_fixture():
+  """#2 under #9 and blocked #1; #1 waits for #3, #3 for #2."""
+  save_todos(10, [
+    TodoItem(
+      id=1, title="A", blocked_by=[3], created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="X", parents=[9, 1],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="B", blocked_by=[2], created="2026-02-20T10:00:00",
+    ),
+    TodoItem(id=9, title="Rm", created="2026-02-20T10:00:00"),
+  ])
+
+
+def test_rm_warns_about_work_it_leaves_stuck(temp_todo_dir):
+  """rm proceeds, but names the circle it leaves."""
+  save_rm_circle_fixture()
+  asked = []
+
+  def confirm(message, **kwargs):
+    asked.append(message)
+    return True
+
+  with patch("nytid.cli.todo.typer.confirm", side_effect=confirm):
+    result = runner.invoke(cli, ["rm", "9"])
+  assert result.exit_code == 0, result.output
+  circle = "  #2 is blocked via #1 by #3; #3 is blocked by #2"
+  assert asked[0].startswith(
+    "Warning: then #1, #2, #3 could never be done:\n"
+  )
+  assert circle in asked[0]
+  assert asked[0].splitlines()[-1].startswith("Remove #9: Rm? (")
+  assert "Warning: #1, #2, #3 could never be done:" in result.output
+  assert circle in result.output
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1, 2, 3]
+
+  save_rm_circle_fixture()
+  forced = runner.invoke(cli, ["rm", "9", "-f"])
+  assert forced.exit_code == 0, forced.output
+  assert "Warning: #1, #2, #3 could never be done:" in forced.output
+@
+
+The check runs on every removal, so it must not trip over an orphan
+elsewhere in the list, nor must the other commands that run it:
+
+<<test functions>>=
+def test_stuck_check_tolerates_orphans(temp_todo_dir):
+  """An orphan does not break rm, ls --blocked or edit."""
+  save_todos(4, [
+    TodoItem(id=1, title="Doomed", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="Orphan", parents=[99],
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=3, title="Other", created="2026-02-20T10:00:00"),
+  ])
+  for args in (
+    ["ls", "--blocked", "--who", ""],
+    ["edit", "3", "--add-blocker", "2"],
+    ["rm", "1", "-f"],
+  ):
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 0, (args, result.output)
+@
+
 Let's verify both halves of the commit by doing work while the
 confirmation prompt is open: a sub-item added under the doomed item
 must go with it, and a note on an unrelated item must stay.
@@ -25892,7 +28130,9 @@ def next_cmd(
 
     If the current context has an active task, start its
     next pending child. Otherwise start the highest-
-    priority pending top-level task.
+    priority pending top-level task.  Items that something
+    blocks are skipped; if only those are left, say what
+    blocks them and fail.
     """
     _, todos = load_todos()
     active = get_current_context_todo(todos, who=who)
@@ -25923,15 +28163,171 @@ def next_cmd(
     )
 @
 
+\paragraph{Only ready work}%
+\label{sec:todo-next-ready}
+
+[[next]] starts only what is ready (\cref{sec:todo-ready}): an item
+that waits for an open blocker is skipped, however high it ranks, and
+the next one down is started instead.  It is readiness with two
+adjustments, which [[find_pending_by_priority]] makes
+(\cref{todo:sub-item-helpers}).  A parent counts, since [[next]]
+descends into its children on the following call.  And in an active
+context, an item is held up by a block on the context, even if it is
+also a top-level item that is clear there.  [[ready]] lists such an
+item, since one of its places is clear, but [[next]] is drilling into
+the context, and the line it works in runs through the blocked item;
+starting the shared item there would put work under a parent that may
+not start.  At the top level, the shared item is found as a top-level
+item and started.
+
+When everything left in the place [[next]] looks is blocked, it says
+so and by what, instead of the bare \enquote{nothing found}: the user
+then knows that the work exists and which item to finish or unblock
+first.  It does not move on to another context.  The active context is
+what the user is working in, and quietly starting something elsewhere
+would hide the fact that the context is stuck.  The exit status is the
+failure of the other case, so that automation stops either way.  The
+message speaks of the \emph{pending} children, or top-level todos, of
+the worker asked for, which are the ones [[next]] could have started:
+others may be in progress, or belong to someone else, and are not
+claimed to be blocked.
+
 <<find next task to start>>=
+blockers = blockers_index(todos)
 if active is not None:
     target = find_pending_by_priority(
-        todos, who=who, parent_id=active.id
+        todos, who=who, parent_id=active.id, blockers=blockers,
     )
 else:
     target = get_top_level_pending_by_priority(
-        todos, who=who
+        todos, who=who, blockers=blockers,
     )
+<<say what blocks the work that is left>>
+@
+
+<<say what blocks the work that is left>>=
+if target is None:
+    place = ROOT_ID if active is None else active.id
+    holding = blockers_holding_up(todos, blockers, who, place)
+    if holding:
+        logging.warning(
+            (
+                "All pending top-level todos" if active is None
+                else f"All pending children of #{active.id}"
+            )
+            + " are blocked by "
+            + ", ".join(f"#{b}" for b in holding)
+        )
+        raise typer.Exit(1)
+<<helpers>>=
+def blockers_holding_up(todos, blockers, who, parent_id):
+    """Return the open blockers that hold up the pending
+    children of `parent_id` whose worker matches `who`.
+
+    Blocks are counted along `parent_id` only, as `next`
+    counts them; `blockers` is the `blockers_index`.
+    """
+    holding = set()
+    for child in children_of(todos, parent_id):
+        if child.status != "pending" or (
+            who and not re.search(who, child.who or default_username)
+        ):
+            continue
+        holding.update(
+            b for b, _ in blocking_reasons(child, blockers, parent_id)
+        )
+    return sorted(holding)
+@
+
+Let's verify the skip and the message.  In the active context \#1,
+the higher child waits for \#9 and is skipped; with \#1 itself blocked,
+every child is held up, the shared one included, and [[next]] says by
+what; when nothing is active, the shared item is started from the top
+level.
+
+<<test functions>>=
+def save_next_blocked_fixture(parent_blocked):
+  """#1 active, children #2 (blocked by #9) and #3, shared #4."""
+  save_todos(10, [
+    TodoItem(
+      id=1, title="Context", priority=1.0, status="in-progress",
+      blocked_by=[9] if parent_blocked else [],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Waits", parents=[1], priority=0.9, blocked_by=[9],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Free", parents=[1], priority=0.5,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=4, title="Shared", parents=[ROOT_ID, 1], priority=5.0,
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=9, title="Blocker", priority=0.1,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  save_active_stack([1])
+
+
+def test_next_skips_blocked_children(temp_todo_dir):
+  """A blocked child is skipped for the next one down."""
+  save_next_blocked_fixture(parent_blocked=False)
+  _, todos = load_todos()
+  todos[3].blocked_by = [9]
+  save_todos(10, todos)
+  with patch("nytid.cli.todo.start") as mock_start:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 0, result.output
+  assert mock_start.call_args.kwargs["todo_id"] == 3
+
+
+def test_next_names_what_blocks_the_context(temp_todo_dir):
+  """A blocked context blocks every child; next says by what."""
+  save_next_blocked_fixture(parent_blocked=True)
+  with patch("nytid.cli.todo.start") as mock_start, patch(
+    "nytid.cli.todo.logging.warning"
+  ) as mock_warning:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 1
+  mock_start.assert_not_called()
+  mock_warning.assert_called_once_with(
+    "All pending children of #1 are blocked by #9"
+  )
+
+  save_active_stack([])
+  with patch("nytid.cli.todo.start") as mock_start:
+    result = runner.invoke(cli, ["next", "--who", ""])
+  assert result.exit_code == 0, result.output
+  assert mock_start.call_args.kwargs["todo_id"] == 4
+@
+
+At the top level the message names what the worker's own top-level
+work waits for:
+
+<<test functions>>=
+def test_next_names_what_blocks_the_top_level(temp_todo_dir):
+  """With only blocked top-level work, next says by what."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Mine", priority=5.0, who="me", blocked_by=[2],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="Theirs", priority=1.0, who="other",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  with patch("nytid.cli.todo.logging.warning") as mock_warning:
+    result = runner.invoke(cli, ["next", "--who", "^me$"])
+  assert result.exit_code == 1
+  mock_warning.assert_called_once_with(
+    "All pending top-level todos are blocked by #2"
+  )
 @
 
 Let's verify the [[next]] command picks the right task:
@@ -26545,8 +28941,100 @@ def start(
     typer.echo(
         f"Started: #{todo_id} {item.title}"
     )
+    <<warn when the started todo is blocked>>
 
     <<spawn subprocess when the todo has work to launch>>
+@
+
+A blocked item (\cref{sec:todo-blockers}) can still be started.
+[[ready]] and [[next]] pass it by, but [[start]] names its item, and
+the user who names a blocked item may know better than the links do:
+the blocker may be done in all but name, or the work may be worth
+beginning anyway.  Refusing would turn a hint into an obstacle.  What
+[[start]] does is say so, on standard error, naming the open blockers
+and, for an inherited block, the ancestor it comes through, so that a
+start by mistake is noticed before the work begins.  An item that a
+parent cycle cuts off from the top level is blocked with no blocker to
+name (\cref{sec:todo-blockers}), and the warning says that instead.
+[[done]] says nothing of the kind: finishing an item is never
+premature in a way the blockers could tell.
+
+<<warn when the started todo is blocked>>=
+blockers = blockers_index(todos)
+reasons = blocking_reasons(item, blockers)
+if reasons:
+    typer.echo(
+        f"Warning: #{todo_id} is blocked by "
+        + format_blocking_reasons(reasons),
+        err=True,
+    )
+elif not is_unblocked(item, blockers):
+    typer.echo(
+        f"Warning: #{todo_id} is blocked "
+        "(cut off from the top level)",
+        err=True,
+    )
+<<helpers>>=
+def format_blocking_reasons(reasons):
+    """Return (blocker, ancestor) pairs from `blocking_reasons`
+    as words, such as `#3, #1 via #2`."""
+    return ", ".join(
+        f"#{blocker_id}" if via is None
+        else f"#{blocker_id} via #{via}"
+        for blocker_id, via in reasons
+    )
+@
+
+Let's verify both kinds of block, that the item is started all the
+same, and that [[done]] is silent:
+
+<<test functions>>=
+def test_start_warns_about_blockers_and_starts(temp_todo_dir):
+  """start names own and inherited blockers, then starts."""
+  save_todos(5, [
+    TodoItem(id=1, title="Blocker", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=2, title="Waits", blocked_by=[1],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="Parent", blocked_by=[1],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=4, title="Child", parents=[3],
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  waits = runner.invoke(cli, ["start", "2", "--no-command"])
+  assert waits.exit_code == 0, waits.output
+  assert "Started: #2 Waits" in waits.output
+  assert "Warning: #2 is blocked by #1\n" in waits.output
+  assert 2 in load_active_stack()
+
+  child = runner.invoke(cli, ["start", "4", "--no-command"])
+  assert child.exit_code == 0, child.output
+  assert "Warning: #4 is blocked by #1 via #3\n" in child.output
+
+  done = runner.invoke(cli, ["done", "2"])
+  assert done.exit_code == 0, done.output
+  assert "blocked" not in done.output
+
+
+def test_start_warns_about_a_cut_off_item(temp_todo_dir):
+  """An item a parent cycle cuts off is blocked; start says so."""
+  save_todos(3, [
+    TodoItem(id=1, title="A", parents=[2],
+             created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="B", parents=[1],
+             created="2026-02-20T10:00:00"),
+  ])
+  result = runner.invoke(cli, ["start", "1", "--no-command"])
+  assert result.exit_code == 0, result.output
+  assert (
+    "Warning: #1 is blocked (cut off from the top level)\n"
+    in result.output
+  )
 @
 
 The context-detection invariant above is easy to break by accident---a
@@ -31093,6 +33581,7 @@ def export_vtodo(todos: list[TodoItem]) -> str:
         <<set vtodo deadline and duration>>
         <<set vtodo status>>
         <<relate the vtodo to its parents>>
+        <<relate the vtodo to its blockers>>
 
         cal.add_component(todo)
 
@@ -31167,6 +33656,51 @@ for parent_id in real_parents_of(item):
 def vtodo_uid(todo_id):
     """Return the iCalendar UID of todo `todo_id`."""
     return f"todo-{todo_id}@nytid"
+@
+
+The blockers travel the same way.  RFC~9253 has a [[RELTYPE]] for
+them as well, [[DEPENDS-ON]], which says that the component depends on
+the one it names, so a task manager that understands dependencies can
+show the order the work has to be done in.  Every stored blocker is
+exported, a done one included, since the relation is a fact about the
+two tasks rather than about whether it still holds anything up; the
+status of the blocker's own component says that.  A removed blocker is
+exported too, for the reason [[RELATED-TO]] may name a component the
+file does not contain: the identifier is stable, and the relation
+simply has no target in this export.
+
+<<relate the vtodo to its blockers>>=
+for blocker_id in item.blocked_by:
+    todo.add(
+        "RELATED-TO", vtodo_uid(blocker_id),
+        parameters={"RELTYPE": "DEPENDS-ON"},
+    )
+@
+
+Let's verify that each blocker becomes such a relation, after the
+parents:
+
+<<test functions>>=
+def test_export_vtodo_relates_every_blocker(temp_todo_dir):
+  """Each blocker becomes a RELATED-TO;RELTYPE=DEPENDS-ON."""
+  save_todos(4, [
+    TodoItem(id=1, title="A", created="2026-02-20T10:00:00"),
+    TodoItem(id=2, title="B", created="2026-02-20T10:00:00"),
+    TodoItem(
+      id=3, title="Waits", parents=[1], blocked_by=[2, 9],
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+  result = runner.invoke(cli, ["export", "--format", "vtodo"])
+  assert result.exit_code == 0, result.output
+  lines = result.stdout.splitlines()
+  assert [
+    line for line in lines if line.startswith("RELATED-TO")
+  ] == [
+    "RELATED-TO;RELTYPE=PARENT:todo-1@nytid",
+    "RELATED-TO;RELTYPE=DEPENDS-ON:todo-2@nytid",
+    "RELATED-TO;RELTYPE=DEPENDS-ON:todo-9@nytid",
+  ]
 @
 
 <<set vtodo status>>=
@@ -33812,6 +36346,7 @@ from nytid.cli.todo import (
     push_active,
     normalize_parents,
     InvalidParentsError,
+    InvalidBlockersError,
     parents_of,
     real_parents_of,
     children_of,
@@ -33844,6 +36379,24 @@ from nytid.cli.todo import (
     todo_depth,
     is_ready,
     children_by_parent,
+    blockers_index,
+    blocker_links,
+    is_unblocked,
+    blocking_ancestors,
+    blocking_reasons,
+    format_todo_refs,
+    apply_blocker_edits,
+    blocked_marker,
+    describe_blocker,
+    lies_below,
+    simulate_completion,
+    find_stuck_items,
+    refuse_new_stuck_items,
+    STUCK_REASON_STEPS,
+    new_stuck_items,
+    stuck_report,
+    stuck_after_removal,
+    format_blocking_reasons,
     todo_path,
     format_todo_path,
     assign_priority_at_position,
