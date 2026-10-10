@@ -4271,25 +4271,48 @@ repair itself impossible; [[ls --blocked]] reports them
 change, makes it on the state inside its locked callback, and asks this
 helper, whose exit abandons the write (\cref{sec:todo-read-modify-write}).
 
+Every path that adds links or reopens items has to run the check.  A
+new blocker or a new place can close a circle, and so can a removed
+place, which may have been an item's one clear path; and so can a done
+item made pending again, since a done blocker holds nothing up and an
+open one may.  [[add]] and [[edit]] check their links here; an editor
+that can reopen items or change places checks in its commit in the same
+way.  [[rm]] is the one exception: it reports the circles it leaves
+rather than refusing, since a removal that was asked for should not
+fail on what it leaves behind (\cref{sec:todo-rm-stuck}).  The
+comparison and the wording are therefore separate helpers, so that the
+reporting command and the refusing ones say the same thing.
+
 <<sub-item helpers>>=
-def refuse_new_stuck_items(todos, stuck_before):
-    """Exit with an error if `todos` holds stuck items that
-    are not among the ids in `stuck_before`."""
-    new = {
+def new_stuck_items(todos, stuck_before):
+    """Return the stuck items of `todos`, as `find_stuck_items`
+    does, whose ids are not in `stuck_before`."""
+    return {
         item_id: reason
         for item_id, reason in find_stuck_items(todos).items()
         if item_id not in stuck_before
     }
+
+
+def stuck_report(stuck):
+    """Return the lines naming the items of `stuck`, a map
+    from id to reason, and their circles."""
+    return [
+        ", ".join(f"#{i}" for i in sorted(stuck))
+        + " could never be done:"
+    ] + [f"  {stuck[i]}" for i in sorted(stuck)]
+
+
+def refuse_new_stuck_items(todos, stuck_before):
+    """Exit with an error if `todos` holds stuck items that
+    are not among the ids in `stuck_before`."""
+    new = new_stuck_items(todos, stuck_before)
     if not new:
         return
-    typer.echo(
-        "Error: refused, since "
-        + ", ".join(f"#{i}" for i in sorted(new))
-        + " could never be done:",
-        err=True,
-    )
-    for item_id in sorted(new):
-        typer.echo(f"  {new[item_id]}", err=True)
+    first, *rest = stuck_report(new)
+    typer.echo(f"Error: refused, since {first}", err=True)
+    for line in rest:
+        typer.echo(line, err=True)
     raise typer.Exit(1)
 @
 
@@ -27150,19 +27173,24 @@ def rm(
 
     def remove_subtree(next_id, todos, stack):
         require_todo(todos, todo_id)
+        stuck_before = find_stuck_items(todos)
         descendants, detached = removal_plan(todos, todo_id)
         <<detach the items that keep another parent>>
-        return next_id, todos, stack, descendants, detached, moved
+        return (
+            next_id, todos, stack, descendants, detached, moved,
+            new_stuck_items(todos, stuck_before),
+        )
 
-    _, todos, _, descendants, detached, moved = mutate_todo_state(
-        remove_subtree
-    )
+    (
+        _, todos, _, descendants, detached, moved, newly_stuck,
+    ) = mutate_todo_state(remove_subtree)
 
     <<stop tracking if active>>
     release_context_ancestors(item, session_worker(item))
 
     typer.echo(f"Removed #{todo_id}: {item.title}")
     <<report the removed sub-items>>
+    <<warn about the work the removal left stuck>>
 @
 
 The prompt names the two counts, and each detached item that loses
@@ -27211,6 +27239,7 @@ for d_id, place in last_in.items():
     )
 if counts:
     msg += f" ({'; '.join(counts)})"
+<<name the work the removal would leave stuck>>
 if not typer.confirm(msg):
     typer.echo("Cancelled.")
     raise typer.Exit(0)
@@ -27293,6 +27322,105 @@ for d in moved:
         f"{describe_places([ranking_context(todos, d)])}"
     )
 @
+\paragraph{Work the removal leaves stuck}%
+\label{sec:todo-rm-stuck}
+Removing an item can leave other work waiting in a circle
+(\cref{sec:todo-stuck}).  A detached item loses the removed parent, and
+that parent may have been its one clear path: an item under the removed
+\#9 and under a blocked \#1 could start through \#9, and is held up
+through \#1 once \#9 is gone.  If \#1 waits, through another item,
+for that very item, the three of them can never be done.
+
+[[rm]] does not refuse that, unlike [[add]] and [[edit]].  The user
+asked to remove something, and refusing would leave the item they no
+longer want, with no way to remove it short of first untangling links
+they may not know about.  But it says so: the confirmation names the
+items that would be left stuck and their circles, so that the user can
+answer no, and after the removal the same lines are printed as a
+warning, also when [[--force]] skipped the question.  The prompt's
+answer is worked out on a copy of the snapshot with the removal
+applied; the warning compares the stuck items before and after the
+removal inside the callback, on the state that was actually changed.
+
+<<sub-item helpers>>=
+def stuck_after_removal(todos, todo_id):
+    """Return the items that removing `todo_id` would leave
+    stuck and that are not stuck now, as a map from id to
+    reason.  `todos` is not changed."""
+    descendants, _ = removal_plan(todos, todo_id)
+    doomed = {todo_id} | {d.id for d in descendants}
+    remaining = []
+    for item in todos:
+        if item.id in doomed:
+            continue
+        if any(p in doomed for p in item.parents):
+            item = copy.copy(item)
+            item.parents = [p for p in item.parents if p not in doomed]
+        remaining.append(item)
+    return new_stuck_items(remaining, find_stuck_items(todos))
+<<name the work the removal would leave stuck>>=
+would_stick = stuck_after_removal(todos, todo_id)
+if would_stick:
+    first, *rest = stuck_report(would_stick)
+    msg = "\n".join([f"Warning: then {first}", *rest, msg])
+<<warn about the work the removal left stuck>>=
+if newly_stuck:
+    first, *rest = stuck_report(newly_stuck)
+    typer.echo(f"Warning: {first}", err=True)
+    for line in rest:
+        typer.echo(line, err=True)
+@
+
+Let's verify the example, with and without the question: the removal
+goes ahead, the prompt names the circle, and the warning follows.
+
+<<test functions>>=
+def save_rm_circle_fixture():
+  """#2 under #9 and blocked #1; #1 waits for #3, #3 for #2."""
+  save_todos(10, [
+    TodoItem(
+      id=1, title="A", blocked_by=[3], created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=2, title="X", parents=[9, 1],
+      created="2026-02-20T10:00:00",
+    ),
+    TodoItem(
+      id=3, title="B", blocked_by=[2], created="2026-02-20T10:00:00",
+    ),
+    TodoItem(id=9, title="Rm", created="2026-02-20T10:00:00"),
+  ])
+
+
+def test_rm_warns_about_work_it_leaves_stuck(temp_todo_dir):
+  """rm proceeds, but names the circle it leaves."""
+  save_rm_circle_fixture()
+  asked = []
+
+  def confirm(message, **kwargs):
+    asked.append(message)
+    return True
+
+  with patch("nytid.cli.todo.typer.confirm", side_effect=confirm):
+    result = runner.invoke(cli, ["rm", "9"])
+  assert result.exit_code == 0, result.output
+  circle = "  #2 is blocked via #1 by #3; #3 is blocked by #2"
+  assert asked[0].startswith(
+    "Warning: then #1, #2, #3 could never be done:\n"
+  )
+  assert circle in asked[0]
+  assert asked[0].splitlines()[-1].startswith("Remove #9: Rm? (")
+  assert "Warning: #1, #2, #3 could never be done:" in result.output
+  assert circle in result.output
+  _, todos = load_todos()
+  assert [t.id for t in todos] == [1, 2, 3]
+
+  save_rm_circle_fixture()
+  forced = runner.invoke(cli, ["rm", "9", "-f"])
+  assert forced.exit_code == 0, forced.output
+  assert "Warning: #1, #2, #3 could never be done:" in forced.output
+@
+
 Let's verify both halves of the commit by doing work while the
 confirmation prompt is open: a sub-item added under the doomed item
 must go with it, and a note on an unrelated item must stay.
@@ -35933,6 +36061,9 @@ from nytid.cli.todo import (
     find_stuck_items,
     refuse_new_stuck_items,
     STUCK_REASON_STEPS,
+    new_stuck_items,
+    stuck_report,
+    stuck_after_removal,
     todo_path,
     format_todo_path,
     assign_priority_at_position,
