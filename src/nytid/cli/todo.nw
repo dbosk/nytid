@@ -2306,7 +2306,9 @@ When multiple workers share a parent, the comparison set must be
 restricted to one worker's items; otherwise the binary search
 would ask the user to rank unrelated tasks against each other.
 The [[who]] filter is applied inside the list comprehension so
-that the sort operates only on the relevant subset.
+that the sort operates only on the relevant subset.  The number the
+item finally gets is still chosen among every worker's siblings
+(\cref{sec:placement-number}), since they share one flat list.
 
 <<sub-item helpers>>=
 def get_active_siblings(
@@ -5278,17 +5280,24 @@ def binary_search_priority(
     Presents existing items and asks the user to compare.
     Returns the computed priority value.
 
-    When ``parent`` and ``todos`` are provided and there
-    are no siblings, the priority is placed within the
-    parent's context range when that parent is ranked.
-    Callers must keep children of an unranked parent
-    unranked instead of asking for numeric placement.
+    The questions compare against `siblings`, one
+    worker's items as the user sees them; the number is
+    taken from the stored priorities of every worker's
+    siblings when `todos` is given (see
+    `number_at_position`).  With no ranked sibling at
+    all, the priority is placed within the parent's
+    range.  Callers must keep children of an unranked
+    parent unranked instead of asking for numeric
+    placement.
     """
     ranked_siblings = [
         sibling for sibling in siblings
         if sibling.priority is not None
     ]
-    if not ranked_siblings:
+    level = placement_level(
+        ranked_siblings, candidate, todos
+    )
+    if not level:
         return default_priority_without_siblings(
             parent, todos
         )
@@ -5338,10 +5347,9 @@ def assign_priority_at_position(
 
     The priority is the midpoint between neighbors,
     or offset by 1.0 at the edges.  `priority_of` reads
-    the number to interpolate between; the binary search
-    compares what the user sees, so it keeps the default
-    effective priority, while the non-interactive
-    placement flags pass the stored one.  `bounds` is
+    the number to interpolate between; every placement
+    passes the stored one, so that a deadline boost is
+    not written into the new number.  `bounds` is
     the `(high, low)` child range of the items' parent,
     if they have one: an edge with room left inside it
     takes the midpoint to the range's end instead.
@@ -5392,9 +5400,25 @@ step past it by~1.0 as before rather than put the new item on the
 wrong side of it.  The top level keeps the plain step, since it has no
 range: [[child_priority_range_or_none]] answers [[None]] there.
 
+The questions are asked in the order the user sees, deadline boosts
+included, because that is the order the user can judge.  The number,
+however, is interpolated between \emph{stored} priorities, for the
+reason non-interactive placement gives (\cref{todo:placement}): a
+boost is temporary, and a number derived from a boosted neighbour would
+keep the borrowed urgency after the deadline that justified it.  In a
+child level it would do worse.  A child of a parent at~5.0 whose
+deadline is an hour away can show an effective priority of~14; placing
+a new child above it by that number stores~15, far above the parent
+itself.  Interpolating between stored numbers keeps the new child in
+the parent's range.  The price is that a boosted sibling the user
+ranked below the new item may still show above it until its boost
+ends.  Turning the position into a number is shared with the
+non-interactive flags, and \cref{sec:placement-number} explains how it
+also takes the other workers' siblings into account.
+
 <<compute midpoint priority>>=
-new_priority = assign_priority_at_position(
-    sorted_items, low,
+new_priority = number_at_position(
+    sorted_items, low, level,
     bounds=(
         child_priority_range_or_none(todos, parent)
         if todos is not None else None
@@ -5559,8 +5583,9 @@ A deadline boost is temporary by design
 and storing the result would let a sibling one day from its deadline
 donate its urgency to the item we are placing, and that borrowed
 urgency would outlive the deadline that justified it.  This is the
-argument the [[--append]] path has always made; what changes is that
-it now covers every non-interactive placement instead of one of them.
+argument the [[--append]] path has always made; it now covers every
+placement, the interactive search included, which still \emph{asks}
+in the boosted order the user sees (\cref{todo:binary-search}).
 
 <<placement helpers>>=
 def require_stored_priority(item: TodoItem) -> float:
@@ -5589,6 +5614,136 @@ def sort_siblings_by_stored_priority(
     )
 @
 
+\subsection{Turning a Position into a Number}%
+\label{sec:placement-number}
+
+The comparison set is one worker's siblings, because asking a user to
+rank another worker's tasks against their own would be meaningless
+(\cref{todo:sub-item-helpers}).  The child ranges, however, are
+computed from every worker's siblings, since they share one flat list.
+A number taken only from one worker's neighbours can therefore land on
+another worker's item, or between that item and its children.  Two
+workers who each add a first child under the same parent both get the
+middle of the parent's range, the same number.
+
+So the position the user chose is translated into a position among
+\emph{all} the active ranked siblings before it becomes a number.  The
+new item goes directly above the sibling of the same worker that it was
+placed above, which is what the user said; at the bottom of that
+worker's list it goes directly below the lowest one.  A worker with no
+ranked sibling yet, where nothing was asked, starts at the bottom of
+the level, which is the least presumptuous place among other people's
+work.  Only the numbers of the neighbours and the parent's range then
+matter, and [[assign_priority_at_position]] reads them as stored
+numbers.  With a single worker the two lists coincide and nothing
+changes.
+
+<<placement helpers>>=
+def placement_level(
+    siblings: list[TodoItem],
+    candidate: TodoItem | None,
+    todos: list[TodoItem] | None,
+) -> list[TodoItem]:
+    """Return every active ranked sibling of `candidate`,
+    of any worker, together with `siblings`.
+
+    Without `todos` or `candidate` only `siblings` are
+    known, and they are returned as they are.
+    """
+    ranked = [s for s in siblings if s.priority is not None]
+    if todos is None or candidate is None:
+        return ranked
+    level = get_active_siblings(
+        todos, candidate, ranked_only=True
+    )
+    known = {s.id for s in level}
+    return level + [s for s in ranked if s.id not in known]
+
+
+def number_at_position(
+    own: list[TodoItem],
+    position: int,
+    level: list[TodoItem],
+    bounds: tuple | None = None,
+) -> float:
+    """Return the stored priority for an insertion at
+    `position` among `own`, interpolated in `level`.
+
+    `own` is the comparison set in the order `position`
+    refers to and must be part of `level`, all the
+    ranked siblings.  `bounds` is the parent's child
+    range, if any.
+    """
+    ordered = sort_siblings_by_stored_priority(level)
+    index = [s.id for s in ordered]
+    if position < len(own):
+        at = index.index(own[position].id)
+    elif own:
+        at = index.index(own[-1].id) + 1
+    else:
+        at = len(ordered)
+    return assign_priority_at_position(
+        ordered, at,
+        priority_of=require_stored_priority,
+        bounds=bounds,
+    )
+@
+
+Let's verify the case that motivated this: another worker's child
+already sits in the middle of the range, and the first child of the
+current worker must not land on it.  Next to a neighbour of its own,
+the new item is placed against all the siblings too.
+
+<<test functions>>=
+def test_number_at_position_avoids_other_workers():
+    """Placement interpolates between every worker's
+    siblings."""
+    mine = TodoItem(id=2, title="Mine", priority=4.5)
+    theirs = TodoItem(id=3, title="Theirs", priority=4.0)
+    assert number_at_position(
+        [], 0, [theirs], bounds=(5.0, 3.0)
+    ) == 3.5
+    assert number_at_position(
+        [mine], 1, [mine, theirs], bounds=(5.0, 3.0)
+    ) == 4.25
+    assert number_at_position(
+        [mine], 0, [mine, theirs], bounds=(5.0, 3.0)
+    ) == 4.75
+@
+
+Through the command, the other worker's first child goes below the
+current worker's child and that child's own subtree, instead of onto
+the middle of the range where the current worker's child already is.
+
+<<test functions>>=
+def test_add_other_workers_child_avoids_mine(
+    temp_todo_dir,
+):
+    """A first child of another worker gets its own
+    number below the existing subtree."""
+    save_todos(4, [
+        TodoItem(
+            id=n, title=t, priority=p, parent_id=parent,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        )
+        for n, t, p, parent in [
+            (1, "A", 1.0, None),
+            (2, "Mine", -4.0, 1),
+            (3, "Mine's child", -4.5, 2),
+        ]
+    ])
+
+    result = runner.invoke(cli, [
+        "add", "-t", "Theirs", "--parent", "1",
+        "--bottom", "--who", "other",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert stored_priority(4) == -6.5
+    assert -6.5 < stored_priority(3) < -4.0
+@
+
 \subsection{The Shared Placement Helper}
 
 With a position and an ordering, placement is one call.  The empty
@@ -5605,26 +5760,30 @@ def place_among_siblings(
     target: TodoItem | None = None,
     parent: TodoItem | None = None,
     todos: list[TodoItem] | None = None,
+    candidate: TodoItem | None = None,
 ) -> float:
     """Return a stored priority placing an item at
     `placement` among `siblings`.
 
     `placement` is one of the `PLACE_*` values;
     `PLACE_ABOVE` and `PLACE_BELOW` need `target`.
-    `parent` and `todos` supply the fallback range for a
-    level with no ranked sibling yet.
+    `parent` and `todos` supply the parent's range and
+    the fallback for a level with no ranked sibling
+    yet; with `candidate`, the item being placed, the
+    number also respects other workers' siblings.
     """
     ordered = sort_siblings_by_stored_priority(siblings)
-    if not ordered:
+    level = placement_level(ordered, candidate, todos)
+    if not level:
         return default_priority_without_siblings(
             parent, todos
         )
-    return assign_priority_at_position(
+    return number_at_position(
         ordered,
         sibling_insert_position(
             ordered, placement, target
         ),
-        priority_of=require_stored_priority,
+        level,
         bounds=(
             child_priority_range_or_none(todos, parent)
             if todos is not None else None
@@ -5785,6 +5944,28 @@ def test_binary_search_top_stays_in_range():
             parent=todos[0], todos=todos,
         )
     assert priority == 4.75
+
+
+def test_binary_search_ignores_boost_for_the_number():
+    """A boosted child is compared as shown, but the new
+    number stays inside the parent's range."""
+    now = datetime.datetime.now()
+    todos = parent_with_children(4.5)
+    todos[2].created = (
+        now - datetime.timedelta(days=10)
+    ).isoformat()
+    todos[2].deadline = (
+        now + datetime.timedelta(hours=1)
+    ).isoformat()
+    assert effective_priority(todos[2]) > 5.0
+    with patch(
+        "nytid.cli.todo.typer.prompt", return_value="y"
+    ):
+        priority = binary_search_priority(
+            todos[2:], TodoItem(id=99, title="New"),
+            parent=todos[0], todos=todos,
+        )
+    assert priority == 4.75
 @
 
 \subsection{Re-ranking an Item That Already Exists}
@@ -5864,6 +6045,7 @@ def place_existing_item(
         target,
         parent=parent_ctx,
         todos=todos,
+        candidate=item,
     )
 @
 
@@ -9551,6 +9733,7 @@ elif top or bottom:
         PLACE_TOP if top else PLACE_BOTTOM,
         parent=parent_ctx,
         todos=todos,
+        candidate=candidate,
     )
 else:
     priority = binary_search_priority(
@@ -27769,6 +27952,7 @@ from nytid.cli.todo import (
     compute_child_priority_range,
     distribute_priorities_in_range,
     default_priority_without_siblings,
+    number_at_position,
     move_subtree_priorities,
     set_priority_with_subtree,
     settle_placement,
