@@ -10205,6 +10205,14 @@ keep.  The registry is a module-level list because the only
 registration happens when [[todo]] is imported, which the CLI does for
 every command, the detached resume hooks included.
 
+A filter is somebody else's code running inside our resume, and it
+reads files of its own; it can fail.  A failing filter must not cost
+the worker the time it was asked to resume, so we log the failure and
+go on with the labels as they were before that filter, which is
+exactly the resume that would have happened without it.  We catch
+[[Exception]] and not everything: an interrupt is the user's decision,
+not a filter's failure.
+
 <<helper functions>>=
 RESUME_LABEL_FILTERS = []
 
@@ -10220,15 +10228,72 @@ def register_resume_label_filter(label_filter):
 
 
 def filter_resumed_labels(who, labels):
-    """Return the `labels` every resume filter keeps."""
+    """Return the `labels` every resume filter keeps.
+
+    A filter that raises is logged and skipped, leaving the
+    labels as they were before it.
+    """
     labels = list(labels)
     for label_filter in RESUME_LABEL_FILTERS:
-        labels = label_filter(who, labels)
+        try:
+            labels = list(label_filter(who, labels))
+        except Exception as exc:
+            logging.warning(
+                f"Resume filter {label_filter!r} failed for "
+                f"{who}: {exc}; resuming its labels unfiltered"
+            )
     return labels
 @
 
 Both resume paths apply them: the pane resume below, and the window
-switch in [[restart_window_batches]].
+switch in [[restart_window_batches]].  The pane resume filters before
+it deletes the suspend file.  Deleting first would be the crash-safe
+order for the restart, as explained above, but the filters run code
+that is not ours, and if anything in them escaped, the labels would
+be gone with the file; deleting after filtering and before starting
+keeps both guarantees.
+
+Let's verify that a failing filter leaves the resume intact, and that
+not even an interrupt in a filter loses the suspended labels:
+
+<<test functions>>=
+def test_resume_survives_failing_filter(temp_tracking_dir):
+  """A raising resume filter leaves the labels as they were."""
+  import nytid.cli.track as track_module
+
+  def broken(who, labels):
+    raise OSError("unreadable store")
+
+  path = suspend_state_path("%3", "alice", TEST_SERVER_KEY)
+  write_suspend_state(path, ["todo:1", "DD1310"])
+  with patch.object(
+    track_module, "RESUME_LABEL_FILTERS", [broken],
+  ):
+    resume_tracking_labels("alice", "%3", TEST_SERVER_KEY)
+
+  active = load_active_session("alice").get_active_labels()
+  assert sorted(active) == ["DD1310", "todo:1"]
+  assert not path.exists()
+
+
+def test_resume_interrupted_filter_keeps_suspend_file(
+  temp_tracking_dir,
+):
+  """The suspend file survives anything a filter lets escape."""
+  import nytid.cli.track as track_module
+
+  def interrupted(who, labels):
+    raise KeyboardInterrupt
+
+  path = suspend_state_path("%3", "alice", TEST_SERVER_KEY)
+  write_suspend_state(path, ["todo:1"])
+  with patch.object(
+    track_module, "RESUME_LABEL_FILTERS", [interrupted],
+  ), pytest.raises(KeyboardInterrupt):
+    resume_tracking_labels("alice", "%3", TEST_SERVER_KEY)
+
+  assert read_suspend_state(path) == ["todo:1"]
+@
 
 <<helper functions>>=
 def resume_tracking_labels(
@@ -10248,8 +10313,8 @@ def resume_tracking_labels(
     if not labels:
         return
 
-    delete_suspend_state(state_path)
     labels = filter_resumed_labels(who, labels)
+    delete_suspend_state(state_path)
     if not labels:
         return
     start_tracking_labels(
