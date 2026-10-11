@@ -59,8 +59,8 @@ def config_writes_escape_the_sandbox():
 
     `typerconf` bakes the configuration path into the default
     arguments of `read_config` and `write_config`; those are the exact
-    slots `tests/conftest.nw` rewrites, so they are also where the
-    redirection can be read back.
+    slots nytid rewrites under the NYTID_HOME that `tests/conftest.nw`
+    sets, so they are also where the redirection can be read back.
     """
     for method in (
         typerconf.Config.read_config,
