@@ -1,0 +1,677 @@
+\chapter{Where nytid keeps its files, the \texttt{home} module}%
+\label{home}
+
+nytid writes to several places, and until this module each part of it
+found its own:
+
+\begin{description}
+\item[The configuration] [[typerconf]] keeps it in
+  [[~/.config/nytid/config.json]], a name it derives from the running
+  program's name.
+\item[The todo store] [[~/.nytid/todos]] (\cref{cli.todo}), unless
+  [[todo.data_dir]] names another directory.
+\item[The tracking store] [[~/.nytid/tracking]] (\cref{cli.track}),
+  unless [[track.data_dir]] does.
+\item[Smaller stores] the calendar cache [[~/.nytid/ics_cache]] of
+  [[nytid.schedules]], the [[mine]] course register
+  [[~/.nytid/mine]] (\cref{mine}) and the hourly agent job's
+  [[agent.log]].
+\item[Runtime state] the tmux-scoped window and pane state, in
+  [[nytid-<uid>]] under the temporary directory
+  (\cref{track:tmux-state-dir}).
+\end{description}
+
+Running nytid against throw-away data---to try a new version, in a
+script, in an experiment---therefore meant knowing every one of these
+and redirecting each.  Missing one is not a theoretical risk.  Scripts
+that redirected only the todo directory still rewrote the user's real
+tracking files, because finishing a todo also stops its time tracking,
+and that went through the tracking store the scripts had not moved
+(issue \#560).
+
+This module gives all of them one root.  When the environment variable
+[[NYTID_HOME]] is set, it replaces [[~/.nytid]] under every default
+above, it holds the configuration as [[$NYTID_HOME/config.json]], and
+the runtime state gets a directory of its own.  When it is unset,
+nothing changes.
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+  & [[NYTID_HOME]] unset & [[NYTID_HOME=/x]] \\
+  \hline
+  configuration & [[~/.config/nytid/config.json]] & [[/x/config.json]] \\
+  todos & [[~/.nytid/todos]] & [[/x/todos]] \\
+  tracking & [[~/.nytid/tracking]] & [[/x/tracking]] \\
+  calendar cache & [[~/.nytid/ics_cache]] & [[/x/ics_cache]] \\
+  [[mine]] register & [[~/.nytid/mine]] & [[/x/mine]] \\
+  tmux state & [[$TMPDIR/nytid-<uid>]] & [[$TMPDIR/nytid-<uid>-<digest>]] \\
+\end{tabular}
+\end{center}
+
+The modules keep their configuration keys: [[todo.data_dir]] still
+wins over the default, read from the configuration in the home when
+the variable is set.
+We first look at the variable itself, then at the data root built on
+it, then at the configuration---the one location that needs more than
+a different default---and finally at the runtime state and at what the
+variable does not reach.
+
+\section{Module structure}
+
+The module imports nothing beyond the cheap parts of the standard
+library at load time.  That matters because importing the [[nytid]]
+package runs it (\cref{sec:home-import}), and [[prompt-nytid]] imports
+the package on every shell prompt (\cref{prompt}).
+
+<<[[home.py]]>>=
+"""Where nytid keeps its configuration and data.
+
+Every default location nytid writes derives from `data_dir()` or
+`config_file()` here, so setting NYTID_HOME moves them all.  See the
+`home` chapter in the manual for the design rationale.
+"""
+import os
+import pathlib
+import sys
+
+<<constants>>
+<<functions>>
+@
+
+
+\section{The variable}
+
+We read the variable on every call rather than once at import, for
+the same reason the modules call [[pathlib.Path.home()]] each time: a
+test or a script that sets it after importing nytid gets the answer it
+set.
+
+An empty value counts as unset.  [[NYTID_HOME= nytid ...]] is how a
+shell user clears a variable for one command, and reading it as a
+relative path would put the data in whatever directory the command
+happened to run in.
+
+A relative value is made absolute against the current directory.  The
+home has to be the same directory for the whole process, and for the
+processes it starts: [[nytid todo start]] launches its work in the
+item's working directory, and anything started there that runs
+[[nytid]] must find the same data.  We expand [[~]] as well, because a
+value quoted in a shell script or a cron table reaches us
+unexpanded.
+
+<<constants>>=
+NYTID_HOME_ENV = "NYTID_HOME"
+<<functions>>=
+def nytid_home():
+    """Return $NYTID_HOME as an absolute path.
+
+    Returns None when the variable is unset or empty.
+    """
+    value = os.environ.get(NYTID_HOME_ENV)
+    if not value:
+        return None
+    return pathlib.Path(
+        os.path.abspath(os.path.expanduser(value))
+    )
+@
+
+\section{The data root}
+
+Every store above used to spell out [[pathlib.Path.home() / ".nytid"]]
+on its own.  They now ask this function, so the variable reaches each
+of them, and a store added later reaches it by doing what the others
+do.
+
+<<functions>>=
+def data_dir():
+    """Return the directory nytid keeps its data under.
+
+    This is $NYTID_HOME when that is set, else ~/.nytid.
+    """
+    home = nytid_home()
+    if home is None:
+        return pathlib.Path.home() / ".nytid"
+    return home
+@
+
+Let's verify both cases, and that an empty value is no value.
+
+<<test functions>>=
+def test_data_dir_defaults_to_dot_nytid(monkeypatch, tmp_path):
+    """Without NYTID_HOME the data stays under ~/.nytid."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for value in (None, ""):
+        if value is None:
+            monkeypatch.delenv(NYTID_HOME_ENV, raising=False)
+        else:
+            monkeypatch.setenv(NYTID_HOME_ENV, value)
+        assert nytid_home() is None
+        assert data_dir() == tmp_path / ".nytid"
+
+
+def test_data_dir_follows_nytid_home(monkeypatch, tmp_path):
+    """NYTID_HOME replaces ~/.nytid, made absolute."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setenv(NYTID_HOME_ENV, str(tmp_path / "abs"))
+    assert data_dir() == tmp_path / "abs"
+
+    monkeypatch.setenv(NYTID_HOME_ENV, "rel")
+    assert data_dir() == tmp_path / "rel"
+
+    monkeypatch.setenv(NYTID_HOME_ENV, "~/tilde")
+    assert data_dir() == tmp_path / "home" / "tilde"
+@
+
+
+\section{The configuration}
+
+Moving the data defaults is not enough on its own, and the reason is
+the configuration.  It may name the data directories explicitly---the
+author's own configuration sets [[todo.data_dir]] to
+[[~/.nytid/todos]]---and an
+explicit key wins over any default.  With only the defaults moved, a
+sandboxed command would read the real configuration, find the real
+directory in it and write there.  So the configuration has to move
+with the data: under [[NYTID_HOME]], nytid reads and writes
+[[$NYTID_HOME/config.json]] and never the user's own file.  A key set
+in \emph{that} file still wins, as it should: a home is a complete
+installation of nytid, with its own settings.
+
+The name of the file is fixed.  [[typerconf]] names its directory after
+the running program, [[sys.argv[0]]], so [[nytid]] reads
+[[~/.config/nytid]] while a script that imports nytid reads a
+directory named after the script, and [[prompt-nytid]] has to
+hard-code [[nytid]] to agree with the CLI (\cref{prompt:config}).
+Inside a home every program finds the same file.
+
+<<constants>>=
+CONFIG_FILE_NAME = "config.json"
+<<functions>>=
+def config_file():
+    """Return the configuration file in $NYTID_HOME.
+
+    Returns None when NYTID_HOME is unset; typerconf's own
+    location then stands.
+    """
+    home = nytid_home()
+    if home is None:
+        return None
+    return home / CONFIG_FILE_NAME
+@
+
+Let's verify where the file lands, and that without the variable we
+leave the choice to [[typerconf]].
+
+<<test functions>>=
+def test_config_file_lives_in_the_home(monkeypatch, tmp_path):
+    """The configuration moves only when NYTID_HOME is set."""
+    monkeypatch.delenv(NYTID_HOME_ENV, raising=False)
+    assert config_file() is None
+    monkeypatch.setenv(NYTID_HOME_ENV, str(tmp_path))
+    assert config_file() == tmp_path / "config.json"
+@
+
+\subsection{Redirecting [[typerconf]]}
+
+Knowing the file is the easy half; [[typerconf]] has to use it.  It
+offers no setting for that.  It computes its directory once, when it
+is imported, and bakes the resulting path into the \emph{default
+arguments} of [[Config.read_config]] and [[Config.write_config]].
+Every configuration access in nytid ends in one of those two
+defaults: the [[nytid config]] command, the module-level
+[[typerconf.get]] and [[typerconf.set]], and the cached [[default]]
+helper (\cref{cli.utils.defaults.cache}).  Changing the environment
+cannot reach a value that has already been computed, so we overwrite
+the captured default itself.  The test suite has always isolated
+itself this way (\cref{sec:isolating-the-config}); it now uses this
+function.
+
+Overwriting a default blindly would be a poor trade.  If a future
+[[typerconf]] moved the path out of the first slot, the assignment
+would still succeed, and nytid would quietly go back to the user's
+real configuration---the one outcome the variable exists to rule out.
+So we check what we replace and refuse to guess.  The error stops
+nytid from starting at all, which is the safe direction.
+
+<<functions>>=
+def replace_config_default(method, conf_file):
+    """Make `conf_file` the default config path of `method`.
+
+    Raises RuntimeError if `method` does not capture a config
+    path as its first default argument.
+    """
+    defaults = method.__defaults__
+    if not defaults or not str(defaults[0]).endswith(
+        CONFIG_FILE_NAME
+    ):
+        raise RuntimeError(
+            f"cannot honour {NYTID_HOME_ENV}: "
+            f"typerconf.{method.__qualname__} no longer "
+            f"captures its config path as its first default "
+            f"argument"
+        )
+    method.__defaults__ = (str(conf_file),) + defaults[1:]
+@
+
+We also replace [[typerconf.dirs]], the [[platformdirs]] object the
+path was computed from, for any code that asks it later.  Every
+attribute of a [[platformdirs.AppDirs]] that ends in [[_dir]] names a
+directory, so a stand-in answering all of them with the home keeps
+those lookups inside it too.
+
+<<functions>>=
+class HomeDirs:
+    """Stand-in for `platformdirs.AppDirs` that resolves every
+    directory to one root."""
+
+    def __init__(self, root):
+        self.root = str(root)
+
+    def __getattr__(self, name):
+        if name.endswith("_dir"):
+            return self.root
+        raise AttributeError(name)
+
+
+def redirect_config(conf_file):
+    """Make typerconf read and write `conf_file` by default."""
+    import typerconf
+
+    typerconf.dirs = HomeDirs(pathlib.Path(conf_file).parent)
+    for method in (
+        typerconf.Config.read_config,
+        typerconf.Config.write_config,
+    ):
+        replace_config_default(method, conf_file)
+@
+
+Let's verify the redirection where it matters: a value set through
+[[typerconf]] lands in our file and is read back from it.  The test
+suite has redirected [[typerconf]] already, so a fixture puts the
+suite's redirection back afterwards.
+
+<<test functions>>=
+@pytest.fixture
+def restore_typerconf():
+    """Undo a test's redirection of typerconf."""
+    saved_dirs = typerconf.dirs
+    methods = (
+        typerconf.Config.read_config,
+        typerconf.Config.write_config,
+    )
+    saved = [method.__defaults__ for method in methods]
+    yield
+    typerconf.dirs = saved_dirs
+    for method, defaults in zip(methods, saved):
+        method.__defaults__ = defaults
+
+
+def test_redirect_config_moves_reads_and_writes(
+    tmp_path, restore_typerconf
+):
+    """typerconf.set and typerconf.get use the new file."""
+    conf_file = tmp_path / "config.json"
+    redirect_config(conf_file)
+
+    typerconf.set("todo.data_dir", "/somewhere")
+
+    assert json.loads(conf_file.read_text()) == {
+        "todo": {"data_dir": "/somewhere"}
+    }
+    assert typerconf.get("todo.data_dir") == "/somewhere"
+    assert typerconf.dirs.user_config_dir == str(tmp_path)
+@
+
+And the refusal: a method whose first default is not a configuration
+path is left alone, and we say why.
+
+<<test functions>>=
+def test_replace_config_default_refuses_to_guess():
+    """An unexpected signature is an error, not a guess."""
+    def read_config(self, verbose=False):
+        pass
+
+    with pytest.raises(RuntimeError, match="NYTID_HOME"):
+        replace_config_default(read_config, "/x/config.json")
+    assert read_config.__defaults__ == (False,)
+@
+
+\subsection{When the redirection happens}%
+\label{sec:home-import}
+
+The redirection must be in place before anything reads the
+configuration, and some of nytid reads it while it is being imported:
+the [[nytid config]] command loads the file when the CLI builds its
+commands.  Nor is the CLI the only way in.  [[prompt-nytid]] imports
+[[nytid.prompt]], and a script may import [[nytid.cli.todo]] or
+[[nytid.courses.registry]] directly.  What all of them have in common
+is that Python imports the [[nytid]] package first.  So the package's
+[[__init__.py]] calls the function below, and every entry point,
+present or future, is covered before its first module body runs.
+
+That file is the package marker, written by hand rather than tangled,
+so it stays a single call to this function:
+
+\begin{minted}{python}
+from nytid.home import apply_nytid_home
+
+apply_nytid_home()
+\end{minted}
+
+Redirecting right there would be too early, though, and the prompt
+would pay for it.  The redirection imports [[typerconf]], which imports
+[[typer]]: about sixty milliseconds, several times what
+[[prompt-nytid]] spends on a whole prompt, and the prompt never reads
+the configuration through [[typerconf]] at all
+(\cref{prompt:config}).  So we redirect at the last possible moment
+instead, just after [[typerconf]] itself has been imported.
+
+If it already has been---a script imported it before nytid, as the
+test suite does---we redirect at once.  Otherwise we put a finder at
+the front of [[sys.meta_path]], the list of objects Python asks to
+locate a module that is imported for the first time.  For any other
+name the finder declines, and Python asks the next one.  For
+[[typerconf]] it removes itself, lets the standard machinery locate
+the module, and hands back the result with the loader wrapped.  The
+wrapper runs the real loader, which executes [[typerconf]]'s module
+body and so computes its default path, and then the redirection---all
+before the [[import]] statement that asked for [[typerconf]] returns.
+No code can see [[typerconf]] unredirected, and a process that never
+imports it never pays for it.
+
+<<functions>>=
+class RedirectOnImport:
+    """Import-system finder that redirects typerconf once it
+    has been imported."""
+
+    def __init__(self, conf_file):
+        self.conf_file = conf_file
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "typerconf":
+            return None
+        sys.meta_path.remove(self)
+        import importlib.util
+
+        spec = importlib.util.find_spec(name)
+        if spec is not None:
+            spec.loader = RedirectingLoader(
+                spec.loader, self.conf_file
+            )
+        return spec
+@
+
+The wrapper puts the real loader back on the module before running
+it, so that to [[typerconf]] and to [[importlib]] the module looks
+exactly as if it had been imported the ordinary way.
+
+<<functions>>=
+class RedirectingLoader:
+    """Loader that runs typerconf's real loader, then
+    redirects it."""
+
+    def __init__(self, loader, conf_file):
+        self.loader = loader
+        self.conf_file = conf_file
+
+    def create_module(self, spec):
+        return self.loader.create_module(spec)
+
+    def exec_module(self, module):
+        module.__loader__ = module.__spec__.loader = self.loader
+        self.loader.exec_module(module)
+        redirect_config(self.conf_file)
+@
+
+A process may apply the variable more than once; the tests do.  A
+second finder would never fire, since the first one's import puts
+[[typerconf]] in [[sys.modules]], where Python looks before asking any
+finder, so we keep a single finder and give it the newest file.
+
+<<functions>>=
+def redirect_when_imported(conf_file):
+    """Redirect typerconf to `conf_file` once it is imported."""
+    for finder in sys.meta_path:
+        if isinstance(finder, RedirectOnImport):
+            finder.conf_file = conf_file
+            return
+    sys.meta_path.insert(0, RedirectOnImport(conf_file))
+@
+
+The function the package calls ties the two cases together.  It also
+writes the absolute form of the variable back into the environment.
+The processes nytid starts---the launched command of a todo, a shell
+in its working directory---inherit the environment, not our current
+directory, so a relative value would name a different directory for
+them (\cref{home}).
+
+<<functions>>=
+def apply_nytid_home():
+    """Honour NYTID_HOME in this process and the ones it starts.
+
+    Does nothing when NYTID_HOME is unset or empty.
+    """
+    home = nytid_home()
+    if home is None:
+        return
+    os.environ[NYTID_HOME_ENV] = str(home)
+    if "typerconf" in sys.modules:
+        redirect_config(config_file())
+    else:
+        redirect_when_imported(config_file())
+@
+
+Let's verify both effects in this process, where [[typerconf]] is
+already imported, and that applying twice leaves one finder waiting
+for a later import.
+
+<<test functions>>=
+def test_apply_nytid_home_pins_the_absolute_home(
+    monkeypatch, tmp_path, restore_typerconf
+):
+    """A relative home is exported absolute and holds the config."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(NYTID_HOME_ENV, "sandbox")
+
+    apply_nytid_home()
+
+    assert os.environ[NYTID_HOME_ENV] == str(tmp_path / "sandbox")
+    assert typerconf.Config.read_config.__defaults__[0] == str(
+        tmp_path / "sandbox" / "config.json"
+    )
+
+
+def test_redirect_when_imported_keeps_one_finder(monkeypatch):
+    """A second application updates the waiting finder."""
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+
+    redirect_when_imported("/a/config.json")
+    redirect_when_imported("/b/config.json")
+
+    finders = [
+        finder for finder in sys.meta_path
+        if isinstance(finder, RedirectOnImport)
+    ]
+    assert [finder.conf_file for finder in finders] == [
+        "/b/config.json"
+    ]
+@
+
+In-process tests cannot show that the import really does it, because
+the test suite imported nytid and [[typerconf]] long before.  A fresh
+process can.  The first one imports nytid and then [[typerconf]], the
+order in which the CLI does it, and reports what [[typerconf]] ended
+up with: the file in the home, and its own loader.
+
+<<test functions>>=
+def test_typerconf_imported_after_nytid_is_redirected(tmp_path):
+    """The finder redirects a later import of typerconf."""
+    probe = (
+        "import sys, nytid;"
+        "assert 'typerconf' not in sys.modules;"
+        "import typerconf;"
+        "print(typerconf.Config.read_config.__defaults__[0]);"
+        "print(type(typerconf.__loader__).__name__)"
+    )
+    env = dict(
+        os.environ,
+        NYTID_HOME=str(tmp_path),
+        PYTHONPATH=str(pathlib.Path(nytid.__file__).parents[1]),
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], env=env,
+        capture_output=True, text=True, check=True,
+    )
+    conf_file, loader = result.stdout.split()
+    assert conf_file == str(tmp_path / "config.json")
+    assert loader != "RedirectingLoader"
+@
+
+The second runs the CLI itself, with [[HOME]] and [[XDG_CONFIG_HOME]]
+pointing at directories of their own so that a failure would be visible there
+rather than in the user's files, and without the tmux variables so
+nothing reaches the user's tmux server.  One command writes the
+configuration and one adds a todo; both must land in the home and
+nowhere else.
+
+<<test functions>>=
+def run_cli_in_fresh_process(env, *args):
+    """Run the nytid CLI with `args` in a new interpreter."""
+    return subprocess.run(
+        [
+            sys.executable, "-c",
+            "from nytid.cli import cli; cli()",
+            *args,
+        ],
+        env=env, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_fresh_process_keeps_everything_in_the_home(tmp_path):
+    """Config and data of a new process land in NYTID_HOME."""
+    sandbox = tmp_path / "nytid-home"
+    elsewhere = tmp_path / "home"
+    elsewhere.mkdir()
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("TMUX", "XDG_"))
+    }
+    env.update({
+        NYTID_HOME_ENV: str(sandbox),
+        "HOME": str(elsewhere),
+        "XDG_CONFIG_HOME": str(elsewhere / "xdg"),
+        "PYTHONPATH": str(pathlib.Path(nytid.__file__).parents[1]),
+    })
+
+    configured = run_cli_in_fresh_process(
+        env, "config", "todo.max_boost", "-s", "5"
+    )
+    assert configured.returncode == 0, configured.stderr
+    added = run_cli_in_fresh_process(
+        env, "todo", "add", "-t", "From the sandbox"
+    )
+    assert added.returncode == 0, added.stderr
+
+    assert json.loads(
+        (sandbox / "config.json").read_text()
+    )["todo"]["max_boost"] == "5"
+    todos = (sandbox / "todos" / "todos.json").read_text()
+    assert "From the sandbox" in todos
+    assert list(elsewhere.iterdir()) == []
+@
+
+
+\section{Runtime state}
+
+The tmux state does not move into the home.  It lives in the temporary
+directory so that a reboot clears it together with the windows it
+describes (\cref{track:tmux-state-dir}), and a home is meant to
+survive reboots.  But it cannot stay in the shared [[nytid-<uid>]]
+either: a sandboxed command run in the user's tmux would then rewrite
+the window labels the user's real tracking relies on.  So a home gets
+its own directory next to it, named by a digest of the home's path.
+The digest keeps the name short and free of the slashes a path would
+bring, and the same home always gets the same directory.  We import
+[[hashlib]] on this branch only: it costs a couple of milliseconds that
+a prompt without [[NYTID_HOME]] has no reason to pay.
+
+<<functions>>=
+def tmux_state_dirname():
+    """Return the name of the tmux-state directory.
+
+    The directory lives in the temporary directory: nytid-<uid>,
+    with a digest of $NYTID_HOME appended when that is set.
+    """
+    name = f"nytid-{os.getuid()}"
+    home = nytid_home()
+    if home is None:
+        return name
+    import hashlib
+
+    digest = hashlib.sha256(
+        str(home).encode()
+    ).hexdigest()[:12]
+    return f"{name}-{digest}"
+@
+
+Let's verify that homes are kept apart and that a home keeps its
+directory.
+
+<<test functions>>=
+def test_tmux_state_dirname_separates_homes(monkeypatch, tmp_path):
+    """Each home has its own state directory, the default none."""
+    monkeypatch.delenv(NYTID_HOME_ENV, raising=False)
+    plain = tmux_state_dirname()
+    assert plain == f"nytid-{os.getuid()}"
+
+    names = []
+    for home in ("a", "b", "a"):
+        monkeypatch.setenv(NYTID_HOME_ENV, str(tmp_path / home))
+        names.append(tmux_state_dirname())
+    assert names[0] == names[2]
+    assert len({plain, names[0], names[1]}) == 3
+    assert all(name.startswith(plain + "-") for name in names)
+@
+
+
+\section{What the variable does not reach}
+
+Two kinds of location stay where they are.
+
+\begin{description}
+\item[Locations named in the configuration] The [[hr]] directories,
+  course registers and similar keys name places outside nytid's own
+  tree, often shared ones in AFS.  In a fresh home they are simply
+  not configured; a home whose configuration names a shared
+  directory writes there, as it would without the variable.
+\item[The tmux hooks] Tracking installs hooks in the tmux server that
+  run [[nytid]] on window and pane events.  Those commands run in the
+  tmux server's environment, not in the one that installed them, so
+  they do not see [[NYTID_HOME]].  A sandbox that starts tracked
+  tmux sessions inside the user's own tmux server therefore still
+  reaches the user's data through those hooks; such a sandbox needs
+  its own tmux server as well ([[tmux -L sandbox]]).
+\end{description}
+
+\section{Test harness}
+
+<<test [[home.py]]>>=
+import json
+import os
+import pathlib
+import subprocess
+import sys
+sys.path.insert(0, "../src")
+
+import pytest
+import typerconf
+
+import nytid
+from nytid.home import *
+
+<<test functions>>
+@
