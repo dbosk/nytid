@@ -110,6 +110,20 @@ nytid courses new DD1310
 nytid schedule show
 ```
 
+## Where the data lives
+
+nytid keeps its configuration in `~/.config/nytid/config.json` and its data
+(todos, time tracking, caches) under `~/.nytid`. Set `NYTID_HOME` to move all
+of it at once, for example to try a new version or run a script on throw-away
+data:
+
+```bash
+NYTID_HOME=/tmp/nytid-sandbox nytid todo ls
+```
+
+The configuration then lives in `$NYTID_HOME/config.json` and the data
+directly under `$NYTID_HOME`.
+
 ## Documentation
 
 For a full introduction and design overview, read the PDF found in the latest
