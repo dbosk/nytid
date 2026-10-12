@@ -1528,9 +1528,16 @@ approaches.
 
 Some items are intentionally left unranked. They still need a stable
 display order, but they should not participate in numeric midpoint
-math. We therefore let [[effective_priority]] return [[None]] when the
-stored priority is unset, and handle mixed ranked/unranked lists with a
-separate display-order helper.
+math. We therefore let [[boosted_priority]], the base priority plus the
+boost, return [[None]] when the stored priority is unset, and handle
+mixed ranked/unranked lists with a separate display-order helper.
+
+The boosted priority is not yet what the rest of the module asks for.
+An item that holds up more urgent work takes that work's priority
+(\cref{sec:todo-urgency-priority}), and [[effective_priority]], which
+the listings, [[next]] and the schedule sort by, is the boosted
+priority raised in that way.  For an item that holds nothing up the two
+are the same, and so they are for every item in this section's tests.
 
 Why quadratic rather than linear? A linear curve would start boosting
 immediately, which is unhelpful for items due in three months. The
@@ -1567,11 +1574,11 @@ which have no number to boost, are ordered by the same deadline, so
 an unranked blocker of urgent work moves up among them too.
 
 <<effective priority>>=
-def effective_priority(
+def boosted_priority(
     item: TodoItem,
     now: datetime.datetime | None = None,
 ) -> float | None:
-    """Compute effective priority including deadline boost.
+    """Compute the priority including the deadline boost.
 
     Returns ``None`` when the stored base priority is
     unset. Otherwise returns base priority plus a
@@ -1633,15 +1640,18 @@ def todo_display_sort_key(
 ) -> tuple:
     """Return the user-facing display-order key.
 
-    Ranked items sort before unranked ones. Among the
-    unranked tail, earlier effective deadlines come first
-    and items without one come last.
+    Ranked items sort before unranked ones, and of two
+    with the same priority, the one that holds up more
+    comes first.  Among the unranked tail, earlier
+    effective deadlines come first and items without one
+    come last.
     """
     priority = effective_priority(item, now)
     if priority is not None:
         return (
             0,
             -priority,
+            -len(held_up_items(item)),
             item.created or "",
             item.id,
         )
@@ -4820,8 +4830,12 @@ are for, load the list afresh.
 
 [[Urgency]] holds the latest finish and its source.  The source is
 [[None]] when it is the item's own deadline, since then there is
-nothing to explain.  A done item gets no [[urgency]] at all and counts
-with its own deadline, as an item does that nothing has linked.
+nothing to explain.  It also holds the open items the item holds up,
+whose priority it takes on (\cref{sec:todo-urgency-priority}).  Those
+are items, not values, so they take no part when two [[Urgency]]
+values are compared or printed.  A done item gets no [[urgency]] at
+all and counts with its own deadline and priority, as an item does that
+nothing has linked.
 
 <<sub-item helpers>>=
 @dataclass
@@ -4831,10 +4845,14 @@ class Urgency:
     `deadline` is the latest the item may finish for every
     item after it to meet its deadline, and `via` the item
     whose own deadline that is, or `None` for the item's
-    own.  Set by `link_urgency`; never stored.
+    own.  `holds_up` are the open items it holds up.  Set
+    by `link_urgency`; never stored.
     """
     deadline: datetime.datetime | None = None
     via: int | None = None
+    holds_up: list = field(
+        default_factory=list, compare=False, repr=False
+    )
 
 
 def link_urgency(todos):
@@ -4848,7 +4866,8 @@ def link_urgency(todos):
     for item in open_items:
         deadline, source = finish.get(item.id, (None, None))
         item.urgency = Urgency(
-            deadline, None if source == item.id else source
+            deadline, None if source == item.id else source,
+            [by_id[i] for i in held_up_ids(item.id, blocks)],
         )
 
 
@@ -5022,9 +5041,9 @@ def test_the_boost_counts_down_to_the_latest_finish():
     ),
   ]
   now = datetime.datetime(2026, 1, 11)
-  assert effective_priority(todos[1], now) == 1.0
+  assert boosted_priority(todos[1], now) == 1.0
   link_urgency(todos)
-  assert effective_priority(todos[1], now) == (
+  assert boosted_priority(todos[1], now) == (
     1.0 + get_max_boost()
   )
 @
@@ -5071,6 +5090,181 @@ def test_loading_links_the_urgency(temp_todo_dir):
   assert "urgency" not in todos[1].to_dict()
   stored = json.loads(get_todo_file().read_text())
   assert all("urgency" not in t for t in stored["todos"])
+@
+
+\paragraph{The priority travels too}%
+\label{sec:todo-urgency-priority}
+The latest finish moves \#15 up, but only through the boost, and the
+boost is added to \#15's own number and capped at
+[[todo.max_boost]], ten by default.  If \#12 is ranked at~50 and \#15
+at~2, the full boost brings \#15 to~12: far below \#12, and below
+everything the user ranked in between.  Yet \#15 is exactly as
+important as \#12, since \#12 cannot be done without it.  Operating
+systems know this situation as priority inversion, a low-priority task
+holding a lock that a high-priority one waits for while everything in
+between runs first, and solve it by priority inheritance: the holder
+runs at the priority of the most urgent task waiting for it.  We do
+the same.  An item's effective priority is at least the boosted
+priority of every open item it holds up.
+
+An item holds up what it blocks, and what that blocks, and so on: a
+blocker of a blocker of \#12 holds \#12 up as surely as \#15 does.  It
+does not run along parents.  A part of \#12 already has a number just
+below \#12's, in \#12's range (\cref{sec:child-priority-helpers}), and
+\#12's deadline reaches it through the latest finish; raising every
+part to its parent's number would tie them all with it and erase the
+order the user gave them.  Nor does it run down into the parts of a
+blocked parent: the blocker holds up the parent, and the parent's
+number is the one the user ranked against the rest of the list.
+
+The raised priority is effective, never stored, like the boost: once
+\#12 is done, or the link is removed, \#15 drops back to its own
+place.  It reaches unranked items as well.  An unranked blocker of
+ranked work takes that work's priority and with it a place among the
+ranked items, since leaving it below every ranked item would hide it
+exactly where it matters.
+
+A raised item ties with the item it took its priority from, and in a
+chain every link ties with the last.  The display order breaks such a
+tie by putting first the item that holds up more, so that a chain is
+listed in the order its work has to be done: \#16, \#15, \#12.
+
+<<sub-item helpers>>=
+def held_up_ids(item_id, blocks):
+    """Return the ids of the items `item_id` holds up.
+
+    Those are the items it blocks, and the ones they block, by
+    `blocks`, the map from blocker id to blocked ids that
+    `open_links` returns.
+    """
+    found, seen = [], {item_id}
+    frontier = list(blocks.get(item_id, []))
+    while frontier:
+        other_id = frontier.pop()
+        if other_id in seen:
+            continue
+        seen.add(other_id)
+        found.append(other_id)
+        frontier.extend(blocks.get(other_id, []))
+    return found
+
+
+def held_up_items(item):
+    """Return the open items `item` holds up, or `[]` if
+    nothing has linked it (`link_urgency`)."""
+    if item.urgency is None:
+        return []
+    return item.urgency.holds_up
+@
+
+[[raised_priority]] returns the priority together with the item it was
+taken from, so that [[view]] can say why an item stands where it does;
+[[effective_priority]] is the priority alone.  Both read the clock once,
+so that the item and the work it holds up are boosted for the same
+moment.
+
+<<sub-item helpers>>=
+def raised_priority(item, now=None):
+    """Return the effective priority of `item` and its source.
+
+    The priority is the highest boosted priority of the item
+    and the open items it holds up, `None` if none of them is
+    ranked.  The source is the id of the held-up item it was
+    taken from, or `None` if it is the item's own.
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    best, source = boosted_priority(item, now), None
+    for other in held_up_items(item):
+        priority = boosted_priority(other, now)
+        if priority is not None and (best is None or priority > best):
+            best, source = priority, other.id
+    return best, source
+
+
+def effective_priority(
+    item: TodoItem,
+    now: datetime.datetime | None = None,
+) -> float | None:
+    """Compute the effective priority of `item`.
+
+    That is its `boosted_priority`, raised to that of the
+    open items it holds up; `None` if neither it nor they
+    are ranked.
+    """
+    return raised_priority(item, now)[0]
+@
+
+Let's verify the example: \#15, ranked at~2, blocks \#12, ranked
+at~50, and \#16 blocks \#15.  Both blockers take \#12's priority, and
+the list shows the chain in the order of the work.  An item ranked
+in between, which holds nothing up, keeps its place below them:
+
+<<test functions>>=
+def test_a_blocker_takes_the_priority_of_what_it_holds_up():
+  """Priority inheritance along the blocks, in work order."""
+  todos = [
+    TodoItem(id=12, title="Report", priority=50.0, blocked_by=[15]),
+    TodoItem(id=15, title="Data", priority=2.0, blocked_by=[16]),
+    TodoItem(id=16, title="Ethics approval", priority=1.0),
+    TodoItem(id=20, title="In between", priority=30.0),
+  ]
+  link_urgency(todos)
+  by_id = {t.id: t for t in todos}
+  assert effective_priority(by_id[15]) == 50.0
+  assert raised_priority(by_id[16]) == (50.0, 12)
+  assert raised_priority(by_id[12]) == (50.0, None)
+  assert [t.id for t in sort_todos_for_display(todos)] == [
+    16, 15, 12, 20,
+  ]
+@
+
+A higher own priority is kept; an unranked blocker joins the ranked
+items; a done item raises nothing, and nothing runs along parents:
+
+<<test functions>>=
+def test_priority_inheritance_limits():
+  """Only open blocked work raises, and never below one's own."""
+  todos = [
+    TodoItem(id=1, title="Low", priority=1.0, blocked_by=[2, 3]),
+    TodoItem(id=2, title="High blocker", priority=9.0),
+    TodoItem(id=3, title="Unranked blocker", priority=None),
+    TodoItem(
+      id=4, title="Done", priority=40.0, status="done",
+      blocked_by=[5],
+    ),
+    TodoItem(id=5, title="Blocks a done item", priority=1.0),
+    TodoItem(id=6, title="Parent", priority=20.0),
+    TodoItem(id=7, title="Part", priority=19.0, parents=[6]),
+  ]
+  link_urgency(todos)
+  by_id = {t.id: t for t in todos}
+  assert raised_priority(by_id[2]) == (9.0, None)
+  assert raised_priority(by_id[3]) == (1.0, 1)
+  assert effective_priority(by_id[5]) == 1.0
+  assert effective_priority(by_id[7]) == 19.0
+@
+
+A blocker takes the work's \emph{boosted} priority, deadline included,
+so the boost on overdue work reaches its blocker in full even when
+the blocker's own boost would not lift it as far:
+
+<<test functions>>=
+def test_a_blocker_takes_the_boosted_priority():
+  """The held-up item's boost counts, not only its number."""
+  todos = [
+    TodoItem(
+      id=1, title="Overdue", priority=50.0,
+      created="2026-01-01T00:00:00",
+      deadline="2026-01-10T00:00:00", blocked_by=[2],
+    ),
+    TodoItem(id=2, title="Blocker", priority=2.0),
+  ]
+  link_urgency(todos)
+  now = datetime.datetime(2026, 1, 11)
+  assert effective_priority(todos[1], now) == (
+    50.0 + get_max_boost()
+  )
 @
 
 \subsection{Context-Aware Child Priorities}%
@@ -20068,6 +20262,34 @@ def test_ready_ranks_like_ls_and_caps(temp_todo_dir):
   assert ready_ids("--who", "", "-n", "0") == [2, 1, 4, 3]
 @
 
+That order includes what an item holds up
+(\cref{sec:todo-urgency-priority}): the blocker of top-ranked work is
+offered first, although it is ranked last and the work itself, being
+blocked, is not offered at all.  This is the case the whole of
+\cref{sec:todo-urgency-chain} is for:
+
+<<test functions>>=
+def test_ready_offers_the_blocker_of_urgent_work_first(
+  temp_todo_dir, temp_tracking_dir,
+):
+  """A low-ranked blocker stands where its blocked work would."""
+  save_todos(4, [
+    TodoItem(
+      id=1, title="Report", priority=50.0, blocked_by=[2],
+      created="2026-01-01T00:00:00", who="me",
+    ),
+    TodoItem(
+      id=2, title="Data", priority=1.0,
+      created="2026-01-01T00:00:00", who="me",
+    ),
+    TodoItem(
+      id=3, title="Middle", priority=30.0,
+      created="2026-01-01T00:00:00", who="me",
+    ),
+  ])
+  assert ready_ids("--who", "") == [2, 3]
+@
+
 The JSON record is [[ls]]'s with the path and the verdict appended;
 under [[--all]] the verdict is what tells a parent from a leaf:
 
@@ -20495,7 +20717,11 @@ own deadline, or have a deadline although it was given none
 \enquote{Needed by}, right after the item's own deadline, with the
 time and the item it is needed for.  The time is to the minute here,
 unlike the day in [[ls]], since an estimate taken off a deadline rarely
-lands on a whole day.
+lands on a whole day.  An item that takes its priority from the work it
+holds up (\cref{sec:todo-urgency-priority}) likewise says so, right
+after its own priority, as \enquote{Raised to: 52.0 for \#12 Report}:
+a user who finds a low-ranked item at the top of the list should not
+have to work out which link put it there.
 
 <<collect metadata fields>>=
 fields = []
@@ -20510,6 +20736,12 @@ if item.priority is not None:
     fields.append(("Priority", f"{item.priority:.1f}"))
 else:
     fields.append(("Priority", "unset"))
+raised_to, raised_for = raised_priority(item)
+if raised_for is not None:
+    fields.append((
+        "Raised to",
+        f"{raised_to:.1f} for {format_todo_refs(todos, [raised_for])}",
+    ))
 if item.deadline:
     fields.append(("Deadline", str(item.deadline)))
 if item.urgency is not None and item.urgency.via is not None:
@@ -20593,6 +20825,35 @@ def test_view_says_when_a_blocker_is_needed(
   report = runner.invoke(cli, ["view", "1", "--format", "plain"])
   assert report.exit_code == 0, report.output
   assert "Needed by" not in report.output
+@
+
+A blocker ranked below the item it holds up says what raised it, and the
+item itself, whose priority is its own, does not:
+
+<<test functions>>=
+def test_view_says_what_raised_a_priority(
+  temp_todo_dir, temp_tracking_dir,
+):
+  """`view` names the item a raised priority comes from."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Report", created="2026-02-20T10:00:00",
+      priority=50.0, blocked_by=[2],
+    ),
+    TodoItem(
+      id=2, title="Data", created="2026-02-20T10:00:00",
+      priority=None,
+    ),
+  ])
+
+  blocker = runner.invoke(cli, ["view", "2", "--format", "plain"])
+  assert blocker.exit_code == 0, blocker.output
+  assert "  Priority: unset\n" in blocker.output
+  assert "  Raised to: 50.0 for #1 Report\n" in blocker.output
+
+  report = runner.invoke(cli, ["view", "1", "--format", "plain"])
+  assert report.exit_code == 0, report.output
+  assert "Raised to" not in report.output
 @
 
 \paragraph{Where the item belongs}%
@@ -39442,6 +39703,8 @@ from nytid.cli.todo import (
     Urgency,
     link_urgency,
     effective_deadline,
+    raised_priority,
+    boosted_priority,
     todo_path,
     format_todo_path,
     assign_priority_at_position,
