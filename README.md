@@ -16,6 +16,7 @@ links.
 ```bash
 nytid courses ls
 nytid courses new DD1310
+nytid courses new prgi27 --base prgi26   # copy prgi26's settings
 nytid courses config DD1310
 ```
 
