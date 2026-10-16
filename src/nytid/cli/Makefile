@@ -16,6 +16,7 @@ EXTRAS+=	nytid.weekly.sh
 EXTRAS+=	nytid.premonthly.sh
 EXTRAS+=	nytid.monthly.sh
 EXTRAS+=	nytid-ignore.sh
+EXTRAS+=	nytid-redovisningar.sh
 
 .PHONY: all
 all: ${MODULES} ${EXTRAS}
