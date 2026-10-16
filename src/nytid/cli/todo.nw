@@ -66,6 +66,7 @@ statistics---works with todo items out of the box.
 
 <<[[todo.py]]>>=
 import click
+import copy
 import csv
 import datetime
 import fcntl
@@ -1219,7 +1220,18 @@ That makes storage updates more subtle than a plain JSON overwrite.
 Commands often need to update both files together, and a crash or
 concurrent command between those writes would leave the task model in an
 impossible state.  We therefore factor persistence into three layers:
-raw loaders, synchronizers, and a locked mutation helper.
+raw loaders, synchronizers, and a locked mutation helper.  Every command
+that changes the state goes through the third layer; how commands that
+must first ask the user something keep to that rule is the subject of
+\cref{sec:todo-read-modify-write}.
+
+The two helpers below are the convenient entry points for whole-state
+reads and writes.  [[load_todos]] is the snapshot read that commands
+start from.  [[save_todos]] \emph{replaces} the stored todos with the
+list it is given; it is right for setting up a known state, as the tests
+do, but it is not a way to save a modification: the list it writes was
+loaded before the lock was taken, so anything another process wrote in
+between would be erased.
 
 <<storage functions>>=
 def ensure_todo_dir():
@@ -1244,7 +1256,12 @@ def load_todos() -> tuple:
 
 
 def save_todos(next_id: int, todos: list[TodoItem]):
-    """Save todos to persistent storage."""
+    """Replace the stored todos with `todos`.
+
+    Not for read-modify-write: a list loaded earlier
+    would overwrite concurrent changes.  Change the state
+    inside a `mutate_todo_state` callback instead.
+    """
     def update(_next_id, _todos, stack):
         return next_id, todos, stack
 
@@ -1708,6 +1725,268 @@ def test_active_stack_discards_unknown_ids(temp_todo_dir):
     """Stack normalization drops IDs missing from todos."""
     save_active_stack([5, 7, 3])
     assert load_active_stack() == []
+@
+
+\subsection{Every Read-Modify-Write Goes Through the Lock}%
+\label{sec:todo-read-modify-write}
+
+[[mutate_todo_state]] protects exactly what happens inside its
+callback, and nothing else.  A command that loads the todos with
+[[load_todos]], changes its copy and hands the copy to [[save_todos]]
+still races, even though [[save_todos]] takes the lock: the lock covers
+the write, but the data being written was read before it.  Two
+commands that overlap show what that costs.  [[todo add]] and
+[[todo note]] start at the same moment and both read the file; [[note]]
+stores its note; [[add]] then writes its copy plus the new item, and
+the note is gone.  Two overlapping [[add]] commands are worse: both
+read the same [[next_id]], so the later one replaces the earlier
+item with a new one under the same ID.  These overlaps are not
+exotic here, since agents run [[note]] and [[done]] from their own
+sessions while the user works in the same list.
+
+The rule every command follows is therefore:
+\begin{description}
+\item[Snapshot] A command may read the state without the lock to decide
+  what to do: resolve which item is meant, ask the user to confirm or to
+  compare priorities, open an editor, or talk to GitHub.
+\item[Commit] The change itself is made inside one [[mutate_todo_state]]
+  callback, on the state that callback receives.  The callback looks
+  the items up again by ID, checks that what the decision assumed still
+  holds, and takes any new IDs from the [[next_id]] it was given.
+\end{description}
+
+Prompts and network calls stay out of the callback because they take
+unbounded time.  Holding the lock across a [[typer.confirm]] would
+block every other [[nytid todo]] command, the agents' included, for as
+long as the user takes to answer.
+
+A check in the commit step can fail.  The commonest case is an item
+that was removed while the command was waiting, and the answer is
+then to stop with an error rather than to write the snapshot's copy
+back, which would bring a deleted item back from the dead.  Raising
+inside the callback is what makes this safe: [[mutate_todo_state]]
+writes only after the callback returns, so an exception leaves the
+files untouched.  Values the command worked out from the snapshot are,
+by contrast, applied as they are.  A priority chosen by binary search
+answers questions about the siblings the user was shown; if a sibling
+changed meanwhile, the number is still where the user put the item,
+and asking again would cost more than a slightly stale rank.
+
+Most callbacks begin with the same look-up, so we give the
+\enquote{no longer exists} error one home.
+
+<<active stack helpers>>=
+def require_todo(todos, todo_id):
+    """Return the item with `todo_id` from a fresh state.
+
+    Exits with an error if it is gone, which inside a
+    `mutate_todo_state` callback also abandons the write.
+    """
+    item = next(
+        (t for t in todos if t.id == todo_id), None
+    )
+    if item is None:
+        typer.echo(
+            f"Error: todo #{todo_id} no longer exists",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return item
+@
+
+Commands that \emph{set} fields, such as [[edit]], need one more tool.
+They change their snapshot copy across many chunks, some of which
+prompt, so moving all of that into a callback would mean moving the
+prompts under the lock too.  Instead we remember what the item looked
+like when the command read it, let the command edit its copy as
+before, and at commit time copy to the fresh item exactly the fields
+that differ from the remembered version.  Those differences are what
+the user asked for; every other field keeps whatever the store holds
+\emph{now}, so a note or a status change that another process wrote
+meanwhile survives the edit.
+
+Comparing stored values is what makes the difference precise.
+[[to_dict]] reports what the item holds rather than the worker defaults
+that attribute reads fall back to (\cref{todo:worker-defaults}), so a
+configured default never looks like an edit.  The remembered version
+must be a deep copy, because [[to_dict]] hands out the item's own label
+list and environment dictionary, which a later in-place change would
+otherwise alter on both sides of the comparison.
+
+Sometimes the right \enquote{before} is not what was read.  An editor
+buffer is not stored verbatim: saving it strips the title and notes and
+normalizes the front matter (\cref{sec:edit-via-editor}).  The changes
+a user made in a buffer are therefore the differences from what saving
+the \emph{untouched} buffer would store, and comparing with the raw
+item instead would mistake a lost trailing newline for an edit.  That
+baseline still differs from what was read, though, and saving an
+untouched buffer has always tidied such values in the store.  The
+optional [[read]] argument keeps that: a field the user left alone is
+still written if the store holds exactly what was read, which means no
+other process changed it meanwhile.  Without [[read]], the baseline is
+what was read and the rule is the simple one above.
+
+The replay is right for setting a field and wrong for adding to one: if
+two commands both append to [[notes]], each sees its own text as the
+change and the later one erases the earlier.  Appends are therefore
+never replayed; they are performed inside the callback, as [[note]]
+does.  The same goes for any edit that is relative to the current
+value, such as [[edit --add-label]]: replaying the resulting label list
+would drop a label that another process added meanwhile.  The [[skip]]
+argument keeps such fields out of the replay, and the caller applies
+the increment to the fresh item instead.
+
+<<active stack helpers>>=
+def item_fields(item):
+    """Return a detached copy of the item's stored fields."""
+    return copy.deepcopy(item.to_dict())
+
+
+def replay_item_edits(
+    target, before, edited, read=None, *, skip=(),
+):
+    """Copy to `target` the fields `edited` changed.
+
+    `before` is the baseline `edited` started from,
+    normally `item_fields` of the item as it was read.
+    A field equal to `before` is left as `target` has
+    it, unless `read` (the fields as read, if they
+    differ from `before`) shows it unchanged in the
+    store, in which case `edited`'s value is written.
+    Fields named in `skip` are never copied.
+    """
+    if read is None:
+        read = before
+    current = target.to_dict()
+    for key, value in edited.to_dict().items():
+        if key in skip:
+            continue
+        if (
+            before.get(key) != value
+            or current.get(key) == read.get(key)
+        ):
+            setattr(target, key, copy.deepcopy(value))
+@
+
+Let's verify that a replay carries the edit and nothing else: the
+title set on the old copy arrives, while the note that reached the
+store in the meantime stays.
+
+<<test functions>>=
+def test_replay_item_edits_keeps_concurrent_fields():
+    """Only fields changed on the copy reach the target."""
+    edited = TodoItem(id=1, title="Old", labels=["a"])
+    before = item_fields(edited)
+    edited.title = "New"
+    edited.labels.append("b")
+    target = TodoItem(
+        id=1, title="Old", labels=["a"], notes="Meanwhile",
+    )
+
+    replay_item_edits(target, before, edited)
+
+    assert target.title == "New"
+    assert target.labels == ["a", "b"]
+    assert target.notes == "Meanwhile"
+@
+
+Testing the rule needs the dangerous interleaving on demand rather than
+by luck.  We get it by holding each thread at its first state read, the
+unlocked snapshot, until every thread has taken one.  After that
+barrier both commands are working from the same old state, which is
+precisely the situation in which an unlocked save loses data.  The
+barrier must not stop a later read: the reads inside
+[[mutate_todo_state]] happen with the lock held, and a thread waiting
+there for a partner that is itself waiting for the lock would never
+wake up.
+
+Each thread runs a real command and so takes the real lock.  That
+matters because [[flock]] locks belong to an open file description:
+[[mutate_todo_state]] opens the lock file afresh on every call, so two
+threads exclude each other just as two processes would, and a mocked
+lock would prove nothing.
+
+<<test functions>>=
+def run_with_shared_snapshot(*commands):
+    """Run each command in its own thread from one old state.
+
+    Every thread is held after its first todo-state read
+    until all threads have made one.  Returns the results
+    and re-raises the first exception from any thread.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from nytid.cli import todo as todo_module
+
+    real_load = todo_module.load_todo_state
+    barrier = threading.Barrier(len(commands), timeout=10)
+    held = set()
+
+    def load_then_wait():
+        state = real_load()
+        me = threading.get_ident()
+        if me not in held:
+            held.add(me)
+            barrier.wait()
+        return state
+
+    with patch(
+        "nytid.cli.todo.load_todo_state",
+        side_effect=load_then_wait,
+    ):
+        with ThreadPoolExecutor(len(commands)) as pool:
+            futures = [pool.submit(c) for c in commands]
+            return [f.result() for f in futures]
+@
+
+With that harness, the two overlaps from the start of this section
+become tests.  We call the command functions directly rather than
+through [[CliRunner]], which redirects the process-wide standard
+streams and so cannot run two invocations at once.  [[--prio]] and
+[[--top-level]] keep [[add]] from prompting or looking for a tmux
+parent.
+
+<<test functions>>=
+def add_ranked(title):
+    """Return a call of `todo add` that needs no prompts."""
+    from nytid.cli.todo import add
+    return lambda: add(
+        None, title=title,
+        top_level=True, explicit_priority=1.0,
+    )
+
+
+def test_overlapping_adds_get_distinct_ids(temp_todo_dir):
+    """Two adds from one snapshot both survive, with own IDs."""
+    run_with_shared_snapshot(
+        add_ranked("First"), add_ranked("Second"),
+    )
+
+    next_id, todos = load_todos()
+    assert sorted(t.title for t in todos) == ["First", "Second"]
+    assert sorted(t.id for t in todos) == [1, 2]
+    assert next_id == 3
+
+
+def test_overlapping_add_keeps_a_note(temp_todo_dir):
+    """A note stored while an add is pending is not lost."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Existing",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    run_with_shared_snapshot(
+        add_ranked("New"),
+        lambda: note(1, message="Progress", edit=False),
+    )
+
+    _, todos = load_todos()
+    by_title = {t.title: t for t in todos}
+    assert by_title["Existing"].notes == "Progress"
+    assert by_title["New"].id == 2
 @
 
 \section{Sub-item Helpers}%
@@ -6137,35 +6416,62 @@ def gh_add_comment(repo, number, body):
 
 \paragraph{Appending notes to items}
 Several places need to add a note to a todo item---the [[note]]
-command, headless output capture, and timeout handling.  Rather
-than duplicating the GitHub-vs-local branching logic, we extract
-a shared helper.  For GitHub-linked items we post a comment
+command, headless output capture, timeout handling and detached-run
+cleanup.  Rather than duplicating the GitHub-vs-local branching logic,
+we extract shared helpers.  For GitHub-linked items we post a comment
 \emph{and} store locally (belt-and-suspenders), because in
 headless mode there is no human to notice a failed API call.
 
-<<helpers>>=
-def append_note_to_item(item, note_text, next_id, todos):
-    """Append a note to a todo item.
+Those two halves are different kinds of work, so they are two helpers
+rather than one.  Posting the comment is network I/O, which can take
+seconds; storing the note is a change to the todo state, which must
+happen on the freshly loaded item inside the caller's
+[[mutate_todo_state]] callback.
+Doing both in one call would force a choice between holding the todo
+lock across a network round trip---stalling every other [[nytid todo]]
+command meanwhile---and appending to a stale snapshot, which is how
+concurrent notes used to get lost.  The caller therefore posts first,
+outside the lock, and then appends in its callback.
 
-    Posts to GitHub if linked, always stores locally.
+<<helpers>>=
+def post_note_comment(item, note_text):
+    """Post a note as a GitHub comment if the item is linked.
+
+    A failed post is logged rather than raised: the note
+    is still stored locally by `append_note_to_item`.
+    Call this outside the todo-state lock.
     """
-    if item.github:
-        try:
-            gh_add_comment(
-                item.github["repo"],
-                item.github["number"],
-                note_text,
-            )
-        except Exception:
-            logging.warning(
-                "Failed to post GitHub comment "
-                f"for #{item.id}"
-            )
+    if not item.github:
+        return
+    try:
+        gh_add_comment(
+            item.github["repo"],
+            item.github["number"],
+            note_text,
+        )
+    except Exception:
+        logging.warning(
+            "Failed to post GitHub comment "
+            f"for #{item.id}"
+        )
+@
+
+The local half only touches the item it is given.  It neither loads
+nor saves, so it can run on whatever item a callback has just looked
+up, and the callback's return value is what persists it.
+
+<<helpers>>=
+def append_note_to_item(item, note_text):
+    """Append `note_text` to the item's local notes.
+
+    Pure: it changes `item` and nothing else.  Run it
+    inside a `mutate_todo_state` callback so the note is
+    added to the current stored notes.
+    """
     if item.notes:
         item.notes += "\n" + note_text
     else:
         item.notes = note_text
-    save_todos(next_id, todos)
 @
 
 \paragraph{Parsing timeout durations}
@@ -6738,13 +7044,15 @@ who: Annotated[str | None, who_opt] = None,
 @
 
 Now the implementation. We first reject contradictory flags and fold
-the [[--note]] paragraphs into one string, then resolve the parent ID,
-determine the priority, and finally save.  The fold happens before the
+the [[--note]] paragraphs into one string, then resolve the parent ID
+and determine the priority, both on the snapshot loaded here, and
+finally create the item under the lock
+(\cref{sec:todo-read-modify-write}).  The fold happens before the
 branch because both ways of creating an item need the result: the
 flag path stores it, and the editor path shows it.
 
 <<add command implementation>>=
-next_id, todos = load_todos()
+_, todos = load_todos()
 try:
     _, run_command = resolve_command_argv(run_command, ctx)
 except ValueError as exc:
@@ -7308,26 +7616,7 @@ resolved_who = who or default_username
 estimated_hours = (
     parse_hours(estimate) if estimate else None
 )
-item = TodoItem(
-    id=next_id,
-    title=title,
-    labels=inherited_labels,
-    priority=priority,
-    status="pending",
-    created=now,
-    deadline=inherited_deadline,
-    estimated=estimated_hours,
-    description=description or "",
-    notes=notes_text,
-    parent_id=resolved_parent,
-    who=resolved_who,
-    wd=resolved_wd,
-    worktree=normalize_worktree_name(worktree),
-    env=resolved_env,
-    command=run_command,
-)
-todos.append(item)
-save_todos(next_id + 1, todos)
+<<append the new todo under the lock>>
 
 typer.echo(f"Added todo #{item.id}: {item.title}")
 if inherited_labels:
@@ -7344,6 +7633,45 @@ if item.worktree:
     typer.echo(f"  Worktree: {item.worktree}")
 if run_command:
     typer.echo(f"  Command: {run_command}")
+@
+
+Everything so far worked on the snapshot read at the start of the
+command, including the binary search, which may have kept the user
+answering questions for a while.  The item itself is created inside a
+locked callback (\cref{sec:todo-read-modify-write}).  Its ID has to
+come from the [[next_id]] that is current when the item is written:
+taking it from the snapshot is what let two overlapping [[add]]s
+hand out the same ID.  The parent chosen at the start is looked up
+again for the same reason, since it may have been removed in the
+meantime, and a child of a removed item would be promoted to the top
+level by [[get_visible_roots]] instead of being refused.
+
+<<append the new todo under the lock>>=
+def append_new_todo(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    item = TodoItem(
+        id=next_id,
+        title=title,
+        labels=inherited_labels,
+        priority=priority,
+        status="pending",
+        created=now,
+        deadline=inherited_deadline,
+        estimated=estimated_hours,
+        description=description or "",
+        notes=notes_text,
+        parent_id=resolved_parent,
+        who=resolved_who,
+        wd=resolved_wd,
+        worktree=normalize_worktree_name(worktree),
+        env=resolved_env,
+        command=run_command,
+    )
+    todos.append(item)
+    return next_id + 1, todos, stack, item
+
+*_, item = mutate_todo_state(append_new_todo)
 @
 
 Let us verify that [[--worktree]] is persisted next to [[wd]], that
@@ -7426,6 +7754,16 @@ environment is often large, noisy, and not something the user wants to
 edit as front matter.  The flag still applies when saving, just without
 dumping the whole environment into the buffer.
 
+The editor session and the priority search both wait for the user, so
+they run on the snapshot, and the items are created afterwards inside
+one locked callback (\cref{sec:todo-read-modify-write}).  That callback
+re-checks the parent and draws every ID---the parent's and all its
+children's---from the current [[next_id]], exactly as the flag path
+does.  The creation chunks below assign to [[next_id]] and [[todos]] as
+they go; inside the callback those names are its parameters, the fresh
+state, so the recursive [[create_children_from_parsed]] picks them up
+through [[nonlocal]] without knowing that a lock is involved.
+
 <<add via editor>>=
 <<build initial editor metadata>>
 initial = title if title else ""
@@ -7444,9 +7782,17 @@ priority_title = parsed.title
 <<resolve parent id>>
 <<inherit from parent>>
 <<resolve priority for new todo>>
-<<create parent from parsed>>
-<<create children from parsed>>
-save_todos(next_id, todos)
+
+
+def append_parsed_todos(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    <<create parent from parsed>>
+    <<create children from parsed>>
+    return next_id, todos, stack
+
+
+mutate_todo_state(append_parsed_todos)
 @
 
 We build a metadata dictionary from CLI flags so the editor opens
@@ -11945,7 +12291,7 @@ def edit(
     except typer.BadParameter as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "edit",
         who=default_username, todos=todos,
@@ -11959,6 +12305,7 @@ def edit(
             err=True,
         )
         raise typer.Exit(1)
+    before = item_fields(item)
 
     if edit_interactive:
         <<edit via editor>>
@@ -12344,8 +12691,92 @@ if explicit_priority is not None:
 elif rerank:
     <<place the edited item among its siblings>>
 
-save_todos(next_id, todos)
+<<commit the flag edits under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+Everything above changed the snapshot copy [[item]], and the
+placement search may have prompted the user on the way.  The commit
+replays those changes onto the item as it is stored now
+(\cref{sec:todo-read-modify-write}), so fields the flags did not
+mention keep any change another process made in the meantime.  A new
+parent is checked again for the reason [[add]] checks its parent: it
+may have been removed while the user was answering questions.
+
+[[--add-label]] and [[--remove-label]] are the exception to the
+replay.  They say how to change the labels, not what the labels should
+be, so the commit applies them again to the fresh labels and keeps the
+label list out of the replay; otherwise a label another process added
+meanwhile would vanish.  [[--label]] replaces the set outright and is
+replayed like any other field.
+
+<<commit the flag edits under the lock>>=
+def commit_flag_edits(next_id, todos, stack):
+    moved = item.parent_id != before["parent_id"]
+    if moved and item.parent_id is not None:
+        require_todo(todos, item.parent_id)
+    fresh = require_todo(todos, todo_id)
+    relative_labels = bool(add_label or remove_label)
+    replay_item_edits(
+        fresh, before, item,
+        skip={"labels"} if relative_labels else (),
+    )
+    if relative_labels:
+        fresh.labels, _ = apply_label_edits(
+            fresh.labels, add_label or [], remove_label or [],
+        )
+    return next_id, todos, stack
+
+
+mutate_todo_state(commit_flag_edits)
+@
+
+Let's verify the replay with the overlap harness from
+\cref{sec:todo-read-modify-write}: an edit of the title and a note
+start from the same old state, and both changes must be stored.
+
+<<test functions>>=
+def test_overlapping_edit_keeps_a_note(temp_todo_dir):
+  """An edit from an old snapshot keeps a concurrent note."""
+  from nytid.cli.todo import edit, note
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Old",
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  run_with_shared_snapshot(
+    lambda: edit(None, todo_id=1, title="New"),
+    lambda: note(1, message="Progress", edit=False),
+  )
+
+  _, todos = load_todos()
+  assert todos[0].title == "New"
+  assert todos[0].notes == "Progress"
+@
+
+Relative label edits get the same treatment: two commands that each
+add a label from the same old state must leave both labels behind.
+
+<<test functions>>=
+def test_overlapping_add_labels_both_kept(temp_todo_dir):
+  """Two --add-label edits from one snapshot both survive."""
+  from nytid.cli.todo import edit
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task", labels=["a"],
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  run_with_shared_snapshot(
+    lambda: edit(None, todo_id=1, add_label=["b"]),
+    lambda: edit(None, todo_id=1, add_label=["c"]),
+  )
+
+  _, todos = load_todos()
+  assert todos[0].labels == ["a", "b", "c"]
 @
 
 The move can also land the item under a parent that is itself
@@ -12588,8 +13019,26 @@ and reconcile. Reconciliation matches existing children by title
 status, and tracked time. New headings create new children; removed
 headings delete children.
 
+The editor session lasts as long as the user likes, so the buffer is
+rendered from the snapshot and applied to the stored state inside a
+locked callback afterwards (\cref{sec:todo-read-modify-write}).  An
+agent may well have added a note or a sub-item in the meantime, and
+the buffer knows nothing of either.  We therefore remember every item
+the buffer showed, the todo and its whole subtree, as [[shown]].  It
+serves twice.  It is the \enquote{before} against which the user's
+changes to each item are measured and replayed, and it tells a child
+the user deleted from one that did not exist when the buffer was
+rendered.
+
 <<edit via editor>>=
 md = render_todo_markdown(item, todos)
+shown = buffer_baseline(
+    item, todos, parse_editor_content(md)
+)
+as_read = {
+    t.id: item_fields(t)
+    for t in [item, *get_descendants(todos, item.id)]
+}
 content = open_editor(md)
 parsed = parse_editor_content(content)
 if not parsed.title:
@@ -12598,9 +13047,58 @@ if not parsed.title:
 
 <<echo parse warnings>>
 <<update parent from parsed>>
-<<reconcile children>>
-save_todos(next_id, todos)
+<<commit the buffer under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+The \enquote{before} must be the item as the \emph{unedited} buffer
+would store it, not the item as it is stored.  Saving does not copy
+the buffer verbatim: the parser strips the title and the notes, and
+[[apply_metadata]] normalizes the front matter.  An item whose notes
+end in a newline, as notes read from standard input usually do, would
+otherwise look edited on every save merely because the buffer lost
+that newline, and the replay would then overwrite a note that arrived
+during the session.  [[buffer_baseline]] therefore saves the untouched
+buffer onto copies of the shown items, through the same steps the real
+save takes, and records the fields that results in.  Whatever the user
+changed differs from that baseline; whatever they left alone does not,
+however it was formatted in the store.  The fields as read are kept
+too, in [[as_read]], so that the replay can still tidy a field nobody
+else touched (\cref{sec:todo-read-modify-write}).
+
+Sections are paired with items the way reconciliation pairs them, by
+normalized title, so every item the buffer showed gets an entry.
+
+<<helpers>>=
+def buffer_baseline(item, todos, parsed):
+    """Return what saving an untouched buffer would store.
+
+    `parsed` is the parse of the buffer rendered from
+    `item`.  Returns `item_fields` of copies of `item`
+    and its shown descendants after the buffer's sections
+    are applied to them, keyed by ID.
+    """
+    baseline = {}
+
+    def settle(original, section):
+        saved = TodoItem.from_dict(item_fields(original))
+        saved.title = section.title
+        saved.notes = section.notes
+        apply_metadata(saved, section.metadata)
+        baseline[original.id] = item_fields(saved)
+        by_title = {
+            c.title.strip().lower(): c
+            for c in get_children(todos, original.id)
+        }
+        for child_section in section.children:
+            child = by_title.get(
+                child_section.title.strip().lower()
+            )
+            if child is not None:
+                settle(child, child_section)
+
+    settle(item, parsed)
+    return baseline
 @
 
 The front matter is handed to [[apply_metadata]]
@@ -12611,12 +13109,33 @@ than from the front-matter block, and they are assigned
 unconditionally, which is the opposite of the metadata rule and
 deliberately so: the parser refuses a buffer with no title, and an
 emptied body really does mean an emptied [[notes]], since there is no
-key to delete or leave out.
+key to delete or leave out.  These assignments go to the snapshot copy;
+only the fields they actually change are carried over at commit time.
 
 <<update parent from parsed>>=
 item.title = parsed.title
 item.notes = parsed.notes
 apply_metadata(item, parsed.metadata)
+@
+
+The commit replays the parent's changes and then reconciles the
+children against the fresh state.  Reconciliation creates children and
+removes them, so it has to run inside the callback: the new IDs come
+from the [[next_id]] the callback receives, and [[reconcile_children]]
+reaches that [[next_id]] and [[todos]] through [[nonlocal]].
+
+<<commit the buffer under the lock>>=
+def commit_the_buffer(next_id, todos, stack):
+    edited = require_todo(todos, todo_id)
+    replay_item_edits(
+        edited, shown[todo_id], item, as_read[todo_id]
+    )
+    <<reconcile children>>
+    reconcile_children(edited, parsed.children)
+    return next_id, todos, stack
+
+
+mutate_todo_state(commit_the_buffer)
 @
 
 Reconciliation matches children by normalized title. Existing
@@ -12661,18 +13180,35 @@ def reconcile_children(parent, parsed_children):
     <<distribute child priorities>>
     <<update or create each parsed child>>
     <<remove deleted children>>
-
-reconcile_children(item, parsed.children)
 @
 
 We normalize titles to lowercase with stripped whitespace so that
 minor formatting changes in the editor do not accidentally create
 duplicate children.
+
+The titles a section is matched against are the ones the buffer
+showed, not the ones stored now.  The buffer carries no IDs, so the
+title is the only thing that connects a section to an item, and the
+connection was made when the buffer was rendered.  If another process
+renames a shown child during the session, matching on the stored title
+would find no section for it: the child would be deleted as if the
+user had removed its heading, and its unchanged section would come
+back as a new child, losing the ID, the notes and the tracked time.
+Keying a shown child by its title in [[shown]] keeps the connection;
+the replay then leaves the new name alone, since the user did not
+change the title in the buffer.  Children the buffer never showed are
+keyed by their stored title, and a shown child wins a clash, because
+the section was written about it.
 <<build existing children index>>=
+children = get_children(todos, parent.id)
 existing_by_title = {
     c.title.strip().lower(): c
-    for c in get_children(todos, parent.id)
+    for c in children if c.id not in shown
 }
+existing_by_title.update({
+    shown[c.id]["title"].strip().lower(): c
+    for c in children if c.id in shown
+})
 @
 
 Priority distribution uses the parent's sibling-context range so
@@ -12741,6 +13277,7 @@ is settled, so a freshly created child can already receive
 grandchildren in the same save.  A newly appended child is on
 [[todos]] by then, which is what lets [[get_children]] find its own
 level on the recursive call.
+
 <<update or create each parsed child>>=
 for parsed_child in parsed_children:
     norm_title = parsed_child.title.strip().lower()
@@ -12757,10 +13294,7 @@ for parsed_child in parsed_children:
         prio = next(priority_iter, None)
     if existing_child is not None:
         child = existing_by_title.pop(norm_title)
-        child.title = parsed_child.title
-        child.notes = parsed_child.notes
-        child.priority = prio
-        apply_metadata(child, parsed_child.metadata)
+        <<apply the section to the matched child>>
     else:
         now = datetime.datetime.now().isoformat()
         child = TodoItem(
@@ -12785,14 +13319,46 @@ for parsed_child in parsed_children:
     reconcile_children(child, parsed_child.children)
 @
 
+A matched child is updated the way the parent is: the section is
+applied to a copy of the child as the untouched buffer would have
+stored it, and only what the section changed is replayed onto the
+stored child, so that a note
+added to a sub-item during the session survives.  A child that matched
+a section but was not shown was added by someone else under the same
+title meanwhile; there is no earlier version to compare with, so the
+section applies to it directly.
+<<apply the section to the matched child>>=
+shown_child = shown.get(child.id)
+if shown_child is None:
+    edited_child = child
+else:
+    edited_child = TodoItem.from_dict(
+        copy.deepcopy(shown_child)
+    )
+edited_child.title = parsed_child.title
+edited_child.notes = parsed_child.notes
+edited_child.priority = prio
+apply_metadata(edited_child, parsed_child.metadata)
+if edited_child is not child:
+    replay_item_edits(
+        child, shown_child, edited_child,
+        as_read[child.id],
+    )
+@
+
 Children remaining in [[existing_by_title]] were not present in the
 parsed document, meaning the user deleted their headings.  Their own
 subtrees go with them: an item whose parent is gone is not hidden but
 promoted to a visible root by [[get_visible_roots]], so leaving
 grandchildren behind would move them into the main list instead of
-removing them.
+removing them.  Only a child the buffer showed can have been deleted
+in it, though.  A child that another process added while the editor
+was open is missing from the buffer for a different reason, and
+removing it would silently undo that process's work.
 <<remove deleted children>>=
 for removed in existing_by_title.values():
+    if removed.id not in shown:
+        continue
     doomed = {removed.id} | {
         d.id
         for d in get_descendants(todos, removed.id)
@@ -13168,6 +13734,100 @@ def test_child_who_override():
     )
 @
 
+Finally, the session itself.  While the editor is open, another
+process adds a note to the parent and to the child, and a new child
+under the parent.  The user changes only the title.  All three pieces
+of concurrent work must survive the save: the notes because the
+buffer left them as they were shown, and the new child because the
+buffer never showed it.
+
+The stored notes are tried both bare and with the trailing newline
+that notes read from standard input carry.  The buffer loses that
+newline, which must not count as the user editing the notes.
+
+<<test functions>>=
+@pytest.mark.parametrize("tail", ["", "\n"])
+def test_edit_editor_keeps_concurrent_work(temp_todo_dir, tail):
+    """Work stored during an edit -E session survives it."""
+    from nytid.cli.todo import add, note
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent", priority=5.0,
+            notes="First" + tail,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1, priority=4.0,
+            notes="Child notes" + tail,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def editor_meanwhile(text):
+        note(1, message="Agent", edit=False)
+        note(2, message="Agent too", edit=False)
+        add(
+            None, title="Agent child",
+            parent=1, explicit_priority=4.5,
+        )
+        return text.replace("Parent", "Renamed", 1)
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=editor_meanwhile,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "-E"])
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    by_id = {t.id: t for t in todos}
+    assert by_id[1].title == "Renamed"
+    assert by_id[1].notes == "First" + tail + "\nAgent"
+    assert by_id[2].notes == "Child notes" + tail + "\nAgent too"
+    assert by_id[3].title == "Agent child"
+@
+
+A rename is the concurrent change that title matching is most
+exposed to.  A shown child renamed during the session must keep its
+ID and notes and its new name, and must not reappear as a new child
+under the old one:
+
+<<test functions>>=
+def test_edit_editor_keeps_child_renamed_meanwhile(
+    temp_todo_dir,
+):
+    """A child renamed during edit -E is neither lost nor doubled."""
+    from nytid.cli.todo import edit
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Parent", priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Child", parent_id=1, priority=4.0,
+            notes="Child notes",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def editor_meanwhile(text):
+        edit(None, todo_id=2, title="Renamed child")
+        return text.replace("Parent", "New parent", 1)
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=editor_meanwhile,
+    ):
+        result = runner.invoke(cli, ["edit", "1", "-E"])
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert [(t.id, t.title, t.notes) for t in todos] == [
+        (1, "New parent", ""),
+        (2, "Renamed child", "Child notes"),
+    ]
+@
+
 \subsection{Testing the [[--parent]] Flag}
 
 Reparenting addresses the common accident of creating a todo as a
@@ -13406,7 +14066,7 @@ def reprioritize(
 
     Alias: reprio
     """
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     <<validate reprioritize placement>>
     if todo_id is None:
         targets = [
@@ -13426,6 +14086,7 @@ def reprioritize(
         targets.sort(
             key=lambda item: todo_depth(todos, item)
         )
+        chosen = {}
         for item in targets:
             parent_ctx = get_parent(todos, item)
             if (
@@ -13451,12 +14112,13 @@ def reprioritize(
             )
             old_priority = item.priority
             item.priority = new_priority
+            chosen[item.id] = new_priority
             typer.echo(
                 f"Reprioritized #{item.id}: "
                 f"{format_stored_priority(old_priority)}"
                 f" -> {format_stored_priority(new_priority)}"
             )
-        save_todos(next_id, todos)
+        <<store the chosen priorities under the lock>>
         return
     item = next(
         (t for t in todos if t.id == todo_id), None
@@ -13488,12 +14150,89 @@ def reprioritize(
     old_priority = item.priority
     item.priority = new_priority
 
-    save_todos(next_id, todos)
+    <<store the new priority under the lock>>
     typer.echo(
         f"Reprioritized #{todo_id}: "
         f"{format_stored_priority(old_priority)}"
         f" -> {format_stored_priority(new_priority)}"
     )
+@
+
+Both paths decide on the snapshot, because the binary search asks the
+user one question after another, and the batch path may ask about many
+items in a row.  The decisions are stored afterwards in one locked
+callback (\cref{sec:todo-read-modify-write}), and they are stored as
+the numbers the user arrived at, without searching again.  The batch
+path keeps a map from ID to chosen priority rather than writing its
+whole snapshot back, which would undo whatever else changed during the
+session.  An item removed meanwhile is the one thing it cannot store,
+and after a long series of questions it skips that item with a warning
+rather than discarding every other answer.
+
+<<store the chosen priorities under the lock>>=
+def store_priorities(next_id, todos, stack):
+    by_id = {t.id: t for t in todos}
+    for chosen_id, priority in chosen.items():
+        if chosen_id in by_id:
+            by_id[chosen_id].priority = priority
+        else:
+            typer.echo(
+                f"Warning: #{chosen_id} no longer exists; "
+                "its priority was not stored",
+                err=True,
+            )
+    return next_id, todos, stack
+
+
+mutate_todo_state(store_priorities)
+@
+
+The single-item path has only one answer to lose, so a vanished item
+is an error here, reported through [[require_todo]] like in the other
+commands, and nothing is written.  Only [[priority]] is set; any other
+change made to the item during the search stays as it was stored.
+
+<<store the new priority under the lock>>=
+def store_priority(next_id, todos, stack):
+    require_todo(todos, todo_id).priority = new_priority
+    return next_id, todos, stack
+
+
+mutate_todo_state(store_priority)
+@
+
+Let's verify the batch path, whose session is the longest: a note
+that lands while the user is answering the comparison questions must
+still be there when the chosen priority is stored.
+
+<<test functions>>=
+def test_reprioritize_batch_keeps_concurrent_note(
+  temp_todo_dir,
+):
+  """Answering the search does not erase a concurrent note."""
+  from nytid.cli.todo import note
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Unranked", priority=None,
+      who=default_username,
+      created="2026-02-20T10:00:00",
+    ),
+  ])
+
+  def search_meanwhile(*args, **kwargs):
+    note(1, message="Agent", edit=False)
+    return 3.0
+
+  with patch(
+    "nytid.cli.todo.binary_search_priority",
+    side_effect=search_meanwhile,
+  ):
+    result = runner.invoke(cli, ["reprioritize"])
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].priority == 3.0
+  assert todos[0].notes == "Agent"
 @
 
 
@@ -14882,7 +15621,10 @@ We package that policy into [[stop_todo_hierarchy]] so manual
 all share one implementation.  The helper stops at the hierarchy
 boundary; callers remain free to apply their own post-stop status policy
 such as prompting for completion or resetting unfinished work to
-[[pending]].
+[[pending]].  The state it returns is a snapshot to base that decision
+on, read after the stop; the decision itself is stored by
+[[record_run_outcome]] (\cref{sec:todo-run-outcome}), never by writing
+this snapshot back, since a prompt may stand between the two.
 
 <<helpers>>=
 def stop_todo_hierarchy(todo_id, who=None):
@@ -15304,6 +16046,18 @@ An omitted ID means \enquote{remove the current active todo}, which mirrors
 the way [[done]], [[note]], and [[edit]] already target the same
 context-aware default.
 
+The prompt can wait as long as the user likes, so it is asked on the
+snapshot, and the subtree is worked out again inside the locked
+callback that removes it (\cref{sec:todo-read-modify-write}).  A
+sub-item added while the question was open has to go with its parent
+for the same reason the subtree goes at all, and the report afterwards
+counts what was actually removed.  If that count differs from the one
+the prompt showed, the report says so, since the user agreed to the
+smaller or larger number.  Tracking is stopped after the
+removal is stored, against the state without the removed items, which
+is what [[stop_todo_tracking]] needs to see in order not to protect
+their labels.
+
 Here [[--force]] only waives the confirmation prompt; the removal it
 skips asking about is the same one either way.  That is a different
 promise from [[done --force]], which changes what the command
@@ -15327,7 +16081,7 @@ def rm(
 
     If no ID given, removes the current active task.
     """
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "remove",
         who=default_username, todos=todos,
@@ -15351,18 +16105,86 @@ def rm(
             typer.echo("Cancelled.")
             raise typer.Exit(0)
 
-    ids_to_remove = {todo_id}
-    ids_to_remove.update(d.id for d in descendants)
-    todos = [t for t in todos if t.id not in ids_to_remove]
+    confirmed = None if force else len(descendants)
+
+    def remove_subtree(next_id, todos, stack):
+        require_todo(todos, todo_id)
+        descendants = get_descendants(todos, todo_id)
+        ids_to_remove = {todo_id}
+        ids_to_remove.update(d.id for d in descendants)
+        todos = [t for t in todos if t.id not in ids_to_remove]
+        return next_id, todos, stack, descendants
+
+    _, todos, _, descendants = mutate_todo_state(
+        remove_subtree
+    )
 
     <<stop tracking if active>>
 
-    save_todos(next_id, todos)
     typer.echo(f"Removed #{todo_id}: {item.title}")
-    if descendants:
-        typer.echo(
-            f"  Also removed {len(descendants)} sub-items"
+    <<report the removed sub-items>>
+@
+
+The usual report is a bare count.  When the user confirmed a
+different number, we add that number so the difference is visible,
+including the case where everything confirmed was already gone and
+nothing more was removed.  With [[--force]] nothing was confirmed, so
+there is nothing to compare with.
+
+<<report the removed sub-items>>=
+changed = (
+    confirmed is not None
+    and confirmed != len(descendants)
+)
+if descendants or changed:
+    report = f"  Also removed {len(descendants)} sub-items"
+    if changed:
+        report += f" ({confirmed} when you confirmed)"
+    typer.echo(report)
+@
+
+Let's verify both halves of the commit by doing work while the
+confirmation prompt is open: a sub-item added under the doomed item
+must go with it, and a note on an unrelated item must stay.
+
+<<test functions>>=
+def test_rm_commits_against_fresh_state(temp_todo_dir):
+    """rm removes a late child and keeps unrelated work."""
+    from nytid.cli.todo import add, note
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Doomed", priority=5.0,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="Bystander",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    def confirm_meanwhile(message, **kwargs):
+        add(
+            None, title="Late child",
+            parent=1, explicit_priority=4.0,
         )
+        note(2, message="Meanwhile", edit=False)
+        return True
+
+    with patch(
+        "nytid.cli.todo.typer.confirm",
+        side_effect=confirm_meanwhile,
+    ):
+        result = runner.invoke(cli, ["rm", "1"])
+
+    assert result.exit_code == 0, result.stdout
+    assert (
+        "Also removed 1 sub-items (0 when you confirmed)"
+        in result.output
+    )
+    _, todos = load_todos()
+    assert [(t.title, t.notes) for t in todos] == [
+        ("Bystander", "Meanwhile"),
+    ]
 @
 
 Let's pin the separation down, since a name collision in a bucket chunk
@@ -16184,6 +17006,81 @@ The note says \enquote{no output} because a detached pane writes to the
 terminal, not to a pipe we can capture; the wording matches the blocking
 path so both kinds of run leave notes in one format.
 
+\paragraph{Storing the outcome of a run}%
+\label{sec:todo-run-outcome}
+Both kinds of run end the same way: stop the hierarchy, decide what
+the run amounted to, and store that decision.  The deciding is where
+the time goes.  The blocking path may ask the user whether the task is
+done, and the answer can take as long as the user likes; meanwhile the
+agent's own session, or anyone else, may have added a note or
+completed the item.  The old way of storing the decision---writing
+back the snapshot that [[stop_todo_hierarchy]] returned---erased all of
+that.
+
+[[record_run_outcome]] therefore takes the decision as data and applies
+it inside one locked callback (\cref{sec:todo-read-modify-write}).  The
+decision has three parts: notes to append, whether the item is done,
+and whom to hand an unfinished item to.  The callback re-checks the
+one assumption the decision rests on, that the item is not done yet.
+If it was completed in the meantime, a \enquote{not done} answer must
+not reopen it, because that answer was about the run, not about the
+completion somebody else recorded.  An item that was removed
+meanwhile is reported and left removed.  Descendants that the stop
+deactivated go back to [[pending]] unless they are done, as before.
+
+Posting a note to GitHub is network I/O and stays outside the lock:
+callers post with [[post_note_comment]] first and pass the same text
+here to be mirrored locally.
+
+<<helpers>>=
+def record_run_outcome(
+    todo_id, descendant_ids, *,
+    notes=(), done=False, reassign_to=None,
+):
+    """Store how a run of `todo_id` ended.
+
+    Appends `notes` locally.  Unless the item is already
+    done, marks it done if `done`, otherwise resets it to
+    pending and assigns it to `reassign_to` if given.
+    Descendants in `descendant_ids` that are not done
+    are reset to pending.  Returns the stored item (or
+    `None` if it no longer exists) and the stored todos.
+    """
+    def update(next_id, todos, stack):
+        item = next(
+            (t for t in todos if t.id == todo_id), None
+        )
+        if item is None:
+            typer.echo(
+                f"Warning: todo #{todo_id} no longer exists; "
+                "the outcome of its run was not stored",
+                err=True,
+            )
+            return next_id, todos, stack, None
+        for note_text in notes:
+            append_note_to_item(item, note_text)
+        if item.status != "done":
+            if done:
+                item.status = "done"
+            else:
+                if reassign_to:
+                    item.who = reassign_to
+                item.status = "pending"
+        for child in todos:
+            if (
+                child.id in descendant_ids
+                and child.status != "done"
+            ):
+                child.status = "pending"
+        return next_id, todos, stack, item
+
+    _, todos, _, item = mutate_todo_state(update)
+    return item, todos
+@
+
+The detached helper uses it directly: it has no prompt, only the exit
+code, so its decision is made at once from that.
+
 <<helpers>>=
 def finalize_detached_todo(
     todo_id, exit_code=1, exit_code_file=None,
@@ -16197,9 +17094,9 @@ def finalize_detached_todo(
     (
         todo_id,
         item,
-        next_id,
-        todos,
-        stack,
+        _,
+        _,
+        _,
         descendants,
     ) = stop_todo_hierarchy(
         todo_id
@@ -16207,22 +17104,16 @@ def finalize_detached_todo(
     if item is None:
         return
 
-    append_note_to_item(
-        item,
-        f"Exit code: {exit_code} (no output)",
-        next_id,
-        todos,
+    exit_note = f"Exit code: {exit_code} (no output)"
+    post_note_comment(item, exit_note)
+    record_run_outcome(
+        todo_id,
+        {child.id for child in descendants},
+        notes=[exit_note],
+        reassign_to=(
+            reassign_to if exit_code != 0 else None
+        ),
     )
-
-    if item.status != "done":
-        if exit_code != 0 and reassign_to:
-            item.who = reassign_to
-        item.status = "pending"
-    for child in descendants:
-        if child.status != "done":
-            child.status = "pending"
-
-    save_todos(next_id, todos)
 
 
 def run_todo_tmux_command(*args, **kwargs):
@@ -18744,13 +19635,22 @@ handler apply the reassignment on the far side of the stop, which is
 exactly what the non-timeout failure path in
 [[<<handle headless exit status>>]] already does.
 
+The note is posted to GitHub before the lock is taken and stored
+inside a callback on the item as it is now
+(\cref{sec:todo-read-modify-write}); the agent was running until a
+moment ago and may well have added notes of its own.  For the same
+reason the reset to pending is conditional: an item that is already
+done was completed by someone---quite possibly by the agent itself,
+just before the timeout killed it---and a timeout is no reason to
+reopen it.  This is the check [[record_run_outcome]] makes too
+(\cref{sec:todo-run-outcome}).
+
 <<handle subprocess timeout>>=
 timed_out = True
 partial = (
     exc.stdout if exc.stdout else ""
 )
-# Reload and post timeout note
-next_id, todos = load_todos()
+_, todos = load_todos()
 item = next(
     (t for t in todos if t.id == todo_id),
     None,
@@ -18764,11 +19664,20 @@ if item is not None:
             f"Partial output:\n"
             f"```\n{partial.strip()}\n```"
         )
-    append_note_to_item(
-        item, note, next_id, todos
-    )
-    item.status = "pending"
-    save_todos(next_id, todos)
+    post_note_comment(item, note)
+
+    def record_timeout(next_id, todos, stack):
+        timed = next(
+            (t for t in todos if t.id == todo_id),
+            None,
+        )
+        if timed is not None:
+            append_note_to_item(timed, note)
+            if timed.status != "done":
+                timed.status = "pending"
+        return next_id, todos, stack
+
+    mutate_todo_state(record_timeout)
 typer.echo(
     f"  Timed out after {timeout}",
     err=True,
@@ -18777,7 +19686,11 @@ typer.echo(
 
 After the subprocess exits, we stop the todo through the same shared
 hierarchy helper used by manual [[todo stop]] and detached tmux cleanup,
-then prompt the user about completion status.  In headless mode we skip
+then prompt the user about completion status.  The prompt is the
+reason this handler only \emph{decides} on the snapshot and leaves the
+storing to [[record_run_outcome]] (\cref{sec:todo-run-outcome}): the
+question can stay open for hours, and a note the agent's session adds
+in that time must not be erased by the answer.  In headless mode we skip
 the prompt: if the subprocess already marked the todo done (via
 [[todo done]]), we respect that; otherwise we reset the todo and any
 auto-stopped descendants to pending for retry.
@@ -18791,17 +19704,20 @@ failed or was reset.
 (
     todo_id,
     item,
-    next_id,
-    todos,
-    stack,
+    _,
+    _,
+    _,
     descendants,
 ) = stop_todo_hierarchy(
     todo_id
 )
 if item is None:
     return
+run_notes = []
 <<post headless output as note>>
 
+mark_done = False
+hand_to = None
 if item.status == "done":
     pass
 elif timed_out:
@@ -18811,16 +19727,16 @@ elif headless:
 elif typer.confirm(
     f"Mark todo #{todo_id} as done?"
 ):
-    item.status = "done"
-else:
-    item.status = "pending"
+    mark_done = True
 
-for child in descendants:
-    if child.status != "done":
-        child.status = "pending"
-
-save_todos(next_id, todos)
-if item.status == "done":
+item, todos = record_run_outcome(
+    todo_id,
+    {child.id for child in descendants},
+    notes=run_notes,
+    done=mark_done,
+    reassign_to=hand_to,
+)
+if item is not None and item.status == "done":
     auto_complete_parent(item, todos)
 @
 
@@ -18839,9 +19755,8 @@ if headless and result is not None:
         )
     else:
         note = f"Exit code: {code} (no output)"
-    append_note_to_item(
-        item, note, next_id, todos
-    )
+    post_note_comment(item, note)
+    run_notes.append(note)
 @
 
 This is the deferred half of the timeout handling: tracking has now
@@ -18853,12 +19768,14 @@ interactive prompt because a killed process never reported an outcome.
 Asking \enquote{mark todo as done?} about work we ourselves cut short
 invites the user to record a completion that did not happen, so a
 timed-out task always goes back to pending regardless of how it was
-launched.
+launched---unless it was recorded as done before the kill, in which
+case the branch is not reached at all.  Leaving [[mark_done]] unset
+is all that takes, since
+[[record_run_outcome]] resets an unfinished item to pending; the
+branch only has to say who receives it.
 
 <<handle timeout exit status>>=
-if reassign_to:
-    item.who = reassign_to
-item.status = "pending"
+hand_to = reassign_to
 @
 
 In headless mode, a non-zero exit code indicates failure.
@@ -18866,54 +19783,123 @@ If [[--reassign-to]] is set, we hand the task back to a human
 so they can investigate.  A zero exit
 code where the subprocess did not mark the task done means the
 agent finished without completing the task---we reset to
-pending for the next retry.
+pending for the next retry.  As in the timeout branch, the reset is
+[[record_run_outcome]]'s default, so only the reassignment is spelled
+out here.
 
 <<handle headless exit status>>=
 if (
     result is not None
     and result.returncode != 0
-    and reassign_to
 ):
-    item.who = reassign_to
-item.status = "pending"
+    hand_to = reassign_to
 @
 
-Let's verify that [[append_note_to_item]] stores notes locally:
+Let's verify the two promises [[record_run_outcome]] makes to the
+blocking path, using the prompt as the window in which other work
+happens.  A note added while the question is open survives a
+\enquote{yes}, and a completion recorded meanwhile survives a
+\enquote{no}.
+
+<<test functions>>=
+@pytest.fixture
+def blocked_window_run(temp_todo_dir):
+  """Run `start 1 --window --block` with `confirm` faked."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Review PR",
+      created="2026-02-20T10:00:00",
+      wd="/tmp/project",
+      command="python -m pytest",
+    ),
+  ])
+
+  def run(confirm):
+    with patch.dict(
+      os.environ, {"TMUX": "session"}, clear=True,
+    ), patch(
+      "nytid.cli.todo.run_todo_tmux_command",
+      return_value=0,
+    ), patch(
+      "nytid.cli.todo.typer.confirm",
+      side_effect=confirm,
+    ):
+      return runner.invoke(
+        cli, [
+          "start", "1", "--window", "--block",
+          "--no-auto-suspend",
+        ],
+      )
+
+  return run
+
+
+def test_start_confirm_keeps_note_added_meanwhile(
+  blocked_window_run,
+):
+  """A note stored while 'Mark done?' waits is kept."""
+  from nytid.cli.todo import note
+
+  def answer_yes(message):
+    note(1, message="Agent", edit=False)
+    return True
+
+  result = blocked_window_run(answer_yes)
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+  assert todos[0].notes == "Agent"
+
+
+def test_start_no_keeps_completion_made_meanwhile(
+  blocked_window_run,
+):
+  """Answering no does not reopen an item done meanwhile."""
+  from nytid.cli.todo import complete_todo_state
+
+  def answer_no(message):
+    complete_todo_state(1)
+    return False
+
+  result = blocked_window_run(answer_no)
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+@
+
+Let's verify that [[append_note_to_item]] changes the item it is
+given and nothing else.  The second assertion is the one its callers
+rely on: the helper must not write the store behind their backs, since
+that write would come from outside their locked callback.
 
 <<test functions>>=
 def test_append_note_to_item_local(temp_todo_dir):
-    """append_note_to_item stores note on local item."""
+    """append_note_to_item changes the item, not the store."""
     save_todos(2, [
         TodoItem(
             id=1, title="Task",
             created="2026-02-20T10:00:00",
         ),
     ])
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     item = todos[0]
-    append_note_to_item(
-        item, "First note", next_id, todos
-    )
+    append_note_to_item(item, "First note")
+    assert item.notes == "First note"
     _, reloaded = load_todos()
-    assert reloaded[0].notes == "First note"
+    assert reloaded[0].notes == ""
 
 
 def test_append_note_to_item_appends(temp_todo_dir):
     """append_note_to_item appends to existing notes."""
-    save_todos(2, [
-        TodoItem(
-            id=1, title="Task",
-            created="2026-02-20T10:00:00",
-            notes="Existing",
-        ),
-    ])
-    next_id, todos = load_todos()
-    item = todos[0]
-    append_note_to_item(
-        item, "Second", next_id, todos
+    item = TodoItem(
+        id=1, title="Task",
+        created="2026-02-20T10:00:00",
+        notes="Existing",
     )
-    _, reloaded = load_todos()
-    assert "Existing\nSecond" == reloaded[0].notes
+    append_note_to_item(item, "Second")
+    assert "Existing\nSecond" == item.notes
 @
 
 Now let's verify headless mode captures output as a note.  We use
@@ -18980,6 +19966,47 @@ def test_start_timeout_stops_original_worker(
   assert item.status == "pending"
   agent_session = load_active_session("agent")
   assert agent_session.get_active_labels() == []
+@
+
+The converse case is a run that recorded its own completion and then
+ran into the timeout anyway.  The timeout must add its note but leave
+the item done, and nobody should be handed a finished task:
+
+<<test functions>>=
+def test_start_timeout_keeps_completion(temp_todo_dir):
+  """A timeout after `todo done` does not reopen the item."""
+  from subprocess import TimeoutExpired
+  from nytid.cli.todo import complete_todo_state
+
+  save_todos(2, [
+    TodoItem(
+      id=1, title="Task",
+      created="2026-02-20T10:00:00",
+      who="agent",
+    ),
+  ])
+
+  def complete_then_time_out(*args, **kwargs):
+    complete_todo_state(1)
+    raise TimeoutExpired(["true"], 1)
+
+  with patch(
+    "nytid.cli.todo.subprocess.run",
+    side_effect=complete_then_time_out,
+  ):
+    result = runner.invoke(
+      cli,
+      ["start", "1", "--headless",
+       "--command", "true",
+       "--timeout", "1s",
+       "--reassign-to", "teacher"],
+    )
+
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert todos[0].status == "done"
+  assert todos[0].who == "agent"
+  assert "Timed out" in todos[0].notes
 @
 
 A failing subprocess in headless mode should reassign to the
@@ -19825,8 +20852,8 @@ def import_github(
     <<fetch github items>>
     <<filter already imported>>
     <<create todos from github items>>
-
-    save_todos(next_id, todos)
+    <<commit the imported todos under the lock>>
+    <<report imported todos>>
     <<report skipped duplicates>>
     typer.echo(f"Imported {imported_count} items.")
 @
@@ -19975,15 +21002,9 @@ each skipped GitHub item collided with, so that the command can report
 the collision below instead of swallowing it.
 
 <<filter already imported>>=
-existing = {}
-for t in todos:
-    if t.github:
-        key = (
-            t.github["repo"],
-            t.github.get("type", "issue"),
-            t.github["number"],
-        )
-        existing[key] = t
+existing = {
+    github_key(t): t for t in todos if t.github
+}
 
 new_items = []
 skipped_items = []
@@ -19997,6 +21018,19 @@ for gh_item in gh_items:
         skipped_items.append((gh_item, existing[key]))
     else:
         new_items.append(gh_item)
+@
+
+The identity is needed twice, here and again when the import is
+committed, so it is a function rather than an inline tuple.
+
+<<helpers>>=
+def github_key(item):
+    """Return the (repo, type, number) a todo is linked to."""
+    return (
+        item.github["repo"],
+        item.github.get("type", "issue"),
+        item.github["number"],
+    )
 @
 
 The age-based priority heuristic scales creation timestamps
@@ -20020,8 +21054,7 @@ if skip_priority and new_items:
 else:
     priorities = {}
 
-imported_count = 0
-imported_rows = []
+imported = []
 for gh_item in new_items:
     gh_labels = list(inherited_labels)
     if repo not in gh_labels:
@@ -20097,15 +21130,139 @@ for gh_item in new_items:
     )
     todos.append(item)
     next_id += 1
-    imported_count += 1
-    imported_rows.append((
-        f"#{item.id}",
-        item.title,
-        gh_item["_type"],
-        f"#{gh_item['number']}",
-    ))
+    imported.append(item)
+@
 
-print_rows(["ID", "Title", "Type", "GH #"], imported_rows)
+The items above are built on the snapshot, and each is appended to it
+so that the next item's binary search compares against the ones
+imported before it.  Their IDs are therefore provisional: they come
+from the snapshot's [[next_id]], which another command may have used
+meanwhile.  The commit gives each item its real ID from the fresh
+state (\cref{sec:todo-read-modify-write}), re-checks the parent as
+[[add]] does, and runs the duplicate check once more, since the
+fetching and the questions leave ample time for an overlapping
+[[import]] of the same repository.  An item that turns out to be
+stored already is left out, which is what the check above would have
+done had it seen it.  It is also added to [[skipped_items]], in the
+shape that check gives its entries, so that the skipped table and its
+count in [[<<report skipped duplicates>>]] include it; the extra line
+printed here says why it was not caught earlier.
+
+<<commit the imported todos under the lock>>=
+def append_imported(next_id, todos, stack):
+    if resolved_parent is not None:
+        require_todo(todos, resolved_parent)
+    stored = {
+        github_key(t): t for t in todos if t.github
+    }
+    committed = []
+    for item in imported:
+        local = stored.get(github_key(item))
+        if local is not None:
+            typer.echo(
+                f"  Skipped {item.title}: imported "
+                f"meanwhile as #{local.id}"
+            )
+            skipped_items.append((
+                {
+                    "_type": item.github["type"],
+                    "number": item.github["number"],
+                },
+                local,
+            ))
+            continue
+        item.id = next_id
+        next_id += 1
+        todos.append(item)
+        committed.append(item)
+    return next_id, todos, stack, committed
+
+
+*_, committed = mutate_todo_state(append_imported)
+imported_count = len(committed)
+@
+
+Let's verify the commit against an import that overlaps with an
+[[add]] and with a second import of one of the same issues, both
+happening while the first import is still fetching.  The added item
+must survive, the shared issue must be stored once, and the remaining
+issue must get the next free ID rather than the one its snapshot
+promised.
+
+<<test functions>>=
+def test_import_commits_against_fresh_state(temp_todo_dir):
+    """Overlapping add and import are kept, not duplicated."""
+    from nytid.cli.todo import add, import_github
+    save_todos(1, [])
+    issues = [
+        {
+            "number": n, "title": f"Issue {n}",
+            "state": "OPEN", "labels": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+        }
+        for n in (5, 6)
+    ]
+
+    def list_meanwhile(repo):
+        add(
+            None, title="Added meanwhile",
+            top_level=True, explicit_priority=1.0,
+        )
+        import_github(
+            "owner/repo", number=5,
+            item_type=ImportType.issue,
+            skip_priority=True, top_level=True,
+        )
+        return [dict(issue) for issue in issues]
+
+    gh_ok = MagicMock(returncode=0)
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=gh_ok,
+    ), patch(
+        "nytid.cli.todo.gh_list_issues",
+        side_effect=list_meanwhile,
+    ), patch(
+        "nytid.cli.todo.gh_fetch_issue",
+        side_effect=lambda repo, n: dict(issues[0]),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo",
+                "--type", "issue",
+                "--skip-priority", "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0, result.stdout
+    assert "imported meanwhile as #2" in result.output
+    assert "Skipped 1 already imported." in result.output
+    assert "Imported 1 items." in result.output
+    _, todos = load_todos()
+    assert [(t.id, t.title) for t in todos] == [
+        (1, "Added meanwhile"),
+        (2, "Issue 5"),
+        (3, "Issue 6"),
+    ]
+@
+
+Only now are the IDs final, so the receipt is printed from what the
+commit stored.
+
+<<report imported todos>>=
+print_rows(
+    ["ID", "Title", "Type", "GH #"],
+    [
+        (
+            f"#{item.id}",
+            item.title,
+            item.github["type"],
+            f"#{item.github['number']}",
+        )
+        for item in committed
+    ],
+)
 @
 
 The receipt this prints used to be a line of prose per item,
@@ -20127,7 +21284,7 @@ of the wrappers we ship parse it.
 
 The footer stays a plain [[typer.echo]].
 It is a sentence rather than a row, and it must still appear when
-[[imported_rows]] is empty, whereas [[print_rows]] deliberately prints
+[[committed]] is empty, whereas [[print_rows]] deliberately prints
 nothing at all when there is nothing to report.
 
 The skipped items collected by [[<<filter already imported>>]] get the
@@ -21045,8 +22202,9 @@ def sync(
 ):
     """Sync todo items with GitHub issues/PRs."""
     require_gh()
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     changes = 0
+    touched = []
 
     for item in todos:
         if not item.github:
@@ -21054,6 +22212,7 @@ def sync(
         if repo and item.github["repo"] != repo:
             continue
 
+        touched.append((item_fields(item), item))
         gh = item.github
         item_type = gh.get("type", "issue")
         try:
@@ -21078,8 +22237,83 @@ def sync(
         <<sync state to github>>
         <<sync title from github>>
 
-    save_todos(next_id, todos)
+    <<store the synced fields under the lock>>
     typer.echo(f"Sync complete. {changes} changes.")
+@
+
+A sync makes one network round trip per linked item, so it can run
+for a while, and it works on the snapshot throughout.  Each item it
+looks at is remembered as it was read, and the commit replays only
+what the sync changed---a status or a title---onto the stored items
+(\cref{sec:todo-read-modify-write}).  A note added to an item during
+the sync therefore stays.  An item removed meanwhile is skipped with a
+warning, as [[reprioritize]] does, rather than failing the whole
+sync.
+
+<<store the synced fields under the lock>>=
+def store_synced(next_id, todos, stack):
+    by_id = {t.id: t for t in todos}
+    for before, item in touched:
+        if item.id in by_id:
+            replay_item_edits(by_id[item.id], before, item)
+        elif item.to_dict() != before:
+            typer.echo(
+                f"  Warning: #{item.id} no longer exists; "
+                "its sync changes were not stored",
+                err=True,
+            )
+    return next_id, todos, stack
+
+
+mutate_todo_state(store_synced)
+@
+
+Let's verify that a sync keeps a note added while it was fetching.
+The note arrives through the mocked [[gh issue view]] call, which is
+where a real sync spends its time.
+
+<<test functions>>=
+def test_sync_keeps_note_added_meanwhile(temp_todo_dir):
+    """Sync stores its changes without erasing a new note."""
+    from nytid.cli.todo import note
+    save_todos(3, [
+        TodoItem(
+            id=1, title="Old title",
+            created="2026-02-20T10:00:00",
+            github={
+                "repo": "owner/repo",
+                "type": "issue",
+                "number": "10",
+            },
+        ),
+        TodoItem(
+            id=2, title="Local task",
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    view_result = MagicMock(returncode=0)
+    view_result.stdout = json.dumps({
+        "title": "New title", "body": "",
+        "state": "CLOSED", "comments": [], "labels": [],
+    })
+
+    def view_meanwhile(cmd, **kwargs):
+        if "view" in cmd:
+            note(2, message="Meanwhile", edit=False)
+        return view_result
+
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        side_effect=view_meanwhile,
+    ):
+        result = runner.invoke(cli, ["sync"])
+
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    by_id = {t.id: t for t in todos}
+    assert by_id[1].title == "New title"
+    assert by_id[1].status == "done"
+    assert by_id[2].notes == "Meanwhile"
 @
 
 GitHub is the authoritative source for issue state: a
@@ -21233,7 +22467,7 @@ def note(
     editing and the saved buffer becomes the new notes; a
     GitHub-linked item opens an empty buffer for a new comment.
     """
-    next_id, todos = load_todos()
+    _, todos = load_todos()
     todo_id = resolve_todo_id(
         todo_id, "add a note",
         who=default_username, todos=todos,
@@ -21302,25 +22536,66 @@ stripped, for the same reason [[parse_editor_content]] strips the
 notes it parses: the trailing newline an editor leaves behind is
 not part of what the user wrote.
 
+Both paths store the note inside a locked callback on the item as it
+is \emph{now} (\cref{sec:todo-read-modify-write}); [[item]] is the
+snapshot the command started from, and an editor session can last long
+enough for an agent to add a note of its own.  For the replacing path
+that raises a question: whose notes win?  We let the buffer win only if
+the user changed it.  A buffer saved as it was opened says nothing
+about the notes, so storing it would erase whatever arrived meanwhile
+for no reason; a changed buffer is the user's version and replaces the
+stored one, as it always has.
+
+\enquote{Changed} has to be judged on what saving would store, not on
+the raw text.  Saving strips the buffer, so an untouched buffer opened
+on notes that end in a newline---as notes read from standard input
+usually do---would differ from [[item.notes]] by that newline alone
+and pass for an edit.  We therefore compare with [[initial]] stripped
+the same way: that is exactly what the untouched buffer stores.  When
+the stored notes are still the ones the buffer was opened on, nobody
+else wrote meanwhile, and we store the buffer either way, which keeps
+the tidying an untouched save has always done.
+
 <<record the note>>=
 if replace_notes:
-    item.notes = note_text.strip()
-    save_todos(next_id, todos)
+    edited_notes = note_text.strip()
+
+    def replace_the_notes(next_id, todos, stack):
+        fresh = require_todo(todos, todo_id)
+        if (
+            edited_notes != initial.strip()
+            or fresh.notes == item.notes
+        ):
+            fresh.notes = edited_notes
+        return next_id, todos, stack
+
+    mutate_todo_state(replace_the_notes)
     typer.echo(f"Notes of #{todo_id} updated")
 else:
     <<post or append the note>>
 @
 
-The appending path is unchanged.  A GitHub-linked item needs a
-working [[gh]] before we promise that the comment was posted, and
-[[append_note_to_item]] both posts it and mirrors it locally.  The
+The appending path keeps its two halves.  A GitHub-linked item needs a
+working [[gh]] before we promise that the comment was posted;
+[[post_note_comment]] posts it, before the lock is taken, and
+[[append_note_to_item]] mirrors it locally inside the callback.  The
 two messages name the outcome rather than the command, so a user
 who expected one path and got the other sees it immediately.
 
 <<post or append the note>>=
 if item.github:
     require_gh()
-append_note_to_item(item, note_text, next_id, todos)
+post_note_comment(item, note_text)
+
+
+def append_the_note(next_id, todos, stack):
+    append_note_to_item(
+        require_todo(todos, todo_id), note_text
+    )
+    return next_id, todos, stack
+
+
+mutate_todo_state(append_the_note)
 if item.github:
     gh = item.github
     typer.echo(
@@ -21582,6 +22857,87 @@ def test_note_edit_github_still_posts_comment(temp_todo_dir):
     assert "Fresh comment" in todos[0].notes
 @
 
+Finally, the editor session is where another process is most likely
+to write meanwhile.  We let a second [[note]] land while the editor is
+open: an untouched buffer must keep it, and an edited buffer is the
+user's version and replaces it.
+
+<<test functions>>=
+@pytest.mark.parametrize(
+    "edit_buffer,expected",
+    [
+        (lambda initial: initial, "First\nAgent"),
+        (lambda initial: "Rewritten", "Rewritten"),
+    ],
+)
+def test_note_edit_while_another_note_lands(
+    temp_todo_dir, edit_buffer, expected,
+):
+    """Only a changed buffer overwrites a concurrent note."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First",
+        ),
+    ])
+
+    def editor_meanwhile(initial=""):
+        note(1, message="Agent", edit=False)
+        return edit_buffer(initial)
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=editor_meanwhile,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == expected
+@
+
+Notes read from standard input usually end in a newline, which the
+saved buffer drops.  That alone must not count as an edit when a note
+landed meanwhile, while an untouched save with nothing landing still
+tidies the newline away as it always has:
+
+<<test functions>>=
+@pytest.mark.parametrize(
+    "meanwhile,expected",
+    [
+        (True, "First\n\nAgent"),
+        (False, "First"),
+    ],
+)
+def test_note_edit_untouched_buffer_with_trailing_newline(
+    temp_todo_dir, meanwhile, expected,
+):
+    """A dropped trailing newline is not an edit."""
+    from nytid.cli.todo import note
+    save_todos(2, [
+        TodoItem(
+            id=1, title="Local task",
+            created="2026-02-20T10:00:00",
+            notes="First\n",
+        ),
+    ])
+
+    def untouched_editor(initial=""):
+        if meanwhile:
+            note(1, message="Agent", edit=False)
+        return initial
+
+    with patch(
+        "nytid.cli.todo.open_editor",
+        side_effect=untouched_editor,
+    ):
+        result = runner.invoke(cli, ["note", "1", "--edit"])
+    assert result.exit_code == 0, result.stdout
+    _, todos = load_todos()
+    assert todos[0].notes == expected
+@
+
 \section{Tests}
 
 The test file follows the same pattern as [[track.nw]]: a fixture
@@ -21634,6 +22990,8 @@ from nytid.cli.todo import (
     sort_todos_for_display,
     load_todos,
     save_todos,
+    item_fields,
+    replay_item_edits,
     get_todo_dir,
     get_todo_file,
     get_worker_default,
