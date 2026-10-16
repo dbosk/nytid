@@ -76,6 +76,7 @@ mode. The schedule view automatically slots pending tasks into free time.
 ```bash
 nytid todo add "Grade assignment 3" --prio 2
 nytid todo ls
+nytid todo ready
 nytid todo start 5
 nytid todo done
 nytid todo sync
