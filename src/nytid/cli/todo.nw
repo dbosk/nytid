@@ -2205,15 +2205,15 @@ def test_overlapping_add_keeps_a_note(temp_todo_dir):
 \section{Sub-item Helpers}%
 \label{todo:sub-item-helpers}
 
-Sub-items create a tree structure within the flat todo list. We need
-helpers to navigate this tree: finding children, finding siblings (for
-priority comparison), and checking whether a parent's children are all
-done.
+Sub-items give the flat todo list a structure.  We need helpers to
+navigate it: finding parents and children, finding siblings (for
+priority comparison), walking up and down, and checking whether a
+parent's children are all done.
 
-Why store sub-items flat with [[parent_id]] rather than nesting them?
-Because flat storage simplifies JSON serialization, avoids recursive
-data structures, and lets commands like [[todo ls --flat]] work
-without flattening logic.
+Why store sub-items flat, with each item naming its parent, rather
+than nesting them?  Because flat storage simplifies JSON
+serialization, avoids recursive data structures, and lets commands
+like [[todo ls --flat]] work without flattening logic.
 
 Priority comparison uses siblings---items sharing the same parent.
 When multiple workers share a parent (say a course-level epic), each
@@ -2230,12 +2230,356 @@ another worker's. [[filter_ids_by_worker]] narrows a list of todo IDs
 to those belonging to a given worker, treating [[who=None]] as
 [[default_username]] for backward compatibility with older items.
 
+\subsection{Parents, the top level, and context}%
+\label{sec:todo-parents}
+
+So far every item has at most one parent, stored in [[parent_id]], and
+the items form a forest.  That is about to change.  An item will be
+allowed several parents, all equal, and it may be a top-level item and
+a sub-item at the same time---a prerequisite shared by two projects,
+say.  The items then form a directed acyclic graph rather than a
+forest, and questions that have one answer in a tree, such as
+\enquote{which is the parent?} or \enquote{what is the path from the
+top?}, get several.
+
+We prepare for that by asking every such question through the helpers
+of this subsection.  They still read [[parent_id]], so the change of
+storage will touch them and nothing else.  Each helper answers the
+question as it is asked of a graph; with one parent per item, the
+answer is exactly the one the tree code it replaced gave.
+
+The top level is treated as a parent of its own: a virtual root with
+the id [[ROOT_ID]], zero.  That turns \enquote{top-level} from a special
+case, a [[None]] where a parent should be, into membership like any
+other.  The top-level items are simply the children of the root, and
+an item that is both top-level and a sub-item will list the root among
+its parents.  Zero is free, because item ids start at one, and it is
+already what [[edit --parent 0]] means (\cref{sec:todo-edit-parent}).
+The root is not an item, though: it appears among parent ids but never
+in a list of items.  [[real_parents_of]] is the view without it, for
+the many callers that go on to look the parents up as items.
+
+<<constants>>=
+ROOT_ID = 0
 <<sub-item helpers>>=
-def get_children(
+def parents_of(item: TodoItem) -> list[int]:
+    """Return the ids of `item`'s parents.
+
+    The top level counts as a parent with the id `ROOT_ID`,
+    so a top-level item answers `[ROOT_ID]`.
+    """
+    if item.parent_id is None:
+        return [ROOT_ID]
+    return [item.parent_id]
+
+
+def real_parents_of(item: TodoItem) -> list[int]:
+    """Return the ids of `item`'s parents that are items,
+    that is, without `ROOT_ID`."""
+    return [p for p in parents_of(item) if p != ROOT_ID]
+@
+
+Children follow from parents: the children of an id are the items that
+list it among theirs, and the children of [[ROOT_ID]] are the
+top-level items.  Siblings follow from children, but in a graph an
+item has one set of siblings per parent, and only the caller knows
+which parent it is asking about---the one the item is being ranked
+under, for instance.  [[siblings_of]] therefore takes that parent as
+an argument instead of guessing.  A caller with no particular parent
+in mind passes the item's [[primary_parent]], defined below.
+
+<<sub-item helpers>>=
+def children_of(
     todos: list[TodoItem], parent_id: int
 ) -> list[TodoItem]:
-    """Get all direct children of a todo item."""
-    return [t for t in todos if t.parent_id == parent_id]
+    """Return the items in `todos` that have `parent_id`
+    among their parents.
+
+    `ROOT_ID` gives the top-level items.
+    """
+    return [t for t in todos if parent_id in parents_of(t)]
+
+
+def siblings_of(
+    todos: list[TodoItem],
+    item: TodoItem,
+    context_parent: int,
+) -> list[TodoItem]:
+    """Return the other children of `context_parent`.
+
+    These are `item`'s siblings at the place under
+    `context_parent`; `ROOT_ID` gives the other top-level
+    items.
+    """
+    return [
+        t for t in children_of(todos, context_parent)
+        if t.id != item.id
+    ]
+@
+
+The transitive walks are where a graph differs from a tree in a way
+that can hurt.  Two paths may lead down to the same item, a diamond,
+which a walk that trusts the shape would visit twice; and a cycle,
+which a hand-edited file can contain whatever the commands allow,
+would make the walk run forever.  Both walks keep the set of ids they
+have seen, which settles both cases: the bottom of a diamond is listed
+once, and a cycle ends where it closes.  The starting id is seen from
+the outset, so an item never turns up among its own descendants or
+ancestors even when a cycle leads back to it.
+
+Direct children are the right unit for display and for priority
+comparison, because both work one level at a time.  Deletion is
+different: it is the one operation whose correctness depends on the
+\emph{whole} subtree, since an item whose parent no longer exists is
+treated as a visible root by [[get_visible_roots]] and would reappear
+at the top of [[ls]].  That is what the transitive walk down is for.
+[[descendants_of]] lists in depth-first order, each item before its
+own children, as the tree walk it replaces did.  [[ancestors_of]]
+follows \emph{every} parent rather than one line, because the
+questions it answers are about all of them---above all, whether an
+item lies above another, which is what keeps a move from making an
+item its own ancestor (\cref{sec:todo-edit-parent}).  It lists the
+nearest ancestors first and never includes the root, which is not an
+item.  An ancestor missing from [[todos]] ends that path, as it does
+in [[context_path]] below.
+
+<<sub-item helpers>>=
+def descendants_of(
+    todos: list[TodoItem], parent_id: int
+) -> list[TodoItem]:
+    """Return every item below `parent_id`, once each.
+
+    Depth-first, each item before its children.  A cycle
+    or a diamond in the parents cannot repeat an item or
+    hang the walk.
+    """
+    found = []
+    seen = {parent_id}
+
+    def visit(current):
+        for child in children_of(todos, current):
+            if child.id not in seen:
+                seen.add(child.id)
+                found.append(child)
+                visit(child.id)
+
+    visit(parent_id)
+    return found
+
+
+def ancestors_of(
+    todos: list[TodoItem],
+    item: TodoItem,
+    by_id: dict[int, TodoItem] | None = None,
+) -> list[TodoItem]:
+    """Return every item above `item` along any of its
+    parents, nearest first, once each.
+
+    The root is not an item and is never returned; a
+    missing parent ends its path, and a cycle cannot
+    hang the walk.  `by_id` may pass a prebuilt map from
+    id to item.
+    """
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
+    found = []
+    seen = {item.id}
+    frontier = real_parents_of(item)
+    while frontier:
+        parent_id = frontier.pop(0)
+        if parent_id in seen or parent_id not in by_id:
+            continue
+        seen.add(parent_id)
+        parent = by_id[parent_id]
+        found.append(parent)
+        frontier.extend(real_parents_of(parent))
+    return found
+@
+
+Some questions want a single line through the graph nevertheless.
+The shell prompt prints one path; starting a sub-item pushes one line
+of ancestors onto the active stack; and the child range of a parent is
+bounded by the line of ranges above it
+(\cref{sec:child-priority-helpers}).  [[primary_parent]] picks the
+parent such a line goes through.
+
+The context decides first.  When one of the parents is on the active
+stack, or in the current tmux window's context, that is the line the
+user is working in, and the item's other places are elsewhere.  The
+caller passes those ids as [[context_ids]], since only the caller
+knows which context applies.  Without a parent in the context, the
+first parent that exists in [[todos]] is taken, and only then a missing
+one, so that an orphan---an item whose only parent was deleted---keeps
+answering what it always has, and [[get_parent]] goes on placing it
+against the top level.  The root comes last, for a top-level item with
+no other parent.  An item with only one parent has nothing to choose
+between, so it answers that parent without looking anything up, which
+keeps the common case as cheap as reading [[parent_id]] was.
+
+[[context_path]] follows primary parents up to the root and returns
+the line root first, the reading order of a path ([[353 > 356 > 359]])
+and the activation order that a parent-before-child stack needs.  The
+root itself is left out.  The walk stops at a missing parent and at a
+repeated id, so a cycle written by a broken editor session cannot hang
+the caller.
+
+<<sub-item helpers>>=
+def primary_parent(
+    todos: list[TodoItem],
+    item: TodoItem,
+    context_ids=(),
+    by_id: dict[int, TodoItem] | None = None,
+) -> int:
+    """Return the id of the parent `item`'s line runs
+    through.
+
+    That is the first parent in `context_ids` (the active
+    stack or the tmux context), else the first parent
+    present in `todos`, else the first real parent, else
+    `ROOT_ID`.  `by_id` may pass a prebuilt map from id
+    to item.
+    """
+    parents = real_parents_of(item)
+    if len(parents) <= 1:
+        return parents[0] if parents else ROOT_ID
+    for parent_id in parents:
+        if parent_id in context_ids:
+            return parent_id
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
+    for parent_id in parents:
+        if parent_id in by_id:
+            return parent_id
+    return parents[0]
+
+
+def context_path(
+    todos: list[TodoItem],
+    item: TodoItem,
+    context_ids=(),
+    *,
+    by_id: dict[int, TodoItem] | None = None,
+) -> list[TodoItem]:
+    """Return the line of ancestors above `item`, root first.
+
+    The line follows `primary_parent` with `context_ids`
+    and stops at the top level, a missing parent, or a
+    cycle.  `by_id` may pass a prebuilt map from id to
+    item, for callers that ask about many items.
+    """
+    if by_id is None:
+        by_id = {t.id: t for t in todos}
+    path = []
+    seen = {item.id}
+    current = item
+    while True:
+        parent_id = primary_parent(
+            todos, current, context_ids, by_id
+        )
+        if (
+            parent_id == ROOT_ID
+            or parent_id not in by_id
+            or parent_id in seen
+        ):
+            break
+        seen.add(parent_id)
+        current = by_id[parent_id]
+        path.append(current)
+    path.reverse()
+    return path
+@
+
+Let's verify the helpers on what one parent per item can already
+express.  The root is a parent like any other: it has the top-level
+items as its children, and top-level items are each other's siblings
+under it.  The walks agree with the tree: one line of ancestors, root
+first for [[context_path]] and nearest first for [[ancestors_of]].
+The context does not matter while there is only one parent to choose.
+
+<<test functions>>=
+def test_root_is_the_parent_of_top_level_items():
+  """`ROOT_ID` stands for the top level among parent ids."""
+  todos = [
+    TodoItem(id=1, title="Top"),
+    TodoItem(id=2, title="Child", parent_id=1),
+    TodoItem(id=3, title="Other top"),
+  ]
+  assert parents_of(todos[0]) == [ROOT_ID]
+  assert real_parents_of(todos[0]) == []
+  assert real_parents_of(todos[1]) == [1]
+  assert [t.id for t in children_of(todos, ROOT_ID)] == [1, 3]
+  assert [t.id for t in children_of(todos, 1)] == [2]
+  assert [
+    t.id for t in siblings_of(todos, todos[0], ROOT_ID)
+  ] == [3]
+  assert primary_parent(todos, todos[0]) == ROOT_ID
+  assert primary_parent(todos, todos[1], context_ids=[3]) == 1
+
+
+def test_walks_follow_the_single_parent_line():
+  """Ancestors nearest first, the path root first."""
+  todos = [
+    TodoItem(id=1, title="A"),
+    TodoItem(id=2, title="B", parent_id=1),
+    TodoItem(id=3, title="C", parent_id=2),
+    TodoItem(id=4, title="D", parent_id=1),
+  ]
+  assert [t.id for t in ancestors_of(todos, todos[2])] == [2, 1]
+  assert [t.id for t in context_path(todos, todos[2])] == [1, 2]
+  assert [t.id for t in descendants_of(todos, 1)] == [2, 3, 4]
+  assert [
+    t.id for t in descendants_of(todos, ROOT_ID)
+  ] == [1, 2, 3, 4]
+@
+
+A cycle cannot be made through the commands any more
+(\cref{sec:todo-edit-parent}), but a file edited by hand, or written
+before that check existed, can still hold one.  Every walk must then
+end, and must not list the item it started from:
+
+<<test functions>>=
+def test_walks_survive_a_parent_cycle():
+  """A cycle ends every walk, without listing the start."""
+  todos = [
+    TodoItem(id=1, title="A", parent_id=3),
+    TodoItem(id=2, title="B", parent_id=1),
+    TodoItem(id=3, title="C", parent_id=2),
+  ]
+  assert [t.id for t in descendants_of(todos, 1)] == [2, 3]
+  assert [t.id for t in ancestors_of(todos, todos[0])] == [3, 2]
+  assert [t.id for t in context_path(todos, todos[0])] == [2, 3]
+  assert descendants_of(todos, ROOT_ID) == []
+@
+
+\subsection{Helpers for the commands}
+
+The commands ask more specific questions than the ones above: which
+siblings to compare an item with, which item is the parent, whether
+all children are done, which task is next.  The rest of this section
+answers them on top of the parent helpers.
+
+The parent helpers also replace four older ones that assumed a tree:
+[[get_children]], [[get_siblings]], [[get_descendants]] and, further
+down, [[get_ancestors]].  The module no longer calls them, but the tests
+written against the tree still do, and they pin exactly the behaviour
+that one parent per item must keep.  We therefore keep the names,
+defined through the new helpers, so that those tests check the new
+helpers without being rewritten.  A [[None]] parent still means the
+top level to [[get_children]], as it did when [[None]] was what a
+top-level item stored.
+
+<<sub-item helpers>>=
+def get_children(
+    todos: list[TodoItem], parent_id: int | None
+) -> list[TodoItem]:
+    """Get all direct children of a todo item.
+
+    Tree-era name for `children_of`; `None` means the top
+    level.
+    """
+    if parent_id is None:
+        parent_id = ROOT_ID
+    return children_of(todos, parent_id)
 
 
 def get_siblings(
@@ -2243,62 +2587,22 @@ def get_siblings(
 ) -> list[TodoItem]:
     """Get siblings of an item (same parent level).
 
-    For top-level items, siblings are all other top-level
-    items. For sub-items, siblings share the same parent.
+    Tree-era name for `siblings_of` under the item's
+    `primary_parent`.
     """
-    return [
-        t
-        for t in todos
-        if t.parent_id == item.parent_id and t.id != item.id
-    ]
-@
-
-Going the other way---from an item to the parent whose range bounds
-it---is the lookup every re-ranking path needs before it can place
-anything, because the parent supplies both the interval and the
-question of whether a numeric position is available at all.  We give
-it a name so that the three commands that ask it cannot drift apart on
-what \enquote{no parent} means: a top-level item and an item whose
-parent has been deleted both answer [[None]], and both are placed
-against the top level.
-
-<<sub-item helpers>>=
-def get_parent(
-    todos: list[TodoItem], item: TodoItem
-) -> TodoItem | None:
-    """Get the parent of an item, or `None` at top
-    level."""
-    if item.parent_id is None:
-        return None
-    return next(
-        (t for t in todos if t.id == item.parent_id),
-        None,
+    return siblings_of(
+        todos, item, primary_parent(todos, item)
     )
-@
 
-Direct children are the right unit for display and for priority
-comparison, because both work one level at a time.  Deletion is
-different: it is the one operation whose correctness depends on the
-\emph{whole} subtree, since an item whose parent no longer exists is
-treated as a visible root by [[get_visible_roots]] and would reappear
-at the top of [[ls]].  We therefore also offer the transitive view.
 
-<<sub-item helpers>>=
 def get_descendants(
     todos: list[TodoItem], parent_id: int
 ) -> list[TodoItem]:
     """Get every descendant of a todo item.
 
-    Returns children, grandchildren, and deeper, in
-    depth-first order.
+    Tree-era name for `descendants_of`.
     """
-    found = []
-    for child in get_children(todos, parent_id):
-        found.append(child)
-        found.extend(
-            get_descendants(todos, child.id)
-        )
-    return found
+    return descendants_of(todos, parent_id)
 @
 
 Let's verify that the transitive walk reaches past the first level and
@@ -2317,6 +2621,31 @@ def test_get_descendants_reaches_grandchildren():
   assert {
     t.id for t in get_descendants(todos, 1)
   } == {2, 3}
+@
+
+Going the other way---from an item to the parent whose range bounds
+it---is the lookup every re-ranking path needs before it can place
+anything, because the parent supplies both the interval and the
+question of whether a numeric position is available at all.  We give
+it a name so that the three commands that ask it cannot drift apart on
+what \enquote{no parent} means: a top-level item and an item whose
+parent has been deleted both answer [[None]], and both are placed
+against the top level.  The parent is the item's [[primary_parent]],
+the one its line runs through.
+
+<<sub-item helpers>>=
+def get_parent(
+    todos: list[TodoItem], item: TodoItem
+) -> TodoItem | None:
+    """Get the parent of an item, or `None` at top
+    level."""
+    parent_id = primary_parent(todos, item)
+    if parent_id == ROOT_ID:
+        return None
+    return next(
+        (t for t in todos if t.id == parent_id),
+        None,
+    )
 @
 
 The [[add]], [[reprioritize]], and [[import]] commands compare a
@@ -2343,7 +2672,9 @@ def get_active_siblings(
     that worker are returned. When ``ranked_only`` is
     true, siblings with unset priorities are excluded.
     """
-    siblings = get_siblings(todos, item)
+    siblings = siblings_of(
+        todos, item, primary_parent(todos, item)
+    )
     active = [
         s
         for s in siblings
@@ -2419,12 +2750,12 @@ Several callers need the whole line of ancestors above an item rather
 than one parent: [[ensure_ancestors_active]] activates all of them,
 the shell prompt (\cref{prompt}) prints the chain from the root down
 to the current task, and the depth of an item is simply the length
-of that line.  We return the ancestors root first, because that is
-the reading order of a path ([[353 > 356 > 359]]) and the activation
-order a parent-before-child stack needs.  The walk stops at a
-missing parent---an orphan is placed against the top level, as
-[[get_parent]] decides---and at a repeated id, so a cycle written by
-a broken editor session cannot hang the caller.
+of that line.  The line is the one [[context_path]] walks
+(\cref{sec:todo-parents}), with whatever context the caller has.
+[[get_ancestors]] is its tree-era name, with no context and an
+optional map from id to item as before; [[todo_depth]] counts the
+line without context, which for one parent per item is the depth in
+the tree.
 
 <<sub-item helpers>>=
 def get_ancestors(
@@ -2434,25 +2765,11 @@ def get_ancestors(
 ) -> list[TodoItem]:
     """Return the ancestors of ``item``, root first.
 
-    Stops at a missing parent or a cycle.  ``by_id`` may pass a
-    prebuilt map from id to item, for callers that ask for many
-    items' ancestors in the same list.
+    Tree-era name for `context_path` without context.
+    Stops at a missing parent or a cycle.  ``by_id`` may
+    pass a prebuilt map from id to item.
     """
-    if by_id is None:
-        by_id = {t.id: t for t in todos}
-    ancestors = []
-    seen = {item.id}
-    parent_id = item.parent_id
-    while (
-        parent_id is not None
-        and parent_id in by_id
-        and parent_id not in seen
-    ):
-        seen.add(parent_id)
-        ancestors.append(by_id[parent_id])
-        parent_id = by_id[parent_id].parent_id
-    ancestors.reverse()
-    return ancestors
+    return context_path(todos, item, by_id=by_id)
 
 
 def todo_depth(
@@ -2460,7 +2777,7 @@ def todo_depth(
     item: TodoItem,
 ) -> int:
     """Return the depth of ``item`` in the todo tree."""
-    return len(get_ancestors(todos, item))
+    return len(context_path(todos, item))
 <<sub-item helpers>>=
 def check_parent_completion(
     todos: list[TodoItem], parent_id: int
@@ -2471,7 +2788,7 @@ def check_parent_completion(
     done. Returns False if there are no children or any
     child is not done.
     """
-    children = get_children(todos, parent_id)
+    children = children_of(todos, parent_id)
     if not children:
         return False
     return all(c.status == "done" for c in children)
@@ -2501,7 +2818,7 @@ def find_pending_by_priority(
         t for t in todos
         if t.status == "pending"
         and (parent_id is None
-             or t.parent_id == parent_id)
+             or parent_id in parents_of(t))
     ]
     if who:
         candidates = [
@@ -2671,8 +2988,9 @@ children of~A should receive priorities in the range $(3.0, 5.0)$,
 so they always appear between~A and~B.
 
 The first helper finds the available priority range for children of
-a given parent. We look at the parent's siblings (same
-[[parent_id]] level) to find the closest one at or below the parent.
+a given parent. We look at the parent's siblings (the other children
+of its [[primary_parent]]) to find the closest one at or below the
+parent.
 The range runs from the parent's priority down to that sibling's
 priority. If no such sibling exists, the floor comes from further up
 the tree, and only at the top level from a generous default; we return
@@ -2744,10 +3062,10 @@ def closest_lower_sibling_priority(
     return max(
         (
             require_stored_priority(t)
-            for t in todos
-            if t.parent_id == item.parent_id
-            and t.id != item.id
-            and t.status != "done"
+            for t in siblings_of(
+                todos, item, primary_parent(todos, item)
+            )
+            if t.status != "done"
             and t.priority is not None
             and t.priority <= item.priority
         ),
@@ -2773,7 +3091,7 @@ tightest one that keeps the subtree inside every enclosing range.
 Only an item whose ancestors all lack a lower sibling reaches the top
 level, and there nothing bounds it; it gets the generous default of
 ten below the top-level ancestor, so that the whole subtree shares
-one floor.  The walk reuses [[get_ancestors]], which stops at a cycle,
+one floor.  The walk reuses [[context_path]], which stops at a cycle,
 and it stops at an unranked ancestor too, since a ranked item under
 an unranked one has no enclosing range to inherit.  The default floor
 is then taken from the last ranked level we saw.
@@ -2796,7 +3114,7 @@ legacy data has) to the same step, rather than a backwards interval.
 
 <<find the nearest lower bound up the ancestor chain>>=
 chain = []
-for level in [parent, *reversed(get_ancestors(todos, parent))]:
+for level in [parent, *reversed(context_path(todos, parent))]:
     if level.priority is None:
         break
     sibling = closest_lower_sibling_priority(todos, level)
@@ -3259,23 +3577,14 @@ def move_subtree_priorities(
     return moved
 @
 
-The walk keeps a set of the items it has seen.  [[get_descendants]]
-has no such guard, and [[edit --parent]] still accepts a move under the
-item's own descendant, after which the subtree is a cycle and an
-unguarded walk would never end.  Seeding the set with the parent also
-keeps the parent out of its own subtree in that case, so its new
-number is not mapped a second time.
+Each descendant must be mapped once.  [[descendants_of]] guarantees
+that (\cref{sec:todo-parents}): it lists the bottom of a diamond once,
+and it never lists the parent itself, even when a hand-edited file
+makes the subtree a cycle, so the parent's new number is not mapped a
+second time.
 
 <<collect the descendants of [[parent]] once each>>=
-descendants = []
-seen = {parent.id}
-frontier = [parent.id]
-while frontier:
-    for child in get_children(todos, frontier.pop()):
-        if child.id not in seen:
-            seen.add(child.id)
-            descendants.append(child)
-            frontier.append(child.id)
+descendants = descendants_of(todos, parent.id)
 @
 
 The callers each hold an item whose number is about to change.  Both
@@ -3575,10 +3884,10 @@ def squeeze_sibling_above(
     if item.priority is None or item.status == "done":
         return []
     above = [
-        s for s in todos
-        if s.parent_id == item.parent_id
-        and s.id != item.id
-        and s.status != "done"
+        s for s in siblings_of(
+            todos, item, primary_parent(todos, item)
+        )
+        if s.status != "done"
         and s.priority is not None
         and s.priority >= item.priority
     ]
@@ -3784,8 +4093,9 @@ def renumber_priorities(todos: list[TodoItem]) -> None:
     ]
     children = {}
     for t in live:
-        children.setdefault(t.parent_id, []).append(t)
-    level = family_order(children.get(None, []))
+        for parent_id in parents_of(t):
+            children.setdefault(parent_id, []).append(t)
+    level = family_order(children.get(ROOT_ID, []))
     <<respace the top level when it is crowded>>
     seen = {t.id for t in level}
     while level:
@@ -4882,7 +5192,7 @@ def render_todo_markdown(
         lines.append(item.notes)
         lines.append("")
     children = sort_todos_for_display(
-        get_children(todos, item.id)
+        children_of(todos, item.id)
     )
     for child in children:
         lines.extend(
@@ -5051,7 +5361,7 @@ def render_child_markdown(item, todos, level):
         lines.append(item.notes)
         lines.append("")
     grandchildren = sort_todos_for_display(
-        get_children(todos, item.id)
+        children_of(todos, item.id)
     )
     for child in grandchildren:
         lines.extend(
@@ -6914,8 +7224,8 @@ the stack grows by pushing children after their parents---the only way
 it is mutated---the latest stack position is also the deepest child in
 the current context.  If that invariant ever weakens, this helper
 still has a well-defined answer (latest push wins), but callers that
-really need the hierarchy leaf should instead rebuild from
-[[parent_id]] the way [[render_active_todo_forest]] does.
+really need the hierarchy leaf should instead rebuild from the
+parents the way [[render_active_todo_forest]] does.
 
 The earlier empty-list sentinel did encode the three states we needed,
 but it did so by overloading the return type: callers had to remember
@@ -7112,10 +7422,16 @@ def apply_todo_mutation(callback):
 
 The next two helpers are read-only policy operations. One picks the
 best top-level candidate when [[todo next]] has no active parent; the
-other renders the active stack as a forest based on real
-[[parent_id]] relationships rather than raw stack position.  We apply
-the same legacy-worker rule here too, so older top-level items without
-an explicit [[who]] remain visible to the default user.
+other renders the active stack as a forest based on real parent
+relationships rather than raw stack position.  We apply the same
+legacy-worker rule here too, so older top-level items without an
+explicit [[who]] remain visible to the default user.
+
+Each active item is drawn once, under the parent its line runs
+through, with the stack itself as the context
+(\cref{sec:todo-parents}): a parent that is active is the one the user
+is working under.  An item whose parent is not active is a root of the
+forest.
 
 <<helpers>>=
 def get_top_level_pending_by_priority(
@@ -7128,7 +7444,8 @@ def get_top_level_pending_by_priority(
     """
     candidates = [
         item for item in todos
-        if item.parent_id is None and item.status == "pending"
+        if ROOT_ID in parents_of(item)
+        and item.status == "pending"
     ]
     if who:
         candidates = [
@@ -7151,13 +7468,19 @@ def render_active_todo_forest(
     order = {
         item.id: index for index, item in enumerate(items)
     }
+    by_id = {item.id: item for item in items}
     children_by_parent = {}
+    roots = []
     for item in items:
-        children_by_parent.setdefault(
-            item.parent_id, []
-        ).append(item)
-    for children in children_by_parent.values():
-        children.sort(key=lambda item: order[item.id])
+        parent_id = primary_parent(
+            items, item, order, by_id
+        )
+        if parent_id in by_id:
+            children_by_parent.setdefault(
+                parent_id, []
+            ).append(item)
+        else:
+            roots.append(item)
 
     lines = []
 
@@ -7169,7 +7492,7 @@ def render_active_todo_forest(
         for child in children_by_parent.get(item.id, []):
             render_tree(child, depth + 1)
 
-    for root in get_visible_roots(items):
+    for root in roots:
         render_tree(root, 0)
 
     return lines
@@ -8108,12 +8431,13 @@ def auto_complete_parent(item, todos, who=None):
     When ``who`` is given, only parents owned by that
     worker are auto-completed.
     """
-    if item.parent_id is None:
+    parent_id = primary_parent(todos, item)
+    if parent_id == ROOT_ID:
         return
-    if not check_parent_completion(todos, item.parent_id):
+    if not check_parent_completion(todos, parent_id):
         return
     parent_item = next(
-        (t for t in todos if t.id == item.parent_id),
+        (t for t in todos if t.id == parent_id),
         None,
     )
     if parent_item is None or parent_item.status == "done":
@@ -8132,7 +8456,7 @@ def auto_complete_parent(item, todos, who=None):
     def mark_parent(next_id, todos, stack):
         parent = next(
             (t for t in todos
-             if t.id == item.parent_id),
+             if t.id == parent_id),
             None,
         )
         if parent and parent.status != "done":
@@ -8157,7 +8481,7 @@ def is_abandoned_context(item, todos, stack):
     return not any(
         child.id in stack
         and session_worker(child) == item.claimed_by
-        for child in get_descendants(todos, item.id)
+        for child in descendants_of(todos, item.id)
     )
 @
 
@@ -8199,10 +8523,12 @@ the hierarchy reported by [[todo status]] would be incomplete, and
 tracking would miss the parent's labels entirely.
 
 Rather than requiring the user to manually start every ancestor first, we
-walk up the [[parent_id]] chain and activate any ancestor that is not
-already on the stack.  We collect ancestors from the child upward, then
-reverse the list so that the outermost ancestor is pushed first, giving
-the stack the correct root-to-leaf order.
+walk up the line of parents and activate any ancestor that is not
+already on the stack.  The line is [[context_path]] with the stack as
+the context (\cref{sec:todo-parents}), so where an item has a parent
+that is already active, its line runs through that one.  It comes
+root first, so the outermost ancestor is pushed first, giving the
+stack the correct root-to-leaf order.
 
 Each activated ancestor is claimed by the worker whose session the
 item belongs to, and gets its labels tracked in that session.  Which
@@ -8242,7 +8568,7 @@ def ensure_ancestors_active(
     """
     missing = [
         ancestor
-        for ancestor in get_ancestors(todos, item)
+        for ancestor in context_path(todos, item, stack)
         if ancestor.id not in stack
     ]
 
@@ -8536,8 +8862,11 @@ worker's context now; or off the stack, if nobody works below it any
 more.  Tracking follows the claim: the old claimant's clock for the
 ancestor stops, and a new claimant's starts.
 
-We walk from the innermost ancestor outwards and decide each one on
-the stack as the previous decisions left it, so a grandparent that
+The ancestors are the line [[context_path]] follows with the stack as
+context (\cref{sec:todo-parents}): the line along which
+[[ensure_ancestors_active]] activated them.  We walk from the
+innermost ancestor outwards and decide each one on the stack as the
+previous decisions left it, so a grandparent that
 was context only for a released parent is released with it.  An
 ancestor that the worker started explicitly is not touched.  That is
 the nested workflow \enquote{[[start 5]], [[start 7]], [[done]],
@@ -8565,7 +8894,7 @@ def release_context_ancestors(item, worker):
 
     def update(next_id, todos, stack):
         changes = []
-        for ancestor in reversed(get_ancestors(todos, item)):
+        for ancestor in reversed(context_path(todos, item, stack)):
             <<decide what becomes of a context ancestor>>
         return next_id, todos, stack, changes
 
@@ -8587,7 +8916,7 @@ if not (
 ):
     continue
 below = [
-    child for child in get_descendants(todos, ancestor.id)
+    child for child in descendants_of(todos, ancestor.id)
     if child.id in stack
 ]
 if any(session_worker(child) == worker for child in below):
@@ -10260,11 +10589,20 @@ Routing [[--bottom]] through it rather than through a bespoke
 [[--top]] and [[--bottom]] remain exact mirror images of each other as
 that reasoning evolves.
 
+The sibling lookup and the comparisons work on a candidate item, built
+once so that they show the same context everywhere.  It is never
+stored, so it gets an id that no stored item can have,
+[[CANDIDATE_ID]].  That id must not be zero, although zero was free
+once: zero is [[ROOT_ID]], the top level among parent ids
+(\cref{sec:todo-parents}), and a candidate with that id would count
+every top-level item as its child wherever its children are asked
+for.
+
+<<constants>>=
+CANDIDATE_ID = -1
 <<resolve priority for new todo>>=
-# Build a candidate item once so sibling lookup and interactive
-# comparison show the same context everywhere.
 candidate = TodoItem(
-    id=0,
+    id=CANDIDATE_ID,
     title=priority_title,
     parent_id=resolved_parent,
     labels=inherited_labels,
@@ -12160,12 +12498,15 @@ Filters such as [[--who]] narrow [[filtered]] to a subset without
 regard to hierarchy.  A subitem assigned to one person may have a
 parent assigned to someone else; after filtering by [[--who]], the
 parent is gone but the child remains.  Treating that child as
-invisible because its [[parent_id is not None]] would silently hide
-an item the filtered user is responsible for.
+invisible because it has a parent would silently hide an item the
+filtered user is responsible for.
 
 The right behaviour is to treat any item as a root when its parent
 is absent from the filtered set---either because it is a true
-top-level item, or because its parent was removed by a filter.  We
+top-level item, or because its parent was removed by a filter.  With
+several parents (\cref{sec:todo-parents}) that reads: an item is a
+root when the top level is among its parents, or when none of its
+parents that are items is in the set.  We
 factor this into a helper so that both the non-tree restriction step
 and the tree renderer share exactly the same logic, with no
 duplication:
@@ -12177,15 +12518,15 @@ def get_visible_roots(
     """Return items whose parent is absent from items.
 
     An item is a visible root when it is a true top-level item
-    (parent_id is None) or when its parent is not present in
-    items---for example, because a --who filter removed it.  Pass a
-    pre-filtered list, not the full todos.
+    (`ROOT_ID` is among its parents) or when none of its parents is
+    present in items---for example, because a --who filter removed
+    it.  Pass a pre-filtered list, not the full todos.
     """
     ids = {t.id for t in items}
     return [
         t for t in items
-        if t.parent_id is None
-        or t.parent_id not in ids
+        if ROOT_ID in parents_of(t)
+        or not any(p in ids for p in real_parents_of(t))
     ]
 @
 
@@ -13068,8 +13409,8 @@ uncut---the flat listing caps rows, the tree caps top-level items, as
 [[truncation_hint]] explains.  Rows come back as (depth, item) pairs
 so the renderer is one loop with an indentation rule, the same shape
 the [[view]] command uses for its sub-items.  No cycle guard is
-needed here, unlike in [[get_ancestors]]: a root is an item whose
-parent is absent, and a [[parent_id]] cycle contains no such item, so
+needed here, unlike in [[context_path]]: a root is an item whose
+parent is absent, and a cycle of parents contains no such item, so
 the walk never enters one.
 
 <<sub-item helpers>>=
@@ -13095,7 +13436,7 @@ def get_subtree_rows(items, item, now=None, depth=0):
     """Return `item` and its descendants in `items` as (depth, item)."""
     rows = [(depth, item)]
     children = sort_todos_for_display(
-        [t for t in items if t.parent_id == item.id], now
+        children_of(items, item.id), now
     )
     for child in children:
         rows.extend(get_subtree_rows(items, child, now, depth + 1))
@@ -13161,7 +13502,7 @@ like the title above it, and the leading empty cells depend on
 whether the priority column is shown, as explained above.
 
 <<add a progress row under a parent>>=
-all_children = get_children(todos, item.id)
+all_children = children_of(todos, item.id)
 if all_children:
     done_count = sum(
         1 for c in all_children
@@ -13725,7 +14066,7 @@ to see the projects that are waiting.  The flag is a parameter of
 whatever else readiness comes to require still applies to those rows.
 
 A caller that asks about every item, as [[ready]] does, would pay for
-[[get_children]]'s scan of the whole list once per item, which is
+[[children_of]]'s scan of the whole list once per item, which is
 quadratic in the number of items.  Such a caller builds a map from
 parent to children once and passes it along.  The map is optional,
 and only a faster way to answer the same question, so the definition
@@ -13736,8 +14077,8 @@ def children_by_parent(todos):
     """Return a map from each parent id to its children in `todos`."""
     index = {}
     for todo in todos:
-        if todo.parent_id is not None:
-            index.setdefault(todo.parent_id, []).append(todo)
+        for parent_id in real_parents_of(todo):
+            index.setdefault(parent_id, []).append(todo)
     return index
 
 
@@ -13756,7 +14097,7 @@ def is_ready(todos, item, allow_open_children=False, children=None):
     if allow_open_children:
         return True
     if children is None:
-        item_children = get_children(todos, item.id)
+        item_children = children_of(todos, item.id)
     else:
         item_children = children.get(item.id, [])
     return all(child.status == "done" for child in item_children)
@@ -13804,7 +14145,7 @@ def test_is_ready_counts_children_of_every_worker():
 
 \paragraph{Where a row belongs}
 
-The path is the line of ancestors that [[get_ancestors]] returns, root
+The path is the line of ancestors that [[context_path]] returns, root
 first, which is the order one reads a path in.  Two encodings of it
 are needed.  A person reads titles, so the table shows them joined by
 [[>]], the separator the shell prompt already uses for the same chain
@@ -13827,7 +14168,7 @@ def todo_path(todos, item, by_id=None):
     """
     return [
         {"id": ancestor.id, "title": ancestor.title}
-        for ancestor in get_ancestors(todos, item, by_id)
+        for ancestor in context_path(todos, item, by_id=by_id)
     ]
 
 
@@ -14867,7 +15208,7 @@ def get_visible_sub_items(
     shown = []
     hidden_done = 0
     for child in sort_todos_for_display(
-        get_children(todos, parent_id)
+        children_of(todos, parent_id)
     ):
         if child.status == "done" and not include_done:
             hidden_done += 1
@@ -16762,6 +17103,9 @@ elif add_label or remove_label:
     item.labels = new_labels
 @
 
+\paragraph{Moving to another parent}%
+\label{sec:todo-edit-parent}
+
 The [[--parent]] flag moves an item in the hierarchy.  Items are
 accidentally created as children when the user runs [[todo add]]
 while another item is on the active stack --- the add command
@@ -16770,13 +17114,14 @@ reparent, the only fix would be to delete and re-add the item,
 losing its creation timestamp and any notes.
 
 We use [[0]] as a sentinel for \enquote{promote to top-level}
-because valid IDs always start from [[1]], so [[0]] is unambiguous.
-Passing a positive integer instead reassigns the item under a
-different parent:
+because valid IDs always start from [[1]], so [[0]] is unambiguous;
+it is the id the top level has among parent ids, [[ROOT_ID]]
+(\cref{sec:todo-parents}).  Passing a positive integer instead
+reassigns the item under a different parent:
 
 <<edit via cli flags>>=
 if parent is not None:
-    if parent == 0:
+    if parent == ROOT_ID:
         item.parent_id = None
     else:
         new_parent = next(
@@ -16789,7 +17134,110 @@ if parent is not None:
                 err=True,
             )
             raise typer.Exit(1)
+        require_acyclic_move(todos, item, parent)
         item.parent_id = parent
+@
+
+A move must not make an item its own ancestor.  Both
+[[edit 5 --parent 5]] and a move of~5 under one of its own
+descendants would.  The
+moved subtree would then be a cycle that no root leads into:
+[[get_visible_roots]] never lists any of it, so the item and
+everything below it would vanish from [[ls]], and a walk down the
+tree without a guard, such as the sub-item listing of [[view]], would
+never end.  We refuse such a move.  The question is whether the item
+lies at or above the new parent, which is what [[ancestors_of]]
+answers, along every parent (\cref{sec:todo-parents}).  The check
+runs on the snapshot, so that it fails before any prompt, and again
+under the lock, because another command may have moved the new parent
+under the item in between.
+
+<<helpers>>=
+def require_acyclic_move(todos, item, parent_id):
+    """Exit with an error if `parent_id` is `item` or below it.
+
+    Making such an item `item`'s parent would make `item` its
+    own ancestor.  Inside a `mutate_todo_state` callback the
+    exit also abandons the write.
+    """
+    parent = next(
+        (t for t in todos if t.id == parent_id), None
+    )
+    if parent is None:
+        return
+    if parent.id == item.id or item.id in {
+        a.id for a in ancestors_of(todos, parent)
+    }:
+        typer.echo(
+            f"Error: cannot move #{item.id} under "
+            f"#{parent_id}, which is #{item.id} itself "
+            "or below it",
+            err=True,
+        )
+        raise typer.Exit(1)
+@
+
+Let's verify both moves the snapshot check refuses, the item itself
+and a grandchild, and that the refusal leaves the file as it was:
+
+<<test functions>>=
+def test_edit_refuses_parent_cycle(temp_todo_dir):
+    """--parent refuses the item itself and its descendants."""
+    save_todos(4, [
+        TodoItem(
+            id=1, title="A", created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="B", parent_id=1,
+            created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=3, title="C", parent_id=2,
+            created="2026-02-20T10:00:00",
+        ),
+    ])
+    stored = load_todos()
+
+    for target in ("1", "3"):
+        result = runner.invoke(
+            cli, ["edit", "1", "--parent", target, "--keep-prio"],
+        )
+        assert result.exit_code == 1
+        assert "cannot move #1 under" in result.output
+    assert load_todos() == stored
+@
+
+The check under the lock needs two moves that are each harmless on
+their own: [[A]] under [[B]] and [[B]] under [[A]], started from the
+same old state.  Whichever commits second would close a cycle, so it
+must fail and leave the first move standing.
+
+<<test functions>>=
+def test_overlapping_moves_cannot_make_a_cycle(temp_todo_dir):
+    """Two moves from one snapshot cannot make a cycle."""
+    from nytid.cli.todo import edit
+    save_todos(3, [
+        TodoItem(
+            id=1, title="A", created="2026-02-20T10:00:00",
+        ),
+        TodoItem(
+            id=2, title="B", created="2026-02-20T10:00:00",
+        ),
+    ])
+
+    with pytest.raises(typer.Exit):
+        run_with_shared_snapshot(
+            lambda: edit(
+                None, todo_id=1, parent=2, top=True,
+            ),
+            lambda: edit(
+                None, todo_id=2, parent=1, top=True,
+            ),
+        )
+
+    _, todos = load_todos()
+    parents = {t.id: t.parent_id for t in todos}
+    assert parents in ({1: 2, 2: None}, {1: None, 2: 1})
 @
 
 [[--discovered-from]] sets the provenance link
@@ -16979,9 +17427,13 @@ leaves every range as it was, and nothing moves.
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
     moved = item.parent_id != before["parent_id"]
-    if moved and item.parent_id is not None:
-        require_todo(todos, item.parent_id)
+    if moved:
+        for parent_id in real_parents_of(item):
+            require_todo(todos, parent_id)
     fresh = require_todo(todos, todo_id)
+    if moved:
+        for parent_id in real_parents_of(item):
+            require_acyclic_move(todos, fresh, parent_id)
     old_range = child_priority_range_or_none(todos, fresh)
     old_place = (fresh.priority, fresh.parent_id)
     relative_labels = bool(add_label or remove_label)
@@ -17071,7 +17523,7 @@ if (
 ):
     typer.echo(
         f"#{todo_id} is now unranked: parent "
-        f"#{item.parent_id} is unranked too"
+        f"#{primary_parent(todos, item)} is unranked too"
     )
 item.priority = new_priority
 @
@@ -17442,7 +17894,7 @@ shown = buffer_baseline(
 )
 as_read = {
     t.id: item_fields(t)
-    for t in [item, *get_descendants(todos, item.id)]
+    for t in [item, *descendants_of(todos, item.id)]
 }
 content = open_editor(md)
 parsed = parse_editor_content(content)
@@ -17493,7 +17945,7 @@ def buffer_baseline(item, todos, parsed):
         baseline[original.id] = item_fields(saved)
         by_title = {
             c.title.strip().lower(): c
-            for c in get_children(todos, original.id)
+            for c in children_of(todos, original.id)
         }
         for child_section in section.children:
             child = by_title.get(
@@ -17608,7 +18060,7 @@ change the title in the buffer.  Children the buffer never showed are
 keyed by their stored title, and a shown child wins a clash, because
 the section was written about it.
 <<build existing children index>>=
-children = get_children(todos, parent.id)
+children = children_of(todos, parent.id)
 existing_by_title = {
     c.title.strip().lower(): c
     for c in children if c.id not in shown
@@ -17767,7 +18219,7 @@ for removed in existing_by_title.values():
         continue
     doomed = {removed.id} | {
         d.id
-        for d in get_descendants(todos, removed.id)
+        for d in descendants_of(todos, removed.id)
     }
     todos = [t for t in todos if t.id not in doomed]
     typer.echo(
@@ -17809,7 +18261,7 @@ for child, _ in settled:
 @
 
 A newly appended child is on [[todos]] by the time we descend, which
-is what lets [[get_children]] find its own level on the recursive call,
+is what lets [[children_of]] find its own level on the recursive call,
 so a freshly created child can already receive grandchildren in the
 same save.
 
@@ -18982,7 +19434,11 @@ if target.id == item.id:
         err=True,
     )
     raise typer.Exit(1)
-if target.parent_id != item.parent_id:
+if target.id not in {
+    s.id for s in siblings_of(
+        todos, item, primary_parent(todos, item)
+    )
+}:
     typer.echo(
         f"Error: #{target_id} is not a sibling of "
         f"#{todo_id}",
@@ -20282,7 +20738,7 @@ def get_active_descendant_ids(
     found = []
 
     def collect(parent_id):
-        children = get_children(todos, parent_id)
+        children = children_of(todos, parent_id)
         for child in children:
             collect(child.id)
             if child.id in stack:
@@ -20871,7 +21327,7 @@ def rm(
         )
         raise typer.Exit(1)
 
-    descendants = get_descendants(todos, todo_id)
+    descendants = descendants_of(todos, todo_id)
     if not force:
         msg = f"Remove #{todo_id}: {item.title}?"
         if descendants:
@@ -20884,7 +21340,7 @@ def rm(
 
     def remove_subtree(next_id, todos, stack):
         require_todo(todos, todo_id)
-        descendants = get_descendants(todos, todo_id)
+        descendants = descendants_of(todos, todo_id)
         ids_to_remove = {todo_id}
         ids_to_remove.update(d.id for d in descendants)
         todos = [t for t in todos if t.id not in ids_to_remove]
@@ -23212,7 +23668,7 @@ def adopt_untracked_window_for_start(
         todo_id, item, worker, auto_suspend,
         arm_finalize=arm_finalize,
     )
-    for ancestor in get_ancestors(todos, item):
+    for ancestor in context_path(todos, item):
         register_tmux_context_labels(
             todo_track_labels(ancestor, ancestor.id),
             worker,
@@ -26864,7 +27320,7 @@ for gh_item in new_items:
         )
     else:
         candidate = TodoItem(
-            id=0,
+            id=CANDIDATE_ID,
             title=gh_item["title"],
             labels=gh_labels,
             parent_id=resolved_parent,
@@ -29053,6 +29509,15 @@ from nytid.cli.todo import (
     get_todo_file,
     get_worker_default,
     should_spawn_shell,
+    ROOT_ID,
+    parents_of,
+    real_parents_of,
+    children_of,
+    siblings_of,
+    descendants_of,
+    ancestors_of,
+    primary_parent,
+    context_path,
     get_children,
     get_descendants,
     get_tree_rows,
