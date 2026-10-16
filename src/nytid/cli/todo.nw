@@ -2306,7 +2306,9 @@ When multiple workers share a parent, the comparison set must be
 restricted to one worker's items; otherwise the binary search
 would ask the user to rank unrelated tasks against each other.
 The [[who]] filter is applied inside the list comprehension so
-that the sort operates only on the relevant subset.
+that the sort operates only on the relevant subset.  The number the
+item finally gets is still chosen among every worker's siblings
+(\cref{sec:placement-number}), since they share one flat list.
 
 <<sub-item helpers>>=
 def get_active_siblings(
@@ -2653,7 +2655,9 @@ The first helper finds the available priority range for children of
 a given parent. We look at the parent's siblings (same
 [[parent_id]] level) to find the closest one at or below the parent.
 The range runs from the parent's priority down to that sibling's
-priority. If no such sibling exists, we use a generous default floor.
+priority. If no such sibling exists, the floor comes from further up
+the tree, and only at the top level from a generous default; we return
+to this case below.
 
 Both bounds read \emph{stored} priorities, for the reason placement
 gives (\cref{todo:placement}): a deadline boost is temporary by design
@@ -2680,10 +2684,11 @@ in a quieter form.  It does leave one degenerate outcome: the closest
 sibling can then equal the parent, and a zero-width (or, if the stored
 numbers ever invert, a backwards) interval gives
 [[distribute_priorities_in_range]] nothing to distribute over, since
-every division point would land on the bound itself.  We open a
-unit-wide range below the parent in that case, which is the same
-one-unit step [[assign_priority_at_position]] takes when it runs off
-the end of a list.
+every division point would land on the bound itself.  At the top
+level we open a unit-wide range below the parent in that case, which is
+the same one-unit step [[assign_priority_at_position]] takes when it
+runs off the end of a list; deeper down the range must also stay inside
+the enclosing one, which we return to below.
 
 <<child priority helpers>>=
 def compute_child_priority_range(
@@ -2694,9 +2699,12 @@ def compute_child_priority_range(
 
     Returns ``(high, low)`` from stored priorities: high
     is the parent's own, and low is that of the closest
-    sibling at or below it (or a default floor when no
-    sibling qualifies).  A degenerate result is widened
-    to a unit-wide range below the parent.
+    sibling at or below it.  A parent with no such
+    sibling inherits the low end of its own parent's
+    range, up the tree; at the top level the floor is
+    ten below.  A parent tied with its sibling gets
+    half the room left above the enclosing floor, or a
+    unit below it where nothing encloses it.
     """
     if parent.priority is None:
         raise ValueError(
@@ -2704,27 +2712,96 @@ def compute_child_priority_range(
             "unprioritized parent"
         )
     high = parent.priority
-    siblings = [
-        t for t in todos
-        if t.parent_id == parent.parent_id
-        and t.id != parent.id
-        and t.status != "done"
-        and t.priority is not None
-    ]
-    lower = [
-        s for s in siblings
-        if require_stored_priority(s) <= high
-    ]
-    if lower:
-        closest = max(
-            lower, key=require_stored_priority
-        )
-        low = require_stored_priority(closest)
-    else:
-        low = high - 10.0
-    if low >= high:
-        low = high - 1.0
+    <<find the nearest lower bound up the ancestor chain>>
     return (high, low)
+
+
+def closest_lower_sibling_priority(
+    todos: list[TodoItem],
+    item: TodoItem,
+) -> float | None:
+    """Return the stored priority of the closest ranked,
+    not-done sibling at or below `item`, or `None`."""
+    return max(
+        (
+            require_stored_priority(t)
+            for t in todos
+            if t.parent_id == item.parent_id
+            and t.id != item.id
+            and t.status != "done"
+            and t.priority is not None
+            and t.priority <= item.priority
+        ),
+        default=None,
+    )
+@
+
+The floor for a parent without a lower sibling is where the ranges
+stop nesting unless we are careful.  Take top-level siblings A at~5.0
+and B at~3.0, and a single child X of~A, placed in the middle of A's
+range at~4.0.  X has no sibling at all, so a floor of [[high - 10]]
+would give X's own children the range $(-6.0, 4.0)$, and X's first
+child would start at~$-1.0$: below~B, in a flat list that is meant to
+show A's whole subtree between A and~B.  The range X's children may
+use is not X's to choose.  It is bounded by the range X itself lives
+in, which here ends at B's~3.0, so X's children get $(3.0, 4.0)$.
+
+In general we walk up the tree: the parent's closest lower sibling
+bounds the range if there is one; otherwise the parent's parent's
+does, and so on.  Each step is the lower end of the range the
+previous level was placed in, so whatever bound we reach is the
+tightest one that keeps the subtree inside every enclosing range.
+Only an item whose ancestors all lack a lower sibling reaches the top
+level, and there nothing bounds it; it gets the generous default of
+ten below the top-level ancestor, so that the whole subtree shares
+one floor.  The walk reuses [[get_ancestors]], which stops at a cycle,
+and it stops at an unranked ancestor too, since a ranked item under
+an unranked one has no enclosing range to inherit.  The default floor
+is then taken from the last ranked level we saw.
+
+A level whose closest sibling sits level with it has no room of its
+own, and the unit-wide range we open below it must not leave the range
+the level itself lives in.  Two children of A tied at~4.8, where A's
+range is $(4.5, 5.0)$, would get $(3.8, 4.8)$ and spread their own
+children below A's lower sibling.  So a tie takes the midpoint between
+the level and the enclosing floor instead: $(4.65, 4.8)$.  That needs
+the enclosing floor, so the walk is in two passes.  Going up, we
+collect the levels until one has a sibling strictly below it, or the
+top is reached; that level's floor is known without looking further.
+Coming back down, each level's floor is its strict lower sibling, the
+midpoint for a tie, or the inherited floor when it has no sibling.
+Only where nothing encloses the level---at the top, or under an
+unranked ancestor---does a tie fall back to the unit step, and an
+inverted floor (a level stored below what it inherits, which only
+legacy data has) to the same step, rather than a backwards interval.
+
+<<find the nearest lower bound up the ancestor chain>>=
+chain = []
+for level in [parent, *reversed(get_ancestors(todos, parent))]:
+    if level.priority is None:
+        break
+    sibling = closest_lower_sibling_priority(todos, level)
+    chain.append((level, sibling))
+    if sibling is not None and sibling < level.priority:
+        break
+low = None
+for level, sibling in reversed(chain):
+    <<take the floor of [[level]] from its sibling or above>>
+@
+
+<<take the floor of [[level]] from its sibling or above>>=
+enclosed = low is not None and low < level.priority
+if sibling is not None and sibling < level.priority:
+    low = sibling
+elif sibling is not None:
+    low = (
+        (level.priority + low) / 2.0 if enclosed
+        else level.priority - 1.0
+    )
+elif low is None:
+    low = level.priority - 10.0
+elif not enclosed:
+    low = level.priority - 1.0
 @
 
 The second helper distributes [[count]] priorities evenly within a
@@ -2876,6 +2953,93 @@ def test_compute_child_priority_range_equal_sibling():
     assert low == 4.0
 
 
+def test_compute_child_priority_range_lone_child():
+    """A lone child's range ends where its parent's does,
+    at any depth."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="X", priority=4.0, parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="Y", priority=3.5, parent_id=3,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[2]
+    ) == (4.0, 3.0)
+    assert compute_child_priority_range(
+        todos, todos[3]
+    ) == (3.5, 3.0)
+    assert default_priority_without_siblings(
+        todos[2], todos
+    ) == 3.5
+
+
+def test_compute_child_priority_range_lone_top_level():
+    """With no lower sibling anywhere, a subtree shares
+    the top-level ancestor's default floor."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(
+            id=2, title="X", priority=0.0, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[1]
+    ) == (0.0, -5.0)
+
+
+def test_compute_child_priority_range_level_ancestor():
+    """An ancestor level with its sibling passes on its
+    widened unit range."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="A2", priority=5.0),
+        TodoItem(
+            id=3, title="X", priority=4.5, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[2]
+    ) == (4.5, 4.0)
+
+
+def test_compute_child_priority_range_tie_stays_enclosed():
+    """Tied children open a range inside their parent's."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=4.5),
+        TodoItem(
+            id=3, title="c1", priority=4.8, parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="c2", priority=4.8, parent_id=1,
+        ),
+    ]
+    high, low = compute_child_priority_range(
+        todos, todos[2]
+    )
+    assert (high, low) == (4.8, pytest.approx(4.65))
+    assert low > 4.5
+
+
+def test_compute_child_priority_range_survives_cycle():
+    """A parent cycle ends the walk instead of hanging."""
+    todos = [
+        TodoItem(
+            id=1, title="A", priority=5.0, parent_id=2,
+        ),
+        TodoItem(
+            id=2, title="B", priority=4.0, parent_id=1,
+        ),
+    ]
+    assert compute_child_priority_range(
+        todos, todos[1]
+    ) == (4.0, -5.0)
+
+
 def test_default_priority_without_siblings():
     """An empty level starts in the middle of the range."""
     todos = [
@@ -2941,6 +3105,794 @@ def test_children_priorities_between_parent_siblings():
     for p in child_prios:
         assert p > 3.0
         assert p < 5.0
+@
+
+\subsection{Children Follow a Re-ranked Parent}%
+\label{sec:subtree-follows-parent}
+
+The range is right only at the moment the children are placed in it.
+It is defined by the parent's number and its lower sibling's, so
+re-ranking the parent moves the range while the children keep the
+numbers they were stored with.  Take top-level siblings A at~5.0,
+B at~3.0 and C at~1.0, with A's children at 4.5, 4.0 and~3.5 inside
+A's range $(3.0, 5.0)$.  Demote A to~2.0, between C and~B, and the
+children are still at 4.5 to~3.5: in the flat list they now sit above
+B, two places from their parent, and [[next]] offers them before B
+although the user has just said that A's work matters less than B's.
+Every path that changes a ranked item's number must therefore move its
+subtree along with it.
+
+The obvious repair, shifting every descendant by the amount the parent
+moved, works only when the new range is as wide as the old one.  Here
+A moves by~$-3.0$ and its children would go to 1.5, 1.0 and~0.5: one
+ties with C and one falls below it, because A's new range $(1.0, 2.0)$
+is half as wide as the old.  We map the old range onto the new one
+instead.  With $\ell$ and~$h$ the low and high ends of the old range,
+and $\ell'$ and~$h'$ those of the new one, a descendant at~$p$ goes to
+\[
+  p' = \ell' + (p - \ell) \cdot \frac{h' - \ell'}{h - \ell},
+\]
+which in the example gives 1.75, 1.5 and~1.25: strictly between C and
+A, in the same order, and spread in proportion to how they were spread
+before.
+
+This is correct in general, not only for the example.  The map is
+strictly increasing, since both widths are positive
+([[compute_child_priority_range]] widens a degenerate range), so it
+keeps the order among the descendants.  It sends $\ell$ to~$\ell'$ and
+$h$ to~$h'$, so what was inside the old range lands inside the new
+one.  When the two ranges are equally wide the factor is one and the
+map \emph{is} the shift; a promotion is the same formula with a range
+higher up.  It also keeps the nesting at every depth.  A grandchild
+lies in its own parent's range, the interval between two numbers in
+A's old range, and an increasing map takes the interval between two
+numbers to the interval between their images.  The grandchild
+therefore stays between its mapped parent and that parent's mapped
+lower sibling, as the child-range rule requires.  This is why we apply
+the map once, to all descendants together, rather than level by
+level: recomputing a child's range after moving it and mapping its
+children again would move the grandchildren twice.
+
+A demotion to the bottom of a level leaves the parent with no lower
+sibling, and its new range ends at the default floor
+(\cref{sec:child-priority-helpers}): ten below the parent at the top
+level.  Demoting A to~0.0, below every sibling, gives the range
+$(-10.0, 0.0)$ and the children $-2.5$, $-5.0$ and~$-7.5$.  The
+subtree then looks exactly as it would had it been built at the bottom
+from the start, which is the point of having one rule for both.
+
+Which descendants move is decided by their stored numbers, not by
+ancestry alone.
+\begin{description}
+\item[Ranked and in the old range] These move.  The range is taken as
+  closed, so that a descendant level with the parent, or with the
+  lower sibling, which only hand-set numbers produce, still moves with
+  the subtree.  Its image is kept strictly inside the new range,
+  though, one floating-point step from the end it would land on: a tie
+  with the parent is exactly what the ranges exist to prevent, and
+  rounding alone can produce one when the new range is narrow---a
+  child just below the parent's old number can round onto its new
+  one.
+\item[Ranked but outside the old range] These stay.  They come from
+  data written before children were placed by range (or before a lone
+  child's range was bounded by its parent's), and outside the range
+  the map extrapolates: a narrowing pulls a far-away number towards
+  the new range and a widening pushes it further out, neither of which
+  says anything the user chose.  Leaving such an item alone is the
+  conservative answer; [[reprioritize]] can place it.
+\item[Unranked] These stay in the unranked tail, since there is no
+  number to map.
+\item[Done] These stay too.  A done item no longer bounds any range
+  and is never offered by [[next]], so its number orders nothing, and
+  rewriting it would only change the record of where it was when it
+  was closed.
+\end{description}
+A parent that was unranked before the change had no range, and one that
+is unranked after it has none to move into; in both cases nothing
+moves.  Finally, an edit that leaves the range as it was (a new title,
+say) returns early, so that it does not rewrite every descendant with
+a value that differs only by rounding.
+
+The rule moves the re-ranked item's own subtree and nothing else.  The
+sibling it lands below loses part of its range at the same time, and
+\cref{sec:sibling-above-squeezed} deals with that subtree.
+
+<<child priority helpers>>=
+def move_subtree_priorities(
+    todos: list[TodoItem],
+    parent: TodoItem,
+    old_range: tuple | None,
+    new_range: tuple | None,
+) -> list[TodoItem]:
+    """Carry `parent`'s descendants from its old child
+    range to its new one, and return those it moved.
+
+    The ranges are `(high, low)` pairs as returned by
+    `compute_child_priority_range`, or `None` for an
+    unranked parent, in which case nothing moves.  Each
+    ranked, not-done descendant whose stored priority
+    lies in the closed old range is mapped linearly onto
+    the new range, strictly inside it; the others keep
+    their numbers.
+    """
+    if old_range is None or new_range is None:
+        return []
+    if old_range == new_range:
+        return []
+    old_high, old_low = old_range
+    new_high, new_low = new_range
+    scale = (new_high - new_low) / (old_high - old_low)
+    <<collect the descendants of [[parent]] once each>>
+    inside = (
+        math.nextafter(new_low, new_high),
+        math.nextafter(new_high, new_low),
+    )
+    moved = []
+    for item in descendants:
+        if item.status == "done" or item.priority is None:
+            continue
+        if old_low <= item.priority <= old_high:
+            mapped = new_low + (item.priority - old_low) * scale
+            item.priority = min(
+                max(mapped, inside[0]), inside[1]
+            )
+            moved.append(item)
+    return moved
+@
+
+The walk keeps a set of the items it has seen.  [[get_descendants]]
+has no such guard, and [[edit --parent]] still accepts a move under the
+item's own descendant, after which the subtree is a cycle and an
+unguarded walk would never end.  Seeding the set with the parent also
+keeps the parent out of its own subtree in that case, so its new
+number is not mapped a second time.
+
+<<collect the descendants of [[parent]] once each>>=
+descendants = []
+seen = {parent.id}
+frontier = [parent.id]
+while frontier:
+    for child in get_children(todos, frontier.pop()):
+        if child.id not in seen:
+            seen.add(child.id)
+            descendants.append(child)
+            frontier.append(child.id)
+@
+
+The callers each hold an item whose number is about to change.  Both
+ranges have to come from the same list, the one about to be saved: the
+old one read before the number changes and the new one after it.
+Computing them from an earlier snapshot would describe a sibling list
+that another process may have changed in the meantime, so the callers
+do this inside their locked callback
+(\cref{sec:todo-read-modify-write}).  An unranked item has no range,
+and [[compute_child_priority_range]] refuses one, so we ask through a
+helper that answers [[None]] instead; that is the [[None]] that
+[[move_subtree_priorities]] treats as nothing to move.  The same
+helper lets the commands refuse a number they were handed, by
+[[--prio]] or [[--keep-prio]], that lies outside the parent's range,
+where no subtree move could make it a position among the parent's
+children; the top level and an unranked parent bound nothing.  It answers
+[[None]] for a missing parent too, which is how placement asks for the
+range a level is bounded by: the top level has no parent and no range
+(\cref{todo:binary-search}).
+
+<<child priority helpers>>=
+def child_priority_range_or_none(
+    todos: list[TodoItem],
+    parent: TodoItem | None,
+) -> tuple | None:
+    """Return `parent`'s child range, or `None` when
+    `parent` is unranked or `None` (the top level)."""
+    if parent is None or parent.priority is None:
+        return None
+    return compute_child_priority_range(todos, parent)
+
+
+def refuse_number_outside_range(
+    todos: list[TodoItem],
+    parent: TodoItem | None,
+    number: float,
+    subject: str,
+    alternatives: str,
+) -> None:
+    """Exit with an error unless `number` lies strictly
+    inside `parent`'s child range.
+
+    The top level and an unranked parent bound nothing,
+    so any number passes there.  `subject` names the
+    number in the message and `alternatives` the flags
+    that would place the item instead.
+    """
+    bounds = child_priority_range_or_none(todos, parent)
+    if bounds is None or bounds[1] < number < bounds[0]:
+        return
+    typer.echo(
+        f"Error: {subject} is outside #{parent.id}'s child "
+        f"range ({bounds[1]:g}, {bounds[0]:g}); "
+        f"use {alternatives} to place it",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def set_priority_with_subtree(
+    todos: list[TodoItem],
+    item: TodoItem,
+    priority: float | None,
+) -> None:
+    """Store `priority` on `item` and move the subtrees
+    its new place affects (see `settle_placement`)."""
+    old_range = child_priority_range_or_none(todos, item)
+    old_place = (item.priority, item.parent_id)
+    item.priority = priority
+    settle_placement(todos, item, old_range, old_place)
+@
+
+Let's verify the example the rule was designed around: a narrowing
+demotion keeps the children strictly between A and~C, in order.
+
+<<test functions>>=
+def abc_with_children():
+    """A, B and C at 5, 3 and 1; A's children at
+    4.5, 4.0 and 3.5."""
+    return [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(id=3, title="C", priority=1.0),
+        TodoItem(
+            id=4, title="A1", priority=4.5, parent_id=1,
+        ),
+        TodoItem(
+            id=5, title="A2", priority=4.0, parent_id=1,
+        ),
+        TodoItem(
+            id=6, title="A3", priority=3.5, parent_id=1,
+        ),
+    ]
+
+
+def child_priorities(todos, parent_id):
+    """The children's stored priorities, by id."""
+    return [
+        t.priority for t in todos
+        if t.parent_id == parent_id
+    ]
+
+
+def test_move_subtree_narrowing_demotion():
+    """Children map into the narrower range below B."""
+    todos = abc_with_children()
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert child_priorities(todos, 1) == [
+        1.75, 1.5, 1.25
+    ]
+
+
+def test_move_subtree_promotion():
+    """Promoting a parent lifts its children above the
+    sibling it passed."""
+    todos = abc_with_children()
+    todos.append(TodoItem(
+        id=7, title="C1", priority=-4.0, parent_id=3,
+    ))
+    set_priority_with_subtree(todos, todos[2], 6.0)
+    assert todos[6].priority == pytest.approx(5.5)
+    assert todos[0].priority < todos[6].priority < 6.0
+
+
+def test_move_subtree_to_the_bottom():
+    """With no lower sibling the default floor bounds the
+    new range."""
+    todos = abc_with_children()
+    set_priority_with_subtree(todos, todos[0], 0.0)
+    assert child_priorities(todos, 1) == [
+        -2.5, -5.0, -7.5
+    ]
+@
+
+Grandchildren follow through the same map rather than a second one,
+and they stay inside their own parent's range afterwards.  The lone
+child is the case \cref{sec:child-priority-helpers} had to fix: its
+child is placed through the ordinary helper, lands in A's range, and
+so follows A.
+
+<<test functions>>=
+def test_move_subtree_grandchildren_once():
+    """A grandchild moves once and stays between its
+    parent and that parent's lower sibling."""
+    todos = abc_with_children()
+    todos.append(TodoItem(
+        id=7, title="A1a", priority=4.25, parent_id=4,
+    ))
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert todos[6].priority == 1.625
+    assert todos[4].priority < todos[6].priority
+    assert todos[6].priority < todos[3].priority
+
+
+def test_move_subtree_lone_child_grandchild():
+    """A lone child's grandchild is placed in A's range
+    and follows A."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(id=3, title="C", priority=1.0),
+        TodoItem(
+            id=4, title="X", priority=4.0, parent_id=1,
+        ),
+    ]
+    first = default_priority_without_siblings(
+        todos[3], todos
+    )
+    assert 3.0 < first < 4.0
+    todos.append(TodoItem(
+        id=5, title="X1", priority=first, parent_id=4,
+    ))
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert 1.0 < todos[4].priority < todos[3].priority
+    assert todos[3].priority < todos[0].priority
+@
+
+And the descendants the rule leaves alone: unranked, done, and ranked
+outside the old range.  An unranked parent has no range to move from,
+so ranking it moves nothing, and a cycle ends the walk.
+
+<<test functions>>=
+def test_move_subtree_leaves_others_alone():
+    """Unranked, done and out-of-range descendants keep
+    their numbers."""
+    todos = abc_with_children()
+    todos += [
+        TodoItem(
+            id=7, title="Unranked", priority=None,
+            parent_id=1,
+        ),
+        TodoItem(
+            id=8, title="Done", priority=3.75,
+            parent_id=1, status="done",
+        ),
+        TodoItem(
+            id=9, title="Legacy", priority=8.0,
+            parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert [t.priority for t in todos[6:]] == [
+        None, 3.75, 8.0
+    ]
+    assert todos[3].priority == 1.75
+
+
+def test_move_subtree_stays_strictly_inside():
+    """A child at the parent's own number is moved just
+    below the parent's new one, not onto it."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(id=3, title="C", priority=1.0),
+        TodoItem(
+            id=4, title="Tied", priority=5.0, parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert 1.0 < todos[3].priority < 2.0
+
+
+def test_move_subtree_from_unranked_parent():
+    """Ranking an unranked parent moves nothing."""
+    todos = [
+        TodoItem(id=1, title="A", priority=None),
+        TodoItem(
+            id=2, title="Child", priority=4.0,
+            parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert todos[0].priority == 2.0
+    assert todos[1].priority == 4.0
+
+
+def test_move_subtree_survives_cycle():
+    """A parent that is its own descendant ends the walk
+    and is not mapped twice."""
+    todos = [
+        TodoItem(
+            id=1, title="A", priority=5.0, parent_id=2,
+        ),
+        TodoItem(
+            id=2, title="B", priority=4.5, parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 7.0)
+    assert todos[0].priority == 7.0
+@
+
+\subsection{The Sibling Above Gives Up Part of Its Range}%
+\label{sec:sibling-above-squeezed}
+
+Moving the re-ranked item's own subtree is half of keeping the ranges
+nested.  The other half is the sibling the item lands \emph{below}.
+Its range ran down to the next sibling under it, and the item is now
+that sibling: dropping A to~2.0 between B at~3.0 and C at~1.0 shrinks
+B's range from $(1.0, 3.0)$ to $(2.0, 3.0)$.  A child of B stored
+at~1.5 is still in B's old range but now sorts after A, among A's own
+children.  The same happens when a new item is placed below B by
+[[add]] or [[import]], so this is a consequence of placing an item, of
+any kind and by any command, not of re-ranking alone.
+
+The answer is the map from \cref{sec:subtree-follows-parent} once more,
+applied to B: its descendants are compressed from the old range onto
+the new one, $(1.0, 3.0)$ onto $(2.0, 3.0)$, which keeps their order
+and nesting for the same reasons as before.  The child at~1.5 goes
+to~2.25 and one at~2.5 to~2.75, both between B and A.  Only the sibling
+directly above the new place is affected: siblings further up are
+bounded by siblings that did not move, and the sibling below the item
+keeps the range under its own number.  The sibling that was directly
+above the item's \emph{old} place gains room instead of losing it;
+its children are still inside its range, so we leave them where they
+are rather than spread them out.
+
+The old range of that sibling is the range it had before the item
+arrived, which we compute from a copy of the list where the item is
+back at its old place---or absent, for a new item.  Comparing the low
+ends tells a range that shrank from one that did not; when nothing
+changed, or the range grew, nothing moves.  A done or unranked item
+bounds no range, so placing one squeezes nothing.
+
+<<child priority helpers>>=
+def squeeze_sibling_above(
+    todos: list[TodoItem],
+    item: TodoItem,
+    old_place: tuple | None = None,
+) -> list[TodoItem]:
+    """Compress the subtree of the sibling just above
+    `item`, whose child range `item` has just cut short,
+    and return the items it moved.
+
+    `old_place` is `item`'s `(priority, parent_id)`
+    before it moved, or `None` when `item` is new.
+    """
+    if item.priority is None or item.status == "done":
+        return []
+    above = [
+        s for s in todos
+        if s.parent_id == item.parent_id
+        and s.id != item.id
+        and s.status != "done"
+        and s.priority is not None
+        and s.priority >= item.priority
+    ]
+    if not above:
+        return []
+    nearest = min(s.priority for s in above)
+    <<rebuild the list as it was before [[item]] moved>>
+    moved = []
+    for sibling in above:
+        if sibling.priority != nearest:
+            continue
+        old_range = compute_child_priority_range(
+            before, sibling
+        )
+        new_range = compute_child_priority_range(
+            todos, sibling
+        )
+        if new_range[1] > old_range[1]:
+            moved += move_subtree_priorities(
+                todos, sibling, old_range, new_range
+            )
+    return moved
+@
+
+The copy leaves every other item shared with [[todos]]: only the
+moved item differs, and only in its number and parent, which are all
+[[compute_child_priority_range]] reads from it.
+
+<<rebuild the list as it was before [[item]] moved>>=
+before = [t for t in todos if t is not item]
+if old_place is not None:
+    stand_in = copy.copy(item)
+    stand_in.priority, stand_in.parent_id = old_place
+    before.append(stand_in)
+@
+
+Every command that gives an item a place calls one helper, so that
+none of them can remember the item's own subtree and forget the
+sibling above, or the other way round.  The order matters little but
+is fixed: the item's own subtree moves first, into the range under its
+new number, and then the sibling above is compressed into the range
+over it; the two ranges do not overlap.  Last, the helper checks
+whether the numbers it touched still have room around them
+(\cref{sec:renumber-priorities}).
+
+<<child priority helpers>>=
+def settle_placement(
+    todos: list[TodoItem],
+    item: TodoItem,
+    old_range: tuple | None = None,
+    old_place: tuple | None = None,
+) -> None:
+    """Move the subtrees whose ranges `item`'s new place
+    changed: its own, and its new upper sibling's.
+    Renumber everything if that left too little room.
+
+    `old_range` is `item`'s child range before the
+    change and `old_place` its `(priority, parent_id)`;
+    both are `None` for an item that is new.
+    """
+    touched = [item]
+    touched += move_subtree_priorities(
+        todos, item, old_range,
+        child_priority_range_or_none(todos, item),
+    )
+    touched += squeeze_sibling_above(todos, item, old_place)
+    if gaps_too_narrow(todos, touched):
+        renumber_priorities(todos)
+@
+
+Let's verify the squeeze on the example: B's children end up between
+B and A, in order, while A's own children move as before.  A sibling
+whose range grew keeps its children where they were---here X drops
+from~5.0 to~3.0 and remains directly under S, whose range opens from
+$(5.0, 7.0)$ to $(3.0, 7.0)$---and a new item squeezes the sibling
+above it just as a moved one does.
+
+<<test functions>>=
+def test_settle_squeezes_the_sibling_above():
+    """B's children are compressed above A's new place."""
+    todos = abc_with_children()
+    todos += [
+        TodoItem(
+            id=7, title="B1", priority=2.5, parent_id=2,
+        ),
+        TodoItem(
+            id=8, title="B2", priority=1.5, parent_id=2,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[0], 2.0)
+    assert child_priorities(todos, 2) == [2.75, 2.25]
+    assert child_priorities(todos, 1) == [
+        1.75, 1.5, 1.25
+    ]
+
+
+def test_settle_leaves_a_widened_range_alone():
+    """A sibling whose range grew keeps its children."""
+    todos = [
+        TodoItem(id=1, title="S", priority=7.0),
+        TodoItem(id=2, title="X", priority=5.0),
+        TodoItem(id=3, title="Y", priority=1.0),
+        TodoItem(
+            id=4, title="S1", priority=6.5, parent_id=1,
+        ),
+    ]
+    set_priority_with_subtree(todos, todos[1], 3.0)
+    assert todos[3].priority == 6.5
+
+
+def test_settle_new_item_squeezes_the_sibling_above():
+    """A new item below A compresses A's children."""
+    todos = abc_with_children()
+    new = TodoItem(id=9, title="New", priority=4.0)
+    todos.append(new)
+    settle_placement(todos, new)
+    assert child_priorities(todos, 1) == [
+        4.75, 4.5, 4.25
+    ]
+@
+
+\subsection{Renumbering When the Room Runs Out}%
+\label{sec:renumber-priorities}
+
+Every placement takes a midpoint, and every squeeze compresses a range,
+so the room between neighbouring numbers shrinks with use.  Adding
+children at the bottom of one parent halves the gap above the floor
+each time; inserting items directly below one sibling halves its range
+each time, and its whole subtree with it.  A float has 52 bits of
+fraction, so after some fifty such steps in one place two neighbours
+round to the same number, and the order the user chose is lost.  No
+choice of midpoint avoids this; only fresh room does.
+
+The numbers themselves carry no meaning beyond their order---they are
+an implementation detail, and the user ranks items by comparing them,
+never by typing a number they have seen---so we are free to renumber.
+After a placement has settled, we look at the numbers it wrote: the
+placed item and every descendant the two subtree moves changed.  If
+any of them is closer to its neighbour in the flat order than a
+millionth of the larger magnitude (or of~1, near zero), the whole
+ranked tree is renumbered.  A relative threshold is the right kind
+because float resolution is relative; a millionth leaves some thirty
+further halvings before rounding would bite, so renumbering happens
+well before anything is lost, yet rarely, since the gaps that ordinary
+use leaves are many orders of magnitude wider.  Checking only the
+touched numbers means that an untouched tie in old data does not
+renumber the list on every unrelated command.
+
+<<child priority helpers>>=
+def gaps_too_narrow(
+    todos: list[TodoItem],
+    touched: list[TodoItem],
+) -> bool:
+    """Tell whether a touched item has too little room
+    next to its neighbours in the flat order."""
+    ranked = sort_siblings_by_stored_priority([
+        t for t in todos if t.status != "done"
+    ])
+    where = {t.id: i for i, t in enumerate(ranked)}
+    for item in touched:
+        i = where.get(item.id)
+        if i is None:
+            continue
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(ranked):
+                a, b = item.priority, ranked[j].priority
+                room = RENUMBER_MIN_GAP * max(1.0, abs(a), abs(b))
+                if abs(a - b) < room:
+                    return True
+    return False
+<<constants>>=
+RENUMBER_MIN_GAP = 1e-6
+@
+
+Renumbering keeps the order and the nesting and rebuilds the room.
+It walks the tree of ranked, not-done items from the top level down,
+one level at a time, and lays each family out again with
+[[distribute_priorities_in_range]] inside the parent's range---the
+same evenly spaced numbers the editor gives a family it creates.  The
+range of a parent is computed only once its whole level has its new
+numbers, for the reason the editor reconciliation gives
+(\cref{sec:edit-via-editor}), and the order within a family is
+the order the stored numbers had, with the ID breaking a tie.
+
+The top level is kept as it is when its neighbours are at least a whole
+unit apart, since that is room enough for everything below and its
+numbers are the ones a user may have chosen with [[--prio]].
+Otherwise it is respaced to whole numbers counting down to~1, as many
+as there are top-level items.  Done and unranked items, and anything
+below them, are not part of the ranked tree and keep their numbers.
+
+<<child priority helpers>>=
+def renumber_priorities(todos: list[TodoItem]) -> None:
+    """Renumber the ranked, not-done tree in place,
+    keeping its order and nesting and making room."""
+    def family_order(items):
+        return sorted(
+            items, key=lambda t: (-t.priority, t.id)
+        )
+    live = [
+        t for t in todos
+        if t.status != "done" and t.priority is not None
+    ]
+    children = {}
+    for t in live:
+        children.setdefault(t.parent_id, []).append(t)
+    level = family_order(children.get(None, []))
+    <<respace the top level when it is crowded>>
+    seen = {t.id for t in level}
+    while level:
+        below = []
+        for parent in level:
+            family = family_order([
+                c for c in children.get(parent.id, [])
+                if c.id not in seen
+            ])
+            if not family:
+                continue
+            high, low = compute_child_priority_range(
+                todos, parent
+            )
+            numbers = distribute_priorities_in_range(
+                len(family), high, low
+            )
+            for child, number in zip(family, numbers):
+                child.priority = number
+                seen.add(child.id)
+            below += family
+        level = below
+@
+
+<<respace the top level when it is crowded>>=
+gaps = [
+    a.priority - b.priority for a, b in zip(level, level[1:])
+]
+if gaps and min(gaps) < 1.0:
+    for i, item in enumerate(level):
+        item.priority = float(len(level) - i)
+@
+
+Let's verify that a collapsed family gets its room back without
+changing its order or nesting, and that the renumbering is triggered
+by a placement that leaves too little room.
+
+<<test functions>>=
+def test_renumber_priorities_restores_room():
+    """Order and nesting survive; the gaps are rebuilt."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="A1", priority=3.0 + 2e-9,
+            parent_id=1,
+        ),
+        TodoItem(
+            id=4, title="A2", priority=3.0 + 1e-9,
+            parent_id=1,
+        ),
+        TodoItem(
+            id=5, title="A1a", priority=3.0 + 1.5e-9,
+            parent_id=3,
+        ),
+        TodoItem(
+            id=6, title="Done", priority=3.0 + 1e-9,
+            parent_id=1, status="done",
+        ),
+    ]
+    renumber_priorities(todos)
+    by_id = {t.id: t.priority for t in todos}
+    assert by_id[1] == 5.0 and by_id[2] == 3.0
+    assert by_id[3] == pytest.approx(5.0 - 2 / 3)
+    assert by_id[4] == pytest.approx(3.0 + 2 / 3)
+    assert by_id[4] < by_id[5] < by_id[3]
+    assert by_id[6] == 3.0 + 1e-9
+
+
+def test_renumber_respaces_a_crowded_top_level():
+    """Top-level items closer than a unit are respaced."""
+    todos = [
+        TodoItem(id=1, title="A", priority=1.5),
+        TodoItem(id=2, title="B", priority=1.25),
+        TodoItem(id=3, title="C", priority=-7.0),
+    ]
+    renumber_priorities(todos)
+    assert [t.priority for t in todos] == [3.0, 2.0, 1.0]
+
+
+def test_settle_renumbers_when_room_runs_out():
+    """A placement into a collapsed gap renumbers."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+        TodoItem(
+            id=3, title="A1", priority=3.0 + 1e-9,
+            parent_id=1,
+        ),
+    ]
+    new = TodoItem(
+        id=4, title="A2", priority=3.0 + 5e-10,
+        parent_id=1,
+    )
+    todos.append(new)
+    settle_placement(todos, new)
+    assert todos[2].priority == pytest.approx(5.0 - 2 / 3)
+    assert new.priority == pytest.approx(3.0 + 2 / 3)
+@
+
+Through the command line, the halving that motivated all this is a
+parent receiving child after child at the bottom.  Without
+renumbering, the sixtieth child would tie with its neighbour.
+
+<<test functions>>=
+def test_many_bottom_children_keep_distinct_numbers(
+    temp_todo_dir,
+):
+    """Repeated --bottom children never tie."""
+    save_todos(3, [
+        TodoItem(
+            id=n, title=t, priority=p,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        )
+        for n, t, p in [(1, "A", 5.0), (2, "B", 3.0)]
+    ])
+    for k in range(60):
+        result = runner.invoke(cli, [
+            "add", "-t", f"c{k}", "--parent", "1", "--bottom",
+        ])
+        assert result.exit_code == 0, result.output
+    _, todos = load_todos()
+    children = [t.priority for t in todos if t.parent_id == 1]
+    assert len(set(children)) == 60
+    assert all(3.0 < p < 5.0 for p in children)
 @
 
 \section{Editor Infrastructure}
@@ -4585,17 +5537,24 @@ def binary_search_priority(
     Presents existing items and asks the user to compare.
     Returns the computed priority value.
 
-    When ``parent`` and ``todos`` are provided and there
-    are no siblings, the priority is placed within the
-    parent's context range when that parent is ranked.
-    Callers must keep children of an unranked parent
-    unranked instead of asking for numeric placement.
+    The questions compare against `siblings`, one
+    worker's items as the user sees them; the number is
+    taken from the stored priorities of every worker's
+    siblings when `todos` is given (see
+    `number_at_position`).  With no ranked sibling at
+    all, the priority is placed within the parent's
+    range.  Callers must keep children of an unranked
+    parent unranked instead of asking for numeric
+    placement.
     """
     ranked_siblings = [
         sibling for sibling in siblings
         if sibling.priority is not None
     ]
-    if not ranked_siblings:
+    level = placement_level(
+        ranked_siblings, candidate, todos
+    )
+    if not level:
         return default_priority_without_siblings(
             parent, todos
         )
@@ -4638,26 +5597,33 @@ def assign_priority_at_position(
     sorted_items: list[TodoItem],
     position: int,
     priority_of=require_effective_priority,
+    bounds: tuple | None = None,
 ) -> float:
     """Compute a priority value at the given insertion
     position in a sorted (descending) list.
 
     The priority is the midpoint between neighbors,
     or offset by 1.0 at the edges.  `priority_of` reads
-    the number to interpolate between; the binary search
-    compares what the user sees, so it keeps the default
-    effective priority, while the non-interactive
-    placement flags pass the stored one.
+    the number to interpolate between; every placement
+    passes the stored one, so that a deadline boost is
+    not written into the new number.  `bounds` is
+    the `(high, low)` child range of the items' parent,
+    if they have one: an edge with room left inside it
+    takes the midpoint to the range's end instead.
     """
     if not sorted_items:
         return 1.0
 
     if position == 0:
         top = priority_of(sorted_items[0])
+        if bounds is not None and top < bounds[0]:
+            return (top + bounds[0]) / 2.0
         return top + 1.0
 
     if position >= len(sorted_items):
         bottom = priority_of(sorted_items[-1])
+        if bounds is not None and bottom > bounds[1]:
+            return (bottom + bounds[1]) / 2.0
         return bottom - 1.0
 
     above = priority_of(sorted_items[position - 1])
@@ -4670,12 +5636,50 @@ midpoint between the neighboring items' priorities. Edge cases
 (inserting at the top or bottom) use a fixed offset of~1.0 instead.
 Priorities are unbounded floats---negative values are valid and
 arise naturally when many items are appended sequentially at the
-bottom.  If the numbers drift far from zero a future renumbering
-pass can normalize them.
+bottom.  Midpoints of midpoints eventually run out of room, which the
+renumbering in \cref{sec:renumber-priorities} restores.
+
+The fixed offset is right only where nothing bounds the list, which is
+the top level.  Among the children of a ranked parent the ends are
+bounded by the parent's child range (\cref{sec:child-priority-helpers}),
+and a step of~1.0 can leave it.  Children of a parent at~5.0 whose
+lower sibling is at~3.0 live in $(3.0, 5.0)$; with one child at~4.5, a
+new child at the top would get~5.5, above its own parent, and one at
+the bottom of a child at~3.5 would get~2.5, below the parent's
+sibling.  So when the items have a parent we split the room left at
+that end instead: the top takes the midpoint between the highest child
+and the parent's number, the bottom the midpoint between the lowest
+child and the low end of the range.  This is the same \enquote{leave
+room for midpoints} rule as everywhere else, now with the range's ends
+as the outer neighbours.  An end sibling that already sits outside the
+range (data placed before ranges existed) leaves no room to split; we
+step past it by~1.0 as before rather than put the new item on the
+wrong side of it.  The top level keeps the plain step, since it has no
+range: [[child_priority_range_or_none]] answers [[None]] there.
+
+The questions are asked in the order the user sees, deadline boosts
+included, because that is the order the user can judge.  The number,
+however, is interpolated between \emph{stored} priorities, for the
+reason non-interactive placement gives (\cref{todo:placement}): a
+boost is temporary, and a number derived from a boosted neighbour would
+keep the borrowed urgency after the deadline that justified it.  In a
+child level it would do worse.  A child of a parent at~5.0 whose
+deadline is an hour away can show an effective priority of~14; placing
+a new child above it by that number stores~15, far above the parent
+itself.  Interpolating between stored numbers keeps the new child in
+the parent's range.  The price is that a boosted sibling the user
+ranked below the new item may still show above it until its boost
+ends.  Turning the position into a number is shared with the
+non-interactive flags, and \cref{sec:placement-number} explains how it
+also takes the other workers' siblings into account.
 
 <<compute midpoint priority>>=
-new_priority = assign_priority_at_position(
-    sorted_items, low
+new_priority = number_at_position(
+    sorted_items, low, level,
+    bounds=(
+        child_priority_range_or_none(todos, parent)
+        if todos is not None else None
+    ),
 )
 @
 
@@ -4836,8 +5840,9 @@ A deadline boost is temporary by design
 and storing the result would let a sibling one day from its deadline
 donate its urgency to the item we are placing, and that borrowed
 urgency would outlive the deadline that justified it.  This is the
-argument the [[--append]] path has always made; what changes is that
-it now covers every non-interactive placement instead of one of them.
+argument the [[--append]] path has always made; it now covers every
+placement, the interactive search included, which still \emph{asks}
+in the boosted order the user sees (\cref{todo:binary-search}).
 
 <<placement helpers>>=
 def require_stored_priority(item: TodoItem) -> float:
@@ -4866,13 +5871,144 @@ def sort_siblings_by_stored_priority(
     )
 @
 
+\subsection{Turning a Position into a Number}%
+\label{sec:placement-number}
+
+The comparison set is one worker's siblings, because asking a user to
+rank another worker's tasks against their own would be meaningless
+(\cref{todo:sub-item-helpers}).  The child ranges, however, are
+computed from every worker's siblings, since they share one flat list.
+A number taken only from one worker's neighbours can therefore land on
+another worker's item, or between that item and its children.  Two
+workers who each add a first child under the same parent both get the
+middle of the parent's range, the same number.
+
+So the position the user chose is translated into a position among
+\emph{all} the active ranked siblings before it becomes a number.  The
+new item goes directly above the sibling of the same worker that it was
+placed above, which is what the user said; at the bottom of that
+worker's list it goes directly below the lowest one.  A worker with no
+ranked sibling yet, where nothing was asked, starts at the bottom of
+the level, which is the least presumptuous place among other people's
+work.  Only the numbers of the neighbours and the parent's range then
+matter, and [[assign_priority_at_position]] reads them as stored
+numbers.  With a single worker the two lists coincide and nothing
+changes.
+
+<<placement helpers>>=
+def placement_level(
+    siblings: list[TodoItem],
+    candidate: TodoItem | None,
+    todos: list[TodoItem] | None,
+) -> list[TodoItem]:
+    """Return every active ranked sibling of `candidate`,
+    of any worker, together with `siblings`.
+
+    Without `todos` or `candidate` only `siblings` are
+    known, and they are returned as they are.
+    """
+    ranked = [s for s in siblings if s.priority is not None]
+    if todos is None or candidate is None:
+        return ranked
+    level = get_active_siblings(
+        todos, candidate, ranked_only=True
+    )
+    known = {s.id for s in level}
+    return level + [s for s in ranked if s.id not in known]
+
+
+def number_at_position(
+    own: list[TodoItem],
+    position: int,
+    level: list[TodoItem],
+    bounds: tuple | None = None,
+) -> float:
+    """Return the stored priority for an insertion at
+    `position` among `own`, interpolated in `level`.
+
+    `own` is the comparison set in the order `position`
+    refers to and must be part of `level`, all the
+    ranked siblings.  `bounds` is the parent's child
+    range, if any.
+    """
+    ordered = sort_siblings_by_stored_priority(level)
+    index = [s.id for s in ordered]
+    if position < len(own):
+        at = index.index(own[position].id)
+    elif own:
+        at = index.index(own[-1].id) + 1
+    else:
+        at = len(ordered)
+    return assign_priority_at_position(
+        ordered, at,
+        priority_of=require_stored_priority,
+        bounds=bounds,
+    )
+@
+
+Let's verify the case that motivated this: another worker's child
+already sits in the middle of the range, and the first child of the
+current worker must not land on it.  Next to a neighbour of its own,
+the new item is placed against all the siblings too.
+
+<<test functions>>=
+def test_number_at_position_avoids_other_workers():
+    """Placement interpolates between every worker's
+    siblings."""
+    mine = TodoItem(id=2, title="Mine", priority=4.5)
+    theirs = TodoItem(id=3, title="Theirs", priority=4.0)
+    assert number_at_position(
+        [], 0, [theirs], bounds=(5.0, 3.0)
+    ) == 3.5
+    assert number_at_position(
+        [mine], 1, [mine, theirs], bounds=(5.0, 3.0)
+    ) == 4.25
+    assert number_at_position(
+        [mine], 0, [mine, theirs], bounds=(5.0, 3.0)
+    ) == 4.75
+@
+
+Through the command, the other worker's first child goes below the
+current worker's child and that child's own subtree, instead of onto
+the middle of the range where the current worker's child already is.
+
+<<test functions>>=
+def test_add_other_workers_child_avoids_mine(
+    temp_todo_dir,
+):
+    """A first child of another worker gets its own
+    number below the existing subtree."""
+    save_todos(4, [
+        TodoItem(
+            id=n, title=t, priority=p, parent_id=parent,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        )
+        for n, t, p, parent in [
+            (1, "A", 1.0, None),
+            (2, "Mine", -4.0, 1),
+            (3, "Mine's child", -4.5, 2),
+        ]
+    ])
+
+    result = runner.invoke(cli, [
+        "add", "-t", "Theirs", "--parent", "1",
+        "--bottom", "--who", "other",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert stored_priority(4) == -6.5
+    assert -6.5 < stored_priority(3) < -4.0
+@
+
 \subsection{The Shared Placement Helper}
 
 With a position and an ordering, placement is one call.  The empty
 comparison set is the only case needing separate treatment, and it
 gets the rule the interactive path already uses
 (\cref{sec:child-priority-helpers}) rather than a second opinion of
-its own.
+its own.  The ends of a child level are bounded by the parent's range,
+exactly as in the interactive search (\cref{todo:binary-search}).
 
 <<placement helpers>>=
 def place_among_siblings(
@@ -4881,26 +6017,34 @@ def place_among_siblings(
     target: TodoItem | None = None,
     parent: TodoItem | None = None,
     todos: list[TodoItem] | None = None,
+    candidate: TodoItem | None = None,
 ) -> float:
     """Return a stored priority placing an item at
     `placement` among `siblings`.
 
     `placement` is one of the `PLACE_*` values;
     `PLACE_ABOVE` and `PLACE_BELOW` need `target`.
-    `parent` and `todos` supply the fallback range for a
-    level with no ranked sibling yet.
+    `parent` and `todos` supply the parent's range and
+    the fallback for a level with no ranked sibling
+    yet; with `candidate`, the item being placed, the
+    number also respects other workers' siblings.
     """
     ordered = sort_siblings_by_stored_priority(siblings)
-    if not ordered:
+    level = placement_level(ordered, candidate, todos)
+    if not level:
         return default_priority_without_siblings(
             parent, todos
         )
-    return assign_priority_at_position(
+    return number_at_position(
         ordered,
         sibling_insert_position(
             ordered, placement, target
         ),
-        priority_of=require_stored_priority,
+        level,
+        bounds=(
+            child_priority_range_or_none(todos, parent)
+            if todos is not None else None
+        ),
     )
 @
 
@@ -4996,6 +6140,91 @@ def test_place_among_siblings_without_siblings():
     assert place_among_siblings([], PLACE_BOTTOM) == 1.0
 @
 
+Among children the ends stay inside the parent's range, while a child
+already outside the range is stepped past as before.  The interactive
+search shares the rule: answering \enquote{yes} to the only comparison
+puts the candidate at the top, halfway to the parent.
+
+<<test functions>>=
+def parent_with_children(*priorities):
+    """A at 5 and B at 3, with A's children at
+    `priorities`."""
+    todos = [
+        TodoItem(id=1, title="A", priority=5.0),
+        TodoItem(id=2, title="B", priority=3.0),
+    ]
+    todos += [
+        TodoItem(
+            id=10 + i, title=f"A{i}", priority=p,
+            parent_id=1,
+        )
+        for i, p in enumerate(priorities)
+    ]
+    return todos
+
+
+def test_place_among_children_stays_in_range():
+    """--top and --bottom split the room left in the
+    parent's range."""
+    todos = parent_with_children(4.5, 3.5)
+    children = todos[2:]
+    for placement, expected in [
+        (PLACE_TOP, 4.75), (PLACE_BOTTOM, 3.25),
+    ]:
+        assert place_among_siblings(
+            children, placement,
+            parent=todos[0], todos=todos,
+        ) == expected
+
+
+def test_place_among_children_outside_range_steps():
+    """A child outside the range is stepped past."""
+    todos = parent_with_children(6.0, 2.0)
+    children = todos[2:]
+    for placement, expected in [
+        (PLACE_TOP, 7.0), (PLACE_BOTTOM, 1.0),
+    ]:
+        assert place_among_siblings(
+            children, placement,
+            parent=todos[0], todos=todos,
+        ) == expected
+
+
+def test_binary_search_top_stays_in_range():
+    """The interactive top end is bounded too."""
+    todos = parent_with_children(4.5)
+    with patch(
+        "nytid.cli.todo.typer.prompt", return_value="y"
+    ):
+        priority = binary_search_priority(
+            todos[2:], TodoItem(id=99, title="New"),
+            parent=todos[0], todos=todos,
+        )
+    assert priority == 4.75
+
+
+def test_binary_search_ignores_boost_for_the_number():
+    """A boosted child is compared as shown, but the new
+    number stays inside the parent's range."""
+    now = datetime.datetime.now()
+    todos = parent_with_children(4.5)
+    todos[2].created = (
+        now - datetime.timedelta(days=10)
+    ).isoformat()
+    todos[2].deadline = (
+        now + datetime.timedelta(hours=1)
+    ).isoformat()
+    assert effective_priority(todos[2]) > 5.0
+    with patch(
+        "nytid.cli.todo.typer.prompt", return_value="y"
+    ):
+        priority = binary_search_priority(
+            todos[2:], TodoItem(id=99, title="New"),
+            parent=todos[0], todos=todos,
+        )
+    assert priority == 4.75
+@
+
 \subsection{Re-ranking an Item That Already Exists}
 
 Two commands re-rank an item already on disk.  [[reprioritize]] does
@@ -5073,6 +6302,7 @@ def place_existing_item(
         target,
         parent=parent_ctx,
         todos=todos,
+        candidate=item,
     )
 @
 
@@ -8753,6 +9983,10 @@ if parent_ctx is not None and parent_ctx.priority is None:
 elif skip_priority:
     priority = None
 elif explicit_priority is not None:
+    refuse_number_outside_range(
+        todos, parent_ctx, explicit_priority,
+        f"--prio {explicit_priority:g}", "--top or --bottom",
+    )
     priority = explicit_priority
 elif top or bottom:
     priority = place_among_siblings(
@@ -8760,6 +9994,7 @@ elif top or bottom:
         PLACE_TOP if top else PLACE_BOTTOM,
         parent=parent_ctx,
         todos=todos,
+        candidate=candidate,
     )
 else:
     priority = binary_search_priority(
@@ -9079,7 +10314,10 @@ taking it from the snapshot is what let two overlapping [[add]]s
 hand out the same ID.  The parent chosen at the start is looked up
 again for the same reason, since it may have been removed in the
 meantime, and a child of a removed item would be promoted to the top
-level by [[get_visible_roots]] instead of being refused.
+level by [[get_visible_roots]] instead of being refused.  Once stored,
+the new item cuts short the range of the sibling directly above it, so
+[[settle_placement]] compresses that sibling's subtree in the same
+callback (\cref{sec:sibling-above-squeezed}).
 
 <<append the new todo under the lock>>=
 def append_new_todo(next_id, todos, stack):
@@ -9105,9 +10343,82 @@ def append_new_todo(next_id, todos, stack):
     for paragraph in note or []:
         append_note_to_item(item, paragraph)
     todos.append(item)
+    settle_placement(todos, item)
     return next_id + 1, todos, stack, item
 
 *_, item = mutate_todo_state(append_new_todo)
+@
+
+Let's verify the squeeze from the side of [[add]]: a new top-level item
+at~4.0, between A at~5.0 and B at~3.0, leaves A's children between A
+and the new item, whether the item came from the flags or from the
+editor.
+
+<<test functions>>=
+def a_and_b_with_children():
+    """Ranked A and B at 5 and 3; A's children at 4.5
+    and 3.5."""
+    return [
+        TodoItem(
+            id=n, title=t, priority=p, parent_id=parent,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        )
+        for n, t, p, parent in [
+            (1, "A", 5.0, None),
+            (2, "B", 3.0, None),
+            (3, "A1", 4.5, 1),
+            (4, "A2", 3.5, 1),
+        ]
+    ]
+
+
+@pytest.mark.parametrize("args", [
+    ["add", "-t", "New", "--prio", "4", "--top-level"],
+    ["add", "--edit", "--prio", "4", "--top-level"],
+])
+def test_add_squeezes_the_sibling_above(
+    temp_todo_dir, args,
+):
+    """A new item below A compresses A's children."""
+    save_todos(5, a_and_b_with_children())
+
+    with patch(
+        "nytid.cli.todo.open_editor", return_value="New\n",
+    ):
+        result = runner.invoke(cli, args)
+
+    assert result.exit_code == 0, result.output
+    assert stored_priority(3) == 4.75
+    assert stored_priority(4) == 4.25
+@
+
+Re-ranking an existing item squeezes the sibling above it in the same
+way, whichever command does it: A dropped below B leaves B's child,
+which sat near the bottom of B's old range, between B and A.
+
+<<test functions>>=
+@pytest.mark.parametrize("args", [
+    ["edit", "1", "--prio", "2"],
+    ["reprioritize", "1", "--bottom"],
+])
+def test_rerank_squeezes_the_sibling_above(
+    temp_todo_dir, args,
+):
+    """A dropped below B compresses B's child above it."""
+    save_todos(6, a_and_b_with_children() + [
+        TodoItem(
+            id=5, title="B1", priority=1.0, parent_id=2,
+            created="2026-02-20T10:00:00",
+            who=default_username,
+        ),
+    ])
+
+    result = runner.invoke(cli, args)
+
+    assert result.exit_code == 0, result.output
+    assert stored_priority(1) == 2.0
+    assert stored_priority(5) == pytest.approx(2.8)
 @
 
 Let us verify that [[--worktree]] is persisted next to [[wd]], that
@@ -9222,7 +10533,9 @@ children's---from the current [[next_id]], exactly as the flag path
 does.  The creation chunks below assign to [[next_id]] and [[todos]] as
 they go; inside the callback those names are its parameters, the fresh
 state, so the recursive [[create_children_from_parsed]] picks them up
-through [[nonlocal]] without knowing that a lock is involved.
+through [[nonlocal]] without knowing that a lock is involved.  The
+parent is settled like any new item (\cref{sec:sibling-above-squeezed})
+before its children are created in the range under it.
 
 <<add via editor>>=
 <<build initial editor metadata>>
@@ -9248,6 +10561,7 @@ def append_parsed_todos(next_id, todos, stack):
     if resolved_parent is not None:
         require_todo(todos, resolved_parent)
     <<create parent from parsed>>
+    settle_placement(todos, parent_item)
     <<create children from parsed>>
     return next_id, todos, stack
 
@@ -15038,6 +16352,7 @@ enough for the whole flow of moving and ranking a batch.
 anyway, so it is a no-op rather than an error.
 
 <<edit via cli flags>>=
+<<refuse a kept number outside the new parent's range>>
 rerank = top or bottom or (
     parent is not None and not keep_prio
 )
@@ -15048,6 +16363,34 @@ elif rerank:
 
 <<commit the flag edits under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+@
+
+A kept number is only a position if it falls inside the new parent's
+child range (\cref{sec:child-priority-helpers}).  Outside it, the item
+would sort above its new parent or below the parent's next sibling,
+away from the rest of its family, and the subtree helpers could not
+repair that: the range the item should live in is exactly the one it
+is not in.  So [[--keep-prio]] under a ranked parent is honoured only
+when the number lies strictly inside that range, and otherwise refused
+with the flags that would place the item instead.  Moving to the top
+level keeps any number, since nothing bounds that level; the sibling
+the item lands below is compressed as for any placement
+(\cref{sec:sibling-above-squeezed}).  An explicit [[--prio]] is held
+to the same rule, here as in [[add]], since a number the user typed is
+no more a position in the wrong range than one the item carried along.
+
+<<refuse a kept number outside the new parent's range>>=
+if keep_prio and parent and item.priority is not None:
+    refuse_number_outside_range(
+        todos, get_parent(todos, item), item.priority,
+        f"priority {item.priority:g} of #{todo_id}",
+        "--top, --bottom or --prio",
+    )
+if explicit_priority is not None:
+    refuse_number_outside_range(
+        todos, get_parent(todos, item), explicit_priority,
+        f"--prio {explicit_priority:g}", "--top or --bottom",
+    )
 @
 
 Everything above changed the snapshot copy [[item]], and the
@@ -15065,12 +16408,28 @@ label list out of the replay; otherwise a label another process added
 meanwhile would vanish.  [[--label]] replaces the set outright and is
 replayed like any other field.
 
+A new number or a new parent gives the item a new child range, and its
+descendants move into it (\cref{sec:subtree-follows-parent}); the
+sibling it lands below is compressed into the range left above it
+(\cref{sec:sibling-above-squeezed}).  Here the replay, not a single
+assignment, changes the number, so instead of
+[[set_priority_with_subtree]] we read the item's range and place before
+the replay ourselves and hand them to [[settle_placement]] after it,
+from the stored state as the other commands do.  A [[--parent]] move
+changes the range even when [[--keep-prio]] keeps the number, since
+the range is bounded by the new siblings; the subtree follows then
+too, so that it stays between the item and the sibling below it at its
+new place.  An edit that touches neither the number nor the parent
+leaves every range as it was, and nothing moves.
+
 <<commit the flag edits under the lock>>=
 def commit_flag_edits(next_id, todos, stack):
     moved = item.parent_id != before["parent_id"]
     if moved and item.parent_id is not None:
         require_todo(todos, item.parent_id)
     fresh = require_todo(todos, todo_id)
+    old_range = child_priority_range_or_none(todos, fresh)
+    old_place = (fresh.priority, fresh.parent_id)
     relative_labels = bool(add_label or remove_label)
     replay_item_edits(
         fresh, before, item,
@@ -15080,6 +16439,7 @@ def commit_flag_edits(next_id, todos, stack):
         fresh.labels, _ = apply_label_edits(
             fresh.labels, add_label or [], remove_label or [],
         )
+    settle_placement(todos, fresh, old_range, old_place)
     return next_id, todos, stack
 
 
@@ -15210,7 +16570,12 @@ A move is where the flags earn their place.  Without one, the item is
 re-ranked among its new siblings by the interactive search; with
 [[--keep-prio]] it arrives carrying the number it had, which is the
 behaviour this command had before; and with [[--top]] or [[--bottom]]
-it arrives at a known end of the new list:
+it arrives at a known end of the new list.  The fixture's child of B
+sits at~[[8.0]], above B itself, as data written before children were
+placed by range can.  [[--top]] therefore steps past it to~[[9.0]],
+since there is no room above it inside B's range to split, while
+[[--bottom]] takes the midpoint between it and the floor of B's range
+$(-4.0, 6.0)$, which is~[[2.0]] (\cref{todo:binary-search}):
 
 <<test functions>>=
 @pytest.fixture
@@ -15263,6 +16628,82 @@ def test_edit_parent_keep_prio(two_parents):
   assert stored_priority(4) == 1.0
 
 
+def test_edit_parent_keep_prio_outside_range(
+  temp_todo_dir,
+):
+  """--keep-prio refuses a number outside the new
+  parent's range and changes nothing."""
+  save_todos(4, [
+    TodoItem(
+      id=n, title=t, priority=p,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    )
+    for n, t, p in [(1, "P", 5.0), (2, "Q", 3.0), (3, "X", 1.0)]
+  ])
+
+  result = runner.invoke(
+    cli, ["edit", "3", "--parent", "1", "--keep-prio"],
+  )
+
+  assert result.exit_code == 1
+  assert "outside #1's child range (3, 5)" in result.output
+  _, todos = load_todos()
+  assert todos[2].parent_id is None
+  assert todos[2].priority == 1.0
+
+
+@pytest.mark.parametrize("args", [
+  ["add", "-t", "X", "--parent", "1", "--prio", "6"],
+  ["edit", "3", "--parent", "1", "--prio", "2"],
+  ["edit", "4", "--prio", "5.5"],
+])
+def test_prio_outside_parent_range_is_refused(
+  temp_todo_dir, args,
+):
+  """--prio under a parent must lie inside its range."""
+  save_todos(5, [
+    TodoItem(
+      id=n, title=t, priority=p, parent_id=parent,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    )
+    for n, t, p, parent in [
+      (1, "P", 5.0, None), (2, "Q", 3.0, None),
+      (3, "X", 1.0, None), (4, "P1", 4.0, 1),
+    ]
+  ])
+
+  result = runner.invoke(cli, args)
+
+  assert result.exit_code == 1
+  assert "outside #1's child range (3, 5)" in result.output
+  assert "use --top or --bottom" in result.output
+  next_id, todos = load_todos()
+  assert next_id == 5
+  assert [(t.parent_id, t.priority) for t in todos] == [
+    (None, 5.0), (None, 3.0), (None, 1.0), (1, 4.0),
+  ]
+
+
+def test_prio_at_top_level_accepts_any_number(
+  temp_todo_dir,
+):
+  """The top level bounds nothing."""
+  save_todos(2, [
+    TodoItem(
+      id=1, title="P", priority=5.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+  result = runner.invoke(
+    cli, ["add", "-t", "X", "--top-level", "--prio", "100"],
+  )
+  assert result.exit_code == 0, result.output
+  assert stored_priority(2) == 100.0
+
+
 def test_edit_parent_top(two_parents):
   """--top places the moved item above its new siblings."""
   result = runner.invoke(
@@ -15278,7 +16719,7 @@ def test_edit_parent_bottom(two_parents):
     cli, ["edit", "4", "--parent", "2", "--bottom"],
   )
   assert result.exit_code == 0
-  assert stored_priority(4) == 7.0
+  assert stored_priority(4) == 2.0
 
 
 def test_edit_keep_prio_alone_is_a_no_op(
@@ -15290,6 +16731,61 @@ def test_edit_keep_prio_alone_is_a_no_op(
   )
   assert result.exit_code == 0
   assert stored_priority(4) == 0.0
+@
+
+Whatever ranks the item, its subtree goes with it.  [[--prio]] drops
+[[First]] from [[6.0]] to [[1.0]], into the range $(0.0, 1.0)$ above
+[[Mover]], and its children follow in order.  A move under another
+parent carries the subtree into the range the item gets there: \#5
+leaves the bottom of the top level, where its range ended at the
+default floor, and the search puts it between \#1's two children, so
+\#5's own child ends up between \#5 and the lower of them.
+
+<<test functions>>=
+def ranked_child(todo_id, parent_id, priority):
+  """A ranked item for the current worker, under
+  `parent_id` or at the top level when that is `None`."""
+  return TodoItem(
+    id=todo_id, title=f"Child {todo_id}",
+    parent_id=parent_id, priority=priority,
+    created="2026-02-20T10:00:00",
+    who=default_username,
+  )
+
+
+def test_edit_prio_moves_subtree(ranked_siblings):
+  """--prio carries the children into the new range."""
+  _, todos = load_todos()
+  save_todos(7, todos + [
+    ranked_child(5, 1, 5.5),
+    ranked_child(6, 1, 5.0),
+  ])
+
+  result = runner.invoke(cli, ["edit", "1", "--prio", "1"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(5) == 0.75
+  assert stored_priority(6) == 0.5
+
+
+def test_edit_parent_moves_subtree(temp_todo_dir):
+  """A move re-ranks the item and carries its subtree."""
+  save_todos(7, [
+    ranked_child(1, None, 5.0),
+    ranked_child(2, None, 3.0),
+    ranked_child(3, 1, 4.5),
+    ranked_child(4, 1, 3.5),
+    ranked_child(5, None, 1.0),
+    ranked_child(6, 5, -4.0),
+  ])
+
+  result = runner.invoke(
+    cli, ["edit", "5", "--parent", "1"], input="y\nn\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(5) == 4.0
+  assert stored_priority(6) == pytest.approx(3.75)
 @
 
 Moving under an unranked parent is the case that has to give up the
@@ -15533,8 +17029,11 @@ def reconcile_children(parent, parsed_children):
     nonlocal next_id, todos
     <<build existing children index>>
     <<distribute child priorities>>
+    <<record the children's ranges before they move>>
     <<update or create each parsed child>>
     <<remove deleted children>>
+    <<carry each child's subtree to its new range>>
+    <<reconcile each child against its own sections>>
 @
 
 We normalize titles to lowercase with stripped whitespace so that
@@ -15627,13 +17126,11 @@ Popping each match out of [[existing_by_title]] doubles as the
 seen-marker: whatever is still in the index afterwards had no section
 and was therefore deleted in the editor.
 
-Each child is reconciled against its own sections immediately after it
-is settled, so a freshly created child can already receive
-grandchildren in the same save.  A newly appended child is on
-[[todos]] by then, which is what lets [[get_children]] find its own
-level on the recursive call.
+Each settled child is collected with its section, and its own
+sections are reconciled only once the whole level is settled (below).
 
 <<update or create each parsed child>>=
+settled = []
 for parsed_child in parsed_children:
     norm_title = parsed_child.title.strip().lower()
     existing_child = existing_by_title.get(norm_title)
@@ -15671,7 +17168,7 @@ for parsed_child in parsed_children:
             f"  Added sub-item #{child.id}: "
             f"{child.title}"
         )
-    reconcile_children(child, parsed_child.children)
+    settled.append((child, parsed_child))
 @
 
 A matched child is updated the way the parent is: the section is
@@ -15726,7 +17223,118 @@ for removed in existing_by_title.values():
 @
 
 
+A child's own range is bounded by its siblings' numbers
+(\cref{sec:child-priority-helpers}), so the level below can only be
+placed once every child at this level has its final number.
+Reconciling each child as soon as it was settled computed its range
+against siblings still carrying their old numbers: a first child
+moved from~4.9 to~4.5 next to a sibling about to go from~3.2 to~4.0
+saw the range $(3.2, 4.5)$ and spread its children below where that
+sibling would land.  We therefore settle the whole level and remove
+what was deleted first, and only then descend.
+
+The new numbers are also new child ranges.  The recursive call
+redistributes the grandchildren the buffer shows, but not one another
+process added under a child during the session, so before descending
+we carry each existing child's subtree from its old range to its new
+one (\cref{sec:subtree-follows-parent}); the old ranges are recorded
+before any number changes.  A newly created child has no subtree yet
+and no old range.
+
+<<record the children's ranges before they move>>=
+old_ranges = {
+    c.id: child_priority_range_or_none(todos, c)
+    for c in children
+}
+<<carry each child's subtree to its new range>>=
+for child, _ in settled:
+    move_subtree_priorities(
+        todos, child, old_ranges.get(child.id),
+        child_priority_range_or_none(todos, child),
+    )
+@
+
+A newly appended child is on [[todos]] by the time we descend, which
+is what lets [[get_children]] find its own level on the recursive call,
+so a freshly created child can already receive grandchildren in the
+same save.
+
+<<reconcile each child against its own sections>>=
+for child, parsed_child in settled:
+    reconcile_children(child, parsed_child.children)
+@
+
 \subsection{Testing Editor Reconciliation}
+
+Let's verify the order of settling: saving the buffer unchanged spreads
+A's children evenly and puts the first child's own child between it
+and the second, not below the second.
+
+<<test functions>>=
+def test_edit_editor_grandchild_uses_settled_siblings(
+  temp_todo_dir,
+):
+  """Grandchildren are placed against the new numbers."""
+  save_todos(7, [
+    TodoItem(
+      id=n, title=t, priority=p, parent_id=parent,
+      created="2026-02-20T10:00:00",
+    )
+    for n, t, p, parent in [
+      (1, "A", 5.0, None), (2, "B", 3.0, None),
+      (3, "c1", 4.9, 1), (4, "c2", 3.2, 1),
+      (5, "c3", 3.1, 1), (6, "g1", 4.0, 3),
+    ]
+  ])
+
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=lambda text: text,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+  assert result.exit_code == 0, result.output
+  assert [stored_priority(i) for i in (3, 4, 5)] == [
+    4.5, 4.0, 3.5
+  ]
+  assert 4.0 < stored_priority(6) < 4.5
+@
+
+A grandchild the buffer never showed, stored under the first child by
+another process during the session, follows its parent too:
+
+<<test functions>>=
+def test_edit_editor_carries_unshown_grandchild(
+  temp_todo_dir,
+):
+  """A grandchild added meanwhile moves with its parent."""
+  save_todos(6, [
+    TodoItem(
+      id=n, title=t, priority=p, parent_id=parent,
+      created="2026-02-20T10:00:00",
+    )
+    for n, t, p, parent in [
+      (1, "A", 5.0, None), (2, "B", 3.0, None),
+      (3, "c1", 4.9, 1), (4, "c2", 3.2, 1),
+      (5, "c3", 3.1, 1),
+    ]
+  ])
+
+  def add_meanwhile(text):
+    next_id, todos = load_todos()
+    save_todos(next_id + 1, todos + [TodoItem(
+      id=next_id, title="Meanwhile", priority=4.8,
+      parent_id=3, created="2026-02-20T10:00:00",
+    )])
+    return text
+
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=add_meanwhile,
+  ):
+    result = runner.invoke(cli, ["edit", "1", "--edit"])
+
+  assert result.exit_code == 0, result.output
+  assert 4.0 < stored_priority(6) < 4.5
+@
 
 The [[github]] key is the one that had drifted: the parent took it from
 the front matter and the children did not, so a sub-item linked to an
@@ -16528,12 +18136,21 @@ session.  An item removed meanwhile is the one thing it cannot store,
 and after a long series of questions it skips that item with a warning
 rather than discarding every other answer.
 
+Each number is stored through [[set_priority_with_subtree]]
+(\cref{sec:subtree-follows-parent}).  The batch only visits unranked
+items, which have no child range to move from, so usually nothing else
+changes; but an item that another process ranked during the session
+is a re-ranked parent by the time we store it, and its subtree must
+follow the number we store just like on the single-item path.
+
 <<store the chosen priorities under the lock>>=
 def store_priorities(next_id, todos, stack):
     by_id = {t.id: t for t in todos}
     for chosen_id, priority in chosen.items():
         if chosen_id in by_id:
-            by_id[chosen_id].priority = priority
+            set_priority_with_subtree(
+                todos, by_id[chosen_id], priority
+            )
         else:
             typer.echo(
                 f"Warning: #{chosen_id} no longer exists; "
@@ -16548,12 +18165,22 @@ mutate_todo_state(store_priorities)
 
 The single-item path has only one answer to lose, so a vanished item
 is an error here, reported through [[require_todo]] like in the other
-commands, and nothing is written.  Only [[priority]] is set; any other
-change made to the item during the search stays as it was stored.
+commands, and nothing is written.  Only [[priority]] is set on the
+item; any other change made to it during the search stays as it was
+stored.
+
+The item's descendants move with it into its new child range
+(\cref{sec:subtree-follows-parent}).  Both ranges are read here, from
+the state about to be saved, not from the snapshot the search ran on:
+a child added under the item, or a sibling moved, while the user was
+answering questions is part of the subtree and the ranges we map
+between.
 
 <<store the new priority under the lock>>=
 def store_priority(next_id, todos, stack):
-    require_todo(todos, todo_id).priority = new_priority
+    set_priority_with_subtree(
+        todos, require_todo(todos, todo_id), new_priority
+    )
     return next_id, todos, stack
 
 
@@ -16592,6 +18219,118 @@ def test_reprioritize_batch_keeps_concurrent_note(
   _, todos = load_todos()
   assert todos[0].priority == 3.0
   assert without_note_headers(todos[0].notes) == "Agent"
+@
+
+A re-ranked parent takes its subtree along whichever flag placed it.
+With [[--below]] the parent [[First]] drops from [[6.0]] to [[1.0]],
+from the range $(4.0, 6.0)$ to $(0.0, 1.0)$, and its children are
+squeezed into the new range in their old order.  With [[--above]]
+[[Mover]] climbs from the bottom, where its range ended at the default
+floor, into the gap between [[First]] and [[Second]].
+
+<<test functions>>=
+def test_reprioritize_below_moves_subtree(ranked_siblings):
+  """--below carries the children into the new range."""
+  _, todos = load_todos()
+  save_todos(7, todos + [
+    ranked_child(5, 1, 5.5),
+    ranked_child(6, 1, 5.0),
+  ])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "1", "--below", "3"]
+  )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(1) == 1.0
+  assert stored_priority(5) == 0.75
+  assert stored_priority(6) == 0.5
+
+
+def test_reprioritize_above_moves_subtree(ranked_siblings):
+  """--above lifts the children from the default floor."""
+  _, todos = load_todos()
+  save_todos(6, todos + [ranked_child(5, 4, -5.0)])
+
+  result = runner.invoke(
+    cli, ["reprioritize", "4", "--above", "2"]
+  )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(4) == 5.0
+  assert stored_priority(5) == pytest.approx(4.5)
+@
+
+The subtree is the one stored when the number is written, not the one
+the search started from: a child added under [[First]] while the
+placement was being decided moves with the others.
+
+<<test functions>>=
+def test_reprioritize_moves_child_added_meanwhile(
+  ranked_siblings,
+):
+  """A child stored during the search follows too."""
+  from nytid.cli.todo import place_existing_item as place
+  _, todos = load_todos()
+  save_todos(6, todos + [ranked_child(5, 1, 5.5)])
+
+  def place_meanwhile(*args, **kwargs):
+    next_id, todos = load_todos()
+    save_todos(
+      next_id + 1, todos + [ranked_child(next_id, 1, 4.5)]
+    )
+    return place(*args, **kwargs)
+
+  with patch(
+    "nytid.cli.todo.place_existing_item",
+    side_effect=place_meanwhile,
+  ):
+    result = runner.invoke(
+      cli, ["reprioritize", "1", "--below", "3"]
+    )
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(5) == 0.75
+  assert stored_priority(6) == 0.25
+@
+
+The batch path meets a ranked parent only when another process ranked
+it during the session.  Its children then follow the number the batch
+stores, as they would on the single-item path.
+
+<<test functions>>=
+def test_reprioritize_batch_moves_subtree_ranked_meanwhile(
+  temp_todo_dir,
+):
+  """An item ranked meanwhile takes its children along."""
+  save_todos(3, [
+    TodoItem(
+      id=1, title="Unranked", priority=None,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+    TodoItem(
+      id=2, title="Ranked", priority=3.0,
+      created="2026-02-20T10:00:00",
+      who=default_username,
+    ),
+  ])
+
+  def rank_meanwhile(*args, **kwargs):
+    _, todos = load_todos()
+    todos[0].priority = 5.0
+    save_todos(4, todos + [ranked_child(3, 1, 4.0)])
+    return 1.0
+
+  with patch(
+    "nytid.cli.todo.binary_search_priority",
+    side_effect=rank_meanwhile,
+  ):
+    result = runner.invoke(cli, ["reprioritize"])
+
+  assert result.exit_code == 0, result.output
+  assert stored_priority(1) == 1.0
+  assert stored_priority(3) == -4.0
 @
 
 
@@ -24550,7 +26289,10 @@ stored already is left out, which is what the check above would have
 done had it seen it.  It is also added to [[skipped_items]], in the
 shape that check gives its entries, so that the skipped table and its
 count in [[<<report skipped duplicates>>]] include it; the extra line
-printed here says why it was not caught earlier.
+printed here says why it was not caught earlier.  Each item that is
+stored goes through [[settle_placement]], as [[add]]'s does
+(\cref{sec:sibling-above-squeezed}): it may cut short the range of
+the sibling above it, and the next item is placed against the result.
 
 <<commit the imported todos under the lock>>=
 def append_imported(next_id, todos, stack):
@@ -24578,12 +26320,43 @@ def append_imported(next_id, todos, stack):
         item.id = next_id
         next_id += 1
         todos.append(item)
+        settle_placement(todos, item)
         committed.append(item)
     return next_id, todos, stack, committed
 
 
 *_, committed = mutate_todo_state(append_imported)
 imported_count = len(committed)
+@
+
+The same holds for an imported item placed below A:
+
+<<test functions>>=
+def test_import_squeezes_the_sibling_above(temp_todo_dir):
+    """An imported item below A compresses A's children."""
+    save_todos(5, a_and_b_with_children())
+    gh_view = MagicMock(returncode=0, stdout=json.dumps({
+        "title": "Imported", "body": "", "state": "OPEN",
+        "comments": [], "labels": [],
+    }))
+    with patch(
+        "nytid.cli.todo.subprocess.run",
+        return_value=gh_view,
+    ), patch(
+        "nytid.cli.todo.binary_search_priority",
+        return_value=4.0,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "import", "owner/repo", "--number", "7",
+                "--type", "issue", "--top-level",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert stored_priority(3) == 4.75
+    assert stored_priority(4) == 4.25
 @
 
 Let's verify the commit against an import that overlaps with an
@@ -26657,6 +28430,11 @@ from nytid.cli.todo import (
     compute_child_priority_range,
     distribute_priorities_in_range,
     default_priority_without_siblings,
+    number_at_position,
+    renumber_priorities,
+    move_subtree_priorities,
+    set_priority_with_subtree,
+    settle_placement,
     PLACE_TOP,
     PLACE_BOTTOM,
     PLACE_ABOVE,
@@ -26882,7 +28660,14 @@ def test_add_append_uses_bottom_priority(temp_todo_dir):
     appended = next(t for t in todos if t.id == 3)
     assert appended.priority == 2.0
 
+@
 
+Under a parent the bottom end is bounded by the parent's range
+(\cref{todo:binary-search}): the parent at~[[5.0]] has no lower
+sibling, so its range is $(-5.0, 5.0)$, and [[--append]] lands halfway
+between the lowest child at~[[3.0]] and that floor, at~[[-1.0]].
+
+<<test functions>>=
 def test_add_append_under_parent(temp_todo_dir):
     """--append works for a parent's active children too."""
     save_todos(4, [
@@ -26918,7 +28703,7 @@ def test_add_append_under_parent(temp_todo_dir):
     _, todos = load_todos()
     appended = next(t for t in todos if t.id == 4)
     assert appended.parent_id == 1
-    assert appended.priority == 2.0
+    assert appended.priority == -1.0
 
 
 def test_add_under_unranked_parent_skips_binary_search(
