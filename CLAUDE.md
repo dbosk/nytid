@@ -297,7 +297,11 @@ This is \emph{very} important.
 This is VERY important.
 ```
 
-### Figures with sidecaption (memoir class)
+### Figures and tables always have captions (memoir sidecaption)
+
+Every table and figure is a float with a caption and a label, referenced
+with `\cref` — never a bare `tabular` or `\includegraphics` in `center`,
+and never \enquote{the table above} (floats move).
 
 ```latex
 \begin{figure}
@@ -305,7 +309,22 @@ This is VERY important.
     \includegraphics[width=0.7\textwidth]{path/to/image}
   \end{sidecaption}
 \end{figure}
+
+\begin{table}
+  \begin{sidecaption}{Description}[tab:label]
+    \begin{tabular}{lr}
+      \toprule
+      \textbf{Key} & \textbf{Value} \\
+      \midrule
+      a & 1 \\
+      \bottomrule
+    \end{tabular}
+  \end{sidecaption}
+\end{table}
 ```
+
+A table as wide as the text may use `\caption` + `\label` instead (see
+`tab:cli-config-keys` in `init.nw`).
 
 ## Git Commit Practices
 
