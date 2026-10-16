@@ -7,6 +7,7 @@ SUBDIR+=	signup
 
 MODULES+=	schedules.py schedules.tex
 MODULES+=	prompt.py prompt.tex
+MODULES+=	home.py home.tex
 
 .PHONY: all
 all: ${MODULES}

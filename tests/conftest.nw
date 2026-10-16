@@ -41,8 +41,10 @@ It has to guard three rather different kinds of leakage.
 
 The order of the module body follows that split: both
 redirections must happen before the first [[nytid]]
-import, whereas the fixtures only have to exist before
-the first test runs.
+module that looks for a location is imported---the
+configuration's is made by importing the [[nytid]]
+package itself---whereas the fixtures only have to exist
+before the first test runs.
 
 <<[[conftest.py]]>>=
 """Shared pytest isolation for CLI tests.
@@ -52,10 +54,9 @@ directory to throw-away locations, and provides
 temporary-directory fixtures that patch storage
 functions, so tests never touch real user data.
 
-Manual debugging outside pytest must apply the same
-patching or point `track.data_dir` at a temporary
-location first; otherwise ad-hoc commands will use
-`~/.nytid/tracking`.
+Manual debugging outside pytest should set NYTID_HOME
+to a temporary directory first; otherwise ad-hoc
+commands use the real configuration and `~/.nytid`.
 """
 import pathlib
 import tempfile
@@ -116,8 +117,8 @@ to build their harness (\cref{sec:courses-test-harness}),
 which pytest executes during collection.  The redirection
 therefore has to happen while [[conftest.py]] itself is
 being imported---pytest imports it before it imports any
-test module---and before this file imports anything from
-[[nytid]].
+test module---and before this file imports any of
+[[nytid]]'s modules.
 
 \subsection{The sandbox}
 
@@ -162,67 +163,56 @@ REAL_CONFIG_FILE = (
 [[typerconf]] computes [[dirs]] once at import time and
 then bakes the resulting path into the \emph{default
 arguments} of [[Config.read_config]] and
-[[Config.write_config]].  A default argument is evaluated
-when the [[def]] executes, so by the time we get control
-the path is already captured in each function's
-[[__defaults__]] tuple.  Reassigning [[typerconf.dirs]]
+[[Config.write_config]].  Reassigning [[typerconf.dirs]]
 alone changes nothing, and neither does patching [[HOME]]
 or [[XDG_CONFIG_HOME]]---those are read before we are.
-We have to overwrite the captured value itself.
+The captured value itself has to be overwritten.
 
-Doing that blindly would be a poor trade: if a future
-[[typerconf]] moves the path out of the first default
-slot, the assignment would quietly succeed and the suite
-would go back to writing the user's real config.  So we
-check what we are about to replace and refuse to guess.
+nytid does exactly that whenever [[NYTID_HOME]] is set
+(\cref{home}): importing the [[nytid]] package points
+[[typerconf]] at [[$NYTID_HOME/config.json]], and refuses to
+start if [[typerconf]] no longer keeps its path where we
+expect it.  So the suite makes the sandbox its
+[[NYTID_HOME]] and imports the package.  Using the
+production mechanism rather than a copy of it has two
+benefits.  Every session exercises the code users rely on
+to sandbox nytid.  And the variable is inherited: a test
+that runs [[nytid]] in a subprocess gets a sandboxed
+process too, which a redirection living only in this
+process could never give it.
+
+The variable also moves nytid's data defaults into the
+sandbox ([[todos]], [[tracking]] and the rest beneath
+it), which suits us.  Tests that exercise the classic
+fallback under [[~/.nytid]] clear the variable for their
+own duration.
 
 <<redirect the persistent config into a sandbox>>=
-def redirect_config_default(method, conf_file):
-    """Point `method`'s captured default config path at
-    `conf_file`."""
-    defaults = method.__defaults__
-    if not defaults or not str(defaults[0]).endswith(
-        "config.json"
-    ):
-        raise RuntimeError(
-            f"typerconf.{method.__qualname__} no longer "
-            f"captures its config path as its first "
-            f"default argument; the test suite's "
-            f"isolation needs updating"
-        )
-    method.__defaults__ = (conf_file,) + defaults[1:]
+import os
+
+os.environ["NYTID_HOME"] = CONFIG_SANDBOX
+import nytid
 @
 
-We still replace [[typerconf.dirs]], for the code that
-has not been written yet.  Any attribute of a
-[[platformdirs.AppDirs]] names a directory, so a
-stand-in that answers every [[*_dir]] query with the
-sandbox keeps future lookups inside it rather than
-letting one escape unnoticed.
+We check that it took.  The guard described next notices
+a configuration still aimed at the user, but not one aimed
+somewhere else: an older [[nytid]] imported from
+[[site-packages]] instead of [[../src]] would ignore the
+variable, and the suite would read whatever configuration
+that installation finds.  Asking for the exact file costs
+one comparison.
 
 <<redirect the persistent config into a sandbox>>=
-class SandboxDirs:
-    """Stand-in for `platformdirs.AppDirs` that resolves
-    every directory to one sandbox."""
-
-    def __init__(self, root):
-        self.root = str(root)
-
-    def __getattr__(self, name):
-        if name.endswith("_dir"):
-            return self.root
-        raise AttributeError(name)
-
-
-typerconf.dirs = SandboxDirs(CONFIG_SANDBOX)
-redirect_config_default(
-    typerconf.Config.read_config,
-    str(pathlib.Path(CONFIG_SANDBOX) / "config.json"),
+SANDBOX_CONFIG_FILE = str(
+    pathlib.Path(CONFIG_SANDBOX) / "config.json"
 )
-redirect_config_default(
-    typerconf.Config.write_config,
-    str(pathlib.Path(CONFIG_SANDBOX) / "config.json"),
-)
+if typerconf.Config.read_config.__defaults__[0] != \
+        SANDBOX_CONFIG_FILE:
+    raise RuntimeError(
+        f"importing {nytid.__file__} did not redirect "
+        f"typerconf to {SANDBOX_CONFIG_FILE}; the test "
+        f"suite's isolation needs updating"
+    )
 @
 
 \subsection{When this file hasn't been built}%
@@ -309,9 +299,7 @@ reconstruct it.
 def preserve_config():
     """Yield the sandboxed config file, restoring its
     contents afterwards."""
-    conf_file = (
-        pathlib.Path(CONFIG_SANDBOX) / "config.json"
-    )
+    conf_file = pathlib.Path(SANDBOX_CONFIG_FILE)
     if conf_file.exists():
         before = conf_file.read_bytes()
     else:
@@ -372,9 +360,12 @@ itself.  Several modules fall back on a path beneath the user's home
 when no configured location is available---the [[mine]] register
 (\cref{mine}), the tracking directory (\cref{cli.track}), the todo
 store (\cref{cli.todo}), the calendar cache---and those fallbacks do
-not merely read.  They call [[os.makedirs]].  Redirecting
-[[typerconf]] does nothing about that: a test that reaches one of them
-creates a directory under the real [[~/.nytid]], which is the leak of
+not merely read.  They call [[os.makedirs]].  The [[NYTID_HOME]] set
+above moves all of them into the configuration sandbox, but only while
+it is set: the tests of the classic fallback clear it on purpose, and
+it does nothing for code that derives a path from the home without
+asking nytid.  A test that reaches such a path creates a directory
+under the real [[~/.nytid]], which is the leak of
 \cref{sec:isolating-the-config} again with a different destination.
 
 As it happens, no test reaches one today.  Each of them points
@@ -417,8 +408,6 @@ before redirecting it: a location nothing names is a location no test
 can check.
 
 <<redirect the home directory into a sandbox>>=
-import os
-
 REAL_HOME = pathlib.Path.home()
 
 HOME_SANDBOX = tempfile.mkdtemp(prefix="nytid-tests-home-")

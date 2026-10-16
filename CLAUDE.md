@@ -74,7 +74,7 @@ The build uses a git submodule (`makefiles/`) providing `noweb.mk` and `subdir.m
 ### Generated vs Handwritten Files
 
 **Almost all `.py` files are generated from `.nw` files** — including `cli/__init__.py` (from `init.nw`) **and all `tests/test_*.py` files**. The `.gitignore` (both root and `tests/.gitignore`) lists all generated paths. The only handwritten Python files are:
-- `src/nytid/__init__.py` (empty package marker)
+- `src/nytid/__init__.py` (package marker; its one call applies `NYTID_HOME` on import, see `src/nytid/home.nw`)
 - `src/nytid/signup/__init__.py` (empty package marker)
 - `conftest.py` **at the repository root** — the build guard. It aborts the
   pytest session (exit 4) when `tests/conftest.py`, which carries the suite's
