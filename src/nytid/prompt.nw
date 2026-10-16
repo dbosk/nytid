@@ -257,10 +257,11 @@ window chain (\cref{prompt:chain}) needs both, and one parse of
 
 <<functions>>=
 def todo_state():
-    """Return the todo tree's parents and the active stack.
+    """Return the todos' parents and the active stack.
 
-    Returns `(parent_by_id, active_ids)`: the parent id (or
-    `None`) of every todo in `todos.json`, and the ids of the
+    Returns `(parents_by_id, active_ids)`: the ids of the
+    parents of every todo in `todos.json` that are todos
+    (the top level left out), and the ids of the
     active todos in stack order, normalized like
     `load_todo_state` and `normalize_active_stack` in
     `nytid.cli.todo`: stack order is kept; ids missing from
@@ -270,7 +271,7 @@ def todo_state():
     directory = todo_dir()
     <<read the todo statuses>>
     <<read and normalize the raw stack>>
-    return parent_by_id, normalized
+    return parents_by_id, normalized
 
 
 def active_todo_ids():
@@ -282,8 +283,14 @@ def active_todo_ids():
     return active
 @
 
-We only need each todo's status and parent, so we index those by
+We only need each todo's status and parents, so we index those by
 id rather than deserializing full todo items.
+A todo lists its parents in [[parents]], where the id~[[0]] stands
+for the top level; files written before that field existed hold a
+single [[parent_id]] instead, [[null]] at the top level, and the CLI
+reads those the same way (\cref{sec:todo-parents-field}).
+The chain needs only the parents that are todos, so we drop the top
+level here, as the CLI's [[real_parents_of]] does.
 The error handling matches the real reader's granularity: on any
 problem with [[todos.json]], [[load_todos_raw]] discards the whole
 file and returns no todos, whereupon normalization drops every
@@ -292,20 +299,23 @@ Empty maps achieve the same.
 
 <<read the todo statuses>>=
 status_by_id = {}
-parent_by_id = {}
+parents_by_id = {}
 try:
     with open(directory / TODO_FILE) as todo_file:
         data = json.load(todo_file)
     for item in data.get("todos", []):
         todo_id = int(item["id"])
         status_by_id[todo_id] = item.get("status", "pending")
-        parent = item.get("parent_id")
-        parent_by_id[todo_id] = (
-            None if parent is None else int(parent)
-        )
+        parents = item.get("parents", [item.get("parent_id")])
+        if not isinstance(parents, list):
+            parents = [parents]
+        parents_by_id[todo_id] = [
+            int(parent) for parent in parents
+            if parent is not None and int(parent) != 0
+        ]
 except (OSError, ValueError, KeyError, TypeError):
     status_by_id = {}
-    parent_by_id = {}
+    parents_by_id = {}
 <<constants>>=
 TODO_FILE = "todos.json"
 @
@@ -691,8 +701,13 @@ if labels is not None:
 @
 
 The chain is the task's ancestors, root first, then the task; the
-walk is [[get_ancestors]] from \cref{cli.todo} on the parent map,
-stopping at a missing parent and at a repeated id.  The three
+walk is [[context_path]] from \cref{cli.todo} on the parent map,
+stopping at a missing parent and at a repeated id.
+A todo with several parents is in several places at once, and the
+chain shows the one the user is working in: the first parent on the
+active stack, as the CLI's [[primary_parent]] chooses with the stack
+as its context.  Without one on the stack, the first parent that
+exists is taken, and only then a missing one, which ends the chain.  The three
 outcomes are kept apart for the caller: [[None]] when untracked,
 the empty string when tracked but idle, the chain otherwise.
 
@@ -705,7 +720,7 @@ def context_todo_chain(who):
     otherwise the ids from the root task down to the window's
     current task joined by `>`, e.g. `353>356>359`.
     """
-    parent_by_id, stack = todo_state()
+    parents_by_id, stack = todo_state()
     tracked, todo_id = context_todo_id(who, stack)
     if not tracked:
         return None
@@ -713,17 +728,37 @@ def context_todo_chain(who):
         return ""
     chain = [todo_id]
     seen = {todo_id}
-    parent = parent_by_id.get(todo_id)
+    parent = primary_parent_id(
+        parents_by_id.get(todo_id, []), stack, parents_by_id
+    )
     while (
         parent is not None
-        and parent in parent_by_id
+        and parent in parents_by_id
         and parent not in seen
     ):
         seen.add(parent)
         chain.append(parent)
-        parent = parent_by_id[parent]
+        parent = primary_parent_id(
+            parents_by_id[parent], stack, parents_by_id
+        )
     chain.reverse()
     return ">".join(str(todo_id) for todo_id in chain)
+
+
+def primary_parent_id(parents, context_ids, known_ids):
+    """Return the parent a chain runs through, or `None`.
+
+    Mirrors `primary_parent` in `nytid.cli.todo`: the first of
+    `parents` in `context_ids`, else the first in `known_ids`,
+    else the first; `None` at the top level.
+    """
+    for parent in parents:
+        if parent in context_ids:
+            return parent
+    for parent in parents:
+        if parent in known_ids:
+            return parent
+    return parents[0] if parents else None
 @
 
 The drift guards put both readers in the same fake tmux: the
@@ -733,7 +768,7 @@ through the real [[track]] writers.  The real resolver must then
 agree with ours on every outcome---the leaf in a window, the pane
 file winning over the window file, a tracked window without a
 todo, and no state at all---and the chain must match
-[[get_ancestors]].
+[[context_path]] with the stack as context.
 
 The CLI reads its configuration through the cached, write-free
 [[default]] helper, so a guard that compares against the CLI has to
@@ -798,11 +833,11 @@ def save_chain(todo_path):
             created="2026-08-25T10:00:00",
         ),
         real_todo.TodoItem(
-            id=356, title="Mid", parent_id=353,
+            id=356, title="Mid", parents=[353],
             created="2026-08-25T10:00:00",
         ),
         real_todo.TodoItem(
-            id=359, title="Leaf", parent_id=356,
+            id=359, title="Leaf", parents=[356],
             created="2026-08-25T10:00:00",
         ),
         real_todo.TodoItem(
@@ -839,9 +874,68 @@ def test_context_todo_matches_real_resolver(
     chain = nytid.prompt.context_todo_chain("alice")
     assert chain == ">".join(
         str(t.id)
-        for t in real_todo.get_ancestors(todos, todos[2])
+        for t in real_todo.context_path(todos, todos[2], stack)
     ) + ">359"
     assert chain == "353>356>359"
+@
+
+A todo with two parents is where the stack matters.  Leaf~359 is
+both a sub-item of~400 and of~356, with~400 listed first, but only
+the line through~356 is active; the chain must run through~356, and
+so must the CLI's [[context_path]] with the stack as context.
+
+<<test functions>>=
+def test_context_chain_follows_the_active_parent(
+    prompt_dirs, monkeypatch,
+):
+    """Drift guard: with two parents, the active one is shown."""
+    key = enter_tracked_tmux(monkeypatch)
+    todos = [
+        real_todo.TodoItem(id=353, title="Root"),
+        real_todo.TodoItem(id=356, title="Mid", parents=[353]),
+        real_todo.TodoItem(id=400, title="Other"),
+        real_todo.TodoItem(
+            id=359, title="Leaf", parents=[400, 356],
+        ),
+    ]
+    real_todo.save_todo_state_unlocked(401, todos, [353, 356, 359])
+    real_track.write_window_labels(
+        "@42", "alice", key, ["todo:353", "todo:356", "todo:359"],
+    )
+    stack = nytid.prompt.active_todo_ids()
+
+    chain = nytid.prompt.context_todo_chain("alice")
+    assert chain == "353>356>359"
+    assert chain == ">".join(
+        str(t.id)
+        for t in real_todo.context_path(todos, todos[3], stack)
+    ) + ">359"
+@
+
+A file that an older version wrote has only [[parent_id]], and the
+chain must read it as before:
+
+<<test functions>>=
+def test_context_chain_reads_legacy_parent_id(
+    prompt_dirs, monkeypatch,
+):
+    """A `parent_id`-only file still yields the chain."""
+    todo_path, _ = prompt_dirs
+    key = enter_tracked_tmux(monkeypatch)
+    (todo_path / "todos.json").write_text(json.dumps({
+        "next_id": 360,
+        "todos": [
+            {"id": 353, "title": "Root", "parent_id": None},
+            {"id": 356, "title": "Mid", "parent_id": 353},
+            {"id": 359, "title": "Leaf", "parent_id": 356},
+        ],
+    }))
+    (todo_path / "active_stack.json").write_text("[353, 356, 359]")
+    real_track.write_window_labels(
+        "@42", "alice", key, ["todo:359"],
+    )
+
+    assert nytid.prompt.context_todo_chain("alice") == "353>356>359"
 
 
 def test_context_pane_file_wins_over_window(
