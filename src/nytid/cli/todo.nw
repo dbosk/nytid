@@ -7558,19 +7558,29 @@ guessing why a key never took effect.  Each warning is one plain
 sentence, so the same list serves both [[add]] and [[edit]] without
 either of them having to know what can go wrong.
 
+A sub-item's heading may also name the item it shows, by its ID, and
+say whether it shows it in full or only refers to an item shown in
+full elsewhere in the buffer (\cref{sec:heading-ids}).  The parser
+records both in [[id]] and [[reference]] and leaves their meaning to
+the caller.
+
 <<editor infrastructure>>=
 @dataclass
 class ParsedItem:
     """A single item parsed from editor content.
 
     Represents either a heading-delimited sub-item or
-    the top-level item in an editor document.
+    the top-level item in an editor document.  `id` is
+    the item a heading names, if any, and `reference`
+    tells a heading that only refers to it.
     """
 
     title: str
     notes: str = ""
     metadata: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
+    id: int | None = None
+    reference: bool = False
 
 
 @dataclass
@@ -7620,7 +7630,7 @@ def parse_yaml_block(text):
     matter format.
     """
     result = {}
-    lines = text.splitlines()
+    lines = buffer_lines(text)
     idx = 0
     while idx < len(lines):
         stripped = lines[idx].strip()
@@ -7830,15 +7840,20 @@ description that is safe to expand today would silently lose text
 tomorrow.  Any string spanning several lines does too, which also
 closes a latent hole: [[command]] and [[wd]] may legally contain
 newlines, and the inline form used to truncate them at the first
-newline on the next round trip.  Finally, a string that would itself
-read as a block indicator, such as a bare [[|]], would otherwise come
-back as the start of a block that swallows the keys after it.
+newline on the next round trip.  A string that would itself read as a
+block indicator, such as a bare [[|]], would otherwise come back as the
+start of a block that swallows the keys after it.  Finally, a string
+that the inline form would give back as something else goes out as a
+block, which gives it back verbatim: one in quotes, which the parser
+strips, as a command such as [["$EDITOR" notes.md]] is; one that reads
+as a number or a list; one with spaces around it.  Inline, such a value
+would be stored changed on the next save, and the check before the
+editor opens (\cref{sec:edit-via-editor}) would refuse the buffer of the
+item and of every item above it.
 
-We split with [[splitlines()]] on both sides rather than on [[\n]]
-alone: the parser sees the buffer through [[splitlines()]], which also
-breaks at form feeds and Unicode line separators, so a value containing
-one would be emitted as one physical line but read back as two, the
-second unindented and the block cut short.  Blank lines go out empty
+We split with [[buffer_lines]] on both sides, the way the parser splits
+the buffer (\cref{sec:buffer-lines}), so that a value is emitted as
+exactly the lines it will be read back as.  Blank lines go out empty
 rather than as two spaces, since many editors strip trailing whitespace
 on save and either form parses the same.  When the first content line
 starts with whitespace we emit the indentation digit, as YAML requires
@@ -7851,14 +7866,16 @@ def needs_literal_block(key, value):
         return False
     if key in LITERAL_BLOCK_KEYS:
         return True
-    if len(value.splitlines()) > 1:
+    if len(buffer_lines(value)) > 1:
         return True
-    return parse_block_indicator(value.strip()) is not None
+    if parse_block_indicator(value.strip()) is not None:
+        return True
+    return parse_yaml_value(value.strip()) != value
 
 
 def render_literal_block(key, value):
     """Render ``value`` as an indented literal block under ``key``."""
-    lines = value.splitlines()
+    lines = buffer_lines(value)
     first = next((line for line in lines if line.strip()), "")
     indicator = "|"
     if first[:1].isspace():
@@ -7977,6 +7994,37 @@ def test_yaml_block_round_trip():
         assert parsed["description"] == value.rstrip("\n")
 @
 
+\subsection{Lines of a Buffer}
+\label{sec:buffer-lines}
+
+A buffer is read line by line, and what counts as a line break has to
+be the same everywhere: where the parser breaks lines, where the
+escaping of notes looks for their starts (\cref{sec:note-escaping}),
+and where the front matter is split.  Python's [[splitlines()]] breaks
+at a carriage return, a form feed, a record separator and the Unicode
+line separators as well as at a newline, while notes are text that may
+hold any of those, pasted from anywhere.  A note line
+\enquote{one\textbackslash{}r\# head} would then read as two lines, the
+second a heading that, with a marker in it, takes over an existing
+item.  So the buffer breaks at newlines only, and every other character
+is part of its line.  A carriage return before a newline is dropped
+first, since an editor on another system may save the buffer with such
+line ends; it carries nothing a user typed.  A final newline ends the
+last line rather than starting an empty one, as with [[splitlines()]],
+which the front matter's literal blocks count on.
+
+<<editor infrastructure>>=
+def buffer_lines(text):
+    """Split editor text into lines at newlines only,
+    taking a carriage return before a newline as part of
+    the line end; a final newline ends the last line, as
+    with `splitlines`."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if len(lines) > 1 and lines[-1] == "":
+        lines.pop()
+    return lines
+@
+
 \subsection{Parsing Editor Content}
 
 The parser walks the document line by line, building a tree from
@@ -8006,7 +8054,7 @@ def parse_editor_content(text):
     notes and reported in ``warnings`` rather than
     discarded.
     """
-    lines = text.splitlines()
+    lines = buffer_lines(text)
     warnings = []
     <<parse title from first line>>
     <<parse optional yaml block>>
@@ -8151,8 +8199,12 @@ push it onto the appropriate children list:
 <<handle heading line>>=
 <<finalize current item>>
 level = len(heading_match.group(1))
-item_title = heading_match.group(2).strip()
-current_item = ParsedItem(title=item_title)
+item_title, item_id, reference = split_heading_id(
+    heading_match.group(2).strip()
+)
+current_item = ParsedItem(
+    title=item_title, id=item_id, reference=reference,
+)
 current_notes_lines = []
 current_yaml_lines = None
 in_yaml = False
@@ -8212,8 +8264,8 @@ if current_item is not None:
         current_item.metadata = parse_yaml_block(
             "\n".join(current_yaml_lines)
         )
-    current_item.notes = "\n".join(
-        current_notes_lines
+    current_item.notes = unescape_note_lines(
+        "\n".join(current_notes_lines)
     ).strip()
 @
 
@@ -8235,7 +8287,7 @@ warnings.append(
 <<finalize last item notes>>=
 if current_item is not None:
     <<finalize current item>>
-parent_notes = "\n".join(parent_notes_lines)
+parent_notes = unescape_note_lines("\n".join(parent_notes_lines))
 @
 
 \subsection{Testing the Editor Parser}
@@ -8436,6 +8488,196 @@ Child notes.
     assert "Child" in result.warnings[0]
 @
 
+\subsection{Notes That Look Like Headings}
+\label{sec:note-escaping}
+
+Notes are free text, and a line of them may begin with [[#]]: a
+Markdown heading pasted from somewhere, an issue number, a shell
+comment.  In the buffer that line would be a heading, and on save it
+would become a sub-item, or worse, with a marker such as [[{#2}]] in
+it, take over an existing sub-item, renaming it and emptying its notes;
+a marker naming an item outside the buffer made [[edit]] fail on an
+unchanged save.  The renderer therefore escapes such a line the way
+Markdown does, with a backslash, [[\# not a heading]], and the parser
+takes the backslash off again, so the stored notes keep the line as it
+was written.  A line that already begins with backslashes before its
+[[#]] gets one more, which the parser removes, so that it too comes
+back as it was.  The escape is in the buffer only; [[view]] and every
+other reader see the notes unchanged.
+
+A line [[---]] is the other line the parser treats specially: in a
+sub-item's section it opens or closes the front matter, so a Markdown
+rule in the notes, or a pair of them, would make the text between them
+read as keys.  It is escaped the same way, [[\---]], and so is a line
+that is [[---]] up to trailing spaces, since the parser ignores those.
+
+<<editor infrastructure>>=
+def escape_note_lines(text):
+    """Return `text` with every line that the parser would
+    not read as a note line, one starting with `#` or being
+    `---` after any backslashes, behind one more
+    backslash."""
+    return "\n".join(
+        "\\" + line if NOTE_SPECIAL_PATTERN.match(line) else line
+        for line in buffer_lines(text)
+    )
+
+
+def unescape_note_lines(text):
+    """Undo `escape_note_lines`: drop one backslash from
+    every line that starts with backslashes and then a `#`
+    or is `---`."""
+    return "\n".join(
+        line[1:] if ESCAPED_SPECIAL_PATTERN.match(line) else line
+        for line in buffer_lines(text)
+    )
+<<constants>>=
+NOTE_SPECIAL_PATTERN = re.compile(r"\\*(#|---\s*$)")
+ESCAPED_SPECIAL_PATTERN = re.compile(r"\\+(#|---\s*$)")
+@
+
+Let's verify the round trip on lines with and without backslashes, and
+that the escaped notes parse as notes, not as sub-items:
+
+<<test functions>>=
+def test_note_lines_round_trip():
+  """Heading-like note lines survive the buffer."""
+  notes = (
+    "# Other {#3}\n\\# kept\n\\\\# two\nplain # not first\n"
+    "---\nlooks: like a key\n--- \n\\---\nnot ---"
+  )
+  escaped = escape_note_lines(notes)
+  assert escaped.split("\n")[:3] == [
+    "\\# Other {#3}", "\\\\# kept", "\\\\\\# two",
+  ]
+  assert escaped.split("\n")[4:] == [
+    "\\---", "looks: like a key", "\\--- ", "\\\\---", "not ---",
+  ]
+  assert unescape_note_lines(escaped) == notes
+  parsed = parse_editor_content(f"Title\n\n{escaped}\n")
+  assert (parsed.notes, parsed.children) == (notes, [])
+  child = parse_editor_content(
+    f"Title\n\n# Child {{#2}}\n\n{escaped}\n"
+  ).children[0]
+  assert (child.notes, child.metadata) == (notes, {})
+@
+
+\subsection{Naming Items in Headings}
+\label{sec:heading-ids}
+
+A buffer rendered from stored items used to connect a heading to its
+item by the title alone.  That connection is weak in three ways.
+Renaming a sub-item in the buffer breaks it: the old item looks
+deleted and the new title looks like a new item, so the ID, the
+status and the tracked time are lost.  Two siblings with the same title
+cannot be told apart.  And an item with several parents
+(\cref{sec:todo-parents}) is shown under each of them, so the same title
+turns up twice for one item.
+
+So every heading of an existing item ends with the item's ID:
+\begin{verbatim}
+# Collect the data {#7}
+\end{verbatim}
+The marker goes last, in braces, which is how Pandoc writes a heading's
+identifier.  The title stays at the start of the line, where the user
+reads and edits it, and Markdown highlighters show the marker as an
+attribute rather than as part of the title.  A heading without a marker
+is a new item, or an old buffer, which is matched by title as before
+(\cref{sec:edit-via-editor}).
+
+The item below two parents that are both in the buffer, the bottom of
+a diamond, is shown in full only once, at its first heading, with its
+front matter, notes and sub-items.  Its later headings refer to it:
+\begin{verbatim}
+## Collect the data {also #7}
+\end{verbatim}
+A reference has no body, and that is why it needs a marker of its own.
+Read as an ordinary section, its empty body would empty the item's
+notes and its missing sub-headings would remove the item's children.
+Telling the two apart by order, the first heading being the full one,
+would not do either: a user who deletes the full section to take the
+item away from one parent would turn the reference into the first
+heading, and the item would lose its notes and children.  So the
+difference is spelt out in the marker, and it does not depend on where
+the heading stands or what is written around it.  A reference cannot be
+mistaken for a new item, since it names one.
+
+The renderer puts the marker last, but the parser does not insist on
+it.  A heading is a line the user types in, and [[## O {#6} today]] or
+a stray space, [[{#6 }]], are easy to write.  Had the marker to end the
+line exactly, either would read as a new item named by all of its
+text, and item~6 would look deleted: its status, its history and its
+tracked time would go, and with it every blocker that named it.  So the
+marker may stand anywhere in the heading, with spaces inside the
+braces, and is taken out of the title with the text on both sides
+kept.  When several markers appear, the last one counts, which is the
+one the renderer wrote, since a title may itself contain one.
+
+<<editor infrastructure>>=
+def split_heading_id(text):
+    """Split a heading into its title and the item it names.
+
+    Returns `(title, id, reference)`.  A heading with a
+    `{#7}` marker names item 7 in full, one with
+    `{also #7}` refers to it; the last marker counts, and
+    the title is the text around it.  A heading without a
+    marker names no item, `id` is `None` and the text is
+    the title.
+    """
+    matches = list(HEADING_ID_PATTERN.finditer(text))
+    if not matches:
+        return text, None, False
+    match = matches[-1]
+    title = " ".join(
+        part for part in (
+            text[:match.start()].strip(),
+            text[match.end():].strip(),
+        ) if part
+    )
+    return (
+        title,
+        int(match.group(2)),
+        match.group(1) is not None,
+    )
+
+
+def heading_id_marker(item_id, reference=False):
+    """Return the marker that ends the heading of item
+    `item_id`, the form for a reference if `reference`."""
+    if reference:
+        return f"{{also #{item_id}}}"
+    return f"{{#{item_id}}}"
+<<constants>>=
+HEADING_ID_PATTERN = re.compile(
+    r"\{\s*(also\s+)?#\s*(\d+)\s*\}"
+)
+@
+
+Let's verify both forms, that a heading whose title merely contains a
+marker keeps it, since only the last marker counts, and that a marker
+with text after it or spaces inside it still names its item.
+
+<<test functions>>=
+@pytest.mark.parametrize("text,expected", [
+  ("Collect {#7}", ("Collect", 7, False)),
+  ("Collect {also #7}", ("Collect", 7, True)),
+  ("Collect", ("Collect", None, False)),
+  ("Fix {#3} again {#7}", ("Fix {#3} again", 7, False)),
+  ("{#7}", ("", 7, False)),
+  ("O {#6} today", ("O today", 6, False)),
+  ("O {#6 }", ("O", 6, False)),
+  ("O { also  # 6 } later", ("O later", 6, True)),
+])
+def test_split_heading_id(text, expected):
+  """The last marker names the item."""
+  assert split_heading_id(text) == expected
+  title, item_id, reference = expected
+  if item_id is not None:
+    assert split_heading_id(
+      f"{title} {heading_id_marker(item_id, reference)}".strip()
+    ) == expected
+@
+
 \subsection{Rendering Todo as Markdown}
 
 The renderer is the inverse of the parser: given a [[TodoItem]]
@@ -8482,21 +8724,42 @@ def render_todo_markdown(
     """
     lines = [item.title]
     meta = build_item_metadata(item)
+    <<show the edited item's places>>
     yaml_block = render_yaml_block(meta)
     if yaml_block:
         lines.append(yaml_block)
     lines.append("")
     if item.notes:
-        lines.append(item.notes)
+        lines.append(escape_note_lines(item.notes))
         lines.append("")
     children = sort_todos_for_display(
         children_of(todos, item.id)
     )
+    shown_in_full = {item.id}
     for child in children:
         lines.extend(
-            render_child_markdown(child, todos, 1)
+            render_child_markdown(
+                child, todos, 1, shown_in_full
+            )
         )
     return "\n".join(lines)
+@
+
+A sub-item's places are its headings, but the edited item has no
+heading: the buffer is its section.  Its parents go in its front
+matter instead, as \texttt{parents: [0, 12]}, with~0 for the top level
+(\cref{sec:todo-parents}), and [[edit]] reads them back
+(\cref{sec:edit-buffer-parents}).  The key is shown only for an item
+with several parents.  An item with one parent is the common case, and
+the line would cost every buffer the space the description argument
+below weighs; a user who wants to give such an item a second place can
+still type the key, or use [[edit --add-parent]].  [[build_item_metadata]]
+does not emit the key, since it also renders the sub-items, whose
+places the headings already give.
+
+<<show the edited item's places>>=
+if len(parents_of(item)) > 1:
+    meta = {"parents": list(parents_of(item)), **meta}
 @
 
 We extract only non-default metadata fields so the YAML block stays
@@ -8641,22 +8904,41 @@ at each depth.  This mirrors the parser's stack-based approach: a
 level-1 child becomes [[#]], a level-2 grandchild becomes [[##]],
 and so on.
 
+Each heading ends with the item's ID (\cref{sec:heading-ids}).  The
+set [[shown_in_full]] holds the items already shown in full, and an
+item met again, the bottom of a diamond, gets a reference heading and
+nothing else.  The edited item starts in the set, so it can never be
+shown again below itself; a cycle in a hand-edited file ends there
+too, as a reference, instead of recursing forever.
+
 <<editor infrastructure>>=
-def render_child_markdown(item, todos, level):
+def render_child_markdown(
+    item, todos, level, shown_in_full=None,
+):
     """Render a child item as markdown heading section.
 
     Returns a list of lines. Level determines the
-    heading depth (1 = #, 2 = ##, etc.).
+    heading depth (1 = #, 2 = ##, etc.).  An item already
+    in `shown_in_full` is rendered as a reference heading
+    only; otherwise it is added to the set.
     """
+    if shown_in_full is None:
+        shown_in_full = set()
     prefix = "#" * level
-    lines = [f"{prefix} {item.title}"]
+    if item.id in shown_in_full:
+        marker = heading_id_marker(item.id, reference=True)
+        return [f"{prefix} {item.title} {marker}", ""]
+    shown_in_full.add(item.id)
+    lines = [
+        f"{prefix} {item.title} {heading_id_marker(item.id)}"
+    ]
     meta = build_item_metadata(item)
     yaml_block = render_yaml_block(meta)
     if yaml_block:
         lines.append(yaml_block)
     lines.append("")
     if item.notes:
-        lines.append(item.notes)
+        lines.append(escape_note_lines(item.notes))
         lines.append("")
     grandchildren = sort_todos_for_display(
         children_of(todos, item.id)
@@ -8664,7 +8946,7 @@ def render_child_markdown(item, todos, level):
     for child in grandchildren:
         lines.extend(
             render_child_markdown(
-                child, todos, level + 1
+                child, todos, level + 1, shown_in_full
             )
         )
     return lines
@@ -8736,6 +9018,38 @@ def test_render_todo_markdown_description():
     assert parsed.children[0].metadata["description"] == (
         "What to check once fetched."
     )
+
+
+def test_render_diamond_shows_the_shared_item_once():
+    """The bottom of a diamond is shown in full once and
+    referred to under its other parent."""
+    todos = [
+        TodoItem(id=1, title="Report"),
+        TodoItem(id=2, title="Draft", parents=[1], priority=2.0),
+        TodoItem(id=3, title="Slides", parents=[1], priority=1.0),
+        TodoItem(
+            id=4, title="Data", parents=[2, 3], priority=1.5,
+            notes="From the survey.",
+        ),
+        TodoItem(id=5, title="Clean", parents=[4], priority=1.2),
+    ]
+    md = render_todo_markdown(todos[0], todos)
+    assert md.count("Data {#4}") == 1
+    assert md.count("Data {also #4}") == 1
+    assert md.index("{#4}") < md.index("{also #4}")
+    assert md.count("From the survey.") == 1
+    assert md.count("Clean {#5}") == 1
+
+    parsed = parse_editor_content(md)
+    draft, slides = parsed.children
+    assert (draft.id, slides.id) == (2, 3)
+    full, = draft.children
+    reference, = slides.children
+    assert (full.id, full.reference) == (4, False)
+    assert full.notes == "From the survey."
+    assert [c.id for c in full.children] == [5]
+    assert (reference.id, reference.reference) == (4, True)
+    assert (reference.notes, reference.children) == ("", [])
 
 
 def test_github_field_roundtrip():
@@ -15159,7 +15473,7 @@ paragraph wins over what [[--note]] put there.
 
 <<prefill notes into the buffer>>=
 if notes_text:
-    initial = initial + "\n" + notes_text
+    initial = initial + "\n" + escape_note_lines(notes_text)
 @
 
 Let's verify both halves of that: the flag's text is in the buffer
@@ -15187,6 +15501,26 @@ def test_add_edit_note_prefills_buffer(temp_todo_dir):
   assert "From the flag." in seen["text"]
   _, todos = load_todos()
   assert todos[0].notes == "From the buffer."
+@
+
+A note line that looks like a heading is escaped in the buffer
+(\cref{sec:note-escaping}), so it stays a note rather than becoming a
+sub-item:
+
+<<test functions>>=
+def test_add_edit_note_heading_line_stays_a_note(temp_todo_dir):
+  """--note '# x' is a note line, not a sub-item."""
+  with patch(
+    "nytid.cli.todo.open_editor", side_effect=lambda text: text,
+  ):
+    result = runner.invoke(
+      cli,
+      ["add", "--edit", "--top-level", "--prio", "1",
+       "-t", "Fetch paper", "--note", "# Section 3"],
+    )
+  assert result.exit_code == 0, result.stdout
+  _, todos = load_todos()
+  assert [t.notes for t in todos] == ["# Section 3"]
 @
 
 The parent is built in three layers, in the order that makes the
@@ -15662,7 +15996,22 @@ another directory does not silently discard the captured environment.
 
 We append the new item to [[todos]] immediately so that recursive
 calls can see it as a parent when processing grandchildren.
+
+Every heading in an [[add]] buffer is a new item, so the buffer has no
+use for the ID markers of an [[edit]] buffer (\cref{sec:heading-ids}).
+A user may still paste a section from one, and the parser has already
+taken the marker off the title.  We create the item under that title
+and say that the item named was not linked; putting an existing item
+under another is what [[edit --add-parent]] is for.
 <<create and append child item>>=
+if parsed_child.id is not None:
+    typer.echo(
+        f"Warning: sub-item {parsed_child.title!r}: "
+        f"add --edit does not link #{parsed_child.id}; "
+        "created a new item instead (link it with "
+        f"edit {parsed_child.id} --add-parent N)",
+        err=True,
+    )
 child = TodoItem(
     id=next_id,
     title=parsed_child.title,
@@ -15684,6 +16033,29 @@ typer.echo(
     f"  Added sub-item #{child.id}: "
     f"{child.title}"
 )
+@
+
+<<test functions>>=
+def test_add_edit_marker_creates_a_new_item(temp_todo_dir):
+  """A pasted ID marker warns and does not link the item."""
+  save_todos(2, [
+    TodoItem(id=1, title="Old", created="2026-02-20T10:00:00"),
+  ])
+  with patch(
+    "nytid.cli.todo.open_editor",
+    return_value="New task\n\n# Old {#1}\n",
+  ):
+    result = runner.invoke(
+      cli, ["add", "--edit", "--top-level", "--skip-priority"],
+    )
+  assert result.exit_code == 0, result.output
+  assert "does not link #1" in result.output
+  assert "edit 1 --add-parent" in result.output
+  _, todos = load_todos()
+  assert [(t.id, t.title, t.parents) for t in todos] == [
+    (1, "Old", [ROOT_ID]), (2, "New task", [ROOT_ID]),
+    (3, "Old", [2]),
+  ]
 @
 
 The inherited deadline needs no [[normalize_deadline]] pass of its own.
@@ -21441,9 +21813,10 @@ stderr.
 Editing updates specific fields of an existing todo. The [[--edit]]
 / [[-E]] flag opens the interactive editor with the todo rendered as
 markdown (using [[render_todo_markdown]]). After editing, the parser
-reconciles changes: existing children are matched by title to preserve
-their IDs and status, new headings become new children, and removed
-headings are deleted.
+reconciles changes: existing children are matched by the IDs their
+headings carry to preserve their IDs and status, new headings become
+new children, and a removed heading takes its sub-item away from that
+place, removing it if it has no other (\cref{sec:edit-via-editor}).
 
 Like [[view]], [[note]], and [[done]], [[edit]] treats an explicit ID
 as authoritative but otherwise falls back to the current active todo.
@@ -21888,7 +22261,7 @@ def test_edit_editor_child_description(temp_todo_dir):
     ])
 
     def fake_editor(text):
-        assert "# Existing\n---\ndescription: |\n  Old text.\n---" in text
+        assert "# Existing {#2}\n---\ndescription: |\n  Old text.\n---" in text
         return text.replace(
             "  Old text.", "  New text."
         ) + (
@@ -22006,6 +22379,25 @@ runs on the snapshot, so that it fails before any prompt, and again
 under the lock, because another command may have moved the new parent
 under the item in between.
 
+The question itself, whether making an item a parent would close a
+cycle, is asked separately, since the editor asks it too and refuses
+only the one place instead of exiting (\cref{sec:edit-via-editor}).
+
+<<helpers>>=
+def would_make_a_cycle(todos, item, parent_id):
+    """Tell whether `parent_id` is `item` or lies below it,
+    so that making it `item`'s parent would make `item` its
+    own ancestor."""
+    parent = next(
+        (t for t in todos if t.id == parent_id), None
+    )
+    if parent is None:
+        return False
+    return parent.id == item.id or item.id in {
+        a.id for a in ancestors_of(todos, parent)
+    }
+@
+
 The places are worded for a reader: the parents that are items by
 their ids, the root as \enquote{the top level}.
 
@@ -22028,14 +22420,7 @@ def require_acyclic_move(todos, item, parent_id):
     own ancestor.  Inside a `mutate_todo_state` callback the
     exit also abandons the write.
     """
-    parent = next(
-        (t for t in todos if t.id == parent_id), None
-    )
-    if parent is None:
-        return
-    if parent.id == item.id or item.id in {
-        a.id for a in ancestors_of(todos, parent)
-    }:
+    if would_make_a_cycle(todos, item, parent_id):
         typer.echo(
             f"Error: cannot move #{item.id} under "
             f"#{parent_id}, which is #{item.id} itself "
@@ -23668,10 +24053,14 @@ def test_edit_rejects_flag_pairs(
 \label{sec:edit-via-editor}
 
 We render the todo as markdown, open the editor, parse the result,
-and reconcile. Reconciliation matches existing children by title
-(case-insensitive, whitespace-stripped) to preserve their IDs,
-status, and tracked time. New headings create new children; removed
-headings delete children.
+and reconcile.  Every heading of an existing item carries the item's
+ID (\cref{sec:heading-ids}), and that is what connects a section to
+its item, so a sub-item keeps its ID, status and tracked time however
+its title is edited.  A heading without an ID is a new item, unless it
+has the title of a child the buffer showed under the same parent: then
+it is that child, which is how a buffer from before the IDs, or one
+whose marker the user deleted along with a title they retyped, still
+finds its items.  Removed headings remove sub-items.
 
 The editor session lasts as long as the user likes, so the buffer is
 rendered from the snapshot and applied to the stored state inside a
@@ -23682,14 +24071,22 @@ the buffer showed, the todo and its whole subtree, as [[shown]].  It
 serves twice.  It is the \enquote{before} against which the user's
 changes to each item are measured and replayed, and it tells a child
 the user deleted from one that did not exist when the buffer was
-rendered.
+rendered.  With several parents per item the second question is about
+places rather than items, so we also remember which children the buffer
+showed under each item, as [[shown_children]]: a child is under a
+heading only because the buffer put it there, and a child missing from
+under a heading was taken away from that place only if the buffer had
+shown it there.
 
 <<edit via editor>>=
-<<refuse a buffer with shared sub-items>>
 md = render_todo_markdown(item, todos)
-shown = buffer_baseline(
-    item, todos, parse_editor_content(md)
-)
+rendered = parse_editor_content(md)
+shown = buffer_baseline(item, todos, rendered)
+<<refuse a buffer that would not read back>>
+shown_children = {
+    t.id: [c.id for c in children_of(todos, t.id)]
+    for t in [item, *descendants_of(todos, item.id)]
+}
 as_read = {
     t.id: item_fields(t)
     for t in [item, *descendants_of(todos, item.id)]
@@ -23702,39 +24099,204 @@ if not parsed.title:
 
 <<echo parse warnings>>
 <<update parent from parsed>>
+refused_places = []
+progress = []
+<<read the edited item's places from the buffer>>
 <<commit the buffer under the lock>>
 typer.echo(f"Updated todo #{todo_id}: {item.title}")
+<<fail when the buffer asked for refused places>>
 @
 
-The buffer knows nothing of items with several parents.  For the edited
-item itself that is harmless: the buffer has no key for parents, so its
-places are left as they are, and its number is not in the buffer
-either.  A shared item \emph{below} it is another matter.  The buffer
-shows it as one heading among the children, and reconciliation treats
-it as one: deleting the heading would remove the item from every one of
-its places, not only this one, and the children's numbers are
-redistributed over this parent's range, although the item may be ranked
-under another (\cref{sec:ranking-context}).  Until reconciliation
-learns to detach and to leave such items' numbers alone, the editor is
-refused for an item with a shared item below it, with the flags that do
-the same work named instead; nothing is lost, since nothing has been
-typed yet.
+Everything above rests on the buffer reading back as it was rendered:
+every heading the renderer wrote parsed as that heading, with its
+marker, nothing else parsed as one, and every item's text read back as
+the text it has.  Splitting at newlines only (\cref{sec:buffer-lines})
+and escaping the notes (\cref{sec:note-escaping}) are what make that so
+for the notes.  A title, though, cannot be escaped: one holding a
+newline, written to the file by some other program, would have its
+second line read as a heading of its own, or, for the edited item, as
+its notes.  Rather than trust that every such way has been thought of,
+we parse the rendered buffer, which we do anyway for the baseline, and
+check it.  The headings must name exactly the items below the edited
+one, every heading must name one, and saving the untouched buffer must
+store, for every item shown, the title, the notes and the front-matter
+fields it has.  If not, [[-E]] is refused before the editor opens, when
+nothing has been typed that could be lost, with the item and the field
+named, and the flags are offered instead.
 
-<<refuse a buffer with shared sub-items>>=
-shared = [
-    d for d in descendants_of(todos, item.id)
-    if len(parents_of(d)) > 1
-]
-if shared:
+The comparison is with what the item's own front matter would store
+through [[apply_metadata]], not with the stored fields themselves, and
+with the title and the notes stripped as the parser strips them, so
+that only a misreading counts, not the normalising every save does.  A
+carriage return before a newline is not a misreading either, since the
+parser drops it (\cref{sec:buffer-lines}), and nor are trailing
+newlines, which a literal block drops; the replay leaves a field alone
+that the user did not change
+(\cref{sec:todo-read-modify-write}).  A dictionary such as the
+[[github]] link is compared by its values as text, since the front
+matter writes them as text.
+
+<<refuse a buffer that would not read back>>=
+below = {d.id for d in descendants_of(todos, item.id)}
+if (
+    section_ids(rendered.children) != below
+    or set(shown) != below | {item.id}
+    or not all_sections_named(rendered.children)
+):
     typer.echo(
-        f"Error: #{shared[0].id} below #{item.id} has several "
-        "parents, which the editor cannot keep yet; edit the "
-        "items with flags such as --title, --add-parent and "
-        "--remove-parent instead",
+        f"Error: the buffer of #{item.id} would not read back as "
+        "it is written, since a title or a note in it reads as a "
+        "heading; edit the items with flags such as --title "
+        "instead",
         err=True,
     )
     raise typer.Exit(1)
+misread = misread_field(todos, shown)
+if misread is not None:
+    typer.echo(
+        f"Error: the {misread[1]} of #{misread[0]} would not read "
+        "back from the buffer as it is; edit it with flags such "
+        "as --title instead",
+        err=True,
+    )
+    raise typer.Exit(1)
+<<helpers>>=
+def misread_field(todos, shown):
+    """Return `(id, field)` for the first item in `shown`, the
+    baseline of an untouched buffer, whose title, notes or
+    front-matter field differs from what the item has, or
+    `None`."""
+    by_id = {t.id: t for t in todos}
+    fields = ["title", "notes"] + [
+        attribute for attribute, _ in METADATA_FIELDS.values()
+    ]
+    for item_id, saved in shown.items():
+        original = by_id[item_id]
+        expected = TodoItem.from_dict(item_fields(original))
+        expected.title = (original.title or "").strip()
+        expected.notes = (original.notes or "").strip()
+        apply_metadata(expected, build_item_metadata(original))
+        expected = item_fields(expected)
+        for field_name in fields:
+            if as_read_back(expected.get(field_name)) != as_read_back(
+                saved.get(field_name)
+            ):
+                return item_id, field_name
+    return None
+
+
+def as_read_back(value):
+    """Return `value` as the buffer gives it back: text with
+    newlines for carriage-return line ends and without
+    trailing newlines, and a dictionary with its values as
+    text."""
+    if isinstance(value, str):
+        return value.replace("\r\n", "\n").rstrip("\n")
+    if isinstance(value, dict):
+        return {k: str(v) for k, v in value.items()}
+    return value
+
+
+def all_sections_named(sections):
+    """Tell whether every heading in `sections`, at any depth,
+    names an item."""
+    return all(
+        section.id is not None
+        and all_sections_named(section.children)
+        for section in sections
+    )
 @
+
+\paragraph{What a buffer says.}
+A buffer is a picture of part of a graph.  Each full section is an
+item, and each heading says that its item is a child of the item whose
+section it stands in.  The headings of one item, its full section and
+its references together, are its places in the buffer.  Reconciliation
+compares those places with the ones the buffer showed and makes the
+stored graph agree with the buffer where they differ:
+\begin{description}
+\item[A heading deleted] takes the item away from that place.  An item
+  that still has a place, another heading in the buffer or a parent the
+  buffer did not show, stays there and is only detached.  An item left
+  with no place at all is removed, and so is whatever below it has no
+  place left either, which is the rule [[rm]] follows
+  (\cref{sec:todo-rm}).  A sub-item with only this parent is therefore
+  removed, as it always was; one shared with another parent is not.
+\item[A heading moved] under another section, the same ID under a
+  different heading, takes the item from its old place to the new one.
+  Matching by ID is what makes this a move and not the removal of one
+  item and the creation of another, which would lose the ID, the notes
+  and the tracked time.
+\item[A reference added] under a section puts the item there as well,
+  as [[edit --add-parent]] would.
+\item[A section's text] is applied to its item when the section shows
+  the item in full.  A reference only places the item; text written
+  under it is ignored with a warning, because the item's text is
+  already in its full section and two versions of it could not both be
+  stored.
+\end{description}
+An item whose full section was deleted but which still has a reference
+keeps its sub-items as they are: the buffer no longer shows them, so it
+cannot have removed them.
+
+Making the graph agree with the buffer must not make it cyclic, and
+the buffer can ask for that: a reference to the edited item, or to an
+item above a section, placed under that section.  Such a place is
+refused with a warning before anything is stored, the check
+[[--add-parent]] makes (\cref{sec:todo-edit-places}).  It is refused
+under the lock, against the graph as stored then, so a move another
+process made during the session counts.  The rest of the buffer is
+stored: refusing the whole save would throw away what the user typed,
+over one heading that the warning names.  The command then fails,
+naming what it refused (\cref{sec:edit-buffer-parents}).  An item
+whose only new place was refused keeps the places it had.
+
+The numbers follow (\cref{sec:ranking-context}).  The order of the
+headings under a section is the ranking of the children ranked there,
+as it always was, and a child ranked under another of its parents, a
+guest here, keeps its number wherever its heading is put: the number
+comes from that other place, and the item keeps the highest place it
+has.  A child moved here, or given this place as well, is ranked here
+by its heading's position; it keeps a higher number it has from
+elsewhere.  A child that lost the place its number came from and has
+no heading in a section that ranks it is put at the bottom of its best
+remaining place, as [[rm]] does.
+
+\paragraph{Limits of the buffer.}
+The buffer is text the user may change in any way, and some changes
+cannot mean what they seem to.  These are the ones the code settles,
+each in its own place below or in \cref{sec:heading-ids}:
+\begin{description}
+\item[Markers] The last [[{#N}]] or [[{also #N}]] anywhere in a
+  heading names the item, so a title can only end in such text if the
+  renderer's marker follows it.  A heading that loses its marker is a
+  new item, matched by title only among the children the buffer showed
+  in full there; a lost marker next to a removed item is warned about.
+\item[Line breaks] Only a newline breaks a line of the buffer; a
+  carriage return, a form feed or a Unicode line separator in a title
+  or a note is part of its line (\cref{sec:buffer-lines}).
+\item[Note lines starting with [[#]] or being [[---]] ] are written
+  with a backslash in the buffer and stored without it
+  (\cref{sec:note-escaping}), so a [[\#]] or [[\---]] typed at the
+  start of a note line is stored without the backslash.
+\item[Titles with newlines] cannot be escaped, and neither can
+  anything else that would not read back as it is stored, such as a
+  label with a comma in it, which the front matter's list splits.
+  [[-E]] is refused before the editor opens for a buffer showing one,
+  and the error names the item and the field.
+\item[IDs that name nothing] A heading naming an item that never was in
+  the buffer and does not exist is a refused place.  One naming an item
+  another process removed during the session is dropped if the user
+  left its section alone, and made again once, under a new ID, if they
+  changed it.
+\item[What has no key] The buffer has no key for the status, the
+  blockers or the number, so it cannot reopen an item, change a
+  blocker or rank an item other than by the order of the headings
+  under a section; a guest's heading does not rank it at all.
+\item[Refusals] A cyclic or missing place is refused alone and the rest
+  stored, with exit status~1; a buffer that leaves work stuck is
+  refused whole and kept in a file.
+\end{description}
 
 The \enquote{before} must be the item as the \emph{unedited} buffer
 would store it, not the item as it is stored.  Saving does not copy
@@ -23751,8 +24313,9 @@ however it was formatted in the store.  The fields as read are kept
 too, in [[as_read]], so that the replay can still tidy a field nobody
 else touched (\cref{sec:todo-read-modify-write}).
 
-Sections are paired with items the way reconciliation pairs them, by
-normalized title, so every item the buffer showed gets an entry.
+Sections are paired with items by the IDs their headings carry.  The
+untouched buffer names every item it shows and shows each in full
+once, so every shown item gets an entry, from its full section.
 
 <<helpers>>=
 def buffer_baseline(item, todos, parsed):
@@ -23763,6 +24326,7 @@ def buffer_baseline(item, todos, parsed):
     and its shown descendants after the buffer's sections
     are applied to them, keyed by ID.
     """
+    by_id = {t.id: t for t in todos}
     baseline = {}
 
     def settle(original, section):
@@ -23771,15 +24335,13 @@ def buffer_baseline(item, todos, parsed):
         saved.notes = section.notes
         apply_metadata(saved, section.metadata)
         baseline[original.id] = item_fields(saved)
-        by_title = {
-            c.title.strip().lower(): c
-            for c in children_of(todos, original.id)
-        }
         for child_section in section.children:
-            child = by_title.get(
-                child_section.title.strip().lower()
-            )
-            if child is not None:
+            child = by_id.get(child_section.id)
+            if (
+                child is not None
+                and not child_section.reference
+                and child.id not in baseline
+            ):
                 settle(child, child_section)
 
     settle(item, parsed)
@@ -23804,258 +24366,924 @@ apply_metadata(item, parsed.metadata)
 @
 
 The commit replays the parent's changes and then reconciles the
-children against the fresh state.  Reconciliation creates children and
-removes them, so it has to run inside the callback: the new IDs come
-from the [[next_id]] the callback receives, and [[reconcile_children]]
-reaches that [[next_id]] and [[todos]] through [[nonlocal]].
+buffer with the fresh state.  Reconciliation creates items and removes
+them, so it has to run inside the callback: the new IDs come from the
+[[next_id]] the callback receives, and the helpers that create items
+reach that [[next_id]] through [[nonlocal]].
 
 <<commit the buffer under the lock>>=
 def commit_the_buffer(next_id, todos, stack):
     edited = require_todo(todos, todo_id)
+    stuck_before = find_stuck_items(todos)
+    <<note whether the ranges nested before the buffer>>
     replay_item_edits(
         edited, shown[todo_id], item, as_read[todo_id]
     )
-    <<reconcile children>>
-    reconcile_children(edited, parsed.children)
+    <<move the edited item to the places the buffer names>>
+    <<reconcile the buffer with the stored items>>
+    <<refuse a buffer that leaves new stuck items>>
     return next_id, todos, stack
 
 
 mutate_todo_state(commit_the_buffer)
+for line in progress:
+    typer.echo(line)
 @
 
-Reconciliation matches children by normalized title. Existing
-children keep their ID, status, and tracked time. New headings get
-fresh IDs. Priorities are distributed within the parent's context
-range (using [[compute_child_priority_range]]) so that children
-sort correctly in flat view, rather than using absolute sequential
-values.  Unranked children are the exception: if a child already has no
-priority, reconciliation keeps it that way instead of silently assigning
-one.  New children only receive numeric priorities when the parent has a
-numeric priority and the new child is entering the ranked subset.
+What the save did, the items added and removed and the places changed,
+is collected in [[progress]] as the callback goes and printed only once
+the callback has returned and the state is stored.  Printed as it
+happened, it would describe a save that a check at the end of the
+callback can still refuse (below), and the user would read that items
+had been added that were never stored.  Warnings are printed at once,
+since they are true whatever happens to the save.
 
-Reconciliation has to recurse, because the buffer the user edited does.
-[[render_child_markdown]] emits each child's own children at one deeper
-heading level and [[parse_editor_content]] parses them back into
-[[parsed_child.children]], so a reconciliation that walked only the
-first level would show the user their grandchildren, accept their
-edits, report success, and discard them.  Silently losing text the user
-typed is the worst failure mode an editor round-trip can have.
+\paragraph{Circles of waiting.}
+A buffer can make work that could never be done
+(\cref{sec:todo-stuck}).  Its places do it as [[--add-parent]] and
+[[--remove-parent]] do: a reference that puts an item under one it is
+blocked by, so that each waits for the other, or a deleted heading that
+was an item's one way out of such a circle.  The editor cannot reopen a
+done item, since the buffer has no key for the status, and it changes
+no blocker, since it has no key for those either; so the places are
+what has to be checked, and the callback checks them as [[edit]]
+checks its links: it notes the stuck items before the buffer is
+applied and refuses the save if the buffer leaves new ones.
 
-We express the recursion as a nested \emph{function} rather than a
-reusable chunk.  The level being reconciled is described entirely by
-[[parent]] and [[parsed_children]]; making those parameters means a
-recursive call cannot accidentally inherit the outer level's variables,
-which is exactly the mistake a chunk reference would invite.  This also
-mirrors [[create_children_from_parsed]] on the [[add]] side, which has
-recursed from the start.
+The refusal takes the whole buffer, not only the places that made the
+circle, unlike a place that would make an item its own ancestor.  That
+one is a property of a single heading and can be refused alone.  A
+circle is a property of the graph the buffer leaves: it may take a new
+place and a removed one together, and taking back one of them would
+change which items are removed, which families are laid out and which
+numbers they get, so there is no part of the buffer that could be
+stored on its own with any confidence.  The exit abandons the write
+(\cref{sec:todo-read-modify-write}).  What the user typed is not lost
+with it: the buffer is kept in a file next to the todo list, which the
+message names, so that it can be pasted into the next [[edit -E]] once
+the circle is broken.  The file is named by the time, and a number if
+need be, so that a second refusal does not overwrite the buffer the
+first one kept.
 
-<<reconcile children>>=
-def reconcile_children(parent, parsed_children):
-    """Match parsed sections against a parent's children.
+<<refuse a buffer that leaves new stuck items>>=
+try:
+    refuse_new_stuck_items(todos, stuck_before)
+except typer.Exit:
+    kept = keep_refused_buffer(todo_id, content)
+    typer.echo(
+        f"Nothing was saved; your buffer is kept in {kept}",
+        err=True,
+    )
+    raise
+<<helpers>>=
+def keep_refused_buffer(todo_id, content):
+    """Write the editor buffer `content` of a refused save of
+    `todo_id` next to the todo list, beside any kept before;
+    return its path."""
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    path = get_todo_dir() / f"refused-edit-{todo_id}-{stamp}.md"
+    count = 1
+    while path.exists():
+        path = path.with_name(
+            f"refused-edit-{todo_id}-{stamp}-{count}.md"
+        )
+        count += 1
+    path.write_text(content)
+    return path
+@
 
-    Sections are matched to existing children by
-    normalized title so that they keep their ID,
-    status, and tracked time.  Unmatched sections
-    become new children, unmatched children are
-    removed with their subtrees, and each matched
-    child is reconciled against its own sections.
+\paragraph{The edited item's own places.}
+\label{sec:edit-buffer-parents}
+The edited item's parents are in its front matter, as [[parents:]],
+when it has several (\cref{sec:heading-ids}), and the user may type the
+key when it has one.  The key follows the rule of every other key: an
+absent key leaves the parents alone.  A value that is not a list of
+IDs is ignored with a warning instead of failing at once, since that
+would throw away the rest of the buffer; the command fails after the
+save instead, as it does for any refused place (below).  An ID may be
+written with its [[#]], as the IDs are written everywhere else.  An
+empty list is refused too, with the list that means the top level as
+the hint: elsewhere an item without parents is a top-level one, but in
+a buffer that showed the parents an empty list more likely means a
+line cleared by mistake.
+
+<<read the edited item's places from the buffer>>=
+buffer_parents = None
+if "parents" in parsed.metadata:
+    try:
+        buffer_parents = parse_parents_key(
+            parsed.metadata["parents"]
+        )
+    except InvalidParentsError as exc:
+        typer.echo(
+            f"Warning: parents: {exc}; kept the places "
+            f"#{todo_id} has",
+            err=True,
+        )
+        refused_places.append(f"the parents of #{todo_id}")
+<<helpers>>=
+def parse_parents_key(value):
+    """Return the parent IDs a `parents:` front-matter key
+    lists, normalized.
+
+    `value` is what the YAML subset made of the key: a list
+    of strings or a single value.  Raises
+    `InvalidParentsError` for anything that is not an ID.
     """
-    nonlocal next_id, todos
-    <<build existing children index>>
-    <<distribute child priorities>>
-    <<record the children's ranges before they move>>
-    <<update or create each parsed child>>
-    <<remove deleted children>>
-    <<carry each child's subtree to its new range>>
-    <<reconcile each child against its own sections>>
+    if value == []:
+        raise InvalidParentsError(
+            "an empty list; write [0] for the top level"
+        )
+    values = value if isinstance(value, list) else [value]
+    ids = []
+    for entry in values:
+        try:
+            ids.append(int(str(entry).strip().lstrip("#")))
+        except ValueError:
+            raise InvalidParentsError(
+                f"{entry!r} is not a todo id"
+            )
+    return normalize_parents(ids)
 @
 
-We normalize titles to lowercase with stripped whitespace so that
-minor formatting changes in the editor do not accidentally create
-duplicate children.
+What the user changed is what the key now says compared with what the
+buffer showed, and it is applied to the parents as they are stored
+now, as [[--add-parent]] and [[--remove-parent]] are
+(\cref{sec:todo-edit-places}), so that a place another process gave the
+item during the session survives.  Each added parent must exist and
+must not lie below the item; one that fails is refused with a warning
+and the rest applied, for the reason places in headings are
+(\cref{sec:edit-via-editor}).
+
+The number follows the rules of [[--remove-parent]] and
+[[--add-parent]], through the helper they share,
+[[place_in_places]] (\cref{sec:place-in-places}), with the bottom as
+the position, since the editor has no one to ask where.  Losing the
+place the number came from, the item's ranking context, puts it at the
+bottom of its highest remaining place, as [[rm]] does.  An added place
+cannot lower the number; when it ranks above the item, the item goes to
+the bottom of it, the least presumptuous place there.  The item is
+settled before its sub-items are reconciled, so that their families
+are laid out in the range it has now; whether the ranges still nest
+is checked once, at the end (below).
+
+<<move the edited item to the places the buffer names>>=
+if buffer_parents is not None:
+    shown_parents = shown[todo_id]["parents"]
+    add = []
+    for parent_id in buffer_parents:
+        if parent_id in shown_parents:
+            continue
+        if parent_id != ROOT_ID and not any(
+            t.id == parent_id for t in todos
+        ):
+            typer.echo(
+                f"Warning: parent #{parent_id} not found",
+                err=True,
+            )
+            refused_places.append(
+                f"#{todo_id} under #{parent_id}"
+            )
+        elif would_make_a_cycle(todos, edited, parent_id):
+            typer.echo(
+                f"Warning: #{todo_id} cannot go under "
+                f"#{parent_id}, which is #{todo_id} itself or "
+                "below it",
+                err=True,
+            )
+            refused_places.append(
+                f"#{todo_id} under #{parent_id}"
+            )
+        else:
+            add.append(parent_id)
+    new_parents, _ = apply_parent_edits(
+        edited.parents, add,
+        [p for p in shown_parents if p not in buffer_parents],
+    )
+    if new_parents != edited.parents:
+        <<move the edited item and settle it>>
+<<move the edited item and settle it>>=
+old_range = child_priority_range_or_none(todos, edited)
+old_place = (edited.priority, list(edited.parents))
+old_context = ranking_context(todos, edited)
+left = [p for p in edited.parents if p not in new_parents]
+joined = [p for p in new_parents if p not in edited.parents]
+edited.parents = new_parents
+if old_context not in new_parents and edited.priority is not None:
+    edited.priority = place_in_places(
+        todos, edited, new_parents, PLACE_BOTTOM,
+    )
+    old_place = None
+elif joined:
+    edited.priority = place_in_places(
+        todos, edited, joined, PLACE_BOTTOM, edited.priority,
+    )
+settle_placement(
+    todos, edited, old_range, old_place, was_nested=False,
+)
+if left:
+    progress.append(
+        f"#{todo_id} is no longer {describe_places(left)}"
+    )
+if joined:
+    also = "also " if len(joined) < len(new_parents) else ""
+    progress.append(
+        f"#{todo_id} is now {also}{describe_places(joined)}"
+    )
+@
+
+A refused place is not a silent one.  The warnings name each as it is
+refused, but a script reads the exit status, and a save that stored
+everything but what was asked for is not a success.  So once the rest
+of the buffer is stored, the command fails, naming the places it
+refused.  The order matters: failing before the save would throw away
+everything else the user typed, which is what refusing a single place
+instead of the whole buffer exists to prevent.  The list is filled
+where the places are refused, the [[parents:]] key before the lock
+and the rest inside the callback, which runs once.
+
+<<fail when the buffer asked for refused places>>=
+if refused_places:
+    typer.echo(
+        "Error: saved the buffer except "
+        + ", ".join(refused_places),
+        err=True,
+    )
+    raise typer.Exit(1)
+@
+
+Reconciliation runs in phases, each over the whole buffer, because
+each needs the previous one finished.  Which item a section names must
+be known before any place is changed, since a moved heading is only a
+move once both its old and its new place are known.  Places must be
+settled before anything is removed, since whether an item is removed
+depends on all its places.  And numbers come last, since a range is
+bounded by the siblings an item ends up with.
+
+<<reconcile the buffer with the stored items>>=
+<<remember where each item was>>
+<<resolve the sections to items>>
+<<change the places the buffer changed>>
+<<warn about markers that may have been lost>>
+<<remove the items the buffer left without a place>>
+<<rank each family the buffer shows>>
+<<place again what lost its place>>
+<<report the changed places>>
+<<settle the edited item and what it heads>>
+@
+
+Whether a child was ranked under a parent, and which places it had,
+are questions about the state before the buffer changed it, so we
+record the answers first.  The ranking context of every item is read
+from the numbers (\cref{sec:ranking-context}), which the phases below
+are about to change.
+
+<<remember where each item was>>=
+by_id = {t.id: t for t in todos}
+context_before = {
+    t.id: ranking_context(todos, t, by_id) for t in todos
+}
+parents_before = {t.id: list(t.parents) for t in todos}
+@
+
+\paragraph{Resolving the sections.}
+The walk goes through the buffer in document order and pairs each
+section with an item, creating the new ones.  It collects each item's
+headings in the buffer, in order, as its [[families]] entry: the
+children the buffer puts under it.  An item's full section and its
+references both contribute, since both are places.  [[full_sections]]
+holds the items whose full section has been applied, with the notes and
+front matter it had, which tells a later heading of the same item that
+it is a repeat; the edited item is the first of them, since the whole
+buffer is its section.  [[resolved]] holds every item the buffer names
+somewhere, which is what keeps an item alive in the next phases.
+
+<<resolve the sections to items>>=
+families = {}
+full_sections = {edited.id: (parsed.notes, parsed.metadata)}
+resolved = {edited.id}
+created = []
+unmarked = {}
+claimed = section_ids(parsed.children)
+full_claimed = {
+    section.id for section in walk_sections(parsed.children)
+    if section.id is not None and not section.reference
+}
+shown_full_under = full_section_parents(item.id, rendered.children)
+<<decide what becomes of items removed meanwhile>>
+<<pair each section with an item>>
+resolve_sections(edited, parsed.children)
+@
+
+The IDs named anywhere in the buffer are collected before the walk,
+for the title match below.
+
+<<helpers>>=
+def section_ids(sections):
+    """Return the IDs the headings in `sections` name, at
+    any depth."""
+    found = set()
+    for section in sections:
+        if section.id is not None:
+            found.add(section.id)
+        found |= section_ids(section.children)
+    return found
+@
+
+A heading with an ID names that item, and one naming an item that does
+not exist is dealt with below.  A heading without an ID is matched by
+title among the parent's children, and only among those no heading
+names by ID: the buffer has already said where those are.  Anything
+else is a new item.
+
+The walk recurses into the sub-headings of every section, references
+included.  A reference renders with none, but a user may write some
+under it, and those are children of the item it names like any other;
+what is typed in the buffer is not dropped without a word.
+
+<<pair each section with an item>>=
+def resolve_sections(parent, sections):
+    """Pair each of `sections` under `parent` with an
+    item, creating new ones, and record the item among
+    `parent`'s children in `families`."""
+    candidates = title_candidates(parent)
+    family = families.setdefault(parent.id, [])
+    for section in sections:
+        if section.id is not None:
+            child = by_id.get(section.id) or recreated.get(section.id)
+            if child is None:
+                <<deal with a heading whose item does not exist>>
+        else:
+            child = next(
+                (
+                    c for c in candidates.get(
+                        section.title.strip().lower(), []
+                    )
+                    if c.id not in resolved
+                ),
+                None,
+            )
+        <<apply the section to its item>>
+        resolved.add(child.id)
+        if all(c.id != child.id for c in family):
+            family.append(child)
+        resolve_sections(child, section.children)
+@
+
+\paragraph{Headings of items that do not exist.}
+A heading may name an item that is not there.  The buffer never showed
+an item by that ID: the user typed the ID, or mistyped it.  There is
+nothing to put in that place, and making up an item for the ID would
+store a stray item under a number the user did not choose, so the
+place is refused like a cyclic one.
+
+Or the buffer showed the item, and another process removed it during
+the session.  That is a conflict between the two, settled by the rule
+every other field follows (\cref{sec:todo-read-modify-write}): replay
+only what the user changed.  If the user left the item's section as it
+was shown, they did not ask for anything about it, the other process's
+removal stands, and its headings, the references included, are dropped
+with a warning.  If they changed it, retitled it or wrote in its notes,
+the removal would throw that away, so the item is made again from its
+section, once, as a new item with a new ID, which its references then
+name too; a warning says so.
+
+Either way the headings under a skipped heading have nothing to stand
+under, but they are not nothing.  The user may have moved an existing
+item there, or typed in the notes of one, and ignoring them would lose
+both: the moved item would have left its old place for none and be
+removed, and the notes would be gone.  So the items named under a
+skipped heading are still named, which keeps them alive and, when the
+buffer gives them no place left, gets them back the places they had
+(\cref{sec:edit-via-editor}); their full sections are applied as
+usual.  They only gain no place there, and a full section applied this
+way takes no places from the sub-items it shows, since its
+sub-headings were not placed either (\cref{sec:edit-via-editor}).  New
+headings under a skipped one have no item to keep and are reported as
+ignored.
+
+<<deal with a heading whose item does not exist>>=
+if section.id not in shown:
+    typer.echo(
+        f"Warning: there is no #{section.id} to put under "
+        f"#{parent.id}; ignored its heading",
+        err=True,
+    )
+    refused_places.append(f"#{section.id} under #{parent.id}")
+    salvage(section.children)
+    continue
+remade = changed_sections.get(section.id)
+if remade is None:
+    if section.id not in dropped:
+        dropped.add(section.id)
+        typer.echo(
+            f"Warning: #{section.id} was removed during the "
+            "session and its section left as it was; dropped "
+            "its headings",
+            err=True,
+        )
+    salvage(section.children)
+    continue
+child = create_sub_item(parent, remade)
+recreated[section.id] = child
+typer.echo(
+    f"Warning: #{section.id} was removed during the session; "
+    f"made your changed section into #{child.id}",
+    err=True,
+)
+@
+
+<<pair each section with an item>>=
+def salvage(sections):
+    """Keep the items named in `sections`, which stand under
+    a skipped heading, and apply their full sections,
+    without giving them a place there."""
+    for section in walk_sections(sections):
+        child = by_id.get(section.id) if section.id else None
+        if child is None:
+            if section.id is None:
+                typer.echo(
+                    f"Warning: ignored {section.title!r}, which "
+                    "stands under a heading that was skipped",
+                    err=True,
+                )
+            continue
+        resolved.add(child.id)
+        if (
+            not section.reference
+            and child.id in shown
+            and child.id not in full_sections
+        ):
+            apply_section(child, section)
+            salvaged.add(child.id)
+@
+
+Whether the user changed the section of a removed item is decided
+before the walk, since its references may come before its full section
+in the buffer.  The section is saved onto the item as it was shown,
+the way [[buffer_baseline]] saves the untouched buffer, and compared
+with what the untouched buffer would have stored.
+
+<<decide what becomes of items removed meanwhile>>=
+recreated, dropped, salvaged = {}, set(), set()
+changed_sections = {}
+for section in walk_sections(parsed.children):
+    if (
+        section.id in shown and section.id not in by_id
+        and not section.reference
+        and section.id not in changed_sections
+    ):
+        saved = TodoItem.from_dict(copy.deepcopy(shown[section.id]))
+        saved.title = section.title or saved.title
+        saved.notes = section.notes
+        apply_metadata(saved, section.metadata)
+        if item_fields(saved) != shown[section.id]:
+            changed_sections[section.id] = section
+<<helpers>>=
+def full_section_parents(item_id, sections):
+    """Return, for each item shown in full in `sections`,
+    the ID of the item its full section stands under;
+    `item_id` is the item `sections` belong to."""
+    found = {}
+    for section in sections:
+        if section.id is not None and not section.reference:
+            found[section.id] = item_id
+        found.update(
+            full_section_parents(section.id, section.children)
+        )
+    return found
+
+
+def walk_sections(sections):
+    """Yield every section in `sections` and below, in
+    document order."""
+    for section in sections:
+        yield section
+        yield from walk_sections(section.children)
+@
 
 The titles a section is matched against are the ones the buffer
-showed, not the ones stored now.  The buffer carries no IDs, so the
-title is the only thing that connects a section to an item, and the
-connection was made when the buffer was rendered.  If another process
-renames a shown child during the session, matching on the stored title
-would find no section for it: the child would be deleted as if the
-user had removed its heading, and its unchanged section would come
-back as a new child, losing the ID, the notes and the tracked time.
-Keying a shown child by its title in [[shown]] keeps the connection;
-the replay then leaves the new name alone, since the user did not
-change the title in the buffer.  Children the buffer never showed are
-keyed by their stored title, and a shown child wins a clash, because
-the section was written about it.
-<<build existing children index>>=
-children = children_of(todos, parent.id)
-existing_by_title = {
-    c.title.strip().lower(): c
-    for c in children if c.id not in shown
-}
-existing_by_title.update({
-    shown[c.id]["title"].strip().lower(): c
-    for c in children if c.id in shown
-})
+showed, not the ones stored now.  If another process renamed a shown
+child during the session, its unchanged section would otherwise find
+no match, and it would come back as a new child.  The IDs make this
+rare, but a buffer without them still depends on it.  Children the
+buffer never showed are keyed by their stored title and come after the
+shown ones, so that a shown child wins a clash, the section being
+written about it.  Each title keeps a list, not one child, so that two
+siblings with the same title are both found, in order.  We normalize
+titles to lowercase with stripped whitespace so that minor formatting
+changes in the editor do not accidentally create duplicate children.
+
+A child that only references name is still free for a title match where
+its full section was shown.  That is what deleting the marker of a full
+section, and keeping a reference elsewhere, comes to: the heading where
+the item was shown in full still describes it, by its title.  Treated as
+claimed, the item would lose that place and a new item would take it.
+Under any other parent the references have said where the item is, and
+it is not matched there.
+
+<<pair each section with an item>>=
+def title_candidates(parent):
+    """Return the children of `parent` a section without
+    an ID may name, by normalized title, shown children
+    first."""
+    candidates = {}
+    children = children_of(todos, parent.id)
+    for child in sorted(children, key=lambda c: c.id not in shown):
+        if child.id in full_claimed or (
+            child.id in claimed
+            and shown_full_under.get(child.id) != parent.id
+        ):
+            continue
+        title = (
+            shown[child.id]["title"] if child.id in shown
+            else child.title
+        )
+        candidates.setdefault(
+            title.strip().lower(), []
+        ).append(child)
+    return candidates
 @
 
-Priority distribution uses the parent's sibling-context range so
-that ranked children sort correctly relative to other top-level items
-when the list is shown flat.  Without this, all children of every
-parent would receive priorities in [0, 1] and would interleave
-arbitrarily.
+A section shows its item in full unless it is marked as a reference or
+the item has already had its full section.  An item the buffer did not
+show, but which a heading names by ID, has no section to be shown in:
+the user linked it, and its heading only places it.  A child another
+process added meanwhile under a title the user typed for a new section
+is the exception the title match exists for, and its section applies
+to it directly.
 
-Existing unranked children do not consume a numeric slot.  They stay in
-the unranked tail until the user runs [[reprioritize]], while ranked or
-new children still share the parent's numeric range.
-<<distribute child priorities>>=
-if parent.priority is None:
-    ranked_titles = []
-    priorities = []
-else:
-    ranked_titles = [
-        parsed_child.title.strip().lower()
-        for parsed_child in parsed_children
+<<apply the section to its item>>=
+if child is None:
+    child = create_sub_item(parent, section)
+elif (
+    not section.reference
+    and child.id not in full_sections
+    and (child.id in shown or section.id is None)
+):
+    <<warn about a reference turned into an empty section>>
+    <<warn about a title match that drops text>>
+    apply_section(child, section)
+elif (
+    (section.notes or section.metadata)
+    and (section.notes, section.metadata)
+    != full_sections.get(child.id)
+):
+    typer.echo(
+        f"Warning: #{child.id} {child.title!r}: ignored the "
+        "text under a heading that does not show it in full",
+        err=True,
+    )
+@
+
+A reference whose [[also]] is deleted, while the full section it
+referred to is deleted too, becomes the item's full section, and an
+empty one: saving it empties the item's notes and takes its sub-items
+from under it.  The user may mean exactly that, but it is also what
+tidying up the wrong heading looks like, so when an empty full section
+stands where the buffer showed a reference and the item had notes or
+sub-items to lose, a warning says what happens.
+
+<<warn about a reference turned into an empty section>>=
+if (
+    child.id in shown
+    and shown_full_under.get(child.id) != parent.id
+    and not (section.notes or section.metadata or section.children)
+    and (shown[child.id]["notes"] or shown_children.get(child.id))
+):
+    typer.echo(
+        f"Warning: #{child.id} {child.title!r} is now shown in "
+        f"full under #{parent.id}, with no notes and no "
+        "sub-items, which empties its notes and takes its "
+        f"sub-items from under it; did you mean {{also #{child.id}}}?",
+        err=True,
+    )
+@
+
+A heading without a marker is matched by its title, and the match may
+be a surprise: the user deleted an item's section and typed a new one
+under the same title, meaning a new item, and finds the old one
+instead, its notes replaced and its sub-items, which the new section
+does not show, taken from under it.  The match is right for a buffer
+from before the markers, so it stands, but when it drops something the
+item had, notes or sub-items, a warning names the item.
+
+<<warn about a title match that drops text>>=
+if section.id is None and child.id in shown and (
+    (shown[child.id]["notes"] and not section.notes)
+    or (shown_children.get(child.id) and not section.children)
+):
+    typer.echo(
+        f"Warning: {section.title!r}, which has no marker, was "
+        f"taken to be #{child.id} by its title; its section, "
+        f"without the notes or sub-items #{child.id} had, "
+        "replaces them",
+        err=True,
+    )
+@
+
+A sub-item's places are its headings, so a [[parents:]] key in its
+front matter, which only the edited item has
+(\cref{sec:edit-buffer-parents}), would contradict them.  The key is
+ignored, as unknown keys are, but with a warning, since a user who
+typed it expected it to do something.
+
+<<apply the section to its item>>=
+if "parents" in section.metadata:
+    typer.echo(
+        f"Warning: sub-item {section.title!r}: ignored "
+        "parents: in its front matter; its headings are its "
+        "places",
+        err=True,
+    )
+@
+
+A matched item is updated the way the edited item is: the section is
+applied to a copy of the item as the untouched buffer would have
+stored it, and only what the section changed is replayed onto the
+stored item, so that a note added to a sub-item during the session
+survives.  A child that matched a section but was not shown was added
+by someone else under the same title meanwhile; there is no earlier
+version to compare with, so the section applies to it directly.  A
+heading reduced to its marker, [[## {#7}]], keeps the title: an item
+without one could not be listed.
+
+<<pair each section with an item>>=
+def apply_section(child, section):
+    """Apply a full section to the item it shows."""
+    full_sections[child.id] = (section.notes, section.metadata)
+    shown_child = shown.get(child.id)
+    if shown_child is None:
+        edited_child = child
+    else:
+        edited_child = TodoItem.from_dict(
+            copy.deepcopy(shown_child)
+        )
+    edited_child.title = section.title or edited_child.title
+    edited_child.notes = section.notes
+    apply_metadata(edited_child, section.metadata)
+    if edited_child is not child:
+        replay_item_edits(
+            child, shown_child, edited_child,
+            as_read[child.id],
+        )
+@
+
+A new item holds what it inherits before its section is applied: the
+parent's labels, deadline and assignee, so that adding a sub-task in
+the editor never silently leaves it unassigned or undated---and then
+its own section overrides any of them.  Inheriting in the constructor
+rather than through [[child_meta.get(key, default)]] is what lets one
+helper, [[apply_metadata]], serve both new and matched items, and it
+puts the fallback where a reader looks for it, next to the field it
+fills.  The new item has no number yet; it gets one with its family
+below.  It is appended to [[todos]] at once, so that its own
+sub-headings find it as their parent.
+
+<<pair each section with an item>>=
+def create_sub_item(parent, section):
+    """Create the item a new section describes, under
+    `parent`."""
+    nonlocal next_id
+    child = TodoItem(
+        id=next_id,
+        title=section.title,
+        labels=list(parent.labels),
+        priority=None,
+        status="pending",
+        created=datetime.datetime.now().isoformat(),
+        deadline=parent.deadline,
+        parents=[parent.id],
+        who=parent.who,
+        notes=section.notes,
+    )
+    apply_metadata(child, section.metadata)
+    todos.append(child)
+    by_id[child.id] = child
+    created.append(child.id)
+    if section.id is None:
+        unmarked.setdefault(parent.id, []).append(child)
+    full_sections[child.id] = (section.notes, section.metadata)
+    next_id += 1
+    progress.append(f"  Added sub-item #{child.id}: {child.title}")
+    return child
+@
+
+\paragraph{Changing places.}
+Only a section that showed its item in full can take places away from
+its children, since only there did the buffer show them all.  For each
+such item, a child the buffer showed under it and no heading puts
+there any more loses that place.  An item that loses every parent it
+has, counting only those that exist, is left without a place for now;
+the next phase decides whether it is removed.
+
+<<change the places the buffer changed>>=
+lost_places = {}
+for parent_id in full_sections:
+    if parent_id in salvaged:
+        continue
+    kept = {c.id for c in families.get(parent_id, [])}
+    for child_id in shown_children.get(parent_id, []):
+        child = by_id.get(child_id)
         if (
-            parsed_child.title.strip().lower()
-            not in existing_by_title
-            or existing_by_title[
-                parsed_child.title.strip().lower()
-            ].priority is not None
+            child is not None
+            and child_id not in kept
+            and parent_id in child.parents
+        ):
+            lost_places.setdefault(child_id, []).append(parent_id)
+placeless = set()
+for child_id, places in lost_places.items():
+    child = by_id[child_id]
+    child.parents = [p for p in child.parents if p not in places]
+    if not any(
+        p == ROOT_ID or p in by_id for p in parents_before[child_id]
+        if p not in places
+    ):
+        placeless.add(child_id)
+@
+
+Then every heading that puts an existing item where the buffer did not
+show it gives it that place, unless the place would make the item its
+own ancestor.  A heading left where it was shown changes nothing, even
+if another process has taken the item from that place meanwhile: the
+user did not ask for it back.  A new item has its first place already;
+one made again from a removed item's section may have more, from its
+references.
+The check runs on the graph as it is at that moment, with the places
+taken away already gone, so that a section moved from one parent to
+another below it is not refused for the place it is leaving.  An item
+that had lost every place takes the new one as its only one; the
+others add to theirs.  An item the buffer names but whose new places
+were all refused gets back the places it had.
+
+<<change the places the buffer changed>>=
+gained_places = {}
+for parent_id, family in families.items():
+    for child in family:
+        if (
+            parent_id in child.parents
+            or child.id in shown_children.get(parent_id, [])
+        ):
+            continue
+        if would_make_a_cycle(todos, child, parent_id):
+            typer.echo(
+                f"Warning: #{child.id} cannot go under "
+                f"#{parent_id}, which is #{child.id} itself or "
+                "below it; left it where it was",
+                err=True,
+            )
+            refused_places.append(
+                f"#{child.id} under #{parent_id}"
+            )
+            continue
+        if child.id in placeless:
+            child.parents = [parent_id]
+            placeless.discard(child.id)
+        else:
+            child.parents = child.parents + [parent_id]
+        gained_places.setdefault(child.id, []).append(parent_id)
+<<keep the places of an item whose new places were refused>>
+placeless -= resolved
+@
+
+Keeping the old places undoes what the user did to them: the heading
+under the old parent was deleted, or moved to the refused place.  That
+is the lesser loss, since the alternative is an item with no place at
+all, which would be removed although the buffer names it, but it must
+not pass in silence.  The warning names the places kept, and says when
+they are not the ones the buffer showed: another process changed them
+during the session, and what is kept is its version.
+
+<<keep the places of an item whose new places were refused>>=
+for child_id in placeless & resolved:
+    child = by_id[child_id]
+    child.parents = parents_before[child_id]
+    left = lost_places.pop(child_id)
+    meanwhile = (
+        "" if child.parents == shown[child_id]["parents"]
+        else ", as another process left them meanwhile"
+    )
+    typer.echo(
+        f"Warning: kept #{child_id} "
+        f"{describe_places(child.parents)}{meanwhile}, although "
+        f"the buffer took it from {describe_places(left)}, since "
+        "the buffer gave it no place it could have",
+        err=True,
+    )
+@
+
+The cycle check is [[would_make_a_cycle]], the question behind
+[[require_acyclic_move]] (\cref{sec:todo-edit-parent}), answered
+rather than enforced: [[--parent]] and [[--add-parent]] exit,
+abandoning the write, while the editor refuses one place and stores
+the rest.
+
+A marker is easy to lose: retyping a heading takes it along.  The
+heading then reads as a new item, and the item it named, now missing
+from under its parent, is removed with its history.  The two together,
+under one parent in one save, look more like that accident than like a
+deliberate removal and addition, so we say so, naming both.  The
+removed item may still be named elsewhere in the buffer, moved rather
+than lost, and then there is nothing to warn about, unless it is named
+only by references: then its full section is what was retitled, and
+the item left this place, keeping the ones its references give it.
+
+<<warn about markers that may have been lost>>=
+for parent_id, new_items in unmarked.items():
+    lost = [
+        by_id[child_id] for child_id, places in lost_places.items()
+        if parent_id in places and (
+            child_id not in resolved or child_id not in full_sections
         )
     ]
-    if ranked_titles:
-        prio_high, prio_low = compute_child_priority_range(
-            todos, parent
-        )
-        priorities = distribute_priorities_in_range(
-            len(ranked_titles), prio_high, prio_low,
-        )
-    else:
-        priorities = []
-priority_iter = iter(priorities)
-@
-
-For each section in the parsed document we either update the matching
-existing child (preserving its ID and status) or create a new one.
-Both branches end in [[apply_metadata]] (\cref{sec:apply-metadata}),
-and the difference between them is only what the item holds before it
-is called.  A matched child holds what it already had, so an absent key
-keeps the value the user saw in the buffer.  A new child holds what it
-inherits: the parent's labels, deadline and assignee, so that adding a
-sub-task in the editor never silently leaves it unassigned or
-undated---and then its own section overrides any of them.  Inheriting
-in the constructor rather than through [[child_meta.get(key, default)]]
-is what lets one helper serve both branches, and it puts the fallback
-where a reader looks for it, next to the field it fills.
-
-Routing both branches through the helper also settles a difference
-that had no reason to exist: a matched child now takes [[github]] from
-its section, which the parent has always done and no child ever did, so
-linking a sub-item to an issue in the editor is no longer silently
-discarded on save.  Both branches gain [[env]] for the same reason,
-which no site read before.
-
-Popping each match out of [[existing_by_title]] doubles as the
-seen-marker: whatever is still in the index afterwards had no section
-and was therefore deleted in the editor.
-
-Each settled child is collected with its section, and its own
-sections are reconciled only once the whole level is settled (below).
-
-<<update or create each parsed child>>=
-settled = []
-for parsed_child in parsed_children:
-    norm_title = parsed_child.title.strip().lower()
-    existing_child = existing_by_title.get(norm_title)
-    if (
-        parent.priority is None
-        or (
-            existing_child is not None
-            and existing_child.priority is None
-        )
-    ):
-        prio = None
-    else:
-        prio = next(priority_iter, None)
-    if existing_child is not None:
-        child = existing_by_title.pop(norm_title)
-        <<apply the section to the matched child>>
-    else:
-        now = datetime.datetime.now().isoformat()
-        child = TodoItem(
-            id=next_id,
-            title=parsed_child.title,
-            labels=list(parent.labels),
-            priority=prio,
-            status="pending",
-            created=now,
-            deadline=parent.deadline,
-            parents=[parent.id],
-            who=parent.who,
-            notes=parsed_child.notes,
-        )
-        apply_metadata(child, parsed_child.metadata)
-        todos.append(child)
-        next_id += 1
+    if lost:
         typer.echo(
-            f"  Added sub-item #{child.id}: "
-            f"{child.title}"
+            "Warning: "
+            + ", ".join(f"#{t.id} {t.title!r}" for t in lost)
+            + f" left #{parent_id} and "
+            + ", ".join(repr(t.title) for t in new_items)
+            + " came in new; did a {#N} marker get lost?",
+            err=True,
         )
-    settled.append((child, parsed_child))
 @
 
-A matched child is updated the way the parent is: the section is
-applied to a copy of the child as the untouched buffer would have
-stored it, and only what the section changed is replayed onto the
-stored child, so that a note
-added to a sub-item during the session survives.  A child that matched
-a section but was not shown was added by someone else under the same
-title meanwhile; there is no earlier version to compare with, so the
-section applies to it directly.
-<<apply the section to the matched child>>=
-shown_child = shown.get(child.id)
-if shown_child is None:
-    edited_child = child
-else:
-    edited_child = TodoItem.from_dict(
-        copy.deepcopy(shown_child)
-    )
-edited_child.title = parsed_child.title
-edited_child.notes = parsed_child.notes
-edited_child.priority = prio
-apply_metadata(edited_child, parsed_child.metadata)
-if edited_child is not child:
-    replay_item_edits(
-        child, shown_child, edited_child,
-        as_read[child.id],
+\paragraph{Removing what has no place.}
+An item left without a place is removed, and with it every item below
+that the buffer does not name and whose parents are all removed or
+gone, which is [[removal_plan]]'s rule worked out over the whole buffer
+at once (\cref{sec:todo-rm}).  The ones the buffer does not name
+include those whose section went with the section above them, and
+sub-items another process added under a removed item meanwhile, which
+go with it as they would with [[rm]].  An item that still has another
+parent stays and is detached from the removed ones.  Only a child the
+buffer showed can be left without a place, so an item another process
+added while the editor was open is never removed for being missing
+from the buffer; it is removed only with its parents.
+
+<<remove the items the buffer left without a place>>=
+doomed = set(placeless)
+changed = True
+while changed:
+    changed = False
+    for t in todos:
+        if t.id in doomed or t.id in resolved:
+            continue
+        if any(p in doomed for p in parents_of(t)) and all(
+            p in doomed or (p != ROOT_ID and p not in by_id)
+            for p in parents_of(t)
+        ):
+            doomed.add(t.id)
+            changed = True
+for t in todos:
+    if t.id in placeless:
+        progress.append(f"  Removed sub-item #{t.id}: {t.title}")
+todos = [t for t in todos if t.id not in doomed]
+for removed_id in doomed:
+    del by_id[removed_id]
+for t in todos:
+    gone = [p for p in t.parents if p in doomed]
+    if gone:
+        t.parents = [p for p in t.parents if p not in doomed]
+        lost_places.setdefault(t.id, []).extend(gone)
+@
+
+The places that changed are reported the way [[edit]] reports them
+(\cref{sec:todo-edit-places}), in words from [[describe_places]], once
+the numbers are settled, so that an item put last in a new place is
+reported in one line rather than two.  A move reads as the place left
+and the place taken.  A new place is \enquote{also} a place only if the
+item has another one besides.
+
+<<report the changed places>>=
+for child_id, places in lost_places.items():
+    if child_id in by_id:
+        progress.append(
+            f"  #{child_id} is no longer "
+            f"{describe_places(places)}"
+        )
+for child_id, places in gained_places.items():
+    others = [
+        p for p in by_id[child_id].parents if p not in places
+    ]
+    also = "also " if others else ""
+    line = f"  #{child_id} is now {also}{describe_places(places)}"
+    if placed_last.get(child_id) in places:
+        line += ", last there" if len(places) == 1 else (
+            f", last {describe_places([placed_last[child_id]])}"
+        )
+        del placed_last[child_id]
+    progress.append(line)
+for child_id, place in placed_last.items():
+    progress.append(
+        f"  #{child_id} is now last {describe_places([place])}"
     )
 @
 
-Children remaining in [[existing_by_title]] were not present in the
-parsed document, meaning the user deleted their headings.  Their own
-subtrees go with them: an item whose parent is gone is not hidden but
-promoted to a visible root by [[get_visible_roots]], so leaving
-grandchildren behind would move them into the main list instead of
-removing them.  Only a child the buffer showed can have been deleted
-in it, though.  A child that another process added while the editor
-was open is missing from the buffer for a different reason, and
-removing it would silently undo that process's work.
-<<remove deleted children>>=
-for removed in existing_by_title.values():
-    if removed.id not in shown:
-        continue
-    doomed = {removed.id} | {
-        d.id
-        for d in descendants_of(todos, removed.id)
-    }
-    todos = [t for t in todos if t.id not in doomed]
-    typer.echo(
-        f"  Removed sub-item #{removed.id}: "
-        f"{removed.title}"
-    )
-@
-
+\paragraph{Ranking the families.}
+Priority distribution uses the parent's child range so that ranked
+children sort correctly relative to other items when the list is
+shown flat.  Without this, all children of every parent would receive
+priorities in [0, 1] and would interleave arbitrarily.
 
 A child's own range is bounded by its siblings' numbers
 (\cref{sec:child-priority-helpers}), so the level below can only be
@@ -24064,45 +25292,200 @@ Reconciling each child as soon as it was settled computed its range
 against siblings still carrying their old numbers: a first child
 moved from~4.9 to~4.5 next to a sibling about to go from~3.2 to~4.0
 saw the range $(3.2, 4.5)$ and spread its children below where that
-sibling would land.  We therefore settle the whole level and remove
-what was deleted first, and only then descend.
+sibling would land.  We therefore rank the buffer level by level, the
+edited item's family first, and each family once, at the first level
+it turns up on.  Only a family whose item the buffer shows in full is
+laid out again, since only there is its order the buffer's; children
+typed under a reference alone are placed at the bottom with those that
+lost their place, below.
 
-The new numbers are also new child ranges.  The recursive call
+<<rank each family the buffer shows>>=
+numbered = set()
+<<rank one family by its headings>>
+level, ranked_families = [edited], set()
+while level:
+    below = []
+    for parent in level:
+        if parent.id in ranked_families or parent.id not in by_id:
+            continue
+        ranked_families.add(parent.id)
+        family = [
+            c for c in families.get(parent.id, [])
+            if c.id in by_id
+        ]
+        if parent.id in full_sections:
+            rank_family(parent, family)
+        below += family
+    level = below
+@
+
+A family is laid out evenly over its parent's range, in the order of
+its headings, by [[distribute_priorities_in_range]].  Not every child
+takes a slot.  An unranked child stays unranked until the user runs
+[[reprioritize]], and a guest keeps the number of the place it is
+ranked in.  The children that take a slot are the new ones, the ones
+ranked under this parent, the ones that lost the place they were
+ranked in, and the ones that have just gained this place; the last
+keep their own number if it is higher, which is the rule that an item
+keeps the highest place it has (\cref{sec:ranking-context}).  So does
+a child already numbered by a family on an earlier level, one the
+user put under two sections.  Under an
+unranked parent the slots are empty, and its own children become
+unranked, since a ranked child of an unranked parent has no range to
+live in.
+
+The new numbers are also new child ranges.  The level below
 redistributes the grandchildren the buffer shows, but not one another
-process added under a child during the session, so before descending
-we carry each existing child's subtree from its old range to its new
-one (\cref{sec:subtree-follows-parent}); the old ranges are recorded
-before any number changes.  A newly created child has no subtree yet
-and no old range.
+process added under a child during the session, so we carry each
+child's subtree from its old range to its new one
+(\cref{sec:subtree-follows-parent}); the old ranges are recorded
+before any number in the family changes.  A newly created child has
+no subtree yet and no old range.
 
-<<record the children's ranges before they move>>=
-old_ranges = {
-    c.id: child_priority_range_or_none(todos, c)
-    for c in children
-}
-<<carry each child's subtree to its new range>>=
-for child, _ in settled:
-    move_subtree_priorities(
-        todos, child, old_ranges.get(child.id),
-        child_priority_range_or_none(todos, child),
+In a tree the subtrees of two siblings are apart.  With several
+parents they may share an item, and once the carry of one sibling has
+moved it, its new number may lie in the old range of another, whose
+carry would then move it a second time, out of the place just made for
+it.  A shared item the buffer shows is laid out again with its family
+on the next level, which hides the damage, but one another process
+added during the session is not, and keeps the wrong number.  So each
+carry leaves alone what an earlier carry moved, and the
+members the layout has just numbered.  A member that kept a higher
+number of its own was not laid out here, and a carry may still move
+it: C, put under Q as well as under S, keeps its number in S's range
+and must go along when S is laid out again under Q.  That never
+skips a move an item needed: siblings' ranges do not overlap, so an
+item lay in the old range of one of them at most.
+
+<<rank one family by its headings>>=
+def rank_family(parent, family):
+    """Number the children in `family` that rank under
+    `parent`, in the order of their headings, and carry
+    their subtrees."""
+    members = [c for c in family if takes_a_slot(parent, c)]
+    if not members:
+        return
+    if parent.priority is None:
+        numbers = [None] * len(members)
+    else:
+        numbers = distribute_priorities_in_range(
+            len(members),
+            *compute_child_priority_range(todos, parent),
+        )
+    old_ranges = {
+        c.id: child_priority_range_or_none(todos, c)
+        for c in members
+    }
+    laid_out = set()
+    for child, number in zip(members, numbers):
+        if child.id not in numbered and (
+            child.priority is None or ranks_here(parent, child)
+        ) or number is not None and (
+            child.priority is None or number > child.priority
+        ):
+            child.priority = number
+            laid_out.add(child.id)
+        numbered.add(child.id)
+    carried = set(laid_out)
+    for child in members:
+        carried.update(
+            moved.id for moved in move_subtree_priorities(
+                todos, child, old_ranges[child.id],
+                child_priority_range_or_none(todos, child),
+                keep=carried,
+            )
+        )
+
+
+def ranks_here(parent, child):
+    """Tell whether `child`'s number belongs to `parent`'s
+    range: it was ranked there, or lost its ranking
+    place."""
+    return (
+        context_before.get(child.id) == parent.id
+        or context_before.get(child.id) not in child.parents
+    )
+
+
+def takes_a_slot(parent, child):
+    """Tell whether `child` is numbered with `parent`'s
+    family."""
+    if parent.id not in child.parents:
+        return False
+    if child.id in created:
+        return True
+    if child.priority is None:
+        return False
+    return ranks_here(parent, child) or (
+        parent.id not in parents_before.get(child.id, [])
     )
 @
 
-A newly appended child is on [[todos]] by the time we descend, which
-is what lets [[children_of]] find its own level on the recursive call,
-so a freshly created child can already receive grandchildren in the
-same save.
+\paragraph{The rest.}
+Two kinds of item still need a number.  A new item typed under a
+reference alone is placed at the bottom of that place.  An item that
+lost the place its number came from, and took no slot in a family
+above, keeps a number from a range it has left; it goes to the bottom
+of its highest remaining place, through [[place_in_places]] as an
+item detached by [[rm]] does (\cref{sec:todo-rm}), and is settled
+like any placed item, the nesting left to the end.
 
-<<reconcile each child against its own sections>>=
-for child, parsed_child in settled:
-    reconcile_children(child, parsed_child.children)
+<<place again what lost its place>>=
+placed_last = {}
+for child in [
+    by_id[i] for i in [*created, *lost_places]
+    if i in by_id and i not in numbered
+]:
+    if child.id not in created and (
+        child.priority is None
+        or context_before.get(child.id) in child.parents
+    ):
+        continue
+    old_range = child_priority_range_or_none(todos, child)
+    child.priority = place_in_places(
+        todos, child, child.parents, PLACE_BOTTOM,
+    )
+    settle_placement(
+        todos, child, old_range, None, was_nested=False,
+    )
+    if child.id not in created and child.priority is not None:
+        placed_last[child.id] = ranking_context(todos, child)
+@
+
+Last, the edited item is settled where it is, as every command settles
+the items it places (\cref{sec:sibling-above-squeezed}).  Its place
+has not changed, so nothing of its own moves; what the call adds is
+the rest of the rule, applied to everything the families' numbering
+moved.  A shared item that a new family layout took below the range of
+one of its other places is lifted back to that place, and the ranges
+are checked to still nest.  The nesting is repaired only if the buffer
+broke it, as with every placement (\cref{sec:ranking-context}): the
+callback notes at its start whether the ranges nested, and the
+intermediate placements above pass [[was_nested=False]], as [[rm]]'s
+do, so that the list is checked once, as a whole, when the buffer is
+in.  A list without shared items before or after is left as the
+layout made it.
+
+<<note whether the ranges nested before the buffer>>=
+shared_before = list_has_shared_items(todos)
+nested_before = ranking_is_consistent(todos)
+
+<<settle the edited item and what it heads>>=
+settle_placement(
+    todos, edited,
+    child_priority_range_or_none(todos, edited),
+    (edited.priority, list(edited.parents)),
+    was_nested=nested_before and (
+        shared_before or list_has_shared_items(todos)
+    ),
+)
 @
 
 \subsection{Testing Editor Reconciliation}
 
 An item with several parents can be edited in the editor, and keeps its
-places; an item with such an item below it cannot, and the editor is
-not even opened.
+places as long as its [[parents:]] line is left alone
+(\cref{sec:edit-buffer-parents}).
 
 <<test functions>>=
 def test_edit_editor_keeps_the_places_of_a_shared_item(
@@ -24126,23 +25509,1055 @@ def test_edit_editor_keeps_the_places_of_a_shared_item(
   assert (todos[1].title, todos[1].parents) == (
     "Renamed", [ROOT_ID, 1],
   )
+@
 
+The tests below edit a diamond.  E~(\#1) is at the top level with
+children P~(\#2) and Q~(\#3).  S~(\#4) is under both and ranked under P,
+with a child C~(\#5) of its own, and O~(\#6) is P's only-child below S.
+Its buffer shows S in full under P and as a reference under Q.  The
+helpers change a buffer the way a user would: drop a section with its
+sub-sections, or add lines at the end, which is under Q.
 
-def test_edit_editor_refuses_a_shared_sub_item(temp_todo_dir):
-  """A shared item below would be mishandled, so -E refuses."""
-  save_todos(4, [
-    TodoItem(id=1, title="A", created="2026-02-20T10:00:00"),
-    TodoItem(id=2, title="B", created="2026-02-20T10:00:00"),
+<<test functions>>=
+def save_diamond():
+  """Save E > P, Q; S under P and Q, ranked under P;
+  C under S; O under P."""
+  save_todos(7, [
     TodoItem(
-      id=3, title="Shared", parents=[1, 2],
-      created="2026-02-20T10:00:00",
-    ),
+      id=n, title=title, parents=parents, priority=priority,
+      notes=notes, created="2026-02-20T10:00:00",
+      who=default_username,
+    )
+    for n, title, parents, priority, notes in [
+      (1, "E", [ROOT_ID], 5.0, ""),
+      (2, "P", [1], 4.5, ""),
+      (3, "Q", [1], 4.0, ""),
+      (4, "S", [2, 3], 4.25, "Shared notes"),
+      (5, "C", [4], 4.2, ""),
+      (6, "O", [2], 4.1, ""),
+    ]
   ])
+
+
+def edit_buffer(todo_id, change):
+  """Run `edit -E` on `todo_id` with the buffer changed by
+  `change`; return the result and the buffer shown."""
+  seen = {}
+
+  def editor(text):
+    seen["text"] = text
+    return change(text)
+
+  with patch("nytid.cli.todo.open_editor", side_effect=editor):
+    result = runner.invoke(cli, ["edit", str(todo_id), "-E"])
+  return result, seen["text"]
+
+
+def drop_section(text, heading):
+  """Return `text` without the section headed `heading`
+  and its sub-sections."""
+  lines = text.split("\n")
+  start = lines.index(heading)
+  level = len(heading) - len(heading.lstrip("#"))
+  end = next(
+    (
+      i for i in range(start + 1, len(lines))
+      if re.match(r"#{1,%d} " % level, lines[i])
+    ),
+    len(lines),
+  )
+  return "\n".join(lines[:start] + lines[end:])
+
+
+def stored_by_id():
+  """Return the stored items by ID."""
+  _, todos = load_todos()
+  return {t.id: t for t in todos}
+@
+
+Saving the buffer unchanged changes nothing but the spacing of the
+numbers, which the editor has always laid out again, and the second
+save not even that.  The shared item keeps both places, its notes and
+its child, and is still ranked under P.
+
+<<test functions>>=
+def test_edit_editor_diamond_round_trip(temp_todo_dir):
+  """An unchanged diamond buffer stores what it showed."""
+  save_diamond()
+  _, before = load_todos()
+  result, text = edit_buffer(1, lambda text: text)
+  assert result.exit_code == 0, result.output
+  assert text.count("S {#4}") == text.count("S {also #4}") == 1
+  _, first = load_todos()
+  assert edit_buffer(1, lambda text: text)[0].exit_code == 0
+  _, second = load_todos()
+  assert second == first
+
+  def shape(todos):
+    return [
+      (t.id, t.title, t.parents, t.notes)
+      for t in sorted(todos, key=lambda t: -t.priority)
+    ]
+  assert shape(first) == shape(before)
+  assert ranking_context(first, first[3]) == 2
+  assert ranking_is_consistent(first)
+@
+
+Deleting S's full section takes S away from P only.  It keeps its notes
+and its child, and since P was where its number came from, it is
+ranked again under Q, where its reference is the only heading.  Deleting
+the reference instead takes S away from Q only.  O, whose only parent
+is P, is removed when its heading is, and S goes too once both its
+headings have.
+
+<<test functions>>=
+def test_edit_editor_delete_under_one_parent_detaches(
+  temp_todo_dir,
+):
+  """Deleting a shared item's section detaches it."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: drop_section(text, "## S {#4}"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 is no longer under #2" in result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == [3]
+  assert by_id[4].notes == "Shared notes"
+  assert by_id[5].parents == [4]
+  todos = list(by_id.values())
+  assert ranking_context(todos, by_id[4]) == 3
+  assert ranking_is_consistent(todos)
+
+
+def test_edit_editor_delete_reference_detaches(temp_todo_dir):
+  """Deleting a reference detaches only that place."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: drop_section(text, "## S {also #4}"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 is no longer under #3" in result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == [2]
+  assert by_id[4].notes == "Shared notes"
+  assert by_id[5].parents == [4]
+
+
+def test_edit_editor_delete_only_parent_child_removes(
+  temp_todo_dir,
+):
+  """A sub-item with no other parent is removed."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: drop_section(text, "## O {#6}"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "Removed sub-item #6: O" in result.output
+  assert set(stored_by_id()) == {1, 2, 3, 4, 5}
+
+
+def test_edit_editor_delete_every_heading_removes(
+  temp_todo_dir,
+):
+  """A shared item goes once all its headings have gone,
+  and its child with it."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(
+      drop_section(text, "## S {also #4}"), "## S {#4}",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert set(stored_by_id()) == {1, 2, 3, 6}
+@
+
+Deleting a parent's section with the shared item in it, the section of
+P, removes P and O but only detaches S, which still has its place
+under Q:
+
+<<test functions>>=
+def test_edit_editor_delete_parent_keeps_shared_child(
+  temp_todo_dir,
+):
+  """Removing a parent detaches a child it shares."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: drop_section(text, "# P {#2}"),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert set(by_id) == {1, 3, 4, 5}
+  assert by_id[4].parents == [3]
+  assert ranking_is_consistent(list(by_id.values()))
+@
+
+Editing P alone, the buffer does not show Q.  Deleting S there detaches
+S from the place its number came from, and no section of the buffer
+ranks it any more, so it goes to the bottom of Q, its remaining place,
+as [[rm]] would put it:
+
+<<test functions>>=
+def test_edit_editor_detached_item_goes_last(temp_todo_dir):
+  """An item detached from its ranking place outside the
+  buffer is put last where it still is."""
+  save_diamond()
+  result, _ = edit_buffer(
+    2, lambda text: drop_section(text, "# S {#4}"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 is now last under #3" in result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == [3]
+  todos = list(by_id.values())
+  assert ranking_context(todos, by_id[4]) == 3
+  assert by_id[4].priority < by_id[3].priority
+  assert ranking_is_consistent(todos)
+@
+
+A section moved under another heading moves the item, keeping its ID,
+and ranks it there; a reference added under a heading gives the item
+that place as well and leaves its number, which is higher than Q's
+range, alone.  Reordering headings re-ranks the children ranked under
+that parent, and C still follows S directly.
+
+<<test functions>>=
+def test_edit_editor_moves_a_section(temp_todo_dir):
+  """A section moved under another heading moves the item."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "## O {#6}") + "\n## O {#6}\n",
+  )
+  assert result.exit_code == 0, result.output
+  assert "#6 is no longer under #2" in result.output
+  assert "#6 is now under #3" in result.output
+  by_id = stored_by_id()
+  assert by_id[6].parents == [3]
+  todos = list(by_id.values())
+  assert ranking_context(todos, by_id[6]) == 3
+  assert ranking_is_consistent(todos)
+
+
+def test_edit_editor_reference_adds_a_place(temp_todo_dir):
+  """A reference typed under a heading adds a place."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text + "\n## O {also #6}\n",
+  )
+  assert result.exit_code == 0, result.output
+  assert "#6 is now also under #3" in result.output
+  by_id = stored_by_id()
+  assert by_id[6].parents == [2, 3]
+  todos = list(by_id.values())
+  assert ranking_context(todos, by_id[6]) == 2
+  assert ranking_is_consistent(todos)
+
+
+def test_edit_editor_reorder_reranks(temp_todo_dir):
+  """Swapping two headings swaps their ranks."""
+  save_diamond()
+
+  def swap(text):
+    o_section = text[text.index("## O {#6}"):text.index("# Q {#3}")]
+    text = text.replace(o_section, "")
+    return text.replace("## S {#4}", o_section + "## S {#4}")
+
+  result, _ = edit_buffer(1, swap)
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert by_id[6].priority > by_id[4].priority
+  todos = list(by_id.values())
+  assert ranking_is_consistent(todos)
+@
+
+Two changes made at once: S, detached from P, is laid out again under
+Q, and C, put under Q as well, keeps the higher number it has in S's
+range.  C is a member of Q's family without being laid out there, so
+S's carry must still take it along; left behind, C would sit above
+everything, ranked under S though far from it.
+
+<<test functions>>=
+def test_edit_editor_carries_a_kept_number(temp_todo_dir):
+  """A child keeping its number moves with its parent."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "## S {#4}")
+    + "\n## C {also #5}\n",
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert (by_id[4].parents, by_id[5].parents) == ([3], [4, 3])
+  assert ranking_is_consistent(list(by_id.values()))
+@
+
+A place that would make an item its own ancestor is refused with a
+warning, the rest of the buffer is stored, and the command fails
+naming the refused place.  Text under a reference
+is not applied, with a warning, since the item's text is in its full
+section.
+
+<<test functions>>=
+def test_edit_editor_refuses_a_cycle(temp_todo_dir):
+  """A reference to the edited item below itself is
+  refused; the rest is saved."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: text.replace("# P {#2}", "# Pa {#2}")
+    + "\n## E {also #1}\n",
+  )
+  assert result.exit_code == 1, result.output
+  assert "#1 cannot go under #3" in result.output
+  assert "saved the buffer except #1 under #3" in result.output
+  by_id = stored_by_id()
+  assert by_id[1].parents == [ROOT_ID]
+  assert by_id[2].title == "Pa"
+
+
+def test_edit_editor_ignores_text_under_a_reference(
+  temp_todo_dir,
+):
+  """Notes typed under a reference warn and are ignored."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: text.replace(
+      "## S {also #4}", "## S {also #4}\n\nOther notes",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "ignored the text" in result.output
+  assert stored_by_id()[4].notes == "Shared notes"
+@
+
+The IDs also settle the collision that matching by title had: two
+siblings with the same title are two items, each edited through its
+own section.
+
+<<test functions>>=
+def test_edit_editor_tells_same_titles_apart(temp_todo_dir):
+  """Two children with one title keep their own notes."""
+  save_todos(4, [
+    TodoItem(
+      id=n, title=title, parents=parents, priority=priority,
+      notes=notes, created="2026-02-20T10:00:00",
+    )
+    for n, title, parents, priority, notes in [
+      (1, "Paper", [ROOT_ID], 5.0, ""),
+      (2, "Review", [1], 4.5, "first"),
+      (3, "Review", [1], 4.0, "second"),
+    ]
+  ])
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("second", "changed"),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert (by_id[2].notes, by_id[3].notes) == ("first", "changed")
+@
+
+A marker followed by more text still names its item, which keeps its
+ID and takes the text around the marker as its title.  A heading that
+lost its marker instead reads as a new item, and the warning names both
+the item that left and the one that came:
+
+<<test functions>>=
+def test_edit_editor_marker_inside_the_heading(temp_todo_dir):
+  """Text after the marker is part of the title."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("## O {#6}", "## O {#6 } today"),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert (by_id[6].title, by_id[6].parents) == ("O today", [2])
+
+
+def test_edit_editor_warns_about_a_lost_marker(temp_todo_dir):
+  """A shown item replaced by a marker-less heading warns."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("## O {#6}", "## O again"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#6 'O' left #2 and 'O again' came in new" in result.output
+@
+
+A full section retitled with its marker lost, while a reference keeps
+the item, is the same accident: S leaves P, kept under Q by its
+reference, and the new item takes its place, so the warning names both.
+A section typed again under the title of one whose section was deleted
+is taken for that item, and when it lacks the notes or sub-items the
+item had, a warning says so; a reference made full but with text of
+its own is not warned about.
+
+<<test functions>>=
+def test_edit_editor_warns_about_a_lost_full_marker(temp_todo_dir):
+  """A retitled full section without its marker warns."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text.replace("## S {#4}", "## S renamed"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 'S' left #2 and 'S renamed' came in new" in (
+    result.output
+  )
+  assert stored_by_id()[4].parents == [3]
+
+
+def test_edit_editor_warns_when_a_title_match_drops_text(
+  temp_todo_dir,
+):
+  """A new section under an old title replaces its text."""
+  save_diamond()
+
+  def retype_s(text):
+    s_section = text[text.index("## S {#4}"):text.index("## O {#6}")]
+    return text.replace(s_section, "## S\n\nfresh\n\n")
+
+  result, _ = edit_buffer(1, retype_s)
+  assert result.exit_code == 0, result.output
+  assert "taken to be #4 by its title" in result.output
+  assert stored_by_id()[4].notes == "fresh"
+
+
+def test_edit_editor_reference_made_full_with_text(temp_todo_dir):
+  """A reference made full, with text, is not warned about."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "## S {#4}").replace(
+      "## S {also #4}", "## S {#4}\n\nKept notes",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "did you mean" not in result.output
+  assert stored_by_id()[4].notes == "Kept notes"
+@
+
+Notes with lines that look like headings, naming items inside the
+buffer and outside it, come back from an unchanged buffer as they
+were, and neither rename a sub-item nor make the save fail
+(\cref{sec:note-escaping}).  A title with a line break in it cannot be
+escaped that way, and the editor is refused before it opens.
+
+<<test functions>>=
+def test_edit_editor_keeps_heading_like_notes(temp_todo_dir):
+  """Notes starting with # stay notes."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[0].notes = f"# Other {{#{next_id}}}\n\\# escaped already"
+  todos[1].notes = "# not a heading {#6}"
+  save_todos(next_id + 1, todos + [TodoItem(
+    id=next_id, title="Outside", created="2026-02-20T10:00:00",
+  )])
+  _, before = load_todos()
+  result, _ = edit_buffer(1, lambda text: text)
+  assert result.exit_code == 0, result.output
+  _, after = load_todos()
+  assert [(t.id, t.title, t.notes, t.parents) for t in after] == [
+    (t.id, t.title, t.notes, t.parents) for t in before
+  ]
+
+
+def test_edit_editor_refuses_a_buffer_that_misreads(
+  temp_todo_dir,
+):
+  """A title with a line break refuses -E before editing."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].title = "O\n# looks like a heading"
+  save_todos(next_id, todos)
   with patch("nytid.cli.todo.open_editor") as editor:
     result = runner.invoke(cli, ["edit", "1", "-E"])
   assert result.exit_code == 1
-  assert "#3 below #1 has several parents" in result.output
+  assert "would not read back" in result.output
   editor.assert_not_called()
+@
+
+Line breaks other than a newline are part of their line
+(\cref{sec:buffer-lines}): a note with a carriage return, a form feed
+or a record separator before a heading-like text, and a title with one,
+come back from an unchanged buffer as they were, and Q keeps its title;
+so does a note with carriage-return line ends, which the save tidies
+into plain newlines.
+A Markdown rule pair in the notes of a sub-item without front matter,
+where the first rule would open one, stays notes
+(\cref{sec:note-escaping}).  The edited item's title with a newline in
+it cannot be shown, and [[-E]] says which field of which item.
+
+<<test functions>>=
+@pytest.mark.parametrize("sep", ["\r", "\x0c", "\x1e", "\u2028", "\r\n"])
+def test_edit_editor_keeps_odd_line_breaks(temp_todo_dir, sep):
+  """Only a newline breaks a buffer line."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].notes = f"one{sep}# head {{#3}}{sep}two"
+  if "\n" not in sep:
+    todos[5].title = f"O{sep}tail"
+  todos[4].notes = "intro\n---\nmiddle: part\n---\nend"
+  todos[4].who = None
+  save_todos(next_id, todos)
+  _, before = load_todos()
+  result, _ = edit_buffer(1, lambda text: text)
+  assert result.exit_code == 0, result.output
+  _, after = load_todos()
+  assert [(t.id, t.title, t.notes, t.parents) for t in after] == [
+    (t.id, t.title, t.notes.replace("\r\n", "\n"), t.parents)
+    for t in before
+  ]
+
+
+@pytest.mark.parametrize("command", [
+  '"$EDITOR" notes.md', "'quoted' arg", "  42",
+])
+def test_edit_editor_keeps_a_quoted_command(temp_todo_dir, command):
+  """A command the inline form would change reads back."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].command = command
+  save_todos(next_id, todos)
+  for todo_id in (6, 1):
+    result, _ = edit_buffer(todo_id, lambda text: text)
+    assert result.exit_code == 0, result.output
+    assert stored_by_id()[6].command == command
+
+
+def test_edit_editor_names_a_field_that_misreads(temp_todo_dir):
+  """A title with a newline in the edited item refuses -E."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[0].title = "E\nsecond line"
+  save_todos(next_id, todos)
+  with patch("nytid.cli.todo.open_editor") as editor:
+    result = runner.invoke(cli, ["edit", "1", "-E"])
+  assert result.exit_code == 1
+  assert "the title of #1 would not read back" in result.output
+  editor.assert_not_called()
+@
+
+A heading naming an item the buffer never showed and that does not
+exist is a refused place, and nothing is made up for it or for the
+headings under it.  An item another process removed during the
+session stays removed when the user left its section alone, and comes
+back once, under a new ID and in every place its headings give it,
+when the user changed it.
+
+<<test functions>>=
+def test_edit_editor_refuses_unknown_ids(temp_todo_dir):
+  """Headings of items that never existed add nothing."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1, lambda text: text + "\n## X {also #55}\n\n## Y {#56}\n\n### Z\n",
+  )
+  assert result.exit_code == 1, result.output
+  assert "no #55 to put under #3" in result.output
+  assert "except #55 under #3, #56 under #3" in result.output
+  assert set(stored_by_id()) == {1, 2, 3, 4, 5, 6}
+
+
+def remove_meanwhile(*ids):
+  """Return an editor that removes `ids` from the store, as
+  another process would, and then applies `change`."""
+  def editor(change):
+    def meanwhile(text):
+      next_id, todos = load_todos()
+      save_todos(next_id, [t for t in todos if t.id not in ids])
+      return change(text)
+    return meanwhile
+  return editor
+
+
+def test_edit_editor_unchanged_removed_item_stays_removed(
+  temp_todo_dir,
+):
+  """An untouched section of an item removed meanwhile is
+  dropped."""
+  save_diamond()
+  result, _ = edit_buffer(1, remove_meanwhile(6)(lambda text: text))
+  assert result.exit_code == 0, result.output
+  assert "#6 was removed during the session" in result.output
+  assert set(stored_by_id()) == {1, 2, 3, 4, 5}
+
+
+def test_edit_editor_changed_removed_item_comes_back_once(
+  temp_todo_dir,
+):
+  """A changed section of an item removed meanwhile is made
+  again, once, in all its places."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    remove_meanwhile(4, 5)(
+      lambda text: text.replace("Shared notes", "Changed notes"),
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "made your changed section into #7" in result.output
+  by_id = stored_by_id()
+  assert set(by_id) == {1, 2, 3, 6, 7}
+  assert (by_id[7].title, by_id[7].notes, by_id[7].parents) == (
+    "S", "Changed notes", [2, 3],
+  )
+  assert ranking_is_consistent(list(by_id.values()))
+@
+
+The headings under a skipped heading still name their items.  O moved
+under a mistyped heading keeps its place under P, with its typed
+notes, instead of being removed with nowhere to go, and S moved there
+with C below it leaves C under S.  O moved into the unchanged section
+of S, which another process removed, keeps its place too, and notes
+typed into C's section there are kept.
+
+<<test functions>>=
+def test_edit_editor_keeps_an_item_under_a_mistyped_heading(
+  temp_todo_dir,
+):
+  """An item moved under an unknown ID keeps its old place."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "## O {#6}")
+    + "\n## Y {#56}\n\n### O {#6}\n\nO notes\n",
+  )
+  assert result.exit_code == 1, result.output
+  assert "kept #6 under #2" in result.output
+  by_id = stored_by_id()
+  assert (by_id[6].parents, by_id[6].notes) == ([2], "O notes")
+
+
+def test_edit_editor_skipped_section_takes_no_places(
+  temp_todo_dir,
+):
+  """A section applied under a skipped heading leaves its
+  sub-items' places alone."""
+  save_diamond()
+
+  def move_s_under_a_typo(text):
+    s_section = text[text.index("## S {#4}"):text.index("## O {#6}")]
+    return text.replace(s_section, "") + "\n## Y {#56}\n\n#" + s_section
+
+  result, _ = edit_buffer(1, move_s_under_a_typo)
+  assert result.exit_code == 1, result.output
+  assert "kept #5" not in result.output
+  by_id = stored_by_id()
+  assert (by_id[4].parents, by_id[5].parents) == ([3], [4])
+
+
+def test_edit_editor_keeps_an_item_under_a_dropped_section(
+  temp_todo_dir,
+):
+  """An item moved into a dropped section keeps its place."""
+  save_diamond()
+
+  def move_o_under_s(text):
+    o_section = text[text.index("## O {#6}"):text.index("# Q {#3}")]
+    text = text.replace(o_section, "")
+    return text.replace("### C {#5}", "#" + o_section + "### C {#5}")
+
+  result, _ = edit_buffer(1, remove_meanwhile(4, 5)(move_o_under_s))
+  assert result.exit_code == 0, result.output
+  assert "#4 was removed during the session" in result.output
+  assert stored_by_id()[6].parents == [2]
+
+
+def test_edit_editor_keeps_notes_typed_in_a_dropped_section(
+  temp_todo_dir,
+):
+  """Notes typed into a sub-item of a dropped section stay."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[4].parents = [4, 3]
+  save_todos(next_id, todos)
+
+  def meanwhile(text):
+    next_id, todos = load_todos()
+    todos[4].parents = [3]
+    save_todos(next_id, [t for t in todos if t.id != 4])
+    return text.replace("### C {#5}\n---\n", "### C {#5}\n\nTyped\n---\n")
+
+  result, _ = edit_buffer(1, meanwhile)
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert (by_id[5].parents, by_id[5].notes) == ([3], "Typed")
+@
+
+Deleting the marker of S's full section, while its reference under Q
+stays, leaves a heading that still describes S where it was shown in
+full.  It is matched by its title there, so S keeps both places and
+takes the edited notes:
+
+<<test functions>>=
+def test_edit_editor_full_section_without_its_marker(
+  temp_todo_dir,
+):
+  """A full section that lost its marker still names S."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: text.replace("## S {#4}", "## S").replace(
+      "Shared notes", "Edited notes",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert set(by_id) == {1, 2, 3, 4, 5, 6}
+  assert (by_id[4].parents, by_id[4].notes) == (
+    [2, 3], "Edited notes",
+  )
+  assert by_id[5].parents == [4]
+@
+
+Moving P's section under S, through a reference typed under S's own
+reference, would put P below its own child, and the place is refused.
+P then has no place the buffer could give it, since its section under
+E is gone, so it keeps the place under E, with a warning, rather than
+being removed while the buffer names it:
+
+<<test functions>>=
+def test_edit_editor_refused_move_keeps_the_old_place(
+  temp_todo_dir,
+):
+  """A refused new place leaves the old one, with a warning."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "# P {#2}")
+    + "\n### P {also #2}\n",
+  )
+  assert result.exit_code == 1, result.output
+  assert "kept #2 under #1, although the buffer took it" in (
+    result.output
+  )
+  by_id = stored_by_id()
+  assert set(by_id) == {1, 2, 3, 4, 5, 6}
+  assert by_id[2].parents == [1]
+@
+
+An item that takes a new place and goes last in it is reported once.
+Editing P, S is taken from under P, the place its number came from,
+and put under X, an item from outside the buffer that the user links
+under P; X ranks above Q, so S goes last under X:
+
+<<test functions>>=
+def test_edit_editor_reports_a_new_last_place_once(temp_todo_dir):
+  """'now also under #7, last there', not two lines."""
+  save_diamond()
+  next_id, todos = load_todos()
+  save_todos(next_id + 1, todos + [TodoItem(
+    id=next_id, title="X", priority=6.0,
+    created="2026-02-20T10:00:00", who=default_username,
+  )])
+  result, _ = edit_buffer(
+    2,
+    lambda text: drop_section(text, "# S {#4}")
+    + "\n# X {#7}\n\n## S {also #4}\n",
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 is now also under #7, last there" in result.output
+  assert "#4 is now last" not in result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == [3, 7]
+  assert ranking_context(list(by_id.values()), by_id[4]) == 7
+@
+
+Deleting S's full section and the [[also]] of its reference makes the
+reference an empty full section.  That empties S's notes and removes
+C, whose only place was under S, and the warning says so beforehand.
+A full heading naming an item from outside the buffer, Q in P's
+buffer, only links it: Q keeps its title and its notes.
+
+<<test functions>>=
+def test_edit_editor_warns_about_an_emptied_reference(
+  temp_todo_dir,
+):
+  """A reference made full and empty warns."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: drop_section(text, "## S {#4}").replace(
+      "## S {also #4}", "## S {#4}",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "did you mean {also #4}?" in result.output
+  by_id = stored_by_id()
+  assert (by_id[4].parents, by_id[4].notes) == ([3], "")
+
+
+def test_edit_editor_full_heading_from_outside_links(
+  temp_todo_dir,
+):
+  """{#3} for an item the buffer did not show only links it."""
+  save_diamond()
+  result, _ = edit_buffer(
+    2, lambda text: text + "\n# Renamed {#3}\n\nNew notes\n",
+  )
+  assert result.exit_code == 0, result.output
+  assert "ignored the text" in result.output
+  by_id = stored_by_id()
+  assert (by_id[3].title, by_id[3].notes, by_id[3].parents) == (
+    "Q", "", [1, 2],
+  )
+@
+
+The places taken away are the ones the buffer showed and the store
+still has.  When another process moved O from P to Q during the
+session, deleting O's heading under P takes nothing: O stays under Q,
+and the editor reports nothing taken from P (the indented lines are
+the editor's; the other command reports its own move).
+
+<<test functions>>=
+def test_edit_editor_deleted_heading_of_a_moved_item(
+  temp_todo_dir,
+):
+  """A place another process already took is not taken
+  again."""
+  from nytid.cli.todo import edit
+  save_diamond()
+
+  def meanwhile(text):
+    edit(None, todo_id=6, parent=3, top=True)
+    return drop_section(text, "## O {#6}")
+
+  result, _ = edit_buffer(1, meanwhile)
+  assert result.exit_code == 0, result.output
+  assert "  #6 is no longer under #2" not in result.output
+  assert stored_by_id()[6].parents == [3]
+@
+
+Finally the session itself, with the overlap of
+\cref{sec:todo-read-modify-write}.  While the buffer is open another
+process adds a note to S and a sub-item under it, and takes O from
+under P; the user detaches S from P.  The note and the sub-item
+survive, since the buffer did not show them, and O stays where the
+other process put it, since the user left its heading where it was
+shown.
+
+<<test functions>>=
+def test_edit_editor_diamond_keeps_concurrent_work(
+  temp_todo_dir,
+):
+  """Work stored during a diamond edit survives it."""
+  from nytid.cli.todo import add, edit, note
+  save_diamond()
+
+  def meanwhile(text):
+    note(4, message="Agent", edit=False)
+    add(
+      None, title="Meanwhile", parent=[4], explicit_priority=4.15,
+    )
+    edit(None, todo_id=6, parent=3, top=True)
+    return drop_section(text, "## S {#4}")
+
+  result, _ = edit_buffer(1, meanwhile)
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == [3]
+  assert without_note_headers(by_id[4].notes) == (
+    "Shared notes\n\nAgent"
+  )
+  assert by_id[7].parents == [4]
+  assert by_id[6].parents == [3]
+@
+
+An item another process puts under both P and Q during the session,
+ranked at the bottom of P, is in neither family the buffer lays out,
+so only the carries move it.  P's carry takes it along into P's new
+range, to the same relative place; Q's carry, whose old range the new
+number lies in, must leave it there.
+
+<<test functions>>=
+def test_edit_editor_carries_a_shared_item_once(temp_todo_dir):
+  """A shared item added meanwhile moves with P only."""
+  save_diamond()
+
+  def meanwhile(text):
+    next_id, todos = load_todos()
+    save_todos(next_id + 1, todos + [TodoItem(
+      id=next_id, title="Z", parents=[2, 3], priority=4.05,
+      created="2026-02-20T10:00:00",
+    )])
+    return text
+
+  result, _ = edit_buffer(1, meanwhile)
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  p, q = by_id[2].priority, by_id[3].priority
+  assert by_id[7].priority == pytest.approx(q + 0.1 * (p - q))
+@
+
+The edited item's own places are in its front matter
+(\cref{sec:edit-buffer-parents}).  S's buffer shows both, P's buffer
+none, and editing the key moves the item: S taken from P, the place its
+number came from, goes to the bottom of Q, below Q's own child R; S
+made top-level as well keeps its number.  A parent below the item, or
+one that does not exist, is refused with a warning, and so is a value
+that is not a list of IDs; the rest is saved and the command fails.
+
+<<test functions>>=
+def test_edit_editor_shows_parents_of_a_shared_item(
+  temp_todo_dir,
+):
+  """Only an item with several parents shows them."""
+  save_diamond()
+  _, text = edit_buffer(4, lambda text: text)
+  assert "parents: [2, 3]" in text
+  _, text = edit_buffer(2, lambda text: text)
+  assert "parents:" not in text
+
+
+@pytest.mark.parametrize("value,parents", [
+  ("[3]", [3]), ("[2, 3, 0]", [2, 3, ROOT_ID]),
+  ("[#3, #2]", [2, 3]),
+])
+def test_edit_editor_front_matter_parents(
+  temp_todo_dir, value, parents,
+):
+  """Editing parents: moves the edited item."""
+  save_diamond()
+  next_id, todos = load_todos()
+  save_todos(next_id + 1, todos + [TodoItem(
+    id=next_id, title="R", parents=[3], priority=3.5,
+    created="2026-02-20T10:00:00", who=default_username,
+  )])
+  result, _ = edit_buffer(
+    4, lambda text: text.replace("[2, 3]", value),
+  )
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert by_id[4].parents == parents
+  todos = list(by_id.values())
+  assert ranking_is_consistent(todos)
+  if 2 not in parents:
+    assert "#4 is no longer under #2" in result.output
+    assert ranking_context(todos, by_id[4]) == 3
+    assert by_id[4].priority < by_id[7].priority
+  else:
+    assert by_id[4].priority == 4.25
+
+
+@pytest.mark.parametrize("value,message", [
+  ("[1, 4]", "#2 cannot go under #4"),
+  ("[1, 9]", "parent #9 not found"),
+  ("[1, x]", "'x' is not a todo id"),
+  ("[]", "write [0] for the top level"),
+])
+def test_edit_editor_front_matter_parents_refused(
+  temp_todo_dir, value, message,
+):
+  """A bad parent is refused; the rest is saved."""
+  save_diamond()
+  result, _ = edit_buffer(
+    2,
+    lambda text: text.replace(
+      "---\n", f"---\nparents: {value}\n", 1,
+    ).replace("P\n", "Pa\n", 1),
+  )
+  assert result.exit_code == 1, result.output
+  assert message in result.output
+  assert "Error: saved the buffer except" in result.output
+  by_id = stored_by_id()
+  assert by_id[2].parents == [1]
+  assert by_id[2].title == "Pa"
+
+
+def test_edit_editor_front_matter_move_reads_right(
+  temp_todo_dir,
+):
+  """A move to the top level is not 'also' there."""
+  save_diamond()
+  result, _ = edit_buffer(
+    4, lambda text: text.replace("[2, 3]", "[0]"),
+  )
+  assert result.exit_code == 0, result.output
+  assert "#4 is no longer under #2 or #3" in result.output
+  assert "#4 is now at the top level" in result.output
+  assert stored_by_id()[4].parents == [ROOT_ID]
+
+
+def test_edit_editor_sub_item_parents_key_ignored(
+  temp_todo_dir,
+):
+  """A sub-item's parents: key warns and changes nothing."""
+  save_diamond()
+  result, _ = edit_buffer(
+    1,
+    lambda text: text.replace(
+      "## O {#6}\n---\n", "## O {#6}\n---\nparents: [3]\n",
+    ),
+  )
+  assert result.exit_code == 0, result.output
+  assert "ignored parents:" in result.output
+  assert stored_by_id()[6].parents == [2]
+@
+
+A buffer that leaves an item waiting for itself is refused whole
+(\cref{sec:edit-via-editor}).  O is blocked by Q, and a reference
+putting P under Q as well would make Q wait for its sub-item P, which
+waits for its sub-item O, which waits for Q.  Nothing is stored, not
+even the new title of P, nothing is reported as done, and the buffer,
+new title included, is kept in the file the message names; a second
+refusal keeps its buffer in a file of its own.
+
+<<test functions>>=
+def test_edit_editor_refuses_a_circle(temp_todo_dir):
+  """A buffer making an item wait for itself is refused
+  whole, and kept."""
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[5].blocked_by = [3]
+  save_todos(next_id, todos)
+  kept = []
+  for _ in range(2):
+    result, _ = edit_buffer(
+      1,
+      lambda text: text.replace("# P {#2}", "# Pa {#2}")
+      + "\n## P {also #2}\n",
+    )
+    assert result.exit_code == 1, result.output
+    assert "could never be done" in result.output
+    assert "is now also under #3" not in result.output
+    kept.append(pathlib.Path(
+      result.output.split("your buffer is kept in ")[1].strip()
+    ))
+  assert "Nothing was saved" in result.output
+  assert kept[0] != kept[1]
+  assert all(k.name.startswith("refused-edit-1-") for k in kept)
+  assert all("# Pa {#2}" in k.read_text() for k in kept)
+  by_id = stored_by_id()
+  assert (by_id[2].title, by_id[2].parents) == ("P", [1])
+@
+
+The blockers are not in the buffer, so the editor must leave them as
+they are stored: those the buffer's items had, those of an item it
+detaches, and one another process added during the session.
+
+<<test functions>>=
+def test_edit_editor_keeps_blockers(temp_todo_dir):
+  """Blockers survive an edit -E session, a detach included."""
+  from nytid.cli.todo import edit
+  save_diamond()
+  next_id, todos = load_todos()
+  todos[1].blocked_by = [3]
+  todos[3].blocked_by = [6]
+  save_todos(next_id, todos)
+
+  def meanwhile(text):
+    edit(None, todo_id=6, add_blocker=[3])
+    return drop_section(
+      text.replace("# P {#2}", "# Pa {#2}"), "## S {#4}",
+    )
+
+  result, _ = edit_buffer(1, meanwhile)
+  assert result.exit_code == 0, result.output
+  by_id = stored_by_id()
+  assert by_id[2].title == "Pa"
+  assert by_id[4].parents == [3]
+  assert [by_id[i].blocked_by for i in (2, 4, 6)] == [[3], [6], [3]]
 @
 
 Let's verify the order of settling: saving the buffer unchanged spreads
@@ -27246,6 +29661,7 @@ def test_done_closes_github_issue(temp_todo_dir):
 @
 
 \subsection{The [[rm]] Command}
+\label{sec:todo-rm}
 
 Removing a todo requires confirmation.  The subtree goes with
 it---children, grandchildren, and deeper---because the store has no
@@ -36425,6 +38841,11 @@ from nytid.cli.todo import (
     format_stored_priority,
     parse_editor_content,
     render_todo_markdown,
+    split_heading_id,
+    heading_id_marker,
+    buffer_lines,
+    escape_note_lines,
+    unescape_note_lines,
     parse_yaml_block,
     render_yaml_block,
     build_item_metadata,
