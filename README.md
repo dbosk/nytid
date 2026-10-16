@@ -27,6 +27,7 @@ application.
 
 ```bash
 nytid schedule show
+nytid schedule next      # every detail of the next event, links included
 nytid schedule ics > schedule.ics
 nytid schedule external add https://cloud.timeedit.net/…
 ```
