@@ -2307,6 +2307,8 @@ def test_has_carry_window():
   assert has_carry_window(sep1, jan18, oct27, jan18)
   assert not has_carry_window(oct27, jan18, oct27, jan18)
   assert not has_carry_window(None, jan18, oct27, jan18)
+  assert has_carry_window(oct27, jan18 + datetime.timedelta(days=1),
+                          oct27, jan18)
 @
 
 \subsubsection{Computing the difference}
@@ -2363,22 +2365,10 @@ We take the contracts' events in the booking window but outside the
 contract's period that are still accounted for and no longer booked.
 A session may be in several contracts (an earlier carry), so we keep
 each session once.
-
-There is one more condition, on the course.
-[[booked]] holds only the sign-up sheets of the courses we matched, but
-the earlier contract may also cover other courses.
-Their sessions would look as if the TA no longer was booked on them,
-although we simply didn't read their sheets.
-So we only judge sessions of a course whose sheet we did read,
-recognising the course by its code in the event name
-([[course_codes]]).
-A session we can't place stays accounted for; it isn't lost, the next
-time sheet still reports it.
+This relies on [[booked]] covering every course of those contracts: a
+session of a course whose sheet we didn't read would look removed.
+Ensuring that is the caller's job (\cref{sec:carry-courses}).
 <<let [[removed]] be the accounted rows no longer booked>>=
-codes_read = set()
-for row in booked:
-  codes_read |= course_codes(row)
-
 removed = []
 removed_summaries = []
 contract_rows = [row for contract in contracts
@@ -2388,23 +2378,13 @@ for row in outside_window(
                                  bookings_start, bookings_end),
     own_start, own_end):
   summary = summarize_user(user, [row])
-  if not summary or not course_codes(row) & codes_read:
+  if not summary:
     continue
   summary = summary[0]
   if summary in accounted and summary not in booked_now \
       and summary not in removed_summaries:
     removed.append(row)
     removed_summaries.append(summary)
-@
-
-We recognise course codes with the same pattern as [[summarize_user]]
-(\cref{sec:summarize-user}).
-<<helper functions>>=
-def course_codes(row):
-  """
-  Returns the set of course codes in the event name of `row`.
-  """
-  return set(re.findall(r"[A-Z]{2,4}\d{3,4}[A-Z]?", row[0]))
 @
 
 Finally, the rows outside a window are those that
@@ -2453,12 +2433,18 @@ def test_carry_diff_removes_missed_session(tmp_path):
                        tas=("frank",))]
   assert _carry(booked, [p1], tmp_path) == ([], [missed])
 
-def test_carry_diff_skips_sessions_of_unread_courses(tmp_path):
-  other = _row("2025-09-08 10:00", "2025-09-08 12:00",
-               event="DD1337 Laboration")
-  p1 = {"events": [_row("2025-09-01 10:00", "2025-09-01 12:00"), other]}
-  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00")]
-  assert _carry(booked, [p1], tmp_path) == ([], [])
+def test_carry_diff_removes_a_session_once(tmp_path):
+  missed = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  p1 = {"events": [missed]}
+  older_carry = {"events": [missed]}
+  assert _carry([], [p1, older_carry], tmp_path) == ([], [missed])
+
+def test_carry_diff_treats_renamed_session_as_replaced(tmp_path):
+  renamed = _sheet_row("2025-09-08 10:00", "2025-09-08 12:00",
+                       event="DD1310 Laboration online")
+  old = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  p1 = {"events": [old]}
+  assert _carry([renamed], [p1], tmp_path) == ([renamed], [old])
 
 def test_carry_diff_skips_sessions_already_on_time_sheets(tmp_path):
   extra = _sheet_row("2025-09-15 10:00", "2025-09-15 12:00")
@@ -2549,11 +2535,16 @@ own_end = set_end or amanuensis[user][1]
 <<let [[kept_contracts]] be [[user]]'s contracts this one won't replace>>
 <<warn if [[kept_contracts]] carried sessions from this period>>
 if has_carry_window(bookings_start, bookings_end, own_start, own_end):
-  added_rows, removed_rows = carry_diff(user, booked,
-                                        (bookings_start, bookings_end),
-                                        (own_start, own_end),
-                                        kept_contracts,
-                                        timesheets_directory())
+  <<let [[uncovered]] be the kept contracts with courses we didn't read>>
+  if uncovered:
+    <<warn that we don't carry because of [[uncovered]]>>
+    added_rows = removed_rows = []
+  else:
+    added_rows, removed_rows = carry_diff(user, booked,
+                                          (bookings_start, bookings_end),
+                                          (own_start, own_end),
+                                          kept_contracts,
+                                          timesheets_directory())
   user_booked = sheets.filter_events_by_date(booked, own_start, own_end) \
               + added_rows
   data = contract_data(user, user_booked, removed_rows,
@@ -2564,6 +2555,84 @@ if has_carry_window(bookings_start, bookings_end, own_start, own_end):
     continue
   amanuensis[user] = data
   <<report the carried difference for [[user]]>>
+@
+
+\paragraph{Reading every course of the earlier contracts}%
+\label{sec:carry-courses}
+
+The difference is only right if we read the sign-up sheets of every
+course the earlier contracts cover.
+Say the period~1 contract was created for [[(datintro|prgi)26]] and we
+create the period~2 contract for [[prgi26]] alone.
+The datintro sessions of the period~1 contract aren't in the sheets we
+read, so they would look as if the TA had dropped them all, and we would
+deduct them.
+Recognising a session's course from its event name doesn't help: the
+names rarely carry a course code.
+Instead we check each kept contract that has events in the carry window:
+its stored [[course_regex]] must match only courses that we read now.
+If not, we carry nothing at all for this TA rather than only the added
+sessions.
+Carrying only the additions isn't safe either: a renamed session shows
+up as one added and one removed, and keeping only the added half would
+pay for it twice.
+A contract that doesn't record its courses can't be checked, so it also
+blocks the carry.
+<<let [[uncovered]] be the kept contracts with courses we didn't read>>=
+uncovered = {}
+for contract in kept_contracts:
+  in_carry_window = outside_window(
+    sheets.filter_events_by_date(
+      contract["events"] + contract.get("removed_events", []),
+      bookings_start, bookings_end),
+    own_start, own_end)
+  if in_carry_window:
+    missing = uncovered_courses(contract, courses, register)
+    if missing is None or missing:
+      uncovered[contract["filename"]] = missing
+<<warn that we don't carry because of [[uncovered]]>>=
+for filename, missing in uncovered.items():
+  if missing is None:
+    reason = "doesn't record which courses it covers"
+  else:
+    reason = "also covers " + ", ".join(sorted({course
+                                               for course, _ in missing}))
+  logging.warning(f"{user}: not carrying the difference: {filename} "
+                  f"{reason}. Use a course regex covering all its "
+                  "courses.")
+@
+
+We resolve the stored regex with the same lookup as the command's own
+course argument, in the same registers, so that the two sets of courses
+are comparable.
+<<helper functions>>=
+def uncovered_courses(contract, courses, register):
+  """
+  Returns the set of (course, register) pairs that `contract` covers but
+  that aren't among `courses`, or None if the contract doesn't record
+  its courses.
+  """
+  regex = contract.get("course_regex")
+  if not regex:
+    return None
+  return set(coursescli.get_courses_configs(regex, register)) - set(courses)
+@
+
+Let's verify both outcomes, stubbing only the course lookup, which reads
+the course registers on disk.
+<<test functions>>=
+def test_uncovered_courses(monkeypatch):
+  from nytid.cli import hr as hrcli
+  known = {"(datintro|prgi)26": {("datintro26", "r"): None,
+                                 ("prgi26", "r"): None},
+           "prgi26": {("prgi26", "r"): None}}
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda regex, register: known[regex])
+  p1 = {"course_regex": "(datintro|prgi)26"}
+  assert uncovered_courses(p1, known["prgi26"], "mine") == \
+    {("datintro26", "r")}
+  assert uncovered_courses(p1, known["(datintro|prgi)26"], "mine") == set()
+  assert uncovered_courses({"course_regex": None}, {}, "mine") is None
 @
 
 The contracts this one won't replace are those whose periods don't
@@ -2638,10 +2707,14 @@ by their \emph{current} contract, which depends on today's date, whereas
 the default selects TAs without one, which [[erin]]'s 2025 contracts
 never are again.
 <<test functions>>=
-def test_carried_difference_leaves_nothing_for_time_sheets(tmp_path,
-                                                           monkeypatch):
+def _erin_scenario(tmp_path, monkeypatch, p1_regex="DD1310"):
+  """
+  Sets up erin's P1 contract (a session `kept`, a session `missed` since
+  given to frank, and enough regular sessions for a contract of its own)
+  and a sign-up sheet with an extra session and enough P2 sessions for a
+  contract. Returns (kept, missed, extra) rows.
+  """
   import typerconf
-  from typer.testing import CliRunner
   from nytid.cli import hr as hrcli
 
   contracts_dir = tmp_path / "contracts"
@@ -2657,8 +2730,12 @@ def test_carried_difference_leaves_nothing_for_time_sheets(tmp_path,
 
   kept = _row("2025-09-01 10:00", "2025-09-01 12:00")
   missed = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  regular = [_sheet_row(f"2025-09-{day:02} 13:00", f"2025-09-{day:02} 17:00")
+             for day in range(16, 24)]
   _write_contract(contracts_dir, "erin", "2025-08-01T10:00:00", *P1,
-                  events=[kept, missed])
+                  events=[kept, missed] + [row[:5] + ["erin"]
+                                           for row in regular],
+                  course_regex=p1_regex)
 
   extra = _sheet_row("2025-09-15 10:00", "2025-09-15 13:00")
   p2_sessions = [_sheet_row(f"2025-11-{day:02} 10:00",
@@ -2667,39 +2744,203 @@ def test_carried_difference_leaves_nothing_for_time_sheets(tmp_path,
   booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00"),
             _sheet_row("2025-09-08 10:00", "2025-09-08 12:00",
                        tas=("frank",)),
-            extra] + p2_sessions
+            extra] + regular + p2_sessions
   config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
                              "code": "DD1310"})
+  # `show --updates` recomputes with the course regex `.*`.
+  registers = {"DD1310": {("DD1310", "reg"): config},
+               ".*": {("DD1310", "reg"): config},
+               "(DD1310|DD1337)": {("DD1310", "reg"): config,
+                                   ("DD1337", "reg"): config}}
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
-                      lambda *a, **k: {("DD1310", "reg"): config})
+                      lambda regex, *a, **k: registers[regex])
   monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
                       lambda url: booked)
   monkeypatch.chdir(tmp_path)
+  return kept, missed, extra
 
-  timesheet = ["timesheets", "generate", "--user", "erin",
-               "--start", "2025-08-25", "--end", "2025-10-26"]
-  before = CliRunner().invoke(hrcli.cli, timesheet)
-  assert before.exit_code == 0, before.output
-  assert "erin" in before.stdout
+ERIN_TIMESHEET = ["timesheets", "generate", "DD1310", "--user", "erin",
+                  "--start", "2025-08-25", "--end", "2025-10-26"]
+ERIN_P2_CARRYING = ["amanuensis", "create", "DD1310", "--user", "erin",
+                    "--no-detailed",
+                    "--start", "2025-08-25", "--end", "2026-01-18",
+                    "--set-start", "2025-10-27", "--set-end", "2026-01-18"]
+ERIN_P2_ALONE = ERIN_P2_CARRYING[:6] + ["--start", "2025-10-27"] \
+              + ERIN_P2_CARRYING[8:]
+ERIN_P1 = ["amanuensis", "create", "DD1310", "--user", "erin",
+           "--no-detailed",
+           "--start", "2025-08-25", "--end", "2025-10-26",
+           "--set-start", "2025-08-25", "--set-end", "2025-10-26"]
 
-  result = CliRunner().invoke(
-    hrcli.cli,
-    ["amanuensis", "create", "--user", "erin", "--no-detailed",
-     "--start", "2025-08-25", "--end", "2026-01-18",
-     "--set-start", "2025-10-27", "--set-end", "2026-01-18"])
-  assert result.exit_code == 0, result.output
+def _printed_hours(output):
+  """Returns the contract hours printed by create with --event-summary."""
+  for line in output.splitlines():
+    fields = line.split("\t")
+    if fields[0] == "erin" and len(fields) == 5:
+      return float(fields[4].removesuffix(" h"))
+  raise AssertionError(f"no contract line in {output!r}")
 
+def _hours(rows):
+  """Returns erin's amanuensis hours for `rows`, prep time included."""
+  return nytid.signup.hr.compute_amanuensis_data(
+    rows, low_percentage=0, min_days=0)["erin"][2]
+
+def _erin_p2_contract():
   p2 = [c for c in get_user_contracts("erin")
         if c["start"].startswith("2025-10-27")]
   assert len(p2) == 1
-  assert extra[:5] + ["erin"] in p2[0]["events"]
-  assert kept not in p2[0]["events"]
-  assert p2[0]["removed_events"] == [missed]
+  return p2[0]
+
+def test_carried_difference_leaves_nothing_for_time_sheets(tmp_path,
+                                                           monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+
+  before = CliRunner().invoke(hrcli.cli, ERIN_TIMESHEET)
+  assert before.exit_code == 0, before.output
+  assert "erin" in before.stdout
+
+  result = CliRunner().invoke(hrcli.cli, ERIN_P2_CARRYING)
+  assert result.exit_code == 0, result.output
+
+  p2 = _erin_p2_contract()
+  assert extra[:5] + ["erin"] in p2["events"]
+  assert kept not in p2["events"]
+  assert p2["removed_events"] == [missed]
   assert len(get_user_contracts("erin")) == 2
 
-  after = CliRunner().invoke(hrcli.cli, timesheet)
+  after = CliRunner().invoke(hrcli.cli, ERIN_TIMESHEET)
   assert after.exit_code == 0, after.output
   assert "erin" not in after.stdout
+@
+
+The point of carrying is the contract's hours, and the time-sheet check
+above can't see them.
+The carrying contract must have exactly the hours of period~2 alone plus
+those of the added session minus those of the missed one.
+We compute the latter two with [[compute_amanuensis_data]] directly, so
+that the expectation doesn't depend on the code under test.
+<<test functions>>=
+def test_carried_difference_changes_the_hours(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+
+  alone = CliRunner().invoke(hrcli.cli,
+                             ERIN_P2_ALONE + ["--draft", "--event-summary"])
+  carrying = CliRunner().invoke(hrcli.cli,
+                                ERIN_P2_CARRYING + ["--event-summary"])
+  assert alone.exit_code == 0 and carrying.exit_code == 0, carrying.output
+  assert _printed_hours(carrying.stdout) == pytest.approx(
+    _printed_hours(alone.stdout) + _hours([extra]) - _hours([missed]))
+@
+
+Re-creating the contract for period~2 must carry the same difference
+again: the old version is replaced, so what it carried mustn't count as
+accounted for.
+<<test functions>>=
+def test_recreated_contract_carries_again(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+
+  for _ in range(2):
+    result = CliRunner().invoke(hrcli.cli, ERIN_P2_CARRYING)
+    assert result.exit_code == 0, result.output
+
+  newest = sorted((tmp_path / "contracts").glob("erin.*.json"))[-1]
+  p2 = _erin_p2_contract()
+  assert p2["filename"] == newest.name
+  assert extra[:5] + ["erin"] in p2["events"]
+  assert p2["removed_events"] == [missed]
+@
+
+[[show]] must recompute the stored contract to the hours it was created
+with, list the removed sessions with [[--events]], and with
+[[--updates]] recompute the carry from the stored booking window, which
+gives the same hours again since nothing has changed.
+<<test functions>>=
+def test_show_recomputes_carrying_contract(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+
+  created = CliRunner().invoke(hrcli.cli,
+                               ERIN_P2_CARRYING + ["--event-summary"])
+  hours = f"{_printed_hours(created.stdout):.2f} h"
+
+  shown = CliRunner().invoke(hrcli.cli,
+                             ["amanuensis", "show", "erin", "--all",
+                              "--events", "--updates"])
+  assert shown.exit_code == 0, shown.output
+  assert "Removed events" in shown.stdout
+  assert shown.stdout.count(hours) == 2
+@
+
+Redoing the period~1 contract after period~2 carried from it must warn,
+naming the period~2 contract.
+<<test functions>>=
+def test_redoing_earlier_contract_warns(tmp_path, monkeypatch, caplog):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+
+  CliRunner().invoke(hrcli.cli, ERIN_P2_CARRYING)
+  p2 = _erin_p2_contract()
+  caplog.clear()
+  result = CliRunner().invoke(hrcli.cli, ERIN_P1 + ["--draft"])
+  assert result.exit_code == 0, result.output
+  assert f"{p2['filename']} carried sessions" in caplog.text
+@
+
+The planning spreadsheet must count the sessions the contract counts:
+the period~2 sessions and the added one, not the period~1 sessions the
+earlier contract already pays for.
+We read the rows handed to the spreadsheet writer instead of the
+workbook, whose cell layout is the template's business; the writer is
+the boundary where the command's output leaves our code.
+<<test functions>>=
+def test_carrying_spreadsheet_counts_contract_sessions(tmp_path,
+                                                       monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  import nytid.signup.hr.timesheet as timesheet
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+  monkeypatch.setattr(hrcli, "get_canvas_user", lambda *a, **k: "erin")
+  written = {}
+  monkeypatch.setattr(timesheet, "make_amanuensis_xlsx",
+                      lambda **kwargs: written.update(kwargs))
+
+  result = CliRunner().invoke(hrcli.cli,
+                              ERIN_P2_CARRYING + ["--draft", "--xlsx"])
+  assert result.exit_code == 0, result.output
+  labb_hours = sum(row["labb_tim"] for row in written["course_rows"])
+  assert labb_hours == 25 * 4 + 3
+@
+
+When the period~1 contract also covers a course whose sheet we don't
+read, nothing may be carried: the contract for period~2 gets only its
+own sessions, and the difference stays for the time sheet.
+<<test functions>>=
+def test_no_carry_when_earlier_contract_has_unread_courses(tmp_path,
+                                                          monkeypatch,
+                                                          caplog):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch,
+                                       p1_regex="(DD1310|DD1337)")
+
+  result = CliRunner().invoke(hrcli.cli, ERIN_P2_CARRYING)
+  assert result.exit_code == 0, result.output
+
+  p2 = _erin_p2_contract()
+  assert p2["removed_events"] == []
+  assert all(event[1] >= "2025-10-27" for event in p2["events"])
+  assert "DD1337" in caplog.text
+
+  after = CliRunner().invoke(hrcli.cli, ERIN_TIMESHEET)
+  assert "erin" in after.stdout
 @
 
 \section{Showing amanuensis contracts}
@@ -3483,6 +3724,8 @@ def test_windows_overlap_boundaries():
   assert windows_overlap((d(2025, 8, 25), d(2025, 10, 27)),
                          (d(2025, 10, 27), d(2026, 1, 18)))
   assert windows_overlap((None, d(2025, 9, 1)), (d(2025, 8, 1), None))
+  assert windows_overlap((d(2025, 10, 27), d(2026, 1, 18)),
+                         (d(2025, 8, 25), d(2025, 10, 27)))
 @
 
 Finally, we need a function to filter contracts to only those active in a given 
