@@ -2824,7 +2824,8 @@ user_booked_by_course = {
 
 Finally, the stored contract must let us recompute it and check it.
 We store the courses we read, as [[(course, register)]] pairs, for the
-course check of later carries (\cref{sec:carry-courses}).
+course check of later carries (\cref{sec:carry-courses}) and to let
+[[show --updates]] read the same registers again.
 The removed sessions are part of the contract, and we also keep the
 booking window: the stored [[start]] and [[end]] are the contract's
 dates (\cref{sec:contract-dates}), so without the booking window,
@@ -2891,9 +2892,7 @@ def _erin_scenario(tmp_path, monkeypatch, p1_regex="DD1310"):
             extra] + regular + p2_sessions
   config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
                              "code": "DD1310"})
-  # `show --updates` recomputes with the course regex `.*`.
   registers = {"DD1310": {("DD1310", "reg"): config},
-               ".*": {("DD1310", "reg"): config},
                "(DD1310|DD1337)": {("DD1310", "reg"): config,
                                    ("DD1337", "reg"): config}}
   monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
@@ -4290,7 +4289,11 @@ contracts don't, and for them the contract dates are the best we have.
 The draft is computed as a replacement of the shown contract: the shown
 contract overlaps it, so what it carried is computed afresh rather than
 taken as already accounted for.
+It reads the courses the contract was created from
+([[contract_course_selection]] below), so that the TA's bookings in other
+courses don't show up as changes.
 <<show draft contract based on [[contract]] with all current hours>>=
+draft_courses, draft_register = contract_course_selection(contract)
 start = contract_date_time(contract, "bookings_start") \
         or contract_date_time(contract, "start")
 end = contract_date_time(contract, "bookings_end") \
@@ -4316,7 +4319,8 @@ except KeyError:
 
 cli_amanuens_create(
   user_regex=contract["user"],
-  course_regex=".*",
+  course_regex=draft_courses,
+  register=draft_register,
   start=start,
   end=end,
   push_start=push_start,
@@ -4327,6 +4331,105 @@ cli_amanuens_create(
   draft=True,
   delimiter=delimiter
 )
+@
+
+The contract stores the course regex it was created with.
+The regex, not the list of courses it matched, is what the user asked
+for, so a course added to the register since then that matches it is
+read too, just as re-running [[create]] would.
+The registers, however, the contract only knows through the courses it
+stores, and [[create]] doesn't store its [[--register]] regex.
+We therefore read exactly the registers of the stored courses: the names
+are escaped, since a register name is not a regex, and anchored at the
+end, since [[registers_regex]] anchors only the start
+([[re.match]]).
+Older contracts lack these fields; for them we fall back to what
+[[create]] defaults to, all courses of the default register.
+<<helper functions>>=
+def contract_course_selection(contract):
+  """
+  Returns (course_regex, register) selecting the courses that `contract`
+  was created from, for re-computing it with the current bookings.
+  """
+  course_regex = contract.get("course_regex") or ".*"
+  if contract.get("courses"):
+    registers = sorted({re.escape(register)
+                        for _, register in contract["courses"]})
+    return course_regex, f"({'|'.join(registers)})$"
+  return course_regex, coursescli.MINE
+@
+
+The draft must show the same contract with today's bookings, so it must
+read the courses the contract was created from, not every course of the
+register.
+Otherwise the TA's sessions in other courses show up as changes, although
+nothing changed for this contract.
+Here [[erin]] also works in DD1337, which her contract for DD1310 doesn't
+cover: the draft must still come out at the contract's hours.
+Her courses are in the register [[reg]], not the default one, and once
+her contract exists the stub selects registers as
+[[get_courses_configs]] does, so the draft must also find that register.
+We drop the scenario's period~1 contract: it stores no courses, so its
+own draft would look in the default register only.
+<<test functions>>=
+def test_show_updates_reads_only_the_contracts_courses(tmp_path,
+                                                       monkeypatch):
+  import typerconf
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  for p1_file in (tmp_path / "contracts").glob("erin.*.json"):
+    p1_file.unlink()
+  created = CliRunner().invoke(hrcli.cli,
+                               ERIN_P2_ALONE + ["--event-summary"])
+  hours = f"{_printed_hours(created.stdout):.2f} h"
+
+  scenario_courses = hrcli.coursescli.get_courses_configs
+  scenario_sheet = nytid.signup.sheets.read_signup_sheet_from_url
+  other = typerconf.Config({"signupsheet": {"url": "https://example.com/t.csv"},
+                            "code": "DD1337"})
+  other_sheet = [_sheet_row("2025-12-01 10:00", "2025-12-01 14:00",
+                            event="DD1337 Laboration")]
+  def courses_with_other(regex, register=hrcli.coursescli.MINE):
+    courses = scenario_courses("DD1310" if regex == ".*" else regex)
+    if regex == ".*":
+      courses = {**courses, ("DD1337", "reg"): other}
+    return {key: config for key, config in courses.items()
+            if re.match(register, key[1])}
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      courses_with_other)
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: other_sheet if url.endswith("t.csv")
+                                  else scenario_sheet(url))
+
+  shown = CliRunner().invoke(hrcli.cli,
+                             ["amanuensis", "show", "erin", "--all",
+                              "--updates"])
+  assert shown.exit_code == 0, shown.output
+  assert shown.stdout.count(hours) == 2
+@
+
+The registers matter too: a contract that stores its courses
+(\cref{sec:carry-difference}) names the registers they came from, and
+the draft must read those, matched exactly, rather than the default
+register only.
+Contracts from before that store no courses, and the oldest ones not
+even a course regex; for them we can only read the default register,
+and all of it.
+<<test functions>>=
+def test_contract_course_selection():
+  regex, register = contract_course_selection(
+    {"course_regex": "prgi26",
+     "courses": [["prgi26", "r"], ["datintro26", "o.t"]]})
+  assert regex == "prgi26"
+  assert re.match(register, "r") and re.match(register, "o.t")
+  assert not any(re.match(register, name)
+                 for name in ["rr", "r2", "oxt", "o"])
+
+  assert contract_course_selection({"course_regex": "prgi26"}) \
+         == ("prgi26", coursescli.MINE)
+  assert contract_course_selection({"events": []}) \
+         == (".*", coursescli.MINE)
 @
 
 \section{Listing amanuenses}
