@@ -1517,8 +1517,10 @@ def cli_amanuens_create(<<option for TAs to filter for>>,
                                           end_date=end)
 
   <<amanuensis iteration variables>>
+  <<let [[bookings_start]] and [[bookings_end]] be the booking window>>
   for user in amanuensis:
     <<skip if [[user_regex]] doesn't match [[user]]>>
+    <<carry the difference from outside the contract period for [[user]]>>
     <<print [[amanuensis]] data for [[user]]>>
     <<write [[user]]'s planning spreadsheet>>
     if not draft:
@@ -1789,7 +1791,8 @@ matches what the cell means: an employment period has day resolution, so a
 <<write [[user]]'s planning spreadsheet>>=
 if xlsx:
   <<resolve [[user]] to a Canvas display name>>
-  course_rows = amanuensis_course_rows(user, booked_by_course, courses,
+  <<let [[user_booked_by_course]] be [[booked_by_course]] for [[user]]>>
+  course_rows = amanuensis_course_rows(user, user_booked_by_course, courses,
                                        default_course_responsible)
   output = amanuensis_xlsx_filename(xlsx_format, user, sheet_user,
                                     courses, period, start)
@@ -2077,7 +2080,13 @@ set_start: Annotated[datetime.datetime, set_start_opt] = None,
 set_end: Annotated[datetime.datetime, set_end_opt] = None
 <<argument and option definitions>>=
 set_start_opt = typer.Option(help="Force the start date of the contract to "
-                                  "this date. Might modify percentage.",
+                                  "this date. Might modify percentage. "
+                                  "With an earlier --start, the sessions "
+                                  "in between that aren't yet accounted "
+                                  "for by other contracts or time sheets "
+                                  "are carried into this contract (and "
+                                  "accounted sessions no longer booked "
+                                  "are deducted).",
                              formats=["%Y-%m-%d"])
 set_end_opt = typer.Option(help="Force the end date of the contract to "
                                 "this date. Might modify percentage.",
@@ -2119,9 +2128,8 @@ We also want the events that the TA booked to keep a record of how the hours
 were computed, so that we can keep track of changes and how that should affect
 the contract.
 <<filter out [[user_events]] for [[user]]>>=
-user_events = sheets.filter_events_by_TA(user, booked)
 user_events = filter(lambda x: user in sheets.get_booked_TAs_from_csv(x)[0],
-                     booked)
+                     user_booked)
 user_events = list(map(lambda x: x[0:len(sheets.SIGNUP_SHEET_HEADER)] + [user],
                        user_events))
 @
@@ -2164,6 +2172,7 @@ with open(path / filename, "w") as outfile:
              "end": end.isoformat() if end else None,
              "set_end": set_end.isoformat() if set_end else None,
              "course_regex": course_regex,
+             <<contract fields for the carried difference>>
              "events": user_events},
             outfile,
             indent=2)
@@ -2186,6 +2195,508 @@ except KeyError as err:
                   f"`nytid config {AMANUENSIS_CONTRACT_PATH} -s <path>`.")
 @
 
+
+\subsection{Carrying the difference into the next contract}%
+\label{sec:carry-difference}
+
+A TA rarely works exactly the sessions of their contract.
+They take extra sessions, or sessions they were contracted for are
+cancelled or taken by someone else.
+The time sheets of \cref{WorkingWithTimesheets} report that difference
+as \enquote{\foreignlanguage{swedish}{mertid}}, positive or negative.
+Often it's simpler to fold the difference into the TA's next contract
+instead, raising or lowering its percentage, and skip the time sheet.
+We do that by letting the bookings reach back into the previous period
+while the contract itself covers only the next one:
+\begin{minted}{bash}
+nytid hr amanuensis create "(datintro|prg[im])25" \
+  --period 25/26-2 --start 2025-08-25
+\end{minted}
+The period sets the contract dates, [[--set-start]] and [[--set-end]],
+to period~2; the explicit [[--start]] overrides only the start of the
+booking window.
+The sessions between the start of the booking window and the start of
+the contract are the ones we carry.
+(The same goes for an [[--end]] after [[--set-end]], although carrying
+from a later period is rarely what we want.)
+
+What we carry must be exactly what the next time sheet would report for
+those dates, no more and no less.
+The contract for period~1 already pays for most of its sessions, so we
+mustn't count them again; and a session the TA was paid for on a time
+sheet mustn't be paid again either.
+So we compute the difference the way [[timesheets generate]] does: the
+sessions the TA is booked on now, compared with the events already
+accounted for by contracts and reported time sheets
+([[accounted_events]], \cref{sec:accounted-events}).
+\begin{description}
+\item[Added sessions] are booked now but not accounted for.
+  They become ordinary events of the new contract.
+\item[Removed sessions] are accounted for but no longer booked.
+  We store them in the contract's [[removed_events]], and their hours are
+  deducted from the contract's hours.
+\end{description}
+Once stored, the new contract accounts for the difference: its events
+cover the added sessions and its [[removed_events]] cancel the removed
+ones (\cref{sec:accounted-events}), so the next time sheet for
+period~1 reports nothing.
+
+The contracts that account for events are those the new contract will
+\emph{not} replace, that is, those whose periods don't overlap its own
+(\cref{contract-filtering}).
+This is what makes re-creating a contract work.
+Contrast three cases.
+\begin{description}
+\item[Carrying from period~1 into period~2.]
+  The period~1 contract doesn't overlap period~2, so it's kept, and its
+  sessions are accounted for: only the difference is carried.
+\item[Re-creating the contract for period~2.]
+  The old version overlaps the new, so it will be replaced, and what it
+  carried isn't accounted for.
+  The difference is computed afresh, as if the old version had never
+  existed.
+\item[Re-creating the contract for period~1 afterwards.]
+  The period~2 contract is kept, and it holds sessions from period~1.
+  If the new period~1 contract now includes those sessions, they are
+  paid twice---or, for removed sessions, deducted twice.
+  We can't fix this from the period~1 side without second-guessing the
+  period~2 contract, so we warn and ask for the period~2 contract to be
+  re-created afterwards; that computes its difference against the new
+  period~1 contract.
+\end{description}
+
+\subsubsection{The windows}
+
+We remember the booking window before the loop over the TAs, because
+the loop reuses [[start]] and [[end]] for each TA's contract dates.
+<<let [[bookings_start]] and [[bookings_end]] be the booking window>>=
+bookings_start, bookings_end = start, end
+@
+
+The contract's own period is [[--set-start]] and [[--set-end]] when
+given, otherwise the dates computed from the bookings, just as when we
+print the contract.
+There is something to carry only if the booking window extends beyond
+that period, and only on a side where the booking window is given
+explicitly.
+Without an explicit [[--start]], the booking window is the whole sign-up
+sheet; we'd have no reasonable lower bound for the contracts' events to
+compare with, so we keep the old behaviour of simply counting the
+bookings.
+<<helper functions>>=
+def has_carry_window(bookings_start, bookings_end, own_start, own_end):
+  """
+  Returns True if the booking window extends beyond the contract's own
+  period on a side where both are given.
+  """
+  return bool(bookings_start and own_start
+              and bookings_start.date() < own_start.date()
+              or bookings_end and own_end
+              and bookings_end.date() > own_end.date())
+@
+
+<<test functions>>=
+def test_has_carry_window():
+  sep1 = datetime.datetime(2025, 8, 25).astimezone()
+  oct27 = datetime.datetime(2025, 10, 27).astimezone()
+  jan18 = datetime.datetime(2026, 1, 18).astimezone()
+  assert has_carry_window(sep1, jan18, oct27, jan18)
+  assert not has_carry_window(oct27, jan18, oct27, jan18)
+  assert not has_carry_window(None, jan18, oct27, jan18)
+@
+
+\subsubsection{Computing the difference}
+
+The difference is computed by [[carry_diff]], which returns the rows to
+add and the rows to remove.
+We compare events in the format of [[summarize_user]], with the same
+equality as the time sheets ([[remove_events]]), so that a session counts
+as the same session here exactly when it would on a time sheet.
+But we return \emph{rows}, not summaries: the contract stores rows, and
+its hours are computed from rows with the amanuensis preparation time
+(\cref{sec:contract-data}), which differs from the hourly one that
+[[summarize_user]] applies.
+<<helper functions>>=
+def carry_diff(user, booked, bookings_window, own_window,
+               contracts, timesheets_dir):
+  """
+  Returns (added, removed): the rows of sessions outside the contract's
+  own period that `user` worked beyond, respectively short of, what
+  `contracts` and the time sheets in `timesheets_dir` account for.
+
+  `booked` are the sign-up sheet rows in the booking window; both
+  windows are (start, end) pairs of datetimes.
+  """
+  <<signup machinery imports>>
+  bookings_start, bookings_end = bookings_window
+  own_start, own_end = own_window
+
+  accounted = accounted_events(user, contracts, timesheets_dir,
+                               bookings_start, bookings_end)
+  booked_now = summarize_user(user, booked)
+
+  <<let [[added]] be the carried rows not accounted for>>
+  <<let [[removed]] be the accounted rows no longer booked>>
+
+  return added, removed
+@
+
+The added rows are the bookings outside the contract's period whose
+session isn't accounted for.
+A row where the TA is only a reserve summarises to nothing and is
+skipped.
+<<let [[added]] be the carried rows not accounted for>>=
+added = []
+for row in outside_window(booked, own_start, own_end):
+  summary = summarize_user(user, [row])
+  if summary and summary[0] not in accounted:
+    added.append(row)
+@
+
+The removed rows come from the contracts, since a session the TA no
+longer is booked on is no longer in [[booked]].
+We take the contracts' events in the booking window but outside the
+contract's period that are still accounted for and no longer booked.
+A session may be in several contracts (an earlier carry), so we keep
+each session once.
+
+There is one more condition, on the course.
+[[booked]] holds only the sign-up sheets of the courses we matched, but
+the earlier contract may also cover other courses.
+Their sessions would look as if the TA no longer was booked on them,
+although we simply didn't read their sheets.
+So we only judge sessions of a course whose sheet we did read,
+recognising the course by its code in the event name
+([[course_codes]]).
+A session we can't place stays accounted for; it isn't lost, the next
+time sheet still reports it.
+<<let [[removed]] be the accounted rows no longer booked>>=
+codes_read = set()
+for row in booked:
+  codes_read |= course_codes(row)
+
+removed = []
+removed_summaries = []
+contract_rows = [row for contract in contracts
+                     for row in contract["events"]]
+for row in outside_window(
+    sheets.filter_events_by_date(contract_rows,
+                                 bookings_start, bookings_end),
+    own_start, own_end):
+  summary = summarize_user(user, [row])
+  if not summary or not course_codes(row) & codes_read:
+    continue
+  summary = summary[0]
+  if summary in accounted and summary not in booked_now \
+      and summary not in removed_summaries:
+    removed.append(row)
+    removed_summaries.append(summary)
+@
+
+We recognise course codes with the same pattern as [[summarize_user]]
+(\cref{sec:summarize-user}).
+<<helper functions>>=
+def course_codes(row):
+  """
+  Returns the set of course codes in the event name of `row`.
+  """
+  return set(re.findall(r"[A-Z]{2,4}\d{3,4}[A-Z]?", row[0]))
+@
+
+Finally, the rows outside a window are those that
+[[filter_events_by_date]] doesn't keep; reusing it keeps the day
+resolution and inclusive bounds identical to the rest of the command.
+<<helper functions>>=
+def outside_window(rows, start, end):
+  """
+  Returns the rows in `rows` that are not between `start` and `end`
+  (inclusive, day resolution).
+  """
+  <<signup machinery imports>>
+  inside = sheets.filter_events_by_date(rows, start, end)
+  return [row for row in rows if row not in inside]
+@
+
+Let's verify the difference in the situations that matter.
+The TA [[erin]] had a period~1 contract with two sessions; we carry into
+period~2.
+Everything is real except the configuration: the contracts are
+dictionaries as loaded from disk and the time sheets are real files in a
+temporary directory, written with [[store_timesheet]].
+<<test functions>>=
+def _carry(booked, contracts, timesheets_dir):
+  start = datetime.datetime(2025, 8, 25).astimezone()
+  own_start = datetime.datetime(2025, 10, 27).astimezone()
+  end = datetime.datetime(2026, 1, 18).astimezone()
+  return carry_diff("erin", booked, (start, end), (own_start, end),
+                    contracts, timesheets_dir)
+
+def _sheet_row(start, end, tas=("erin",), event="DD1310 Laboration"):
+  return [event, start, end, "D1", "1"] + list(tas)
+
+def test_carry_diff_adds_extra_session(tmp_path):
+  p1 = {"events": [_row("2025-09-01 10:00", "2025-09-01 12:00")]}
+  extra = _sheet_row("2025-09-15 10:00", "2025-09-15 12:00")
+  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00"), extra,
+            _sheet_row("2025-11-03 10:00", "2025-11-03 12:00")]
+  assert _carry(booked, [p1], tmp_path) == ([extra], [])
+
+def test_carry_diff_removes_missed_session(tmp_path):
+  missed = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  p1 = {"events": [_row("2025-09-01 10:00", "2025-09-01 12:00"), missed]}
+  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00"),
+            _sheet_row("2025-09-08 10:00", "2025-09-08 12:00",
+                       tas=("frank",))]
+  assert _carry(booked, [p1], tmp_path) == ([], [missed])
+
+def test_carry_diff_skips_sessions_of_unread_courses(tmp_path):
+  other = _row("2025-09-08 10:00", "2025-09-08 12:00",
+               event="DD1337 Laboration")
+  p1 = {"events": [_row("2025-09-01 10:00", "2025-09-01 12:00"), other]}
+  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00")]
+  assert _carry(booked, [p1], tmp_path) == ([], [])
+
+def test_carry_diff_skips_sessions_already_on_time_sheets(tmp_path):
+  extra = _sheet_row("2025-09-15 10:00", "2025-09-15 12:00")
+  missed = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  p1 = {"events": [_row("2025-09-01 10:00", "2025-09-01 12:00"), missed]}
+  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00"), extra]
+  store_timesheet(tmp_path, "erin", summarize_user("erin", [extra]),
+                  summarize_user("erin", [missed]))
+  assert _carry(booked, [p1], tmp_path) == ([], [])
+
+def test_carry_diff_ignores_own_period_and_replaced_contracts(tmp_path):
+  p2_session = _sheet_row("2025-11-03 10:00", "2025-11-03 12:00")
+  extra = _sheet_row("2025-09-15 10:00", "2025-09-15 12:00")
+  # The old P2 version carried `extra`, but it is replaced, so it isn't
+  # among the contracts passed in, and `extra` is carried again.
+  assert _carry([extra, p2_session], [], tmp_path) == ([extra], [])
+@
+
+\subsubsection{The contract's hours}\label{sec:contract-data}
+
+With removed sessions, a contract's hours are no longer just the hours
+of its events.
+[[contract_data]] computes them as the hours of the events minus the
+hours of the removed sessions, both with [[compute_amanuensis_data]] so
+that the amanuensis preparation time applies to both.
+For the removed sessions we turn off the minimum percentage and number
+of days: those thresholds judge whether a contract is worth having, not
+how many hours a set of sessions amounts to.
+Both [[create]] and [[show]] use it, so a stored contract shows the same
+percentage it was created with.
+<<helper functions>>=
+def contract_data(user, events, removed_events, start, end, **kwargs):
+  """
+  Returns `user`'s (start, end, hours) for a contract with `events`,
+  deducting the hours of `removed_events`, or None if the contract
+  falls below the thresholds of `compute_amanuensis_data`.
+  `start`, `end` and `kwargs` are passed to `compute_amanuensis_data`.
+  """
+  <<signup machinery imports>>
+  data = hr.compute_amanuensis_data(events, begin_date=start,
+                                    end_date=end, **kwargs)
+  if user not in data:
+    return None
+  start, end, hours = data[user]
+  if removed_events:
+    removed = hr.compute_amanuensis_data(removed_events,
+                                         low_percentage=0, min_days=0)
+    if user in removed:
+      hours -= removed[user][2]
+  return start, end, hours
+@
+
+<<test functions>>=
+def test_contract_data_deducts_removed_hours():
+  start = datetime.datetime(2025, 10, 27).astimezone()
+  end = datetime.datetime(2026, 1, 18).astimezone()
+  events = [_row("2025-11-03 10:00", "2025-11-03 12:00"),
+            _row("2025-11-10 10:00", "2025-11-10 12:00")]
+  removed = [_row("2025-09-08 10:00", "2025-09-08 12:00")]
+  full = contract_data("erin", events, [], start, end,
+                       low_percentage=0, min_days=0)
+  less = contract_data("erin", events, removed, start, end,
+                       low_percentage=0, min_days=0)
+  one = contract_data("erin", events[:1], [], start, end,
+                      low_percentage=0, min_days=0)
+  assert full[2] - less[2] == pytest.approx(one[2])
+  assert less[:2] == full[:2]
+@
+
+\subsubsection{Carrying for each TA}
+
+Now we can put the parts together in [[create]].
+For each TA we determine the contract's own period and which of the TA's
+contracts it will not replace.
+If there is something to carry, we compute the difference, replace the
+TA's bookings by the bookings in the period plus the added rows, and
+recompute the TA's data from them.
+We recompute with the contract's own period as the forced dates, so that
+the minimum percentage is judged over the period the contract actually
+covers, not over the longer booking window.
+[[user_booked]] then takes the place of [[booked]] for this TA when we
+record the contract's events.
+<<carry the difference from outside the contract period for [[user]]>>=
+user_booked = booked
+removed_rows = []
+own_start = set_start or amanuensis[user][0]
+own_end = set_end or amanuensis[user][1]
+<<let [[kept_contracts]] be [[user]]'s contracts this one won't replace>>
+<<warn if [[kept_contracts]] carried sessions from this period>>
+if has_carry_window(bookings_start, bookings_end, own_start, own_end):
+  added_rows, removed_rows = carry_diff(user, booked,
+                                        (bookings_start, bookings_end),
+                                        (own_start, own_end),
+                                        kept_contracts,
+                                        timesheets_directory())
+  user_booked = sheets.filter_events_by_date(booked, own_start, own_end) \
+              + added_rows
+  data = contract_data(user, user_booked, removed_rows,
+                       own_start, own_end)
+  if not data:
+    logging.warning(f"{user}: no contract after carrying the difference, "
+                    "it falls below the minimum percentage or days.")
+    continue
+  amanuensis[user] = data
+  <<report the carried difference for [[user]]>>
+@
+
+The contracts this one won't replace are those whose periods don't
+overlap its own, the same rule [[get_valid_contracts]] will apply once
+the new contract is stored.
+<<let [[kept_contracts]] be [[user]]'s contracts this one won't replace>>=
+own_window = (own_start.date() if own_start else None,
+              own_end.date() if own_end else None)
+kept_contracts = [contract for contract in get_user_contracts(user)
+                  if not windows_overlap(contract_window(contract),
+                                         own_window)]
+@
+
+A kept contract with events inside this contract's period must have
+carried them there, since its own period doesn't overlap ours.
+That's the third case above.
+<<warn if [[kept_contracts]] carried sessions from this period>>=
+for contract in kept_contracts:
+  carried = contract["events"] + contract.get("removed_events", [])
+  if sheets.filter_events_by_date(carried, own_start, own_end):
+    logging.warning(f"{user}: {contract['filename']} carried sessions "
+                    "from this contract's period. Re-create that "
+                    "contract after this one, so that the sessions "
+                    "aren't counted twice.")
+@
+
+The difference changes the percentage, so we say what was carried.
+We list the dates rather than just counting the sessions, since that's
+what lets us check the result against the sign-up sheet.
+<<report the carried difference for [[user]]>>=
+if added_rows or removed_rows:
+  logging.warning(
+    f"{user}: carrying into the contract: "
+    f"added {', '.join(row[1] for row in added_rows) or 'none'}; "
+    f"removed {', '.join(row[1] for row in removed_rows) or 'none'}.")
+@
+
+The planning spreadsheet must count the same sessions as the contract,
+so it gets the TA's bookings per course restricted to [[user_booked]].
+The removed sessions have no place in its per-course rows, so the
+spreadsheet shows the sessions worked, not the deduction.
+<<let [[user_booked_by_course]] be [[booked_by_course]] for [[user]]>>=
+user_booked_by_course = {
+    key: [row for row in rows if row in user_booked]
+    for key, rows in booked_by_course.items()
+}
+@
+
+Finally, the stored contract must let us recompute it.
+The removed sessions are part of the contract, and we also keep the
+booking window: the stored [[start]] and [[end]] are the contract's
+dates (\cref{sec:contract-dates}), so without the booking window,
+re-computing the contract from current bookings in [[show --updates]]
+couldn't know that it was meant to carry anything.
+<<contract fields for the carried difference>>=
+"bookings_start": bookings_start.isoformat() if bookings_start else None,
+"bookings_end": bookings_end.isoformat() if bookings_end else None,
+"removed_events": removed_rows,
+@
+
+Let's verify the whole round trip through the real commands.
+[[erin]] had a period~1 contract for two sessions; she then dropped the
+second to [[frank]] and took an extra, longer session.
+We first check that a period~1 time sheet would report that difference,
+so that the final check isn't vacuous; then we create the period~2
+contract carrying it, and check that the time sheet reports nothing.
+Only the network-bound pieces are stubbed (the course configuration and
+the sign-up sheet download) along with the configuration of the two
+directories; the contract computation is real.
+We run the time sheets without [[--amanuensis]]: that option selects TAs
+by their \emph{current} contract, which depends on today's date, whereas
+the default selects TAs without one, which [[erin]]'s 2025 contracts
+never are again.
+<<test functions>>=
+def test_carried_difference_leaves_nothing_for_time_sheets(tmp_path,
+                                                           monkeypatch):
+  import typerconf
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+
+  contracts_dir = tmp_path / "contracts"
+  contracts_dir.mkdir()
+  timesheets_dir = tmp_path / "timesheets"
+  def mock_config_get(key):
+    if key == "hr.amanuensis.contract_dir":
+      return str(contracts_dir)
+    if key == "hr.timesheets.timesheets_dir":
+      return str(timesheets_dir)
+    raise KeyError(key)
+  monkeypatch.setattr(typerconf, "get", mock_config_get)
+
+  kept = _row("2025-09-01 10:00", "2025-09-01 12:00")
+  missed = _row("2025-09-08 10:00", "2025-09-08 12:00")
+  _write_contract(contracts_dir, "erin", "2025-08-01T10:00:00", *P1,
+                  events=[kept, missed])
+
+  extra = _sheet_row("2025-09-15 10:00", "2025-09-15 13:00")
+  p2_sessions = [_sheet_row(f"2025-11-{day:02} 10:00",
+                            f"2025-11-{day:02} 14:00")
+                 for day in range(3, 28)]
+  booked = [_sheet_row("2025-09-01 10:00", "2025-09-01 12:00"),
+            _sheet_row("2025-09-08 10:00", "2025-09-08 12:00",
+                       tas=("frank",)),
+            extra] + p2_sessions
+  config = typerconf.Config({"signupsheet": {"url": "https://example.com/s.csv"},
+                             "code": "DD1310"})
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *a, **k: {("DD1310", "reg"): config})
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: booked)
+  monkeypatch.chdir(tmp_path)
+
+  timesheet = ["timesheets", "generate", "--user", "erin",
+               "--start", "2025-08-25", "--end", "2025-10-26"]
+  before = CliRunner().invoke(hrcli.cli, timesheet)
+  assert before.exit_code == 0, before.output
+  assert "erin" in before.stdout
+
+  result = CliRunner().invoke(
+    hrcli.cli,
+    ["amanuensis", "create", "--user", "erin", "--no-detailed",
+     "--start", "2025-08-25", "--end", "2026-01-18",
+     "--set-start", "2025-10-27", "--set-end", "2026-01-18"])
+  assert result.exit_code == 0, result.output
+
+  p2 = [c for c in get_user_contracts("erin")
+        if c["start"].startswith("2025-10-27")]
+  assert len(p2) == 1
+  assert extra[:5] + ["erin"] in p2[0]["events"]
+  assert kept not in p2[0]["events"]
+  assert p2[0]["removed_events"] == [missed]
+  assert len(get_user_contracts("erin")) == 2
+
+  after = CliRunner().invoke(hrcli.cli, timesheet)
+  assert after.exit_code == 0, after.output
+  assert "erin" not in after.stdout
+@
 
 \section{Showing amanuensis contracts}
 
@@ -2391,8 +2902,16 @@ def contract_date(contract, field):
   Returns the date in `contract[field]`, or None if it's missing or
   malformed.
   """
+  time = contract_date_time(contract, field)
+  return time.date() if time else None
+
+def contract_date_time(contract, field):
+  """
+  Returns the datetime in `contract[field]`, or None if it's missing or
+  malformed.
+  """
   try:
-    return datetime.datetime.fromisoformat(contract[field]).date()
+    return datetime.datetime.fromisoformat(contract[field])
   except (KeyError, TypeError, ValueError):
     return None
 <<fall back to the dates of the events in [[contract]]>>=
@@ -3074,7 +3593,7 @@ We just need to set up the same variables and then do
 [[<<print [[amanuensis]] data for [[user]]>>]].
 <<print [[contract]]>>=
 user = contract["user"]
-booked = contract["events"]
+booked = user_booked = contract["events"]
 
 start = datetime.datetime.fromisoformat(contract["start"]) \
           if "start" in contract and contract["start"] else None
@@ -3101,12 +3620,14 @@ except KeyError:
 When we recompute the amanuensis data, we want to set the low percentage and 
 minimum days to zero so that those settings don't interfere.
 Maybe those settings have changed, but then we still have a contract.
+We recompute with [[contract_data]] (\cref{sec:contract-data}), so that
+the hours of any sessions the contract deducted are subtracted, as they
+were when it was created.
 <<let [[amanuensis]] be the recomputed data from [[booked]] between [[start]] and [[end]]>>=
-amanuensis = hr.compute_amanuensis_data(booked,
-                                        begin_date=start,
-                                        end_date=end,
-                                        low_percentage=0,
-                                        min_days=0)
+amanuensis = {user: contract_data(user, booked,
+                                  contract.get("removed_events", []),
+                                  start, end,
+                                  low_percentage=0, min_days=0)}
 
 @
 
@@ -3135,6 +3656,11 @@ separated CSV to stdout.
 csvout = csv.writer(sys.stdout, delimiter="\t")
 for event in contract["events"]:
   csvout.writerow(event)
+if contract.get("removed_events"):
+  csvout.writerow([])
+  csvout.writerow(["Removed events"])
+  for event in contract["removed_events"]:
+    csvout.writerow(event)
 <<option [[events]] to include events>>=
 events: Annotated[bool, events_opt] = False
 <<argument and option definitions>>=
@@ -3225,18 +3751,18 @@ We can reuse the [[create]] command ([[cli_amanuens_create]]) to generate the
 draft contract.
 We use the dates from the contract as arguments to the [[create]] command.
 Finally, we must ensure to set [[draft]] to [[True]] to not store the contract.
-<<show draft contract based on [[contract]] with all current hours>>=
-try:
-  start = datetime.datetime.fromisoformat(contract["start"]) \
-            if contract["start"] else None
-except KeyError:
-  start = None
 
-try:
-  end = datetime.datetime.fromisoformat(contract["end"]) \
-          if contract["end"] else None
-except KeyError:
-  end = None
+The booking window is the stored [[bookings_start]] and [[bookings_end]]
+when the contract has them (\cref{sec:carry-difference}); older
+contracts don't, and for them the contract dates are the best we have.
+The draft is computed as a replacement of the shown contract: the shown
+contract overlaps it, so what it carried is computed afresh rather than
+taken as already accounted for.
+<<show draft contract based on [[contract]] with all current hours>>=
+start = contract_date_time(contract, "bookings_start") \
+        or contract_date_time(contract, "start")
+end = contract_date_time(contract, "bookings_end") \
+      or contract_date_time(contract, "end")
 
 try:
   push_start = datetime.datetime.fromisoformat(contract["push_start"]) \
@@ -3905,7 +4431,7 @@ if len(set(projects)) == 1:
   project = projects[0]
 @
 
-\subsection{Summarize the events for a TA}
+\subsection{Summarize the events for a TA}\label{sec:summarize-user}
 
 The [[summarize_user]] function will take a user and the course events and
 return a list that can be put into the time sheet.
