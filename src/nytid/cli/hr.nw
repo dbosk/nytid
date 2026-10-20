@@ -2303,11 +2303,16 @@ Over time, a single TA might have multiple contract files:
       spring)
 \end{itemize}
 
-We consider two contracts to overlap if they share any teaching events.
-A valid contract is the most recent version in a series of overlapping 
+We consider two contracts to overlap if their employment periods overlap
+(\cref{sec:contract-dates}).
+A valid contract is the most recent version in a series of overlapping
 contracts.
-However, if a TA has non-overlapping contracts (such as separate autumn and 
+However, if a TA has non-overlapping contracts (such as separate autumn and
 spring contracts), all of them are valid.
+A consequence is that a TA has at most one valid contract per period: a
+contract for other courses in the same period replaces the earlier one
+rather than adding to it, so a TA working in several courses needs one
+contract covering all of them.
 
 The [[filter_mode]] parameter further refines which valid contracts to return:
 \begin{description}
@@ -2349,6 +2354,73 @@ def get_valid_contracts(user_regex, filter_mode=ContractFilterMode.CURRENT):
     <<filter contracts based on [[filter_mode]]>>
 
   return contracts
+@
+
+\subsubsection{A contract's employment period}\label{sec:contract-dates}
+
+Both the filtering and the replacement of contracts ask the same
+question: when is this contract's employment?
+The [[start]] and [[end]] fields answer it.
+Note that they are not the [[--start]] and [[--end]] options the
+contract was created with: [[create]] stores the contract's resolved
+dates, after [[--set-start]], [[--set-end]] and [[--push-start]] have
+been applied (\cref{sec:modify-contract-dates}).
+That is what makes them the employment period, and it matters once a
+contract may hold sessions from before its period
+(\cref{sec:carry-difference}): those sessions lie outside the stored
+dates.
+
+Contract files written by hand or by old versions may lack the dates.
+For those we fall back to the first and last event, which is what
+[[compute_amanuensis_data]] would have based the dates on anyway.
+We return plain dates, since an employment period has day resolution.
+<<helper functions>>=
+def contract_window(contract):
+  """
+  Returns the employment period of `contract` as a pair (start, end) of
+  `datetime.date`. A bound that can't be determined is None.
+  """
+  start = contract_date(contract, "start")
+  end = contract_date(contract, "end")
+  if not start or not end:
+    <<fall back to the dates of the events in [[contract]]>>
+  return start, end
+
+def contract_date(contract, field):
+  """
+  Returns the date in `contract[field]`, or None if it's missing or
+  malformed.
+  """
+  try:
+    return datetime.datetime.fromisoformat(contract[field]).date()
+  except (KeyError, TypeError, ValueError):
+    return None
+<<fall back to the dates of the events in [[contract]]>>=
+event_dates = sorted(datetime.datetime.fromisoformat(event[i]).date()
+                     for event in contract.get("events", [])
+                     for i in (1, 2))
+if event_dates:
+  start = start or event_dates[0]
+  end = end or event_dates[-1]
+@
+
+<<test functions>>=
+def test_contract_window_uses_stored_dates():
+  contract = {"start": "2025-10-27T00:00:00+01:00",
+              "end": "2026-01-18T00:00:00+01:00",
+              "events": [["Lab", "2025-09-01 10:00", "2025-09-01 12:00",
+                          "D1", "1", "erin"]]}
+  assert contract_window(contract) == (datetime.date(2025, 10, 27),
+                                       datetime.date(2026, 1, 18))
+
+def test_contract_window_falls_back_to_events():
+  contract = {"start": None,
+              "events": [["Lab", "2025-09-08 10:00", "2025-09-08 12:00",
+                          "D1", "1", "erin"],
+                         ["Lab", "2025-09-01 10:00", "2025-09-01 12:00",
+                          "D1", "1", "erin"]]}
+  assert contract_window(contract) == (datetime.date(2025, 9, 1),
+                                       datetime.date(2025, 9, 8))
 @
 
 \subsubsection{Filtering contracts by time period}
@@ -2700,16 +2772,33 @@ for contract in contracts_path.glob("*.json"):
 @
 
 The valid contract is the latest contract in a series of overlapping contracts.
-This means that we can simply sort the contracts by name (as the sorted ISO 
-time is the same as alphabetical order) and go through them.
-As soon as we find a contract that doesn't overlap with the previous one, we 
-know that the previous one is the latest valid contract.
+A newer contract replaces every older one whose employment period
+overlaps its own, so we walk the contracts from the newest to the oldest
+and keep a contract only if no newer contract overlaps it.
+
+Two simpler walks suggest themselves, and both are wrong.
+An earlier version sorted the files oldest first and compared each
+contract only with the one just before it.
+That works for a single chain of versions, but not when contracts for
+different periods are interleaved in time.
+Say we create a contract for period~1, then one for period~2, and then
+redo the one for period~1.
+The first version of period~1 is followed by period~2, which doesn't
+overlap it, so it was kept---alongside the new version that was meant
+to replace it.
+Comparing against the newer contracts we have \emph{kept}, rather than
+against \emph{all} newer contracts, goes wrong in the opposite
+direction: if a contract spanning periods~1 and~2 is replaced by one
+covering only period~2, the old period~1 contract would come back to
+life, although the spanning contract had already replaced it.
+Comparing with every newer contract gives each replacement its effect
+once and for all.
 
 Remember that a TA can have several valid contracts:
 they might have had a contract for the autumn semester and then got a new one
 for the spring semester.
-Both of those contracts are considered valid since they don't overlap in
-teaching events.
+Both of those contracts are considered valid since their periods don't
+overlap.
 
 \subsubsection{Loading contracts from disk}\label{loading-contracts}
 
@@ -2724,13 +2813,15 @@ with open(contract_file) as infile:
 contract["filename"] = contract_file.name
 @
 
-Now we can implement the logic to add valid contracts for a user:
+Now we can implement the logic to add valid contracts for a user.
+The filenames sort in the order the contracts were created, so reversing
+them puts the newest first.
 <<add the valid contracts for [[user]] to [[contracts]]>>=
 user_contracts = []
+newer_contracts = []
 
 contract_files = sorted(contracts_path.glob(f"{user}.*.json"),
-                        key=lambda x: x.name)
-prev_contract = None
+                        key=lambda x: x.name, reverse=True)
 for contract_file in contract_files:
   try:
     <<read [[contract]] from [[contract_file]]>>
@@ -2738,48 +2829,137 @@ for contract_file in contract_files:
     logging.warning(f"Can't read {contract_file}, skipping: {err}")
     continue
 
-  if prev_contract and not contract_overlap(prev_contract, contract):
-    user_contracts.append(prev_contract)
+  if not any(contract_overlap(contract, newer)
+             for newer in newer_contracts):
+    user_contracts.append(contract)
 
-  prev_contract = contract
+  newer_contracts.append(contract)
 
-user_contracts.append(contract)
-
-contracts += user_contracts
+contracts += reversed(user_contracts)
 @
 
-To check if two contracts overlap, we need to check if they have any events in 
-common.
-If they do, we consider them to overlap.
+We add the user's contracts oldest first, as the earlier walk did, so
+that the order of the output doesn't change.
+
+\subsubsection{When two contracts overlap}
+
+Two contracts overlap when their employment periods overlap
+(\cref{sec:contract-dates}).
+An earlier version said they overlap when they share a teaching event.
+That rule has two holes.
+First, a new version of a contract need not share any event with the old
+one: if the TA's bookings change completely, the two versions have
+disjoint events and both would count, paying the TA twice for the same
+period.
+Second, a contract may legitimately contain events from outside its own
+period: when we carry the difference from an earlier period into the
+next contract (\cref{sec:carry-difference}), the period~2 contract holds
+sessions from period~1.
+Under the event rule, that contract would silently replace the period~1
+contract.
+The periods are what the employment is about, so they are what decides.
 <<helper functions>>=
 def contract_overlap(contract1, contract2):
   """
-  Returns True if the contracts overlap, False otherwise.
-
-  We define overlap as having at least one event in common.
+  Returns True if the contracts' employment periods overlap, False
+  otherwise.
   """
-  for event1 in contract1["events"]:
-    for event2 in contract2["events"]:
-      if event_overlap(event1, event2):
-        return True
-  return False
+  return windows_overlap(contract_window(contract1),
+                         contract_window(contract2))
 @
 
-To compare the events, we need to compare the times of the events only.
-If they overlap in time, we consider them to be the same event.
+The periods have day resolution and are inclusive at both ends, so a
+contract ending on the 26th and one starting on the 27th don't overlap.
+A missing bound means the period is open in that direction.
 <<helper functions>>=
-def event_overlap(event1, event2):
+def windows_overlap(window1, window2):
   """
-  Returns True if the events overlap, False otherwise.
-
-  We define overlap as overlapping in time.
+  Returns True if the date windows overlap. Each window is a pair
+  (start, end) of `datetime.date` objects, inclusive; None means open.
   """
-  start1 = datetime.datetime.fromisoformat(event1[1])
-  end1 = datetime.datetime.fromisoformat(event1[2])
-  start2 = datetime.datetime.fromisoformat(event2[1])
-  end2 = datetime.datetime.fromisoformat(event2[2])
+  start1, end1 = window1
+  start2, end2 = window2
+  return (start1 is None or end2 is None or start1 <= end2) \
+     and (start2 is None or end1 is None or start2 <= end1)
+@
 
-  return start1 < end2 and start2 < end1
+Let's verify the replacement rule on the cases above.
+We write the contracts to a temporary contract directory, as the
+[[temp_contracts_dir]] fixture does, so that the test runs the real
+loading and walking code.
+<<test functions>>=
+def _write_contract(path, user, created, start, end, events=None,
+                    **fields):
+  contract = {"user": user, "start": start, "end": end,
+              "events": events or []}
+  contract.update(fields)
+  with open(path / f"{user}.{created}.json", "w") as outfile:
+    json.dump(contract, outfile)
+
+def _contract_dirs(monkeypatch, contracts_path):
+  import typerconf
+  def mock_config_get(key):
+    if key == "hr.amanuensis.contract_dir":
+      return str(contracts_path)
+    raise KeyError(key)
+  monkeypatch.setattr(typerconf, "get", mock_config_get)
+
+P1 = ("2025-08-25T00:00:00+02:00", "2025-10-26T00:00:00+01:00")
+P2 = ("2025-10-27T00:00:00+01:00", "2026-01-18T00:00:00+01:00")
+
+def _row(start, end, user="erin", event="DD1310 Laboration"):
+  return [event, start, end, "D1", "1", user]
+
+def test_new_version_with_disjoint_events_replaces(tmp_path, monkeypatch):
+  """A new version replaces the old even if no event is shared."""
+  _contract_dirs(monkeypatch, tmp_path)
+  _write_contract(tmp_path, "erin", "2025-10-01T10:00:00", *P2,
+                  events=[_row("2025-11-03 10:00", "2025-11-03 12:00")])
+  _write_contract(tmp_path, "erin", "2025-10-02T10:00:00", *P2,
+                  events=[_row("2025-11-10 10:00", "2025-11-10 12:00")])
+  contracts = get_user_contracts("erin")
+  assert [c["filename"] for c in contracts] == \
+    ["erin.2025-10-02T10:00:00.json"]
+
+def test_events_from_other_period_dont_replace(tmp_path, monkeypatch):
+  """A P2 contract holding P1 sessions doesn't replace the P1 one."""
+  _contract_dirs(monkeypatch, tmp_path)
+  p1_session = _row("2025-09-01 10:00", "2025-09-01 12:00")
+  _write_contract(tmp_path, "erin", "2025-08-01T10:00:00", *P1,
+                  events=[p1_session])
+  _write_contract(tmp_path, "erin", "2025-10-20T10:00:00", *P2,
+                  events=[p1_session,
+                          _row("2025-11-03 10:00", "2025-11-03 12:00")])
+  assert len(get_user_contracts("erin")) == 2
+
+def test_redone_earlier_contract_replaces_its_old_version(tmp_path,
+                                                         monkeypatch):
+  """P1, P2, P1-v2: the valid ones are P1-v2 and P2."""
+  _contract_dirs(monkeypatch, tmp_path)
+  _write_contract(tmp_path, "erin", "2025-08-01T10:00:00", *P1)
+  _write_contract(tmp_path, "erin", "2025-10-20T10:00:00", *P2)
+  _write_contract(tmp_path, "erin", "2025-10-21T10:00:00", *P1)
+  contracts = get_user_contracts("erin")
+  assert [c["filename"] for c in contracts] == \
+    ["erin.2025-10-20T10:00:00.json", "erin.2025-10-21T10:00:00.json"]
+
+def test_replaced_contract_stays_replaced(tmp_path, monkeypatch):
+  """A contract replaced by a spanning one doesn't come back."""
+  _contract_dirs(monkeypatch, tmp_path)
+  _write_contract(tmp_path, "erin", "2025-08-01T10:00:00", *P1)
+  _write_contract(tmp_path, "erin", "2025-09-01T10:00:00", P1[0], P2[1])
+  _write_contract(tmp_path, "erin", "2025-10-20T10:00:00", *P2)
+  contracts = get_user_contracts("erin")
+  assert [c["filename"] for c in contracts] == \
+    ["erin.2025-10-20T10:00:00.json"]
+
+def test_windows_overlap_boundaries():
+  d = datetime.date
+  assert not windows_overlap((d(2025, 8, 25), d(2025, 10, 26)),
+                             (d(2025, 10, 27), d(2026, 1, 18)))
+  assert windows_overlap((d(2025, 8, 25), d(2025, 10, 27)),
+                         (d(2025, 10, 27), d(2026, 1, 18)))
+  assert windows_overlap((None, d(2025, 9, 1)), (d(2025, 8, 1), None))
 @
 
 Finally, we need a function to filter contracts to only those active in a given 
