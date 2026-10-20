@@ -54,6 +54,14 @@ nytid hr timesheets generate DD1310
 nytid hr time DD1310
 ```
 
+Instead of a time sheet for the extra (or missed) sessions of one period,
+the difference can be carried into the next contract by letting `--start`
+reach back before the contract period:
+
+```bash
+nytid hr amanuensis create DD1310 --period 25/26-2 --start 2025-08-25
+```
+
 ### `track` — track time on activities
 
 Track time spent on course activities with free-form labels. Start a label
