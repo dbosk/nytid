@@ -9,6 +9,7 @@ MODULES+=	hr.py
 MODULES+=	track.py
 MODULES+=	todo.py
 MODULES+=	zulip.py
+MODULES+=	medvind.py
 
 EXTRAS+=	nytid.hourly.sh
 EXTRAS+=	nytid.daily.sh
