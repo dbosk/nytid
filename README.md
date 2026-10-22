@@ -43,7 +43,7 @@ nytid signupsheets generate DD1310
 nytid signupsheets set_url DD1310 https://docs.google.com/…
 ```
 
-### `hr` — employment contracts and time sheets
+### `hr` — employment contracts, time sheets and reported hours
 
 Compute employment data from completed sign-up sheets: generate amanuensis
 contracts, produce time sheets for hourly-employed TAs, and summarize hours per
@@ -63,17 +63,16 @@ reach back before the contract period:
 nytid hr amanuensis create DD1310 --period 25/26-2 --start 2025-08-25
 ```
 
-### `medvind` — the hours TAs have reported
-
-Read the times TAs have reported in Medvind (Visma), KTH's time-reporting
-system, to check them against what the TAs were booked for. Logging in reuses
-the KTH credentials and session of `ladok login`, and may ask for an
-Authenticator approval. Piped output is tab-separated rows for scripts.
+The `hr medvind` commands read the times TAs have reported in Medvind (Visma),
+KTH's time-reporting system, to check them against what the TAs were booked
+for. Logging in reuses the KTH credentials and session of `ladok login`, and
+may ask for an Authenticator approval. Piped output is tab-separated rows for
+scripts.
 
 ```bash
-nytid medvind plans
-nytid medvind hours --leader 'Ada Lärare' --no-attested
-nytid medvind hours --ta 'Tolvan' --comment DD1301 --from 2026-09-01 --to 2026-09-30
+nytid hr medvind plans
+nytid hr medvind hours --leader 'Ada Lärare' --no-attested
+nytid hr medvind hours --ta 'Tolvan' --comment DD1301 --from 2026-09-01 --to 2026-09-30
 ```
 
 ### `track` — track time on activities
