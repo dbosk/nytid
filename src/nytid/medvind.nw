@@ -1,0 +1,1180 @@
+\chapter{Reported hours from Medvind, the \texttt{medvind} module}%
+\label{medvind}
+
+TAs report the hours they have worked in Medvind, Visma's time-reporting
+system, and the course responsible attests them there.
+We book TAs in nytid (\cref{cli.hr}), so nytid knows what each TA
+\emph{should} have reported.
+Comparing the two by hand means scrolling the attest view in a web
+browser and holding the booking sheet in one's head.
+This module is the first half of automating that comparison: it reads
+the reported times out of Medvind, so that a script---or a later nytid
+command---can set them against the bookings.
+
+Medvind has no public API.
+Its web interface, however, is a JavaScript application that fetches
+everything it shows as JSON from a single endpoint, and once we hold
+the same cookies as the browser we can call that endpoint ourselves.
+Everything we know about it comes from a recording of the browser's
+traffic (a HAR file) while the attest view was open.
+The module therefore has three parts, which we present in the order a
+request experiences them:
+\begin{description}
+\item[Logging in (\cref{medvind.login})] Medvind sits behind KTH's
+  single sign-on with multi-factor authentication.
+  The [[weblogin]] package handles the password and the MFA steps; we
+  add the one handler it lacks, [[MedvindSSO]], which forwards the
+  SAML and WS-Federation relay pages between the systems.
+\item[The data API (\cref{medvind.api})] The class [[Medvind]] wraps
+  the JSON endpoint: one method per kind of request, no decisions.
+\item[Records to rows (\cref{medvind.rows})] Pure functions turn the
+  records Medvind returns into the rows we print, and select the rows
+  we are interested in.
+  These are the parts a comparison with the bookings will reuse.
+\end{description}
+
+<<[[medvind.py]]>>=
+"""Read the hours TAs have reported in Medvind (Visma) at KTH.
+
+`Medvind` logs in through KTH's single sign-on and fetches the
+reported times from Medvind's attest view; `record_to_row` and
+`select` turn those records into printable, filterable rows.
+"""
+<<imports>>
+
+<<constants>>
+<<classes>>
+<<functions>>
+@
+
+Medvind's address is a constant, but we read it at call time rather
+than binding it into default arguments.
+That lets the tests point the module at a local server
+(\cref{medvind.api}) without any extra parameter in the API.
+
+<<constants>>=
+BASE_URL = "https://kth.medvind.visma.com/Seamless/MvWeb"
+@
+
+
+\section{Logging in}%
+\label{medvind.login}
+
+The browser's way into the attest view is a chain of five pages.
+Opening [[MvWeb.aspx?ws=ATTEST]] redirects to Medvind's own login
+service, [[login.medvind.visma.com]], and from there:
+\begin{enumerate}
+\item an auto-submitting form posts a [[SAMLRequest]] to KTH's identity
+  provider, the ADFS server at [[login.ug.kth.se]];
+\item ADFS answers with its username and password form;
+\item after the password, ADFS shows the Authenticator
+  number-matching page, which polls until the user approves on the
+  phone;
+\item an auto-submitting form posts the [[SAMLResponse]] back to
+  Medvind's login service;
+\item that service in turn posts a WS-Federation token ([[wresult]])
+  to [[kth.medvind.visma.com]], which redirects to the attest view and
+  sets the cookie [[medvind.sso.token]].
+\end{enumerate}
+The last cookie is the one that matters: the data API starts its
+session from it (\cref{medvind.api}).
+
+Steps 2 and 3 are already solved.
+[[weblogin.kth.UGlogin]] fills in KTH's password form, and
+[[weblogin.microsoft.AzureMFA]] recognises the number-matching page by
+its [[validEntropyNumber]] element, shows the number and polls.
+The relays in steps 1, 4 and 5 are not handled by any [[weblogin]]
+handler: they are plain HTML forms that a browser submits with
+JavaScript, and [[requests]] does not run JavaScript.
+So the one thing this section adds is a handler that submits relay
+forms.
+
+\subsection{Sharing the session with \texttt{ladok3}}
+
+Which [[requests]] session should carry all this?
+A fresh [[weblogin.AutologinSession]] would work, but it would cost a
+password and an MFA approval on every run.
+The [[ladok3]] package already keeps a shared, logged-in session,
+[[ladok3.session.session]], and saves it---cookies included,
+encrypted---when the program exits.
+That session holds the KTH identity provider's cookies whenever
+[[ladok]] or [[kthutils]] was used recently, and ADFS's \enquote{keep me
+signed in} cookie means that step 2 and 3 are then skipped altogether.
+It also already carries an [[AzureMFA]] handler that matches any host,
+so step 3 is covered without us adding anything.
+We only add our relay handler, with [[add_handler]], which skips
+handlers that are already present---exactly what a session restored
+from [[ladok3]]'s cache needs.
+The credentials are [[ladok3]]'s too: [[ladok login]] stores the KTH
+username and password in the system keyring.
+
+We import [[ladok3]] inside the function.
+Importing it is not free, and a caller that brings its own session---a
+test, for instance---should not pay for it, nor need LADOK credentials.
+<<functions>>=
+def shared_session():
+    """Return `ladok3`'s shared session, extended to log into Medvind.
+
+    The session keeps the KTH identity provider's cookies between runs,
+    so a recent login through `ladok` or `kthutils` spares us the
+    password and the MFA approval.  Requires `ladok login` to have
+    stored the KTH credentials.
+    """
+    import ladok3
+    import ladok3.cli
+
+    session = ladok3.session.session
+    _, credentials = ladok3.cli.load_credentials()
+    session.add_handler(
+        MedvindSSO(credentials["username"], credentials["password"])
+    )
+    return session
+@
+
+\subsection{Recognising a relay page}
+
+A relay page is a form that carries a security token from one system
+to the next.
+Contrast it with the two other forms the chain shows us: the password
+form has a [[Password]] field, and the MFA page's form carries only
+ADFS's own [[AuthMethod]] and [[Context]].
+The relay forms are the only ones with a [[SAMLRequest]], a
+[[SAMLResponse]] or a [[wresult]] field, so the presence of one of
+those is what we test for.
+
+Recognising the form is not enough to submit it, though.
+A [[SAMLResponse]] is the proof that we have logged in; submitting it
+wherever a page's form happens to point would hand that proof to
+whoever controls the page.
+We therefore only forward to the three hosts the chain actually uses,
+and we refuse---with a warning, since it means the chain changed or
+something is wrong---a relay form that points anywhere else.
+<<constants>>=
+RELAY_INPUTS = frozenset({"SAMLRequest", "SAMLResponse", "wresult"})
+RELAY_HOSTS = frozenset(
+    {
+        "login.medvind.visma.com",
+        "login.ug.kth.se",
+        "kth.medvind.visma.com",
+    }
+)
+@
+
+The function returns everything needed to submit the form, so that the
+handler below does not have to parse the page a second time.
+Pages that are not HTML at all---the JSON from the data API, for
+instance, also passes through the session's handlers---are rejected
+before we try to parse them.
+<<functions>>=
+def relay_form(response, hosts=RELAY_HOSTS):
+    """Return `(method, url, data)` for an SSO relay form, or `None`.
+
+    A relay form is one with a `SAMLRequest`, `SAMLResponse` or
+    `wresult` field.  `None` is also returned when the form would post
+    to a host outside `hosts`, so that a security token is never sent
+    anywhere else.
+    """
+    if "html" not in response.headers.get("Content-Type", ""):
+        return None
+    try:
+        tree = html.fromstring(response.content)
+    except (etree.ParserError, ValueError):
+        return None
+    for form in tree.xpath("//form"):
+        data = {
+            field.name: field.value or ""
+            for field in form.xpath(".//input")
+            if field.name
+        }
+        if not RELAY_INPUTS & data.keys():
+            continue
+        url = urllib.parse.urljoin(response.url, form.action or "")
+        if urllib.parse.urlsplit(url).hostname not in hosts:
+            logger.warning("Refusing to relay a sign-on token to %s", url)
+            return None
+        return (form.method or "POST"), url, data
+    return None
+<<imports>>=
+import logging
+import urllib.parse
+
+from lxml import etree, html
+<<constants>>=
+logger = logging.getLogger(__name__)
+@
+
+[[lxml]] is not among nytid's own dependencies; it comes with
+[[weblogin]], which parses its pages with it too.
+
+The tests in this section exercise real HTTP over the loopback
+interface: a small server plays the part of the systems in the chain
+(rung~2 of the test-double ladder, a real local instance), so the
+relays, the redirects and the cookie handling all run through
+[[requests]] exactly as they do against Medvind.
+Each test gives the server a table of routes, from a path to a
+function that returns the status, the headers and the body; the server
+records every request it receives.
+<<test [[medvind.py]]>>=
+import contextlib
+import datetime
+import http.server
+import json
+import subprocess
+import sys
+import threading
+import urllib.parse
+
+import pytest
+import requests
+import weblogin
+
+import nytid.medvind as medvind_module
+from nytid.medvind import *
+
+<<test helpers>>
+<<test functions>>
+@
+
+<<test helpers>>=
+@contextlib.contextmanager
+def local_server(routes):
+  """Serve `routes` on a free loopback port; yield (url, requests)."""
+  received = []
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+    def handle_any(self):
+      length = int(self.headers.get("Content-Length") or 0)
+      body = self.rfile.read(length).decode("utf-8")
+      path, _, query = self.path.partition("?")
+      received.append({"method": self.command, "path": path,
+                       "query": urllib.parse.parse_qs(query),
+                       "body": body})
+      status, headers, content = routes[path](self, body)
+      self.send_response(status)
+      for name, value in headers:
+        self.send_header(name, value)
+      content = content.encode("utf-8")
+      self.send_header("Content-Length", str(len(content)))
+      self.end_headers()
+      self.wfile.write(content)
+
+    do_GET = do_POST = handle_any
+
+    def log_message(self, *args):
+      pass
+
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  try:
+    yield f"http://127.0.0.1:{server.server_port}", received
+  finally:
+    server.shutdown()
+    server.server_close()
+
+def page(text):
+  """A route answer with an HTML page."""
+  return 200, [("Content-Type", "text/html; charset=utf-8")], text
+
+def relay_page(action, field="SAMLResponse"):
+  """An auto-submitting relay page shaped like the ones in the chain."""
+  return page(f'<html><body><form method="POST" name="hiddenform" '
+              f'action="{action}"><input type="hidden" name="{field}" '
+              f'value="token-123"><input type="hidden" '
+              f'name="RelayState" value="state"></form></body></html>')
+
+LOCAL = frozenset({"127.0.0.1"})
+@
+
+A relay page is recognised and resolved to the form's target, while
+the password and MFA forms are left alone, and so is anything that is
+not HTML:
+<<test functions>>=
+def test_relay_form_finds_saml_form():
+  with local_server({"/relay": lambda h, b: relay_page("/next")}) as (url, _):
+    response = requests.get(url + "/relay")
+  method, target, data = relay_form(response, LOCAL)
+  assert method == "POST"
+  assert target == url + "/next"
+  assert data == {"SAMLResponse": "token-123", "RelayState": "state"}
+
+def test_relay_form_ignores_password_and_mfa_forms():
+  login = page('<form id="loginForm" method="post" action="/adfs">'
+               '<input name="UserName"><input name="Password"></form>')
+  mfa = page('<form id="loginForm" method="post">'
+             '<input name="AuthMethod" value="AzureMfaAuthentication">'
+             '<input name="Context" value="c"></form>'
+             '<p id="validEntropyNumber">33</p>')
+  json_answer = (200, [("Content-Type", "application/json")], "{}")
+  routes = {"/login": lambda h, b: login, "/mfa": lambda h, b: mfa,
+            "/json": lambda h, b: json_answer}
+  with local_server(routes) as (url, _):
+    for path in routes:
+      assert relay_form(requests.get(url + path), LOCAL) is None
+@
+
+The host check is the security property of the function, so it gets a
+test of its own: a relay form that points to a host outside the
+allowlist is not forwarded.
+<<test functions>>=
+def test_relay_form_refuses_foreign_host():
+  routes = {"/relay":
+            lambda h, b: relay_page("https://attacker.example/collect")}
+  with local_server(routes) as (url, _):
+    response = requests.get(url + "/relay")
+  assert relay_form(response, LOCAL) is None
+@
+
+\subsection{The relay handler}
+
+A [[weblogin]] handler answers two questions about every response the
+session receives: does this response need us ([[need_login]]), and if
+so, what is the response after we have done our part ([[login]])?
+For a relay, the first answer is [[relay_form]], and the second is the
+response to submitting the form.
+
+The interesting part is how the steps of the chain find each other.
+[[AutologinSession]] runs every response past its handlers, in order,
+and a handler that sends a request through the session triggers the
+same check on \emph{that} response, nested inside its own call.
+So when we submit the relay in step 1, the nested check sees the
+password page; when the password handler submits the password, the
+nested check sees the MFA page, and [[AzureMFA]] resolves it; the page
+after the MFA is the relay of step 4, which reaches our handler again,
+nested, and so on until the attest view.
+Contrast this with [[weblogin]]'s own handlers, which set a
+[[__logging_in]] flag that makes them ignore responses while they are
+busy.
+We deliberately do not: the chain contains three relays, and a handler
+that ignored nested relays would forward only the first of them.
+
+Without that guard, a relay that leads back to itself---a
+misconfigured service, or a page that keeps re-posting an expired
+token---would recurse until Python gives up.
+We bound the nesting instead and fail with an authentication error;
+the real chain needs three relays, so a bound of ten leaves room for
+changes in the chain while still stopping a loop quickly.
+<<constants>>=
+MAX_RELAY_DEPTH = 10
+@
+
+That leaves step 2.
+Why not simply register [[weblogin.kth.UGlogin]] on the session next
+to our handler?
+[[UGlogin]] decides whether a page is its business by looking at the
+URL: with a [[base_url]] it requires that the redirects leading to the
+password page started at that URL, and the password page here is the
+answer to our relay's POST, which has no redirect history at all.
+Without a [[base_url]] it claims \emph{every} page on
+[[login.ug.kth.se]].
+On a session that [[ladok3]] pickles and other programs restore, such
+a handler would also step into their sign-on flows.
+So our handler keeps a private [[UGlogin]] and hands it the password
+page itself; nothing outside the Medvind chain ever sees it.
+We recognise the password page by its [[Password]] field, which also
+tells it apart from the MFA page that ADFS renders with the same
+[[loginForm]] identifier.
+<<classes>>=
+class MedvindSSO(weblogin.AutologinHandler):
+    """Login handler that forwards the relays of Medvind's sign-on.
+
+    Submits the auto-submitting SAML and WS-Federation forms that pass
+    a token between Medvind and KTH's identity provider, and fills in
+    the KTH password form when the identity provider asks for it.  MFA
+    is left to a `weblogin.microsoft.AzureMFA` handler on the same
+    session.
+    """
+
+    def __init__(self, username, password, hosts=RELAY_HOSTS):
+        super().__init__()
+        self.__ug = weblogin.kth.UGlogin(username, password)
+        self.__hosts = frozenset(hosts)
+        self.__depth = 0
+
+    def need_login(self, response):
+        """Return True if `response` is a relay page we should submit."""
+        return relay_form(response, self.__hosts) is not None
+
+    def login(self, session, response, args=None, kwargs=None):
+        """Submit the relay in `response`; return the resulting response."""
+        <<refuse to relay deeper than [[MAX_RELAY_DEPTH]]>>
+        self.__depth += 1
+        try:
+            method, url, data = relay_form(response, self.__hosts)
+            result = session.request(method, url, data=data)
+            if has_password_form(result):
+                result = self.__ug.login(session, result)
+            return result
+        finally:
+            self.__depth -= 1
+<<imports>>=
+import weblogin
+import weblogin.kth
+@
+
+The depth is part of the handler's state, so [[pickle]] would save
+it---but it is zero whenever no login is in progress, which is the
+only time [[ladok3]] saves the session.
+
+<<refuse to relay deeper than [[MAX_RELAY_DEPTH]]>>=
+if self.__depth >= MAX_RELAY_DEPTH:
+    raise weblogin.AuthenticationError(
+        f"Medvind sign-on relayed more than {MAX_RELAY_DEPTH} times "
+        f"without reaching Medvind, last at {response.url}"
+    )
+@
+
+<<functions>>=
+def has_password_form(response):
+    """Return True if `response` shows a form asking for a password."""
+    if "html" not in response.headers.get("Content-Type", ""):
+        return False
+    try:
+        tree = html.fromstring(response.content)
+    except (etree.ParserError, ValueError):
+        return False
+    return bool(tree.xpath("//form//input[@name='Password']"))
+@
+
+The test that matters most replays the chain's shape end to end: a
+relay leads to a password form, the password leads to a second relay,
+and that relay leads to the final page.
+It checks that the password reached the identity provider in the form
+KTH expects (with [[@ug.kth.se]] appended by [[UGlogin]]), that both
+tokens were relayed, and that the caller receives the final page---which
+is only possible if the nested handler checks work as described above.
+The password form's action is absolute because [[UGlogin]] resolves a
+relative action against [[login.ug.kth.se]], not against the page.
+<<test functions>>=
+def test_medvind_sso_follows_the_whole_chain():
+  routes = {
+    "/start": lambda h, b: relay_page("/idp", field="SAMLRequest"),
+    "/idp": lambda h, b: page(
+      f'<form id="loginForm" method="post" '
+      f'action="http://{h.headers["Host"]}/idp/password">'
+      '<input name="UserName"><input name="Password" type="password">'
+      '</form>'),
+    "/idp/password": lambda h, b: relay_page("/sp", field="SAMLResponse"),
+    "/sp": lambda h, b: relay_page("/app", field="wresult"),
+    "/app": lambda h, b: page("<html>attest view</html>"),
+  }
+  with local_server(routes) as (url, received):
+    session = weblogin.AutologinSession(
+      [MedvindSSO("tolvan", "secret", hosts=LOCAL)])
+    response = session.get(url + "/start")
+  assert response.text == "<html>attest view</html>"
+  assert [r["path"] for r in received] == \
+    ["/start", "/idp", "/idp/password", "/sp", "/app"]
+  password_post = urllib.parse.parse_qs(received[2]["body"])
+  assert password_post["UserName"] == ["tolvan@ug.kth.se"]
+  assert password_post["Password"] == ["secret"]
+  assert urllib.parse.parse_qs(received[3]["body"])["SAMLResponse"] \
+    == ["token-123"]
+@
+
+A relay that points back to itself must end in an error, not in a
+[[RecursionError]] or a hang:
+<<test functions>>=
+def test_medvind_sso_stops_a_relay_loop():
+  routes = {"/loop": lambda h, b: relay_page("/loop")}
+  with local_server(routes) as (url, received):
+    session = weblogin.AutologinSession(
+      [MedvindSSO("tolvan", "secret", hosts=LOCAL)])
+    with pytest.raises(weblogin.AuthenticationError):
+      session.get(url + "/loop")
+  assert len(received) == MAX_RELAY_DEPTH + 1
+@
+
+\subsection{Keeping the MFA number off standard output}
+
+[[AzureMFA]] shows the number to type into the Authenticator app with
+[[figlet]], or with [[print]] when [[figlet]] is missing.
+Both write to standard output.
+For a command whose standard output is data---[[nytid medvind hours]]
+prints rows for scripts---that is doubly wrong when the output is
+piped: the user never sees the number, so the login cannot complete,
+and the number ends up in the data.
+The right fix belongs in [[weblogin]] (dbosk/weblogin\#48).
+Until it is released we guard the login: for its duration, standard
+output is pointed at standard error.
+
+The guard has to work at two levels.
+[[print]] writes to [[sys.stdout]], the Python object, which
+[[contextlib.redirect_stdout]] swaps out.
+[[figlet]] is a separate process that inherits file descriptor~1,
+which no Python object controls, so we also duplicate descriptor~2
+onto descriptor~1 and restore the original afterwards.
+We name the descriptors by number rather than ask [[sys.stdout]] for
+its [[fileno()]].
+The two need not agree: a program that has replaced [[sys.stdout]]
+(a test runner capturing output, for one) answers with the
+descriptor of its replacement, while a subprocess still writes to
+descriptor~1.
+Only when descriptor~1 is not open at all is there nothing to divert
+at that level, and the first level is all we do.
+<<functions>>=
+@contextlib.contextmanager
+def stdout_to_stderr():
+    """Send everything written to standard output to standard error.
+
+    Covers both Python's `sys.stdout` and file descriptor 1, so that
+    subprocesses are redirected too.
+    """
+    sys.stdout.flush()
+    try:
+        saved_fd = os.dup(STDOUT_FD)
+    except OSError:
+        saved_fd = None
+    if saved_fd is not None:
+        os.dup2(STDERR_FD, STDOUT_FD)
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
+    finally:
+        if saved_fd is not None:
+            sys.stderr.flush()
+            os.dup2(saved_fd, STDOUT_FD)
+            os.close(saved_fd)
+<<constants>>=
+STDOUT_FD = 1
+STDERR_FD = 2
+<<imports>>=
+import contextlib
+import os
+import sys
+@
+
+We verify both levels with pytest's descriptor-level capture: a
+[[print]] and a subprocess inside the guard must both land on standard
+error, and standard output must work normally again afterwards.
+<<test functions>>=
+def test_stdout_to_stderr_covers_print_and_subprocesses(capfd):
+  with stdout_to_stderr():
+    print("from python")
+    subprocess.run(["echo", "from a subprocess"], check=True)
+  print("after")
+  out, err = capfd.readouterr()
+  assert out == "after\n"
+  assert "from python" in err and "from a subprocess" in err
+@
+
+
+\section{The data API}%
+\label{medvind.api}
+
+Every request the attest view makes goes to the same address,
+[[MvData.aspx]], with three query parameters: the module and the
+function to call, and the output format, which is always JSON.
+The parameters of the function travel in the body, as XML:
+\begin{quote}
+[[<postdata><postParams><PLANID>...</PLANID>...</postParams></postdata>]]
+\end{quote}
+sent with the content type [[application/json]]---the content type is
+wrong, but it is what the browser sends, and we copy the browser.
+
+A Medvind session starts from the single sign-on cookie: the function
+[[CREATE]] of the module [[SESSION]] takes the cookie's value and
+returns a session token, the user's identity and, among much else, the
+organisation units the user last worked with.
+Every later request must carry three parameters: the token, the user
+and the role.
+The attest view is the work of a manager, so the role is
+[[MANAGER]]; the same person has an [[EMPLOYEE]] role for reporting
+their own hours, which we have no use for here.
+<<constants>>=
+SSO_COOKIE = "medvind.sso.token"
+WORKSPACE = "ATTEST"
+ROLE = "MANAGER"
+@
+
+\subsection{Encoding the parameters}
+
+The values are user data---dates, but also identifiers that we pass
+on from Medvind's own answers---so we escape them as XML text.
+We keep the parameter names exactly as given: they are not uniform
+([[sso_wif]] is in lower case, [[PLANID]] in upper), and Medvind's
+server is the authority on how they are spelled.
+<<functions>>=
+def postdata(params):
+    """Encode `params` as the XML body Medvind's data API expects."""
+    fields = "".join(
+        f"<{name}>{escape(str(value))}</{name}>" for name, value in params.items()
+    )
+    return f"<postdata><postParams>{fields}</postParams></postdata>"
+<<imports>>=
+from xml.sax.saxutils import escape
+@
+
+<<test functions>>=
+def test_postdata_wraps_and_escapes_parameters():
+  assert postdata({"PLANID": "P1", "sso_wif": "a<b&c"}) == (
+    "<postdata><postParams><PLANID>P1</PLANID>"
+    "<sso_wif>a&lt;b&amp;c</sso_wif></postParams></postdata>")
+@
+
+\subsection{The \texttt{Medvind} class}
+
+The class holds the session and Medvind's session token, and has one
+method per request.
+It makes no decisions about what to fetch or how to present it; those
+belong to the caller and to the functions of \cref{medvind.rows}.
+That separation is also what makes it testable: the class is the only
+part of the module that talks to Medvind, so it is the only part that
+needs a server in the tests.
+
+When no session is given, the class uses the shared one
+(\cref{medvind.login}).
+Both the session factory and [[BASE_URL]] are looked up when an object
+is created, not when the module is loaded, which is the seam the CLI's
+tests use.
+<<classes>>=
+class Medvind:
+    """A connection to Medvind's attest view.
+
+    Call `login` before any other method.  `session` defaults to
+    `ladok3`'s shared session, extended by `shared_session`; `base_url`
+    defaults to KTH's Medvind.
+    """
+
+    def __init__(self, session=None, base_url=None):
+        self.__session = session if session is not None else shared_session()
+        self.__base_url = base_url or BASE_URL
+        self.__token = None
+        self.__userid = None
+        self.__plans = []
+        self.username = None
+
+    <<[[Medvind]] methods>>
+@
+
+\paragraph{Calling a function.}
+Medvind reports failures inside the JSON, in [[mvresult.success]],
+with HTTP status 200, so checking the status alone would let a failed
+call through as an empty answer.
+We check both.
+<<[[Medvind]] methods>>=
+def call(self, module, func, **params):
+    """Call `func` of `module` in Medvind's data API; return the JSON.
+
+    Adds the session parameters once `login` has run.  Raises
+    `MedvindError` if Medvind reports a failure.
+    """
+    if self.__token:
+        params.update(TOKEN=self.__token, USERID=self.__userid, ROLE=ROLE)
+    response = self.__session.post(
+        f"{self.__base_url}/MvData.aspx",
+        params={"MODULE": module, "OUT": "JSON", "FUNC": func},
+        data=postdata(params).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("mvresult", {}).get("success"):
+        raise MedvindError(f"Medvind {module}/{func} failed: {result.get('mvresult')}")
+    return result
+<<classes>>=
+class MedvindError(Exception):
+    """Medvind's data API reported a failure."""
+@
+
+\paragraph{Logging in.}
+We open the attest view exactly as the browser does and let the
+session's handlers follow the sign-on chain.
+Afterwards the cookie tells us whether we got through: whatever the
+chain ended in, without [[medvind.sso.token]] there is no Medvind
+session to start.
+The cookie is host-only, so we look it up for Medvind's host; a lookup
+by name alone fails when another host in the jar set a cookie with the
+same name.
+<<[[Medvind]] methods>>=
+def login(self):
+    """Log into Medvind through single sign-on and start a session.
+
+    May ask for MFA approval; the number is shown on standard error.
+    Raises `weblogin.AuthenticationError` if the sign-on fails.
+    """
+    with stdout_to_stderr():
+        self.__session.get(
+            f"{self.__base_url}/MvWeb.aspx", params={"ws": WORKSPACE}
+        )
+    host = urllib.parse.urlsplit(self.__base_url).hostname
+    sso_token = self.__session.cookies.get(SSO_COOKIE, domain=host)
+    if not sso_token:
+        raise weblogin.AuthenticationError(
+            f"Medvind sign-on did not yield the {SSO_COOKIE} cookie"
+        )
+    session = self.call("SESSION", "CREATE", sso_wif=sso_token)["session"]
+    self.__token = session["token"]
+    self.__userid = session["userid"]
+    self.__plans = session.get("lastplan", [])
+    self.username = session.get("username")
+@
+
+\paragraph{Plans.}
+Medvind organises people in \emph{plans}, nodes in the organisation
+tree, and the attest view shows one plan at a time.
+A plan is identified by its [[id]], but requests also need its
+[[strpos]], the path from the root of the tree to the node.
+The session answer lists the plans the user last worked with, most
+recent first, with both; the recorded traffic contains no request that
+lists the whole tree, so these are the plans we can offer.
+<<[[Medvind]] methods>>=
+def plans(self):
+    """Return the plans the user last worked with, most recent first.
+
+    Each plan is a dictionary with at least `id`, `text` and `strpos`.
+    """
+    return list(self.__plans)
+@
+
+\paragraph{The reported times.}
+The attest view loads the times with [[LOAD_TIMELIST]] of the module
+[[APPROVE]], for a plan and a range of dates.
+We default to the most recent plan, which is the one the web interface
+opens with.
+<<[[Medvind]] methods>>=
+def timelist(self, start, end, plan=None):
+    """Return the reported times from `start` to `end` (dates).
+
+    `plan` is a plan id from `plans`; it defaults to the most recent.
+    Each time is a dictionary as Medvind returns it, see `record_to_row`.
+    """
+    plan = self.__plan(plan)
+    result = self.call(
+        "APPROVE",
+        "LOAD_TIMELIST",
+        PLANID=plan["id"],
+        STRPOS=plan["strpos"],
+        LOADFROM=start.isoformat(),
+        LOADUNTIL=end.isoformat(),
+        VIEW="PLAN",
+    )
+    return result.get("timeapprove", [])
+
+def __plan(self, plan_id):
+    if not self.__plans:
+        raise MedvindError("Medvind returned no plans for this user")
+    if plan_id is None:
+        return self.__plans[0]
+    for plan in self.__plans:
+        if plan["id"] == plan_id:
+            return plan
+    known = ", ".join(plan["id"] for plan in self.__plans)
+    raise ValueError(f"unknown plan {plan_id}, known plans: {known}")
+@
+
+\subsection{Testing against recorded answers}
+
+We test the class against a local server that answers with Medvind's
+recorded responses.
+The responses are pseudonymised: the people are the fictive Tolvan
+and Tolva Tolvansson, the identifiers are made up, and the free-text
+comments are replaced; the field names and the format of every value
+are as recorded.
+Medvind leaves out a field rather than send it empty, which is why the
+last two times lack the comment, the work leader or the account.
+Tolva's personnummer deliberately fails the checksum, so that it
+cannot be anyone's.
+<<test helpers>>=
+SESSION_ANSWER = {
+  "mvresult": {"success": True},
+  "session": {
+    "token": "0123456789abcdef0123456789abcdef",
+    "userid": "tolvan",
+    "username": "Tolvan Tolvansson",
+    "active_role": "MANAGER",
+    "lastplan": [
+      {"id": "0132TESTNODE", "nodetype": "1",
+       "text": "Exempelavdelningen Personal (JXX)",
+       "strpos": "0132ROOT.0132TESTNODE"},
+      {"id": "0132OTHERNOD", "nodetype": "1",
+       "text": "Exempelinstitutionen (JX)",
+       "strpos": "0132ROOT.0132OTHERNOD"},
+    ],
+  },
+}
+
+def time(fnamn, enamn, realpnr, datum, start, end, **fields):
+  """A recorded time with the fields every time has, plus `fields`."""
+  return {"persnr": "015P0000TA01", "realpnr": realpnr,
+          "anstnr": "1000001:01", "planid": "0132TESTPLAN",
+          "plantext": "Exempelavdelningen Personal (JXX), Intermittent",
+          "placid": "0132TESTPL01", "enamn": enamn, "fnamn": fnamn,
+          "datum": datum, "dygn": "0", "starttid": start,
+          "sluttid": end, "tidtyp": "27", "tidtyptext": "Student(165)",
+          "rastminut": "0", **fields}
+
+TIMELIST_ANSWER = {
+  "mvresult": {"success": True},
+  "timeapprove": [
+    time("Tolvan", "Tolvansson", "121212-1212", "2026-06-04",
+         "09:00", "11:45", arbledare_orsak="Ada Lärare",
+         tidtyp_orsak="DD1301 labbpass",
+         arbledare_godk="2026-07-06 11:53:51.000 approver",
+         atteststatus="A", avv_konto="JXX,110210,"),
+    time("Tolvan", "Tolvansson", "121212-1212", "2026-08-25",
+         "13:15", "17:00", arbledare_orsak="Ada Lärare",
+         tidtyp_orsak="DD1310 handledning\r\n2h schablon",
+         arbledare_godk="2026-10-07 12:39:02.000 approver",
+         atteststatus="A", avv_konto="JXX     ,110210  ,          "),
+    time("Tolva", "Tolvansson", "121212-2223", "2026-09-01",
+         "08:00", "12:00", tidtyp_orsak="DD1301 labbpass"),
+    time("Tolva", "Tolvansson", "121212-2223", "2026-09-02",
+         "10:15", "12:00",
+         arbledare_godk="2026-10-07 12:35:45.000 approver",
+         atteststatus="A"),
+  ],
+}
+
+def medvind_routes(sso_cookie="sso-abc"):
+  """Routes that mimic the attest view and Medvind's data API."""
+  def attest_view(handler, body):
+    headers = [("Content-Type", "text/html")]
+    if sso_cookie:
+      headers.append(("Set-Cookie",
+                      f"{SSO_COOKIE}={sso_cookie}; path=/"))
+    return 200, headers, "<html>attest view</html>"
+
+  def data_api(handler, body):
+    answers = {"CREATE": SESSION_ANSWER,
+               "LOAD_TIMELIST": TIMELIST_ANSWER}
+    func = urllib.parse.parse_qs(handler.path.partition("?")[2])["FUNC"][0]
+    return (200, [("Content-Type", "application/json")],
+            json.dumps(answers[func]))
+
+  return {"/MvWeb.aspx": attest_view, "/MvData.aspx": data_api}
+@
+
+Logging in must hand the cookie to [[SESSION/CREATE]], and the request
+for the times must carry the session's parameters and the plan's id
+and path:
+<<test functions>>=
+def test_login_and_timelist_send_what_medvind_expects():
+  with local_server(medvind_routes()) as (url, received):
+    medvind = Medvind(session=requests.Session(), base_url=url)
+    medvind.login()
+    times = medvind.timelist(datetime.date(2026, 9, 1),
+                             datetime.date(2026, 9, 30))
+  create, load = received[1], received[2]
+  assert create["query"]["FUNC"] == ["CREATE"]
+  assert "<sso_wif>sso-abc</sso_wif>" in create["body"]
+  assert load["query"] == {"MODULE": ["APPROVE"], "OUT": ["JSON"],
+                           "FUNC": ["LOAD_TIMELIST"]}
+  for field in ["<PLANID>0132TESTNODE</PLANID>",
+                "<STRPOS>0132ROOT.0132TESTNODE</STRPOS>",
+                "<LOADFROM>2026-09-01</LOADFROM>",
+                "<LOADUNTIL>2026-09-30</LOADUNTIL>",
+                "<TOKEN>0123456789abcdef0123456789abcdef</TOKEN>",
+                "<USERID>tolvan</USERID>", "<ROLE>MANAGER</ROLE>"]:
+    assert field in load["body"]
+  assert times == TIMELIST_ANSWER["timeapprove"]
+  assert medvind.username == "Tolvan Tolvansson"
+@
+
+A plan other than the most recent is found by its id, and its path
+goes with it; an unknown plan is an error that names the known ones.
+<<test functions>>=
+def test_timelist_uses_the_chosen_plan():
+  with local_server(medvind_routes()) as (url, received):
+    medvind = Medvind(session=requests.Session(), base_url=url)
+    medvind.login()
+    medvind.timelist(datetime.date(2026, 9, 1),
+                     datetime.date(2026, 9, 30), plan="0132OTHERNOD")
+    with pytest.raises(ValueError, match="0132TESTNODE"):
+      medvind.timelist(datetime.date(2026, 9, 1),
+                       datetime.date(2026, 9, 30), plan="nonexistent")
+  assert "<STRPOS>0132ROOT.0132OTHERNOD</STRPOS>" in received[2]["body"]
+@
+
+Without the sign-on cookie, logging in must fail before any data
+request is made:
+<<test functions>>=
+def test_login_without_sso_cookie_fails():
+  with local_server(medvind_routes(sso_cookie=None)) as (url, received):
+    medvind = Medvind(session=requests.Session(), base_url=url)
+    with pytest.raises(weblogin.AuthenticationError):
+      medvind.login()
+  assert [r["path"] for r in received] == ["/MvWeb.aspx"]
+@
+
+A failure that Medvind reports in the JSON must not pass as an empty
+answer:
+<<test functions>>=
+def test_call_raises_on_reported_failure():
+  routes = {"/MvData.aspx": lambda h, b: (
+    200, [("Content-Type", "application/json")],
+    json.dumps({"mvresult": {"success": False}}))}
+  with local_server(routes) as (url, _):
+    medvind = Medvind(session=requests.Session(), base_url=url)
+    with pytest.raises(MedvindError):
+      medvind.call("UTIL", "GETGLOBALDATA")
+@
+
+
+\section{From records to rows}%
+\label{medvind.rows}
+
+A time, as Medvind returns it, is a dictionary of Swedish
+abbreviations.
+\Cref{tab:medvind-fields} lists the fields we use.
+The rest are internal identifiers ([[persnr]], [[anstnr]],
+[[placid]], [[planid]]) and the codes behind the texts.
+
+\begin{table}
+  \begin{sidecaption}{The fields of a reported time that we
+    use.}[tab:medvind-fields]
+    \begin{tabular}{ll}
+      \toprule
+      \textbf{Field} & \textbf{Meaning} \\
+      \midrule
+      [[fnamn]], [[enamn]] & first name, last name \\
+      [[realpnr]] & personnummer, [[YYMMDD-NNNN]] \\
+      [[datum]] & date, [[YYYY-MM-DD]] \\
+      [[starttid]], [[sluttid]] & start and end time, [[HH:MM]] \\
+      [[rastminut]] & break, in minutes \\
+      [[tidtyptext]] & kind of time, \eg [[Student(165)]] \\
+      [[tidtyp_orsak]] & the TA's comment, \eg [[DD1301 labbpass]] \\
+      [[arbledare_orsak]] & the work leader the TA chose \\
+      [[atteststatus]] & [[A]] once attested, otherwise absent \\
+      [[avv_konto]] & the account the time is charged to \\
+      \bottomrule
+    \end{tabular}
+  \end{sidecaption}
+\end{table}
+
+What is \emph{not} there matters as much.
+There is no KTH username and no e-mail address, in this answer or in
+any other the attest view receives.
+A TA is identified by name and personnummer only, which is why the
+selection below (\cref{medvind.select}) offers both, and why matching
+the times against the bookings will have to go by name or
+personnummer too.
+
+\subsection{Hours}
+
+The hours of a time are the time between start and end, less the
+break.
+An end before the start means the time ran past midnight, which is the
+only reading under which such a time is a valid one.
+
+There is one more field that looks relevant, [[dygn]] (day).
+In the recorded data it is [[0]] for every time except a pair on the
+same date, both from 15:00 to 17:00 and neither attested, one with
+[[-1]] and one with [[1]].
+Whatever the field means, it does not mean that a time crosses
+midnight, and adding a day for it would turn two hours into 26.
+We therefore leave it out of the calculation.
+<<functions>>=
+def hours(record):
+    """Return the hours of a reported time: end − start − break."""
+    start = minutes_since_midnight(record["starttid"])
+    end = minutes_since_midnight(record["sluttid"])
+    if end < start:
+        end += MINUTES_PER_DAY
+    return (end - start - int(record.get("rastminut") or 0)) / 60
+
+def minutes_since_midnight(clock):
+    """Return the minutes since midnight of an `HH:MM` time."""
+    hour, minute = clock.split(":")
+    return int(hour) * 60 + int(minute)
+<<constants>>=
+MINUTES_PER_DAY = 24 * 60
+@
+
+The recorded times have no breaks, so we cover them, and the passing
+of midnight, with times of our own:
+<<test functions>>=
+def test_hours_subtracts_the_break():
+  assert hours({"starttid": "08:00", "sluttid": "11:45",
+                "rastminut": "0"}) == 3.75
+  assert hours({"starttid": "08:00", "sluttid": "17:00",
+                "rastminut": "60"}) == 8
+
+def test_hours_across_midnight():
+  assert hours({"starttid": "22:00", "sluttid": "01:30"}) == 3.5
+
+def test_hours_ignores_dygn():
+  assert hours({"starttid": "15:00", "sluttid": "17:00",
+                "dygn": "-1"}) == 2
+@
+
+\subsection{A row per time}
+
+A row is what we print, so it is made for reading and for scripts at
+the same time.
+Two normalisations make that possible.
+The comment is free text and may contain line breaks or tabs---the
+recording has a comment with [[\r\n]] in it---either of which would
+split a tab-separated row; we collapse all white space to single
+spaces.
+The account is padded to fixed widths in some records
+([[JXX     ,110210  ,]]) and not in others ([[JXX,110210,]]); stripping
+the padding of each part makes the same account print the same, so
+that a script can group by it.
+
+The hours are rounded to two decimals and printed without trailing
+zeros, since nearly all reported times are whole quarters of an hour:
+\enquote{2.75} rather than \enquote{2.750000}, and \enquote{4} rather
+than \enquote{4.0}.
+The personnummer is not part of the row.
+We need it to select a TA, but printing it would spread it into every
+file and terminal a script writes to.
+<<constants>>=
+ROW_COLUMNS = (
+    "name",
+    "date",
+    "start",
+    "end",
+    "hours",
+    "type",
+    "comment",
+    "leader",
+    "status",
+    "account",
+)
+<<functions>>=
+def record_to_row(record):
+    """Return a reported time as a tuple of strings, see `ROW_COLUMNS`."""
+    return (
+        one_line(full_name(record)),
+        record.get("datum", ""),
+        record.get("starttid", ""),
+        record.get("sluttid", ""),
+        f"{round(hours(record), 2):g}",
+        one_line(record.get("tidtyptext", "")),
+        one_line(record.get("tidtyp_orsak", "")),
+        one_line(record.get("arbledare_orsak", "")),
+        record.get("atteststatus", ""),
+        ",".join(part.strip() for part in record.get("avv_konto", "").split(",")),
+    )
+
+def full_name(record):
+    """Return the full name of the person who reported `record`."""
+    return f"{record.get('fnamn', '')} {record.get('enamn', '')}".strip()
+
+def one_line(text):
+    """Return `text` with every run of white space as a single space."""
+    return " ".join(str(text).split())
+@
+
+The recorded times give us both normalisations, and a time with
+fields left out must still give a full row:
+<<test functions>>=
+def test_record_to_row():
+  first, second, third, fourth = TIMELIST_ANSWER["timeapprove"]
+  assert record_to_row(first) == (
+    "Tolvan Tolvansson", "2026-06-04", "09:00", "11:45", "2.75",
+    "Student(165)", "DD1301 labbpass", "Ada Lärare", "A", "JXX,110210,")
+  assert record_to_row(second)[6] == "DD1310 handledning 2h schablon"
+  assert record_to_row(second)[9] == "JXX,110210,"
+  assert record_to_row(third)[4] == "4"
+  assert record_to_row(fourth)[6:] == ("", "", "A", "")
+  assert all(len(record_to_row(r)) == len(ROW_COLUMNS)
+             for r in TIMELIST_ANSWER["timeapprove"])
+@
+
+\subsection{Selecting times}%
+\label{medvind.select}
+
+The attest view returns the times of everyone in the plan, for every
+work leader---hundreds of rows for a department.
+We select among them on four properties, all optional and combined
+with \enquote{and}:
+\begin{description}
+\item[The TA] by name or by personnummer, see below.
+\item[The work leader] a regular expression matched against
+  [[arbledare_orsak]], so that a teacher finds the times reported to
+  them.
+\item[The comment] a regular expression matched against
+  [[tidtyp_orsak]]; TAs tend to put the course code there, as in
+  \enquote{DD1301 labbpass}.
+\item[Attested or not] a time is attested once its [[atteststatus]] is
+  [[A]]. The ones that are not are the ones that still need checking.
+\end{description}
+The regular expressions are searched for, not matched in full, and
+case is ignored, so \enquote{dd1301} finds \enquote{DD1301 labbpass}.
+
+<<functions>>=
+def select(records, ta=None, leader=None, comment=None, attested=None):
+    """Return the records that satisfy all the given criteria.
+
+    `ta` is a name regex or a personnummer (see `matches_ta`); `leader`
+    and `comment` are regexes searched case-insensitively in the work
+    leader and the comment; `attested` is True for attested times only,
+    False for unattested only and None for both.
+    """
+    return [
+        record
+        for record in records
+        if (ta is None or matches_ta(record, ta))
+        and (leader is None or searches(leader, record.get("arbledare_orsak", "")))
+        and (comment is None or searches(comment, record.get("tidtyp_orsak", "")))
+        and (attested is None or is_attested(record) == attested)
+    ]
+
+def searches(pattern, text):
+    """Return True if the regex `pattern` occurs in `text`, ignoring case."""
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+def is_attested(record):
+    """Return True if the time in `record` has been attested."""
+    return record.get("atteststatus") == ATTESTED
+<<constants>>=
+ATTESTED = "A"
+<<imports>>=
+import re
+@
+
+\paragraph{Selecting a TA.}
+A name is how the attest view shows a TA, so a name is what a teacher
+will type.
+But names are ambiguous, and a personnummer is not.
+Rather than adding an option for each, we tell them apart by their
+form: a personnummer is ten or twelve digits, perhaps with a [[-]] or,
+for those over a hundred, a [[+]] before the last four; nobody's name
+looks like that.
+Medvind writes the personnummer with ten digits, so we compare the
+last ten digits of both.
+<<constants>>=
+PERSONNUMMER = re.compile(r"(\d{2})?(\d{6})[-+]?(\d{4})")
+<<functions>>=
+def matches_ta(record, pattern):
+    """Return True if `record` was reported by the TA `pattern`.
+
+    A `pattern` shaped like a personnummer (10 or 12 digits, optionally
+    with `-` or `+`) is compared with the record's personnummer;
+    anything else is a regex searched for in the full name.
+    """
+    personnummer = PERSONNUMMER.fullmatch(pattern.strip())
+    if personnummer:
+        wanted = personnummer.group(2) + personnummer.group(3)
+        return re.sub(r"\D", "", record.get("realpnr", ""))[-10:] == wanted
+    return searches(pattern, full_name(record))
+@
+
+We exercise each criterion on the recorded times.
+The personnummer is tried in all four spellings, and a name with a
+trailing space tells Tolvan from Tolva, whose name is a prefix of his.
+<<test functions>>=
+def test_select_by_ta_name_and_personnummer():
+  times = TIMELIST_ANSWER["timeapprove"]
+  assert len(select(times, ta="tolvan ")) == 2
+  assert len(select(times, ta="Tolva")) == 4
+  for spelling in ["19121212-1212", "191212121212",
+                   "121212-1212", "1212121212"]:
+    assert {full_name(r) for r in select(times, ta=spelling)} \
+      == {"Tolvan Tolvansson"}
+
+def test_select_by_leader_comment_and_attestation():
+  times = TIMELIST_ANSWER["timeapprove"]
+  assert len(select(times, leader="ada")) == 2
+  assert len(select(times, comment="dd1301")) == 2
+  assert [r["datum"] for r in select(times, attested=False)] \
+    == ["2026-09-01"]
+  assert len(select(times, attested=True)) == 3
+  assert select(times, ta="Tolva ", comment="DD1301",
+                attested=True) == []
+@
