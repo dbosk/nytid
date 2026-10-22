@@ -1,7 +1,8 @@
 # nytid
 
 A CLI and library for managing TA bookings, course schedules, sign-up sheets,
-employment contracts, time tracking, and task management. Every interactive
+employment contracts, the hours TAs report in Medvind, time tracking, and task
+management. Every interactive
 workflow has a scriptable equivalent, so repetitive tasks can be handed off to
 Cron or AI agents.
 
@@ -60,6 +61,19 @@ reach back before the contract period:
 
 ```bash
 nytid hr amanuensis create DD1310 --period 25/26-2 --start 2025-08-25
+```
+
+### `medvind` — the hours TAs have reported
+
+Read the times TAs have reported in Medvind (Visma), KTH's time-reporting
+system, to check them against what the TAs were booked for. Logging in reuses
+the KTH credentials and session of `ladok login`, and may ask for an
+Authenticator approval. Piped output is tab-separated rows for scripts.
+
+```bash
+nytid medvind plans
+nytid medvind hours --leader 'Ada Lärare' --no-attested
+nytid medvind hours --ta 'Tolvan' --comment DD1301 --from 2026-09-01 --to 2026-09-30
 ```
 
 ### `track` — track time on activities

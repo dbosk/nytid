@@ -1,0 +1,381 @@
+\chapter{The \texttt{cli.medvind} module and the \texttt{medvind}
+subcommands}%
+\label{cli.medvind}
+
+The [[nytid medvind]] commands read the hours that TAs have reported in
+Medvind, so that we can check them against what the TAs were booked
+for.
+All the work of talking to Medvind is done by the [[medvind]] library
+module (\cref{medvind}); this module decides what to fetch and how to
+present it.
+There are two commands:
+\begin{description}
+\item[ [[nytid medvind plans]] ] lists the plans---Medvind's
+  organisation units---that the user last worked with, since a plan's
+  identifier is what [[--plan]] wants.
+\item[ [[nytid medvind hours]] ] prints the reported times, one row per
+  time, selected by TA, work leader, comment and attestation.
+\end{description}
+Both print through [[print_rows]] (\cref{cli.utils.output}): an
+aligned table on a terminal, headerless tab-separated rows in a pipe.
+The second form is the point of the command: a script that compares
+the reports with the bookings reads it with [[cut]], [[awk]] or
+Python's [[csv]] module.
+\begin{minted}{bash}
+nytid medvind hours --leader 'Ada Lärare' --no-attested
+nytid medvind hours --ta 'Tolvan' --comment DD1301 | awk -F'\t' '{s+=$5} END {print s}'
+\end{minted}
+
+<<[[medvind.py]]>>=
+"""The nytid medvind command: read reported hours from Medvind."""
+
+import datetime
+import logging
+import typer
+from typing import Annotated, Optional
+
+from nytid.cli.utils.defaults import default, config_hint
+from nytid.cli.utils.output import Column, print_rows
+
+<<constants>>
+
+cli = typer.Typer(
+    name="medvind",
+    help="Read the hours TAs have reported in Medvind (Visma).",
+)
+
+<<helper functions>>
+<<commands>>
+
+if __name__ == "__main__":
+    cli()
+@
+
+Every invocation of [[nytid]] imports all command modules, including
+this one, if only to build the help and the tab completion
+(\cref{climodule}).
+The [[medvind]] library pulls in [[weblogin]] and [[lxml]], and
+logging in pulls in [[ladok3]].
+So we import the library inside the functions that use it; the
+commands that never touch Medvind do not pay for it.
+
+
+\section{Connecting}
+
+Both commands start the same way: log in and get a [[Medvind]] object.
+What can go wrong is the user's to fix, not a bug: missing
+credentials (which [[ladok3]] reports as a [[RuntimeError]] that
+says to run [[ladok login]]), a sign-on that does not complete, or
+Medvind refusing a request.
+So we print the reason and exit with an error code instead of showing
+a traceback.
+<<helper functions>>=
+def connect():
+    """Log into Medvind; exit with an error message if that fails."""
+    import requests
+    import weblogin
+    import nytid.medvind as medvind
+
+    try:
+        connection = medvind.Medvind()
+        connection.login()
+    except (
+        RuntimeError,
+        weblogin.AuthenticationError,
+        medvind.MedvindError,
+        requests.RequestException,
+    ) as err:
+        logging.error(f"Can't log into Medvind: {err}")
+        raise typer.Exit(1)
+    return connection
+@
+
+
+\section{Listing the plans}
+
+<<commands>>=
+@cli.command(name="plans")
+def plans_cmd():
+    """
+    Lists the Medvind plans (organisation units) you last worked with,
+    most recent first. The first is the default for `hours --plan`.
+    """
+    medvind = connect()
+    print_rows(
+        ["Plan", "Name"],
+        [(plan["id"], plan.get("text", "")) for plan in medvind.plans()],
+    )
+@
+
+
+\section{Printing the reported hours}
+
+The command fetches the times of one plan for a period, selects among
+them and prints the selection.
+Fetching and selecting are separate steps because Medvind can only
+filter by plan and dates; everything else happens on our side, in
+[[medvind.select]].
+<<commands>>=
+@cli.command(name="hours")
+def hours_cmd(
+    <<options for the period and plan>>
+    <<options for selecting times>>
+):
+    """
+    Prints the hours TAs have reported in Medvind, one row per reported
+    time: name, date, start, end, hours, type, comment, work leader,
+    attestation status (A when attested) and account.
+
+    Piped, the rows are tab-separated without a header, for scripts.
+    """
+    import nytid.medvind as medvind
+
+    <<determine the period>>
+    connection = connect()
+    try:
+        times = connection.timelist(start, end, plan)
+    except (ValueError, medvind.MedvindError) as err:
+        logging.error(err)
+        raise typer.Exit(1)
+    times = medvind.select(
+        times, ta=ta, leader=leader, comment=comment, attested=attested
+    )
+    print_rows(
+        <<the columns of the hours table>>,
+        [medvind.record_to_row(time) for time in times],
+    )
+@
+
+The terminal table takes its column titles from the library's
+[[ROW_COLUMNS]], so the two cannot drift apart.
+The hours are right-aligned so that they line up as numbers, and the
+comment, the one column of free text, wraps rather than being cut off.
+<<the columns of the hours table>>=
+[
+    Column(
+        name.capitalize(),
+        justify="right" if name == "hours" else "left",
+        fold=name == "comment",
+    )
+    for name in medvind.ROW_COLUMNS
+]
+@
+
+\subsection{The period}
+
+TAs report their hours for a month, and the reports are attested in the
+first days of the next.
+So early in a month, the month we want to check is the one that just
+ended; later, it is the current one.
+That is the default: up to and including the eighth, the previous
+month; from the ninth, the current month.
+The eighth is a guess at when the previous month's checking is done,
+so it can be changed with the configuration key [[medvind.cutoff_day]].
+Both ends can be given explicitly with [[--from]] and [[--to]], each
+replacing only its own end of the default period.
+<<options for the period and plan>>=
+start: Annotated[Optional[datetime.datetime], from_opt] = None,
+end: Annotated[Optional[datetime.datetime], to_opt] = None,
+<<constants>>=
+CUTOFF_DAY_CONFIG = "medvind.cutoff_day"
+DEFAULT_CUTOFF_DAY = default(CUTOFF_DAY_CONFIG, 8, cast=int)
+PERIOD_HELP = (
+    "Defaults to the previous month up to the cutoff day of the month, "
+    "and to the current month after it. " + config_hint(CUTOFF_DAY_CONFIG)
+)
+from_opt = typer.Option(
+    "--from",
+    help="The first date (YYYY-MM-DD). " + PERIOD_HELP,
+    formats=["%Y-%m-%d"],
+)
+to_opt = typer.Option(
+    "--to",
+    help="The last date (YYYY-MM-DD). " + PERIOD_HELP,
+    formats=["%Y-%m-%d"],
+)
+<<determine the period>>=
+period_start, period_end = default_period(today(), DEFAULT_CUTOFF_DAY)
+start = start.date() if start else period_start
+end = end.date() if end else period_end
+@
+
+The last day of a month is the day before the first of the next.
+We reach the next month by adding 31 days to the first of this one,
+which always lands in the next month and never beyond it.
+<<helper functions>>=
+def default_period(today, cutoff_day):
+    """Return the first and last date of the month to check by default.
+
+    Up to and including day `cutoff_day` of the month that is the
+    previous month, after it the current one.
+    """
+    first = today.replace(day=1)
+    if today.day <= cutoff_day:
+        first = (first - datetime.timedelta(days=1)).replace(day=1)
+    next_first = (first + datetime.timedelta(days=31)).replace(day=1)
+    return first, next_first - datetime.timedelta(days=1)
+@
+
+The function takes the date as a parameter, so we can test it on the
+cutoff, the day after, and across a new year.
+The command gets the date from [[today]], the module's one reading of
+the clock, which the command's own tests fix (\cref{cli.medvind.tests}).
+<<helper functions>>=
+def today():
+    """Return today's date; the module's only reading of the clock."""
+    return datetime.date.today()
+<<test functions>>=
+def test_default_period_before_and_after_cutoff():
+  assert default_period(datetime.date(2026, 10, 8), 8) == \
+    (datetime.date(2026, 9, 1), datetime.date(2026, 9, 30))
+  assert default_period(datetime.date(2026, 10, 9), 8) == \
+    (datetime.date(2026, 10, 1), datetime.date(2026, 10, 31))
+
+def test_default_period_across_new_year_and_february():
+  assert default_period(datetime.date(2027, 1, 3), 8) == \
+    (datetime.date(2026, 12, 1), datetime.date(2026, 12, 31))
+  assert default_period(datetime.date(2028, 2, 20), 8) == \
+    (datetime.date(2028, 2, 1), datetime.date(2028, 2, 29))
+@
+
+\subsection{The plan}
+
+A plan is given by its identifier, as [[nytid medvind plans]] lists
+them; without one we use the plan the user last worked with in
+Medvind, which is also what the web interface opens.
+<<options for the period and plan>>=
+plan: Annotated[Optional[str], plan_opt] = None,
+<<constants>>=
+plan_opt = typer.Option(
+    help="The plan to read, see `nytid medvind plans`. "
+    "Defaults to the plan you last worked with.",
+)
+@
+
+\subsection{Selecting times}
+
+The four selections are those of [[medvind.select]]
+(\cref{medvind.select}).
+The TA can be given by name or by personnummer; Medvind knows no
+usernames, so a username would match nothing.
+[[--attested]] and [[--no-attested]] are the two halves of one flag,
+and leaving both out shows all times, so the flag has three states.
+<<options for selecting times>>=
+ta: Annotated[Optional[str], ta_opt] = None,
+leader: Annotated[Optional[str], leader_opt] = None,
+comment: Annotated[Optional[str], comment_opt] = None,
+attested: Annotated[Optional[bool], attested_opt] = None,
+<<constants>>=
+ta_opt = typer.Option(
+    help="Only times of this TA: a regex for the name, or a "
+    "personnummer (YYMMDD-NNNN or YYYYMMDDNNNN).",
+)
+leader_opt = typer.Option(
+    help="Only times reported to a work leader matching this regex.",
+)
+comment_opt = typer.Option(
+    help="Only times whose comment matches this regex, e.g. a course code.",
+)
+attested_opt = typer.Option(
+    "--attested/--no-attested",
+    help="Only attested or only unattested times. Default: both.",
+)
+@
+
+
+\section{Testing the commands}%
+\label{cli.medvind.tests}
+
+The commands' tests run the real library against the local Medvind
+server of the library's tests (\cref{medvind.api}), with the recorded
+answers.
+We import the server and the answers from [[test_medvind]] rather than
+repeating them: pytest puts the [[tests]] directory on the module path
+when it collects the test files there, so the import works whether the
+whole suite runs or only this file.
+We replace two things in [[nytid.medvind]]: [[BASE_URL]], to reach the
+server, and [[shared_session]], to use a plain [[requests]] session
+instead of [[ladok3]]'s, which would need real credentials.
+Those are the module's two connections to the outside; everything
+between them and the printed rows is the code under test.
+<<test [[climedvind.py]]>>=
+import datetime
+
+import pytest
+import requests
+from typer.testing import CliRunner
+
+import nytid.medvind
+from nytid.cli.medvind import *
+from test_medvind import local_server, medvind_routes, TIMELIST_ANSWER
+
+<<test fixtures>>
+<<test functions>>
+@
+
+<<test fixtures>>=
+@pytest.fixture
+def medvind_server(monkeypatch):
+  with local_server(medvind_routes()) as (url, received):
+    monkeypatch.setattr(nytid.medvind, "BASE_URL", url)
+    monkeypatch.setattr(nytid.medvind, "shared_session", requests.Session)
+    yield received
+
+runner = CliRunner()
+@
+
+The output of [[hours]] is not a terminal under [[CliRunner]], so it is
+the tab-separated form, and the period on the command line must reach
+Medvind:
+<<test functions>>=
+def test_hours_prints_tab_separated_rows(medvind_server):
+  result = runner.invoke(cli, ["hours", "--from", "2026-06-01",
+                               "--to", "2026-09-30"])
+  assert result.exit_code == 0, result.output
+  lines = result.stdout.splitlines()
+  assert len(lines) == len(TIMELIST_ANSWER["timeapprove"])
+  assert lines[0].split("\t") == [
+    "Tolvan Tolvansson", "2026-06-04", "09:00", "11:45", "2.75",
+    "Student(165)", "DD1301 labbpass", "Ada Lärare", "A", "JXX,110210,"]
+  assert all(len(line.split("\t")) == 10 for line in lines)
+  assert "<LOADFROM>2026-06-01</LOADFROM>" in medvind_server[-1]["body"]
+  assert "<LOADUNTIL>2026-09-30</LOADUNTIL>" in medvind_server[-1]["body"]
+@
+
+The options must reach the selection---a personnummer for the TA, and
+the three states of [[--attested]]:
+<<test functions>>=
+def test_hours_selects_times(medvind_server):
+  def dates(*args):
+    result = runner.invoke(cli, ["hours", *args])
+    assert result.exit_code == 0, result.output
+    return [line.split("\t")[1] for line in result.stdout.splitlines()]
+  assert dates("--ta", "121212-1212") == ["2026-06-04", "2026-08-25"]
+  assert dates("--no-attested") == ["2026-09-01"]
+  assert dates("--attested", "--comment", "dd1301") == ["2026-06-04"]
+  assert len(dates()) == 4
+@
+
+Without [[--from]] and [[--to]] the default period is used---for a
+fixed date and cutoff, since the configured cutoff is the user's---and
+an unknown plan is an error message, not a traceback:
+<<test functions>>=
+def test_hours_defaults_to_the_default_period(medvind_server, monkeypatch):
+  monkeypatch.setattr("nytid.cli.medvind.today",
+                      lambda: datetime.date(2026, 10, 22))
+  monkeypatch.setattr("nytid.cli.medvind.DEFAULT_CUTOFF_DAY", 8)
+  runner.invoke(cli, ["hours"])
+  assert "<LOADFROM>2026-10-01</LOADFROM>" in medvind_server[-1]["body"]
+  assert "<LOADUNTIL>2026-10-31</LOADUNTIL>" in medvind_server[-1]["body"]
+
+def test_hours_unknown_plan_is_an_error(medvind_server):
+  result = runner.invoke(cli, ["hours", "--plan", "nonexistent"])
+  assert result.exit_code == 1
+  assert result.stdout == ""
+
+def test_plans_lists_id_and_name(medvind_server):
+  result = runner.invoke(cli, ["plans"])
+  assert result.stdout.splitlines() == [
+    "0132TESTNODE\tExempelavdelningen Personal (JXX)",
+    "0132OTHERNOD\tExempelinstitutionen (JX)"]
+@

@@ -14,6 +14,7 @@ nytid.pdf: ../src/nytid/cli/track.tex
 nytid.pdf: ../src/nytid/cli/todo.tex
 nytid.pdf: ../src/nytid/prompt.tex
 nytid.pdf: ../src/nytid/cli/zulip.tex
+nytid.pdf: ../src/nytid/cli/medvind.tex
 nytid.pdf: ../tests/conftest.tex
 nytid.pdf: ../src/nytid/cli/utils/init.tex
 nytid.pdf: ../src/nytid/cli/utils/defaults.tex
