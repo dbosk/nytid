@@ -67,12 +67,14 @@ The `hr medvind` commands read the times TAs have reported in Medvind (Visma),
 KTH's time-reporting system, to check them against what the TAs were booked
 for. Logging in reuses the KTH credentials and session of `ladok login`, and
 may ask for an Authenticator approval. Piped output is tab-separated rows for
-scripts.
+scripts. `deviations` lists the hourly TAs whose reports differ from their
+bookings (prep time included), which the monthly cron script mails out.
 
 ```bash
 nytid hr medvind plans
 nytid hr medvind hours --leader 'Ada Lärare' --no-attested
 nytid hr medvind hours --ta 'Tolvan' --comment DD1301 --from 2026-09-01 --to 2026-09-30
+nytid hr medvind deviations "(datintro|prg[im])" --leader 'Ada Lärare'
 ```
 
 ### `track` — track time on activities
