@@ -89,48 +89,6 @@ JavaScript, and [[requests]] does not run JavaScript.
 So the one thing this section adds is a handler that submits relay
 forms.
 
-\subsection{Sharing the session with \texttt{ladok3}}
-
-Which [[requests]] session should carry all this?
-A fresh [[weblogin.AutologinSession]] would work, but it would cost a
-password and an MFA approval on every run.
-The [[ladok3]] package already keeps a shared, logged-in session,
-[[ladok3.session.session]], and saves it---cookies included,
-encrypted---when the program exits.
-That session holds the KTH identity provider's cookies whenever
-[[ladok]] or [[kthutils]] was used recently, and ADFS's \enquote{keep me
-signed in} cookie means that step 2 and 3 are then skipped altogether.
-It also already carries an [[AzureMFA]] handler that matches any host,
-so step 3 is covered without us adding anything.
-We only add our relay handler, with [[add_handler]], which skips
-handlers that are already present---exactly what a session restored
-from [[ladok3]]'s cache needs.
-The credentials are [[ladok3]]'s too: [[ladok login]] stores the KTH
-username and password in the system keyring.
-
-We import [[ladok3]] inside the function.
-Importing it is not free, and a caller that brings its own session---a
-test, for instance---should not pay for it, nor need LADOK credentials.
-<<functions>>=
-def shared_session():
-    """Return `ladok3`'s shared session, extended to log into Medvind.
-
-    The session keeps the KTH identity provider's cookies between runs,
-    so a recent login through `ladok` or `kthutils` spares us the
-    password and the MFA approval.  Requires `ladok login` to have
-    stored the KTH credentials.
-    """
-    import ladok3
-    import ladok3.cli
-
-    session = ladok3.session.session
-    _, credentials = ladok3.cli.load_credentials()
-    session.add_handler(
-        MedvindSSO(credentials["username"], credentials["password"])
-    )
-    return session
-@
-
 \subsection{Recognising a relay page}
 
 A relay page is a form that carries a security token from one system
@@ -141,38 +99,21 @@ ADFS's own [[AuthMethod]] and [[Context]].
 The relay forms are the only ones with a [[SAMLRequest]], a
 [[SAMLResponse]] or a [[wresult]] field, so the presence of one of
 those is what we test for.
-
-Recognising the form is not enough to submit it, though.
-A [[SAMLResponse]] is the proof that we have logged in; submitting it
-wherever a page's form happens to point would hand that proof to
-whoever controls the page.
-We therefore only forward to the three hosts the chain actually uses,
-and we refuse---with a warning, since it means the chain changed or
-something is wrong---a relay form that points anywhere else.
 <<constants>>=
 RELAY_INPUTS = frozenset({"SAMLRequest", "SAMLResponse", "wresult"})
-RELAY_HOSTS = frozenset(
-    {
-        "login.medvind.visma.com",
-        "login.ug.kth.se",
-        "kth.medvind.visma.com",
-    }
-)
 @
 
 The function returns everything needed to submit the form, so that the
 handler below does not have to parse the page a second time.
-Pages that are not HTML at all---the JSON from the data API, for
+Responses that are not HTML---the JSON from the data API, for
 instance, also passes through the session's handlers---are rejected
-before we try to parse them.
+before we parse them, whatever their body contains.
 <<functions>>=
-def relay_form(response, hosts=RELAY_HOSTS):
+def relay_form(response):
     """Return `(method, url, data)` for an SSO relay form, or `None`.
 
     A relay form is one with a `SAMLRequest`, `SAMLResponse` or
-    `wresult` field.  `None` is also returned when the form would post
-    to a host outside `hosts`, so that a security token is never sent
-    anywhere else.
+    `wresult` field; `url` is the absolute address it posts to.
     """
     if "html" not in response.headers.get("Content-Type", ""):
         return None
@@ -186,25 +127,15 @@ def relay_form(response, hosts=RELAY_HOSTS):
             for field in form.xpath(".//input")
             if field.name
         }
-        if not RELAY_INPUTS & data.keys():
-            continue
-        url = urllib.parse.urljoin(response.url, form.action or "")
-        if urllib.parse.urlsplit(url).hostname not in hosts:
-            logger.warning("Refusing to relay a sign-on token to %s", url)
-            return None
-        return (form.method or "POST"), url, data
+        if RELAY_INPUTS & data.keys():
+            url = urllib.parse.urljoin(response.url, form.action or "")
+            return (form.method or "POST"), url, data
     return None
 <<imports>>=
-import logging
 import urllib.parse
 
 from lxml import etree, html
-<<constants>>=
-logger = logging.getLogger(__name__)
 @
-
-[[lxml]] is not among nytid's own dependencies; it comes with
-[[weblogin]], which parses its pages with it too.
 
 The tests in this section exercise real HTTP over the loopback
 interface: a small server plays the part of the systems in the chain
@@ -287,42 +218,72 @@ LOCAL = frozenset({"127.0.0.1"})
 @
 
 A relay page is recognised and resolved to the form's target, while
-the password and MFA forms are left alone, and so is anything that is
-not HTML:
+the password and MFA forms are left alone, and so is a response that
+is not HTML, even when its body contains a relay form:
 <<test functions>>=
 def test_relay_form_finds_saml_form():
   with local_server({"/relay": lambda h, b: relay_page("/next")}) as (url, _):
     response = requests.get(url + "/relay")
-  method, target, data = relay_form(response, LOCAL)
+  method, target, data = relay_form(response)
   assert method == "POST"
   assert target == url + "/next"
   assert data == {"SAMLResponse": "token-123", "RelayState": "state"}
 
-def test_relay_form_ignores_password_and_mfa_forms():
+def test_relay_form_ignores_password_mfa_and_non_html():
   login = page('<form id="loginForm" method="post" action="/adfs">'
                '<input name="UserName"><input name="Password"></form>')
   mfa = page('<form id="loginForm" method="post">'
              '<input name="AuthMethod" value="AzureMfaAuthentication">'
              '<input name="Context" value="c"></form>'
              '<p id="validEntropyNumber">33</p>')
-  json_answer = (200, [("Content-Type", "application/json")], "{}")
+  _, _, relay_html = relay_page("/next")
+  json_answer = (200, [("Content-Type", "application/json")], relay_html)
   routes = {"/login": lambda h, b: login, "/mfa": lambda h, b: mfa,
             "/json": lambda h, b: json_answer}
   with local_server(routes) as (url, _):
     for path in routes:
-      assert relay_form(requests.get(url + path), LOCAL) is None
+      assert relay_form(requests.get(url + path)) is None
 @
 
-The host check is the security property of the function, so it gets a
-test of its own: a relay form that points to a host outside the
-allowlist is not forwarded.
+\subsection{Where a token may go}
+
+Recognising a relay form is not enough to submit it.
+A [[SAMLResponse]] is the proof that we have logged in; submitting it
+wherever a page's form happens to point would hand that proof to
+whoever controls the page.
+So we relay only to the three hosts the chain uses, and never from
+HTTPS to plain HTTP, where anyone on the network could read the token.
+<<constants>>=
+RELAY_HOSTS = frozenset(
+    {
+        "login.medvind.visma.com",
+        "login.ug.kth.se",
+        "kth.medvind.visma.com",
+    }
+)
+<<functions>>=
+def safe_relay_target(page_url, target_url, hosts=RELAY_HOSTS):
+    """Return True if a token on `page_url` may be posted to `target_url`.
+
+    The target must be one of `hosts` and must not downgrade the
+    connection from HTTPS to HTTP.
+    """
+    page = urllib.parse.urlsplit(page_url)
+    target = urllib.parse.urlsplit(target_url)
+    downgrade = page.scheme == "https" and target.scheme != "https"
+    return target.hostname in hosts and not downgrade
+@
+
+This is the security property of the module, so we check each way a
+target can fail, with the real hosts:
 <<test functions>>=
-def test_relay_form_refuses_foreign_host():
-  routes = {"/relay":
-            lambda h, b: relay_page("https://attacker.example/collect")}
-  with local_server(routes) as (url, _):
-    response = requests.get(url + "/relay")
-  assert relay_form(response, LOCAL) is None
+def test_safe_relay_target():
+  medvind = "https://login.medvind.visma.com/MedvindSSO/Login/"
+  assert safe_relay_target(medvind, "https://login.ug.kth.se/adfs/ls/")
+  assert not safe_relay_target(medvind, "https://attacker.example/")
+  assert not safe_relay_target(medvind, "http://login.ug.kth.se/adfs/ls/")
+  assert safe_relay_target("http://127.0.0.1:8000/a",
+                           "http://127.0.0.1:8000/b", LOCAL)
 @
 
 \subsection{The relay handler}
@@ -332,16 +293,19 @@ session receives: does this response need us ([[need_login]]), and if
 so, what is the response after we have done our part ([[login]])?
 For a relay, the first answer is [[relay_form]], and the second is the
 response to submitting the form.
+A relay to a target that [[safe_relay_target]] rejects is not
+something to skip quietly: the chain cannot continue without it, so we
+fail the login and name the target.
 
 The interesting part is how the steps of the chain find each other.
 [[AutologinSession]] runs every response past its handlers, in order,
 and a handler that sends a request through the session triggers the
 same check on \emph{that} response, nested inside its own call.
 So when we submit the relay in step 1, the nested check sees the
-password page; when the password handler submits the password, the
-nested check sees the MFA page, and [[AzureMFA]] resolves it; the page
-after the MFA is the relay of step 4, which reaches our handler again,
-nested, and so on until the attest view.
+password page; when the password is submitted, the nested check sees
+the MFA page, and [[AzureMFA]] resolves it; the page after the MFA is
+the relay of step 4, which reaches our handler again, nested, and so
+on until the attest view.
 Contrast this with [[weblogin]]'s own handlers, which set a
 [[__logging_in]] flag that makes them ignore responses while they are
 busy.
@@ -362,18 +326,19 @@ That leaves step 2.
 Why not simply register [[weblogin.kth.UGlogin]] on the session next
 to our handler?
 [[UGlogin]] decides whether a page is its business by looking at the
-URL: with a [[base_url]] it requires that the redirects leading to the
+URL.
+With a [[base_url]] it requires that the redirects leading to the
 password page started at that URL, and the password page here is the
-answer to our relay's POST, which has no redirect history at all.
+answer to our relay's POST, which has no redirect history at all; so
+it never acts.
 Without a [[base_url]] it claims \emph{every} page on
-[[login.ug.kth.se]].
-On a session that [[ladok3]] pickles and other programs restore, such
-a handler would also step into their sign-on flows.
-So our handler keeps a private [[UGlogin]] and hands it the password
-page itself; nothing outside the Medvind chain ever sees it.
-We recognise the password page by its [[Password]] field, which also
-tells it apart from the MFA page that ADFS renders with the same
-[[loginForm]] identifier.
+[[login.ug.kth.se]]---including the MFA page, which ADFS renders with
+the same [[loginForm]] identifier as the password form, and into which
+[[UGlogin]] would then post the password.
+That happens whenever ADFS remembers the user but still wants MFA.
+So our handler keeps a private [[UGlogin]] and hands it only the pages
+that ask for a password, which we recognise by their [[Password]]
+field.
 <<classes>>=
 class MedvindSSO(weblogin.AutologinHandler):
     """Login handler that forwards the relays of Medvind's sign-on.
@@ -381,8 +346,8 @@ class MedvindSSO(weblogin.AutologinHandler):
     Submits the auto-submitting SAML and WS-Federation forms that pass
     a token between Medvind and KTH's identity provider, and fills in
     the KTH password form when the identity provider asks for it.  MFA
-    is left to a `weblogin.microsoft.AzureMFA` handler on the same
-    session.
+    is left to a `weblogin.microsoft.AzureMFA` handler, which must come
+    before this one in the session's handlers, see `make_session`.
     """
 
     def __init__(self, username, password, hosts=RELAY_HOSTS):
@@ -392,15 +357,20 @@ class MedvindSSO(weblogin.AutologinHandler):
         self.__depth = 0
 
     def need_login(self, response):
-        """Return True if `response` is a relay page we should submit."""
-        return relay_form(response, self.__hosts) is not None
+        """Return True if `response` is a relay page to submit."""
+        return relay_form(response) is not None
 
     def login(self, session, response, args=None, kwargs=None):
-        """Submit the relay in `response`; return the resulting response."""
+        """Submit the relay in `response`; return the resulting response.
+
+        Raises `weblogin.AuthenticationError` if the relay would post to
+        an unsafe target or the relays do not end.
+        """
         <<refuse to relay deeper than [[MAX_RELAY_DEPTH]]>>
+        method, url, data = relay_form(response)
+        <<refuse to relay to an unsafe target>>
         self.__depth += 1
         try:
-            method, url, data = relay_form(response, self.__hosts)
             result = session.request(method, url, data=data)
             if has_password_form(result):
                 result = self.__ug.login(session, result)
@@ -412,18 +382,17 @@ import weblogin
 import weblogin.kth
 @
 
-The depth is part of the handler's state, so [[pickle]] would save
-it---but it is zero whenever no login is in progress, which is the
-only time [[ladok3]] saves the session.
-
 <<refuse to relay deeper than [[MAX_RELAY_DEPTH]]>>=
 if self.__depth >= MAX_RELAY_DEPTH:
     raise weblogin.AuthenticationError(
         f"Medvind sign-on relayed more than {MAX_RELAY_DEPTH} times "
         f"without reaching Medvind, last at {response.url}"
     )
-@
-
+<<refuse to relay to an unsafe target>>=
+if not safe_relay_target(response.url, url, self.__hosts):
+    raise weblogin.AuthenticationError(
+        f"refusing to relay a sign-on token from {response.url} to {url}"
+    )
 <<functions>>=
 def has_password_form(response):
     """Return True if `response` shows a form asking for a password."""
@@ -436,40 +405,19 @@ def has_password_form(response):
     return bool(tree.xpath("//form//input[@name='Password']"))
 @
 
-The test that matters most replays the chain's shape end to end: a
-relay leads to a password form, the password leads to a second relay,
-and that relay leads to the final page.
-It checks that the password reached the identity provider in the form
-KTH expects (with [[@ug.kth.se]] appended by [[UGlogin]]), that both
-tokens were relayed, and that the caller receives the final page---which
-is only possible if the nested handler checks work as described above.
-The password form's action is absolute because [[UGlogin]] resolves a
-relative action against [[login.ug.kth.se]], not against the page.
+A relay page that points elsewhere must stop the login before the
+token leaves:
 <<test functions>>=
-def test_medvind_sso_follows_the_whole_chain():
-  routes = {
-    "/start": lambda h, b: relay_page("/idp", field="SAMLRequest"),
-    "/idp": lambda h, b: page(
-      f'<form id="loginForm" method="post" '
-      f'action="http://{h.headers["Host"]}/idp/password">'
-      '<input name="UserName"><input name="Password" type="password">'
-      '</form>'),
-    "/idp/password": lambda h, b: relay_page("/sp", field="SAMLResponse"),
-    "/sp": lambda h, b: relay_page("/app", field="wresult"),
-    "/app": lambda h, b: page("<html>attest view</html>"),
-  }
+def test_medvind_sso_refuses_an_unsafe_target():
+  routes = {"/relay":
+            lambda h, b: relay_page("https://attacker.example/collect")}
   with local_server(routes) as (url, received):
     session = weblogin.AutologinSession(
       [MedvindSSO("tolvan", "secret", hosts=LOCAL)])
-    response = session.get(url + "/start")
-  assert response.text == "<html>attest view</html>"
-  assert [r["path"] for r in received] == \
-    ["/start", "/idp", "/idp/password", "/sp", "/app"]
-  password_post = urllib.parse.parse_qs(received[2]["body"])
-  assert password_post["UserName"] == ["tolvan@ug.kth.se"]
-  assert password_post["Password"] == ["secret"]
-  assert urllib.parse.parse_qs(received[3]["body"])["SAMLResponse"] \
-    == ["token-123"]
+    with pytest.raises(weblogin.AuthenticationError,
+                       match="attacker.example"):
+      session.get(url + "/relay")
+  assert [r["path"] for r in received] == ["/relay"]
 @
 
 A relay that points back to itself must end in an error, not in a
@@ -484,6 +432,135 @@ def test_medvind_sso_stops_a_relay_loop():
       session.get(url + "/loop")
   assert len(received) == MAX_RELAY_DEPTH + 1
 @
+
+\subsection{Assembling the session}
+
+A session that logs into Medvind needs two handlers: [[AzureMFA]] for
+step 3 and ours for the rest.
+Their order matters, because each response is checked against the
+handlers once, in order.
+The page that follows the MFA is the relay of step 4, and it is
+[[AzureMFA]] that returns it, in the nested check after the password.
+With our handler after [[AzureMFA]], that same check goes on to
+forward the relay; with our handler first, the check would already be
+past it, and the relay would reach the caller unsubmitted.
+We restrict [[AzureMFA]] to KTH's identity provider, as [[weblogin]]
+recommends, so that no other page can make it poll.
+<<constants>>=
+MFA_URL = "https://login.ug.kth.se"
+<<functions>>=
+def make_session(username, password, hosts=RELAY_HOSTS, mfa_url=MFA_URL):
+    """Return a session that logs into Medvind through KTH's sign-on.
+
+    `username` and `password` are the KTH credentials; `hosts` and
+    `mfa_url` say where relays may go and where to expect MFA.
+    """
+    return weblogin.AutologinSession(
+        [
+            weblogin.microsoft.AzureMFA(url=mfa_url),
+            MedvindSSO(username, password, hosts=hosts),
+        ]
+    )
+<<imports>>=
+import weblogin.microsoft
+@
+
+The test that matters most replays the whole chain on a session built
+by [[make_session]]: a relay leads to a password form, the password to
+the MFA page, the MFA poll to a second relay, and the relays to the
+final page.
+It checks that the password reached the identity provider in the form
+KTH expects (with [[@ug.kth.se]] appended by [[UGlogin]]), that the MFA
+page was polled, that every token was relayed, and that the caller
+receives the final page---which is only possible if the nested checks
+and the order of the handlers work as described above.
+The password form's action is absolute because [[UGlogin]] resolves a
+relative action against [[login.ug.kth.se]], not against the page.
+[[AzureMFA]] announces the number through the command in
+[[WEBLOGIN_MFA_NOTIFICATION]], which we set to [[true]] so that the
+test neither prints nor runs whatever command the user has configured;
+it also waits two seconds before polling, which this test pays once.
+<<test functions>>=
+def test_make_session_follows_the_whole_chain(monkeypatch):
+  monkeypatch.setenv("WEBLOGIN_MFA_NOTIFICATION", "true")
+  mfa_page = page(
+    '<form id="loginForm" method="post" action="/mfa">'
+    '<input name="AuthMethod" value="AzureMfaAuthentication">'
+    '<input name="Context" value="ctx"></form>'
+    '<p id="validEntropyNumber">33</p>')
+  routes = {
+    "/start": lambda h, b: relay_page("/idp", field="SAMLRequest"),
+    "/idp": lambda h, b: page(
+      f'<form id="loginForm" method="post" '
+      f'action="http://{h.headers["Host"]}/idp/password">'
+      '<input name="UserName"><input name="Password" type="password">'
+      '</form>'),
+    "/idp/password": lambda h, b: mfa_page,
+    "/mfa": lambda h, b: relay_page("/sp", field="SAMLResponse"),
+    "/sp": lambda h, b: relay_page("/app", field="wresult"),
+    "/app": lambda h, b: page("<html>attest view</html>"),
+  }
+  with local_server(routes) as (url, received):
+    session = make_session("tolvan", "secret", hosts=LOCAL, mfa_url=url)
+    response = session.get(url + "/start")
+  assert response.text == "<html>attest view</html>"
+  assert [r["path"] for r in received] == \
+    ["/start", "/idp", "/idp/password", "/mfa", "/sp", "/app"]
+  password_post = urllib.parse.parse_qs(received[2]["body"])
+  assert password_post["UserName"] == ["tolvan@ug.kth.se"]
+  assert password_post["Password"] == ["secret"]
+  assert urllib.parse.parse_qs(received[3]["body"])["Context"] == ["ctx"]
+  assert urllib.parse.parse_qs(received[4]["body"])["SAMLResponse"] \
+    == ["token-123"]
+@
+
+\subsection{Sharing the cookies with \texttt{ladok3}}
+
+A session from [[make_session]] works, but on its own it would cost a
+password and an MFA approval on every run.
+The [[ladok3]] package keeps a shared, logged-in session,
+[[ladok3.session.session]], and saves it---cookies included,
+encrypted---when the program exits.
+Its cookies include the KTH identity provider's whenever [[ladok]] or
+[[kthutils]] was used recently, and with ADFS's \enquote{keep me
+signed in} cookie, steps 2 and 3 are then skipped altogether.
+
+What we want from that session is its cookies, not its handlers.
+So we give our session [[ladok3]]'s cookie jar---the same object, not
+a copy---and keep our own handlers.
+Contrast the alternative of adding our handler to [[ladok3]]'s
+session: the handler would be pickled into [[ladok3]]'s cache with
+everything else, take part in the sign-on of every later [[ladok]] and
+[[kthutils]] run, and make each of them complain about a handler it
+cannot load whenever nytid is not installed beside it.
+Sharing the jar avoids all three, and loses nothing: what we add to the
+jar---Medvind's cookies, refreshed identity-provider cookies---is saved
+with [[ladok3]]'s session at exit, so the next run of either program
+benefits.
+The credentials are [[ladok3]]'s too: [[ladok login]] stores the KTH
+username and password in the system keyring.
+
+We import [[ladok3]] inside the function.
+Importing it is not free, and a caller that brings its own session---a
+test, for instance---should not pay for it, nor need LADOK credentials.
+<<functions>>=
+def shared_session():
+    """Return a session for Medvind that shares `ladok3`'s cookies.
+
+    The cookies, which `ladok3` saves between runs, spare us the
+    password and the MFA approval after a recent login through `ladok`,
+    `kthutils` or this module.  Requires `ladok login` to have stored
+    the KTH credentials.
+    """
+    import ladok3
+    import ladok3.cli
+
+    _, credentials = ladok3.cli.load_credentials()
+    session = make_session(credentials["username"], credentials["password"])
+    session.cookies = ladok3.session.session.cookies
+    return session
+@
+
 
 \subsection{Keeping the MFA number off standard output}
 
@@ -598,7 +675,8 @@ server is the authority on how they are spelled.
 def postdata(params):
     """Encode `params` as the XML body Medvind's data API expects."""
     fields = "".join(
-        f"<{name}>{escape(str(value))}</{name}>" for name, value in params.items()
+        f"<{name}>{escape(str(value))}</{name}>"
+        for name, value in params.items()
     )
     return f"<postdata><postParams>{fields}</postParams></postdata>"
 <<imports>>=
@@ -632,7 +710,7 @@ class Medvind:
     """A connection to Medvind's attest view.
 
     Call `login` before any other method.  `session` defaults to
-    `ladok3`'s shared session, extended by `shared_session`; `base_url`
+    `shared_session()`, which shares `ladok3`'s cookies; `base_url`
     defaults to KTH's Medvind.
     """
 
@@ -673,7 +751,9 @@ def call(self, module, func, **params):
     response.raise_for_status()
     result = response.json()
     if not result.get("mvresult", {}).get("success"):
-        raise MedvindError(f"Medvind {module}/{func} failed: {result.get('mvresult')}")
+        raise MedvindError(
+            f"Medvind {module}/{func} failed: {result.get('mvresult')}"
+        )
     return result
 <<classes>>=
 class MedvindError(Exception):
@@ -688,7 +768,7 @@ chain ended in, without [[medvind.sso.token]] there is no Medvind
 session to start.
 The cookie is host-only, so we look it up for Medvind's host; a lookup
 by name alone fails when another host in the jar set a cookie with the
-same name.
+same name---and the jar is [[ladok3]]'s, shared with other programs.
 <<[[Medvind]] methods>>=
 def login(self):
     """Log into Medvind through single sign-on and start a session.
@@ -900,6 +980,21 @@ def test_login_without_sso_cookie_fails():
   assert [r["path"] for r in received] == ["/MvWeb.aspx"]
 @
 
+A cookie of the same name from another host must not get in the way.
+The local server answers as [[localhost]] too, which to the cookie jar
+is a different host from [[127.0.0.1]]:
+<<test functions>>=
+def test_login_picks_the_sso_cookie_of_medvinds_host():
+  routes = medvind_routes()
+  routes["/elsewhere"] = lambda h, b: (
+    200, [("Set-Cookie", f"{SSO_COOKIE}=other-host; path=/")], "")
+  with local_server(routes) as (url, received):
+    session = requests.Session()
+    session.get(url.replace("127.0.0.1", "localhost") + "/elsewhere")
+    Medvind(session=session, base_url=url).login()
+  assert "<sso_wif>sso-abc</sso_wif>" in received[2]["body"]
+@
+
 A failure that Medvind reports in the JSON must not pass as an empty
 answer:
 <<test functions>>=
@@ -1048,8 +1143,12 @@ def record_to_row(record):
         one_line(record.get("tidtyp_orsak", "")),
         one_line(record.get("arbledare_orsak", "")),
         record.get("atteststatus", ""),
-        ",".join(part.strip() for part in record.get("avv_konto", "").split(",")),
+        normalise_account(record.get("avv_konto", "")),
     )
+
+def normalise_account(account):
+    """Return `account` without the padding around its parts."""
+    return ",".join(part.strip() for part in account.split(","))
 
 def full_name(record):
     """Return the full name of the person who reported `record`."""
@@ -1110,8 +1209,10 @@ def select(records, ta=None, leader=None, comment=None, attested=None):
         record
         for record in records
         if (ta is None or matches_ta(record, ta))
-        and (leader is None or searches(leader, record.get("arbledare_orsak", "")))
-        and (comment is None or searches(comment, record.get("tidtyp_orsak", "")))
+        and (leader is None
+             or searches(leader, record.get("arbledare_orsak", "")))
+        and (comment is None
+             or searches(comment, record.get("tidtyp_orsak", "")))
         and (attested is None or is_attested(record) == attested)
     ]
 
