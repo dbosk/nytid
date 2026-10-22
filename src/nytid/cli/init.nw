@@ -115,20 +115,34 @@ for the rest of the script, LADOK and Medvind alike.
 Each failed attempt starts a new login, which sends a new number, so we
 back off exponentially between attempts.
 <<wait for a valid KTH login>>=
+<<exit unless [[ladok]] is installed>>
+<<skip this run if the previous one still waits>>
 <<take the login lock>>
 backoff=1
 until ladok student ${LADOK_ME} >/dev/null 2>&1; do
-  sleep ${backoff}
+  sleep ${backoff} 8>&- 9>&-
   backoff=$((2 * backoff < MAX_BACKOFF ? 2 * backoff : MAX_BACKOFF))
 done
-<<release the login lock>>
+<<release the locks>>
 <<constants for the login wait>>=
 LADOK_ME=de709f81-a867-11e7-8dbf-78e86dc2470c
 @ [[LADOK_ME]] is our own identifier in LADOK, the one [[ladok3]]'s
 scripts look up for the same purpose.
 
-Two things differ from [[ladok3]]'s loop.
-First, the backoff has a ceiling: pure doubling would, after waiting a
+A few things differ from [[ladok3]]'s loop.
+The loop cannot tell a login that is not approved yet from a [[ladok]]
+that is not there at all, since we silence its errors; a missing
+[[ladok]] would make the script wait forever, without a word.
+So we check for it first, and say so on standard error, which cron
+mails us.
+<<exit unless [[ladok]] is installed>>=
+if ! command -v ladok >/dev/null; then
+  echo "error: ladok not found, can't check the KTH login" >&2
+  exit 1
+fi
+@
+
+The backoff has a ceiling: pure doubling would, after waiting a
 night of about nine hours, next sleep for eighteen, and so miss the
 approval we give in the morning.
 With a ceiling of an hour, we are at most an hour late.
@@ -136,20 +150,42 @@ With a ceiling of an hour, we are at most an hour late.
 MAX_BACKOFF=3600
 @
 
-Second, the scripts overlap: the hourly script starts again while an
-earlier one is still waiting, and on some days the daily, weekly and
-monthly scripts start too.
-Each waiting loop would ask for its own approval.
-So only one script at a time may wait for the login; the others wait
-for that one with [[flock]], and then pass the check at once on the
-shared cookies.
-The lock file is per user, and in [[$TMPDIR]] since cron need not set
-[[$XDG_RUNTIME_DIR]].
+The scripts also overlap while they wait: the hourly script starts
+again every hour, and on some days the daily, weekly and monthly
+scripts start too.
+Two locks, both taken with [[flock]], keep that in order.
+
+The first keeps a script from queueing behind itself.
+Were the hourly script to wait in line, a weekend without approval
+would leave dozens of them waiting, all of which would run at once
+when we approve, sending the same mails over and over.
+A run that finds the previous run of the same script still waiting
+therefore gives up, quietly: the next run will do its work.
+<<skip this run if the previous one still waits>>=
+exec 8>"${TMPDIR:-/tmp}/nytid-$(basename "$0")-$(id -u).lock"
+flock -n 8 || exit 0
+@ The lock files are per user, and in [[$TMPDIR]] since cron need not
+set [[$XDG_RUNTIME_DIR]].
+
+The second keeps different scripts from logging in at the same time.
+Each waiting loop would otherwise ask for its own approval.
+So only one script at a time may try to log in; the others, the daily
+script waiting behind the hourly one, say, wait for it, and then pass
+the check at once on the shared cookies.
 <<take the login lock>>=
 exec 9>"${TMPDIR:-/tmp}/nytid-login-$(id -u).lock"
 flock 9
-<<release the login lock>>=
-flock -u 9
+@
+
+Once the login is valid, we close both lock files, which releases the
+locks.
+A lock lives as long as some process has the file open, and every
+command we start inherits our open files.
+So we also close them for [[sleep]] above: if the script is killed
+while it sleeps, an orphaned [[sleep]] would otherwise keep the lock
+for up to an hour.
+<<release the locks>>=
+exec 8>&- 9>&-
 @
 
 \subsection{Setting up a course}
@@ -1461,6 +1497,7 @@ That makes a monthly mail: the monthly script runs on the second to
 the fifth, when the default period is the month that just ended.
 We use the same courses as for the drafts, since those are the hours
 the TAs were asked to report, and mail only when there are deviations.
+Piped, the command prints no header, so we add one to the mail.
 The login to Medvind is covered by the wait at the start of the script
 (\cref{CLIoverview}): it shares [[ladok3]]'s cookies.
 <<[[nytid.monthly.sh]]>>=
@@ -1468,7 +1505,8 @@ The login to Medvind is covered by the wait at the start of the script
 deviations=$(nytid hr medvind deviations "${TIMESHEETS_COURSES}") \
   || echo "error: failed to compare Medvind reports with bookings"
 if test -n "${deviations}"; then
-  echo "${deviations}" \
+  (echo -e "User\tName\tBooked\tReported\tDifference"
+   echo "${deviations}") \
     | mutt -s "avvikande tidrapporter i Medvind" dbosk@kth.se \
     || echo "error: failed to send the Medvind deviations"
 fi
