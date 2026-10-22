@@ -62,9 +62,19 @@ ${FIGS}:
 	${MAKE} -C $(dir $@) $(notdir $@)
 
 
+# tex.mk's clean only removes ${TEX_OUTDIR}.  A stray `xelatex nytid` run
+# here, without -output-directory, leaves its output next to nytid.tex
+# instead.  When such a run is killed, the truncated nytid.aux and
+# nytid.out break every later build from scratch: with ltxobj/ still
+# empty, TeX falls back to the current directory and reads them.  So
+# remove those strays as well.
+STRAY_TEX_OUTPUT=	$(addprefix nytid.,aux out toc log bcf bbl blg \
+			  run.xml fls xdv unq fdb_latexmk pytxcode)
+
 .PHONY: clean
 clean:
 	${RM} nytid.pdf noweb_lexer.py
+	${RM} ${STRAY_TEX_OUTPUT}
 	#${MAKE} -C ../src/nytid/cli clean
 	${MAKE} -C ../src/nytid clean
 	${MAKE} -C figs clean
