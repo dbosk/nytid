@@ -85,8 +85,8 @@ cli = typer.Typer(
                     " time sheets\n"
                     "  nytid hr time prgi24                   # summarize"
                     " hours\n"
-                    "  nytid hr medvind hours --no-attested   # reported,"
-                    " not attested"
+                    "  nytid hr medvind deviations prgi24     # check"
+                    " reported hours"
                   ))
 
 <<helper functions>>
@@ -7144,20 +7144,418 @@ therefore what each TA should be paid for.
 The other half of the picture is what the TAs themselves report in
 Medvind, KTH's time-reporting system, and comparing the two is HR
 work.
-So the commands that read those reports, [[nytid hr medvind plans]] and
-[[nytid hr medvind hours]], belong here.
+So the commands that read those reports belong here.
 
-They share no code with this module, though: they talk to Medvind, not
-to the sign-up sheets.
-They therefore live in a module and chapter of their own
-(\cref{cli.medvind}), and we only mount their group.
+Two of them, [[nytid hr medvind plans]] and [[nytid hr medvind hours]],
+only read Medvind and share no code with this module.
+They live in a module and chapter of their own (\cref{cli.medvind}),
+and we only mount their group.
 That module names its Typer [[medvindcli]], not [[cli]], so the CLI's
 start-up (\cref{climodule}) leaves it to us instead of also mounting it
 at the top level.
 <<imports>>=
-from nytid.cli.medvind import medvindcli
+from nytid.cli import medvind as medvindcmds
 <<subcommands>>=
-cli.add_typer(medvindcli)
+cli.add_typer(medvindcmds.medvindcli)
+@
+
+The third command, [[nytid hr medvind deviations]], compares the two
+sides and lists the TAs whose reports do not match their bookings.
+It is defined here rather than with the other two because it needs
+both sides: the bookings, the contracts and the TAs' personal data
+from this module, and the times from Medvind.
+It is still a command of the [[medvind]] group, so we add it to
+[[medvindcmds.medvindcli]].
+The command is meant for a monthly cron job that mails the list
+(\cref{CheckingReportedHours}), so its output says nothing at all when
+everything matches.
+\begin{minted}{bash}
+nytid hr medvind deviations "(datintro|prg[im]|tilkry)"
+\end{minted}
+
+
+\subsection{What to compare}
+
+What we compare follows from what we tell the TAs.
+The time-sheet draft that the TAs get each month
+(\cref{CLIoverview}) lists their bookings with the prep time included,
+the salary hours ([[omr_tid]] from [[summarize_user]]), and asks them
+to report those hours in Medvind.
+So for each TA we compare the sum of [[omr_tid]] over the bookings in
+the period with the sum of the hours they reported in Medvind.
+
+Only hourly TAs report their hours this way.
+An amanuensis is paid by contract, so a booking need not have a
+matching report; we leave them out of the comparison.
+
+On the Medvind side, the times that matter are those reported to us.
+A plan holds the times of everyone in the organisation unit, and a TA
+who also works for a colleague reports those hours too, with the
+colleague as work leader.
+So we select the times by work leader, [[--leader]], which is a regular
+expression for our name as the TAs pick it in Medvind.
+It has no sensible default, so it must be configured or given.
+
+Finally, small differences are not worth an email.
+Medvind counts in minutes, while the prep factors give hours like
+[[2.66]], so a report can be a few minutes off without anything being
+wrong.
+A difference counts only when it is at least [[--tolerance]] hours,
+by default a quarter of an hour.
+<<argument and option definitions>>=
+MEDVIND_LEADER_CONFIG = "medvind.leader"
+DEFAULT_MEDVIND_LEADER = default(MEDVIND_LEADER_CONFIG, None)
+medvind_leader_opt = typer.Option(
+  "--leader",
+  help="Compare only times reported to a work leader matching this "
+       "regex, normally your own name. "
+       + config_hint(MEDVIND_LEADER_CONFIG))
+
+MEDVIND_TOLERANCE_CONFIG = "medvind.tolerance"
+DEFAULT_MEDVIND_TOLERANCE = default(MEDVIND_TOLERANCE_CONFIG, 0.25,
+                                    cast=float)
+medvind_tolerance_opt = typer.Option(
+  "--tolerance",
+  help="The smallest difference, in hours, that counts as a deviation. "
+       + config_hint(MEDVIND_TOLERANCE_CONFIG))
+@
+
+
+\subsection{The command}
+
+The command first settles the period, the same way as
+[[nytid hr medvind hours]] (the previous month up to the cutoff day,
+\cref{cli.medvind}), then collects the booked hours, then the reported
+times, and prints the TAs that deviate.
+We collect the bookings before logging in to Medvind, so that a
+mistyped course regex fails at once instead of after a login.
+<<subcommands>>=
+@medvindcmds.medvindcli.command(name="deviations")
+def cli_medvind_deviations(
+    <<argument for matching courses>>,
+    <<option for matching registers, default to mine>>,
+    start: Annotated[Optional[datetime.datetime],
+                     medvindcmds.from_opt] = None,
+    end: Annotated[Optional[datetime.datetime],
+                   medvindcmds.to_opt] = None,
+    plan: Annotated[Optional[str], medvindcmds.plan_opt] = None,
+    leader: Annotated[Optional[str],
+                      medvind_leader_opt] = DEFAULT_MEDVIND_LEADER,
+    tolerance: Annotated[float,
+                         medvind_tolerance_opt] = DEFAULT_MEDVIND_TOLERANCE):
+  """
+  Lists the hourly TAs whose hours reported in Medvind differ from their
+  booked hours (prep time included): user, name, booked, reported and
+  the difference. Reporters without bookings have user `-`.
+
+  Prints nothing when every TA's report matches.
+  """
+  import nytid.medvind as medvind
+
+  <<let [[start]], [[end]] be the Medvind period>>
+  <<exit unless we know the work [[leader]]>>
+  <<set list [[courses]] to ((course, register), config)-pairs>>
+  tas = booked_hourly_hours(courses, course_regex, start, end)
+  connection = medvindcmds.connect()
+  try:
+    times = medvind.select(connection.timelist(start, end, plan),
+                           leader=leader)
+  except (ValueError, medvind.MedvindError) as err:
+    logging.error(err)
+    raise typer.Exit(1)
+  except re.error as err:
+    logging.error(f"Invalid regular expression {err.pattern!r}: {err}")
+    raise typer.Exit(1)
+  print_rows(["User", "Name", "Booked", "Reported", "Difference"],
+             hours_deviations(tas, times, tolerance))
+@
+
+The period comes from [[nytid.cli.medvind]] through the module, not
+as copied names, so that the module's one reading of the clock,
+[[medvindcmds.today]], is the one a test fixes.
+<<let [[start]], [[end]] be the Medvind period>>=
+period_start, period_end = medvindcmds.default_period(
+  medvindcmds.today(), medvindcmds.DEFAULT_CUTOFF_DAY)
+start = start.date() if start else period_start
+end = end.date() if end else period_end
+<<exit unless we know the work [[leader]]>>=
+if not leader:
+  logging.error("Give the work leader with --leader, or set it with "
+                f"`nytid config {MEDVIND_LEADER_CONFIG} -s REGEX`.")
+  raise typer.Exit(1)
+<<imports>>=
+from typing import Optional
+@
+
+
+\subsection{The booked hours}
+
+For each TA booked in the period, [[booked_hourly_hours]] gives the
+username, the personnummer and the name, which Medvind identifies the
+TA by, and the booked salary hours.
+The personnummer and the name come from LADOK, as for the time sheets
+(\cref{WorkingWithTimesheets}).
+Without LADOK we still have the username, but no personnummer, and
+the TA's times cannot be found; the comparison then reports all of the
+TA's booked hours as missing, which is the safe direction to err in.
+
+An amanuensis gets [[None]] as hours rather than being left out.
+We still need the personnummer: their times in Medvind are theirs and
+must not turn up as times reported by someone we have no bookings for.
+
+Whether a TA is an amanuensis we decide from the contracts, but not
+with the default of [[get_valid_contracts]], which looks at the
+contracts that are valid \emph{today}.
+The command checks the previous month in the first days of the next,
+so a contract that ended with the month would be missed.
+Instead we ask for every contract and check whether its period
+(\cref{sec:contract-dates}) overlaps ours.
+We also anchor the username: [[get_valid_contracts]] takes a regular
+expression and matches it as a prefix, so [[ab]] alone would also find
+the contracts of [[abc]].
+<<helper functions>>=
+def booked_hourly_hours(courses, course_regex, start, end):
+  """
+  Returns `(user, personnummer, name, hours)` for each TA booked in
+  `courses` from `start` to `end` (dates, inclusive). `hours` is the
+  booked salary hours, prep time included, or None for an amanuensis.
+  `personnummer` is None when LADOK can't give it.
+  """
+  <<signup machinery imports>>
+  <<let [[booked]] be all bookings from [[courses]]>>
+  booked = sheets.filter_events_by_date(
+    booked,
+    datetime.datetime.combine(start, datetime.time.min),
+    datetime.datetime.combine(end, datetime.time.max))
+
+  tas = []
+  for user in sorted(hr.hours_per_TA(booked)):
+    <<set [[user_obj]] to most detailed version possible of [[user]]>>
+    try:
+      personnummer = user_obj.personnummer
+      name = f"{user_obj.first_name} {user_obj.last_name}"
+    except AttributeError as err:
+      logging.warning(f"can't access {user}'s LADOK data: {err}")
+      personnummer = None
+      name = str(user_obj)
+
+    if has_contract_in(user, start, end):
+      hours = None
+    else:
+      hours = sum(event["omr_tid"]
+                  for event in summarize_user(user, booked))
+    tas.append((user, personnummer, name, hours))
+  return tas
+
+def has_contract_in(user, start, end):
+  """Returns True if `user` has a contract overlapping `start`--`end`."""
+  for contract in get_valid_contracts(f"{re.escape(user)}$",
+                                      ContractFilterMode.ALL):
+    contract_start, contract_end = contract_window(contract)
+    if (contract_start is None or contract_start <= end) \
+        and (contract_end is None or contract_end >= start):
+      return True
+  return False
+@
+
+The contracts of [[temp_contracts_dir]] carry no dates of their own,
+so their periods are those of their sessions: Alice's only session is
+on 1~September 2025, and Charlie's second contract covers a session on
+15~November.
+A month containing a session finds the contract, the month after does
+not, and [[ali]] is not [[alice]]:
+<<test functions>>=
+def test_has_contract_in(temp_contracts_dir):
+  september = (datetime.date(2025, 9, 1), datetime.date(2025, 9, 30))
+  october = (datetime.date(2025, 10, 1), datetime.date(2025, 10, 31))
+  november = (datetime.date(2025, 11, 1), datetime.date(2025, 11, 30))
+  assert has_contract_in("alice", *september)
+  assert not has_contract_in("alice", *october)
+  assert has_contract_in("charlie", *november)
+  assert not has_contract_in("ali", *september)
+@
+
+
+\subsection{Comparing}
+
+The comparison itself needs no network, so it is a plain function of
+the TAs and the times, which the tests below feed directly.
+A TA's times are found by personnummer when we have it, through
+[[medvind.matches_ta]] (\cref{medvind.select}), and otherwise by the
+exact full name.
+Whatever times are left over were reported to us by someone we have no
+bookings for in these courses, which is just as much a deviation: a
+row with [[-]] as user and nothing booked.
+<<helper functions>>=
+def hours_deviations(tas, records, tolerance):
+  """
+  Returns rows `(user, name, booked, reported, difference)` of strings
+  for the hourly TAs in `tas` (as from `booked_hourly_hours`) whose
+  reported hours in `records` differ from the booked by at least
+  `tolerance` hours, then for reporters not in `tas`.
+  """
+  import nytid.medvind as medvind
+
+  deviations = []
+  left = list(records)
+  for user, personnummer, name, booked_hours in tas:
+    pattern = personnummer or f"^{re.escape(name)}$"
+    own = [record for record in left
+           if medvind.matches_ta(record, pattern)]
+    left = [record for record in left if record not in own]
+    if booked_hours is not None:
+      deviations.append((user, name, booked_hours,
+                         sum(medvind.hours(record) for record in own)))
+
+  <<add the reporters we have no bookings for to [[deviations]]>>
+
+  return [(user, name, hours_str(booked_hours), hours_str(reported),
+           hours_str(reported - booked_hours))
+          for user, name, booked_hours, reported in deviations
+          if deviates(reported - booked_hours, tolerance)]
+@
+
+The left-over times are grouped by personnummer, which every time in
+Medvind has, and labelled with the name.
+<<add the reporters we have no bookings for to [[deviations]]>>=
+unbooked = {}
+for record in left:
+  key = record.get("realpnr") or medvind.full_name(record)
+  name, reported = unbooked.get(key, (medvind.full_name(record), 0))
+  unbooked[key] = (name, reported + medvind.hours(record))
+for name, reported in sorted(unbooked.values()):
+  deviations.append(("-", name, 0, reported))
+@
+
+Hours are summed as floats, so a difference that should be zero may
+come out as [[1e-15]], and one that should be exactly the tolerance a
+little below it.
+We therefore decide on the difference rounded to hundredths, the
+precision we print with, and a zero difference never deviates, even
+with a tolerance of zero.
+<<helper functions>>=
+def deviates(difference, tolerance):
+  """Returns True if `difference` hours is a deviation."""
+  difference = abs(round(difference, 2))
+  return difference > 0 and difference >= tolerance
+
+def hours_str(hours):
+  """Returns `hours` as a string with at most two decimals."""
+  return f"{round(hours, 2):g}"
+@
+
+\subsection{Testing the comparison}
+
+We build the times with the helper of the Medvind library's tests, so
+they have the shape of the recorded answers, and use the fictive
+Tolvan identities from there.
+Tolvan's two times reported to Ada Lärare add up to $2.75 + 3.75 = 6.5$
+hours.
+<<test imports>>=
+from test_medvind import time as medvind_time
+from test_medvind import local_server, medvind_routes
+<<test functions>>=
+TOLVAN = ("tolvan", "121212-1212", "Tolvan Tolvansson")
+TOLVANS_TIMES = [
+  medvind_time("Tolvan", "Tolvansson", "121212-1212", "2026-06-04",
+               "09:00", "11:45", arbledare_orsak="Ada Lärare"),
+  medvind_time("Tolvan", "Tolvansson", "121212-1212", "2026-08-25",
+               "13:15", "17:00", arbledare_orsak="Ada Lärare")]
+
+def test_deviations_within_tolerance_are_quiet():
+  assert hours_deviations([(*TOLVAN, 6.5)], TOLVANS_TIMES, 0.25) == []
+  assert hours_deviations([(*TOLVAN, 6.3)], TOLVANS_TIMES, 0.25) == []
+  assert hours_deviations([(*TOLVAN, 6.5)], TOLVANS_TIMES, 0) == []
+
+def test_deviations_over_and_under_reported():
+  assert hours_deviations([(*TOLVAN, 6.25)], TOLVANS_TIMES, 0.25) == [
+    ("tolvan", "Tolvan Tolvansson", "6.25", "6.5", "0.25")]
+  assert hours_deviations([(*TOLVAN, 8)], [], 0.25) == [
+    ("tolvan", "Tolvan Tolvansson", "8", "0", "-8")]
+@
+
+Times are found by personnummer when there is one, whatever the name;
+without one, by the name.
+An amanuensis is not compared, but their times are theirs, and times
+nobody claims come out as unbooked:
+<<test functions>>=
+def test_deviations_match_personnummer_then_name():
+  renamed = ("tolvan", "121212-1212", "T. Tolvansson", 0)
+  assert hours_deviations([renamed], TOLVANS_TIMES, 0.25) == [
+    ("tolvan", "T. Tolvansson", "0", "6.5", "6.5")]
+  no_pnr = ("tolvan", None, "Tolvan Tolvansson", 6.5)
+  assert hours_deviations([no_pnr], TOLVANS_TIMES, 0.25) == []
+
+def test_deviations_amanuenses_and_unbooked_reporters():
+  amanuensis = (*TOLVAN, None)
+  assert hours_deviations([amanuensis], TOLVANS_TIMES, 0.25) == []
+  assert hours_deviations([], TOLVANS_TIMES, 0.25) == [
+    ("-", "Tolvan Tolvansson", "0", "6.5", "6.5")]
+@
+
+\subsection{Testing the command}
+
+The command test runs the real command through [[nytid]]'s top-level
+app, against the local Medvind server of the library's tests with its
+recorded answers, as the tests of the other Medvind commands do
+(\cref{cli.medvind.tests}).
+The bookings are the part we replace: they come from Google Sheets,
+Canvas and LADOK, which the test cannot reach, and
+[[booked_hourly_hours]] only combines helpers that are tested
+elsewhere in this chapter.
+So we monkeypatch it to two booked hourly TAs, Tolvan and Tolva.
+Tolva's times have no work leader, so under Ada Lärare she has reported
+nothing.
+<<test setup>>=
+@pytest.fixture
+def medvind_server(monkeypatch):
+  import requests
+  import nytid.medvind
+  with local_server(medvind_routes()) as (url, received):
+    monkeypatch.setattr(nytid.medvind, "BASE_URL", url)
+    monkeypatch.setattr(nytid.medvind, "shared_session", requests.Session)
+    yield received
+<<test functions>>=
+def test_cli_medvind_deviations(medvind_server, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+  from nytid.cli import hr as hrcli
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *args, **kwargs: {("DD1301", "mine"): None})
+  monkeypatch.setattr(hrcli, "booked_hourly_hours",
+                      lambda *args: [(*TOLVAN, 6.5),
+                                     ("tolva", "121212-2223",
+                                      "Tolva Tolvansson", 2)])
+
+  def deviations(*options):
+    result = CliRunner().invoke(nytid_cli, [
+      "hr", "medvind", "deviations", "DD1301",
+      "--from", "2026-06-01", "--to", "2026-09-30", *options])
+    assert result.exit_code == 0, result.output
+    return result.stdout.splitlines()
+
+  assert deviations("--leader", "Ada") == [
+    "tolva\tTolva Tolvansson\t2\t0\t-2"]
+  assert deviations("--leader", "Nobody") == [
+    "tolvan\tTolvan Tolvansson\t6.5\t0\t-6.5",
+    "tolva\tTolva Tolvansson\t2\t0\t-2"]
+@
+
+Without a work leader the command cannot know which times are ours, so
+it refuses, naming the configuration key.
+The test suite runs with an empty configuration
+(\cref{sec:isolating-the-config}), so leaving out [[--leader]] is
+enough:
+<<test functions>>=
+def test_cli_medvind_deviations_needs_a_leader(caplog):
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+
+  result = CliRunner().invoke(nytid_cli,
+                              ["hr", "medvind", "deviations", "DD1301"])
+  assert result.exit_code == 1
+  assert "medvind.leader" in caplog.text
 @
 
 
