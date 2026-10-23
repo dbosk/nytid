@@ -397,8 +397,10 @@ git add src/module.py   # Generated from .nw - DO NOT COMMIT
 
 - **Canvas LMS**: Requires `canvaslms login` for Canvas integration
 - **LADOK**: Requires `ladok login` for student system integration
-- **Medvind**: `nytid medvind` logs in with the `ladok login` credentials on its
+- **Medvind**: `nytid hr medvind` logs in with the `ladok login` credentials on its
   own `weblogin` session that shares `ladok3.session.session`'s cookie jar (SSO
   cookies cached between runs); a fresh login asks for an Authenticator (MFA)
-  approval, so live runs must be attended
+  approval. The cron scripts (`<<cronjob header>>` in `src/nytid/cli/init.nw`)
+  wait for it by looping `ladok student` under a lock; the user approves the
+  number relayed over Zulip. Never trigger live logins from tests
 - **AFS**: Andrew File System for secure storage (optional)

@@ -14,6 +14,9 @@ it's the [[cli.hr]] module.
 They compute employment data from the completed sign-up sheets:
 amanuensis contracts, time sheets, hour summaries and the tracking of
 who is reported to HR as employed.
+The [[medvind]] subgroup reads back the hours TAs have reported in
+Medvind, so that they can be checked against the bookings
+(\cref{sec:hr-medvind}).
 
 Much of that data lives in Canvas and LADOK, so this module talks to
 both.
@@ -71,7 +74,8 @@ cli = typer.Typer(
                     "Employment contracts and time sheets.\n\n"
                     "Compute employment data from completed sign-up sheets:\n"
                     "generate amanuensis contracts, produce time sheets,\n"
-                    "and summarize hours per course.\n\n"
+                    "and summarize hours per course. Check the hours\n"
+                    "TAs have reported in Medvind.\n\n"
                     "Examples:\n\n\b"
                     "  nytid hr users prgi24 --detailed       # list TAs"
                     " with personnummer\n"
@@ -80,7 +84,9 @@ cli = typer.Typer(
                     "  nytid hr timesheets generate prgi24    # produce"
                     " time sheets\n"
                     "  nytid hr time prgi24                   # summarize"
-                    " hours"
+                    " hours\n"
+                    "  nytid hr medvind deviations prgi24     # check"
+                    " reported hours"
                   ))
 
 <<helper functions>>
@@ -2940,10 +2946,9 @@ contract carrying it, and check that the time sheet reports nothing.
 Only the network-bound pieces are stubbed (the course configuration and
 the sign-up sheet download) along with the configuration of the two
 directories; the contract computation is real.
-We run the time sheets without [[--amanuensis]]: that option selects TAs
-by their \emph{current} contract, which depends on today's date, whereas
-the default selects TAs without one, which [[erin]]'s 2025 contracts
-never are again.
+[[erin]] has a contract in the period, so her difference is
+\enquote{\foreignlanguage{swedish}{mertid}} and the time sheet is run
+with [[--amanuensis]] (\cref{sec:timesheets-amanuensis}).
 <<test functions>>=
 def _erin_scenario(tmp_path, monkeypatch, p1_regex="DD1310"):
   """
@@ -2996,7 +3001,8 @@ def _erin_scenario(tmp_path, monkeypatch, p1_regex="DD1310"):
   return kept, missed, extra
 
 ERIN_TIMESHEET = ["timesheets", "generate", "DD1310", "--user", "erin",
-                  "--start", "2025-08-25", "--end", "2025-10-26"]
+                  "--start", "2025-08-25", "--end", "2025-10-26",
+                  "--amanuensis"]
 ERIN_P2_CARRYING = ["amanuensis", "create", "DD1310", "--user", "erin",
                     "--no-detailed",
                     "--start", "2025-08-25", "--end", "2026-01-18",
@@ -4922,13 +4928,16 @@ def cli_generate_timesheets(<<option for TAs to filter for>>,
   <<timesheet generation user iteration variables>>
   for user in users:
     <<skip if [[user_regex]] doesn't match [[user]]>>
-    <<skip depending on [[amanuensis]] option>>
+    <<let [[added_events]], [[removed_events]] be [[user]]'s difference>>
+    <<keep only [[user]]'s sessions for this kind of time sheet>>
     <<do timesheet processing for [[user]]>>
 @
 
 Let's start with all the processing for a user.
 We first want to compute [[added_events]] and [[removed_events]].
-<<do timesheet processing for [[user]]>>=
+The amanuensis option then decides which of them go on this time sheet
+(\cref{sec:timesheets-amanuensis}).
+<<let [[added_events]], [[removed_events]] be [[user]]'s difference>>=
 ta_events = summarize_user(user, booked)
 all_prev_events = accounted_events(user, get_user_contracts(user),
                                    timesheets_dir, start, end)
@@ -5037,25 +5046,405 @@ def salary_difference(added_events, removed_events):
            - sum(map(lambda x: x["belopp"], removed_events))
 @
 
-\subsection{Work with amanuensis or hourly TAs option}
+\subsection{Hourly or mertid time sheets}
+\label{sec:timesheets-amanuensis}
 
-We want to be able to separate time sheets for amanuensis and hourly TAs.
-We want to check if the TA has a valid amanuensis contract that overlaps with 
-the period.
-If they have that, they should report extra hours as 
+We want to be able to separate the hourly time sheets from the mertid ones.
+An amanuensis reports the sessions worked beyond the contract as
 \enquote{\foreignlanguage{swedish}{mertid}} instead.
+One run generates one kind; the jobs run both.
 <<option [[amanuensis]] to include amanuensis mertid>>=
 amanuensis: Annotated[bool, amanuensis_opt] = False
 <<argument and option definitions>>=
-amanuensis_opt = typer.Option(help="Include only amanuenses, i.e. generate "
-                                   "mertid time sheets. no-amanuensis "
-                                   "include only hourly TAs.")
-<<skip depending on [[amanuensis]] option>>=
-contracts = get_valid_contracts(user)
-if amanuensis and not contracts:
+amanuensis_opt = typer.Option(help="Generate mertid time sheets, with the "
+                                   "sessions of the TA's employments. "
+                                   "no-amanuensis: hourly time sheets, "
+                                   "with the other sessions and those of "
+                                   "employments ended before later hourly "
+                                   "work.")
+@
+
+Which time sheet a session belongs on depends on the TA's contracts,
+and the question is when.
+Contrast the two simple answers, which both put sessions on the wrong
+time sheet:
+\begin{description}
+\item[Today] The monthly jobs run in the first days of the next month,
+  so a contract that ended with the month is missed, and the extra
+  sessions in it go on an hourly time sheet.
+\item[In the time sheet's period] The jobs give only [[--end]], and
+  their course pattern matches every round of a course, so the period
+  reaches back over every contract the TA ever had.
+  A former amanuensis would never get an hourly time sheet again.
+\end{description}
+What a session is about is the day it is on.
+So we first ask, for each session, whether a contract employed the TA
+on that day: if so, it belongs to that employment, otherwise it is
+hourly.
+A removed session is one we have accounted for, and it belongs where it
+was paid.
+Mostly that is its day too, with one exception: a contract can pay for
+a session outside its own employment, a difference carried from an
+earlier period (\cref{sec:carry-difference}).
+So a removed session also belongs to the employment of a contract that
+lists it.
+
+Then we settle what is left of an employment that has ended.
+A TA who missed a contracted session and then works by the hour has
+that session deducted from the hourly hours, and an extra session
+worked under the contract is paid with them.
+So when the TA has worked an hourly session after an employment's end,
+the sessions of that employment move to the hourly time sheet, the extra
+and the missing alike.
+Worked, that is: a deduction is no hourly work to settle against.
+Otherwise they stay on the mertid time sheet: while the employment
+runs, or when no hourly work comes after it.
+Two cases show the rule:
+\begin{itemize}
+\item A TA who worked by the hour in P1 and has a contract from P2,
+  with extra time in P2, has the P1 sessions on the hourly time sheet
+  and the extra time on the mertid one.
+  Their contract has not ended, so nothing moves.
+\item A former amanuensis's extra session, which stays in the difference
+  until its time sheet is stored, goes with the TA's hourly sessions of
+  today, instead of on a mertid draft that would be mailed every month
+  for an employment that is over.
+\end{itemize}
+A TA can thus have both time sheets at once, and the drafts of
+[[nytid.premonthly.sh]] send each that is not empty.
+
+Since what moves depends on what is not yet stored, the outstanding
+sessions of an ended employment are on the mertid draft until hourly
+work follows, and on the hourly draft after.
+Every session is still on exactly one time sheet when we store, so
+nothing is paid twice, as long as we store a TA's time sheets, both
+kinds, with the [[--end]] of the drafts they reported from and before
+the next drafts go out.
+Otherwise the TA can be asked for the same sessions twice, once on
+each draft.
+The comparison with Medvind uses the same split (\cref{sec:hr-medvind}).
+
+An employment's end is that of the span the session's day is in, or,
+for a removed session outside them, the latest end of the contracts that
+list it.
+A session that belongs to no employment has none.
+Only dated contracts take part, as everywhere above: a contract without
+dates employs no one, and the sessions it lists are hourly.
+<<helper functions>>=
+def split_by_employment(user, added_events, removed_events):
+  """
+  Splits `user`'s difference, the summarized `added_events` and
+  `removed_events`, into `(hourly, mertid)`, each an `(added, removed)`
+  pair: what goes on the hourly and on the mertid time sheet.
+  """
+  contracts = dated_contracts(user)
+
+  def employment_end(event, removed):
+    day = session_day(event)
+    ends = [end for start, end, events in contracts if start <= day <= end]
+    if removed:
+      ends += [end for start, end, events in contracts if event in events]
+    return max(ends, default=None)
+
+  added = [(event, employment_end(event, False)) for event in added_events]
+  removed = [(event, employment_end(event, True))
+             for event in removed_events]
+  last_hourly = max((session_day(event) for event, end in added
+                     if end is None), default=None)
+
+  def is_hourly(end):
+    return end is None or (last_hourly is not None and end < last_hourly)
+
+  def part(hourly):
+    return ([event for event, end in added if is_hourly(end) == hourly],
+            [event for event, end in removed if is_hourly(end) == hourly])
+  return part(True), part(False)
+
+def session_day(event):
+  """Returns the day of the summarized `event` as a `datetime.date`."""
+  return datetime.date.fromisoformat(event["datum"])
+@
+
+We keep the sessions of the time sheet asked for, and a TA with nothing
+left gets no time sheet: we skip them, so that nothing is printed or
+stored for them.
+<<keep only [[user]]'s sessions for this kind of time sheet>>=
+hourly, mertid = split_by_employment(user, added_events, removed_events)
+added_events, removed_events = mertid if amanuensis else hourly
+if not added_events and not removed_events:
   continue
-elif not amanuensis and contracts:
-  continue
+@
+
+Employed means the contract's employment dates, [[start]] and [[end]],
+not the period it claims (\cref{sec:contract-dates}).
+The claimed period runs from the first to the last session the contract
+pays for, and it decides which contracts replace each other.
+An amanuensis, however, is employed, and works extra, over the whole
+employment, also after the last session of the contract.
+A contract without both dates employs no one: like the listing of
+contracts, we leave out what we can't date rather than let it cover
+every day.
+
+We must look up the TA's contracts with [[get_user_contracts]], which
+matches the username exactly.
+[[get_valid_contracts]] takes a regular expression and matches it from
+the start of the username only, so [[ab]] would also get the contracts
+of [[abc]].
+We read each contract's dates and events once per TA, since the split
+asks about every session.
+<<helper functions>>=
+def dated_contracts(user):
+  """
+  Returns `(start, end, events)` for each of `user`'s contracts that has
+  both employment dates: the first and last day of the employment, as
+  `datetime.date`, and the contract's events, summarized.
+  """
+  contracts = []
+  for contract in get_user_contracts(user):
+    start = contract_date_time(contract, "start")
+    end = contract_date_time(contract, "end")
+    if start and end:
+      contracts.append((start.date(), end.date(),
+                        summarize_user(user, contract["events"])))
+  return contracts
+@
+
+Alice is employed from 25~August to 26~October 2025.
+On her own, the first and the last day of the employment are mertid and
+the day before it hourly; nothing hourly follows the employment, so
+nothing moves.
+Once she has an hourly session after it, all of it moves to the hourly
+side, but not for a deduction after it.
+Dana's contract has sessions but no dates, so the deduction of one of
+them is hourly.
+And [[ali]] is not [[alice]]: on Alice's days, his sessions are hourly.
+<<test functions>>=
+def test_split_by_employment(temp_contracts_dir):
+  with open(temp_contracts_dir / "dana.2025-08-01T10:00:00.json", "w") as f:
+    json.dump({"user": "dana", "events": [
+      ["Lab", "2025-09-01 10:00", "2025-09-01 12:00", "DD1321", "2", "dana"]
+    ]}, f)
+  def sessions(user, *days):
+    return summarize_user(user, [_row(f"{day} 10:00", f"{day} 12:00",
+                                      user=user) for day in days])
+  before, first, last, after = sessions(
+    "alice", "2025-08-24", "2025-08-25", "2025-10-26", "2025-10-27")
+
+  hourly, mertid = split_by_employment("alice", [before, first, last], [])
+  assert hourly == ([before], []) and mertid == ([first, last], [])
+  hourly, mertid = split_by_employment("alice",
+                                       [before, first, last, after], [])
+  assert hourly == ([before, first, last, after], [])
+  assert mertid == ([], [])
+
+  later_deduction = sessions("alice", "2025-11-03")
+  hourly, mertid = split_by_employment("alice", [first], later_deduction)
+  assert hourly == ([], later_deduction) and mertid == ([first], [])
+
+  danas = summarize_user("dana", [
+    ["Lab", "2025-09-01 10:00", "2025-09-01 12:00", "DD1321", "2", "dana"]])
+  assert split_by_employment("dana", [], danas) == (([], danas), ([], []))
+  alis = sessions("ali", "2025-09-01")
+  assert split_by_employment("ali", alis, []) == ((alis, []), ([], []))
+@
+
+Through the command, two runs over [[erin]]'s sheet
+(\cref{sec:carry-difference}) split its TAs.
+[[erin]] has a contract in the period.
+[[frank]], who took over her missed session, works by the hour: his own
+contract is from 2024, and [[frankie]]'s, which does cover the period,
+isn't his.
+We give only [[--end]], as the monthly jobs do.
+<<test functions>>=
+def test_timesheets_tell_amanuenses_by_their_contracts(tmp_path,
+                                                       monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  contracts_dir = tmp_path / "contracts"
+  _write_contract(contracts_dir, "frank", "2024-08-01T10:00:00",
+                  "2024-08-26T00:00:00+02:00", "2024-10-27T00:00:00+01:00")
+  _write_contract(contracts_dir, "frankie", "2025-08-01T10:00:00", *P1)
+  until_p1_end = ["timesheets", "generate", "DD1310", "--end", "2025-10-26"]
+
+  hourly = CliRunner().invoke(hrcli.cli, until_p1_end)
+  amanuenses = CliRunner().invoke(hrcli.cli, until_p1_end + ["--amanuensis"])
+  assert hourly.exit_code == 0, hourly.output
+  assert amanuenses.exit_code == 0, amanuenses.output
+  assert "frank" in hourly.stdout and "erin" not in hourly.stdout
+  assert "erin" in amanuenses.stdout and "frank" not in amanuenses.stdout
+@
+
+A contract that is over must not reach the sessions after it, even when
+the sheet still holds the sessions it paid for.
+That happens every month: the jobs give only [[--end]], and their
+course pattern matches every round of a course, so the sheets reach
+back over earlier contracts.
+[[frank]] had a period~1 contract covering his session of 8~September;
+in one case he then works by the hour in November, in the other his
+contract and session are from 2024 and he works by the hour in 2025.
+In 2024 he also worked an extra session whose time sheet is not yet
+stored, so it is still in his difference.
+Both times the sessions of 2025 are hourly, and the extra session of
+2024, from an employment that has ended since, goes with them.
+<<test functions>>=
+def _add_sessions(monkeypatch, rows):
+  """Adds `rows` to the sign-up sheet that `_erin_scenario` serves."""
+  served = nytid.signup.sheets.read_signup_sheet_from_url
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: served(url) + rows)
+
+def _frank_hourly_after(contract_period, session, extra_rows, end,
+                        tmp_path, monkeypatch):
+  """
+  Returns the stdout of the hourly and the amanuensis time sheets up to
+  `end`, for frank with a contract for `contract_period` paying for
+  `session`, `extra_rows` added to the sheet.
+  """
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  _write_contract(tmp_path / "contracts", "frank", "2024-08-01T10:00:00",
+                  *contract_period, events=[_row(*session, user="frank")])
+  _add_sessions(monkeypatch, extra_rows)
+  args = ["timesheets", "generate", "DD1310", "--user", "frank",
+          "--end", end]
+  hourly = CliRunner().invoke(hrcli.cli, args)
+  amanuenses = CliRunner().invoke(hrcli.cli, args + ["--amanuensis"])
+  assert hourly.exit_code == 0, hourly.output
+  assert amanuenses.exit_code == 0, amanuenses.output
+  return hourly.stdout, amanuenses.stdout
+
+def test_timesheets_after_a_contract_period(tmp_path, monkeypatch):
+  november = ("2025-11-10 10:00", "2025-11-10 12:00")
+  hourly, amanuenses = _frank_hourly_after(
+    P1, ("2025-09-08 10:00", "2025-09-08 12:00"),
+    [_sheet_row(*november, tas=("frank",))], "2025-11-30",
+    tmp_path, monkeypatch)
+  assert "2025-11-10" in hourly and "2025-09-08" not in hourly
+  assert "frank" not in amanuenses
+
+def test_timesheets_after_last_years_contract(tmp_path, monkeypatch):
+  last_year = ("2024-09-09 10:00", "2024-09-09 12:00")
+  unstored_extra = ("2024-09-16 10:00", "2024-09-16 12:00")
+  hourly, amanuenses = _frank_hourly_after(
+    ("2024-08-26T00:00:00+02:00", "2024-10-27T00:00:00+01:00"), last_year,
+    [_sheet_row(*last_year, tas=("frank",)),
+     _sheet_row(*unstored_extra, tas=("frank",))], "2025-10-26",
+    tmp_path, monkeypatch)
+  assert "2025-09-08" in hourly and "2024-09-16" in hourly
+  assert "2024-09-09" not in hourly
+  assert "frank" not in amanuenses
+@
+
+A difference can also straddle a contract's end.
+Up to November, [[erin]]'s difference is her extra session in September
+and her missed one, inside her period~1 contract, and her period~2
+sessions, for which she has no contract yet.
+Her contract has ended before the hourly sessions, so all of it goes on
+the hourly time sheet, the missed session netted against the rest.
+A run may not record anything for a TA it reports nothing for:
+with [[--diff --store]], the hourly run over period~1 alone, where
+nothing hourly follows the contract, must leave [[erin]] without a
+stored time sheet.
+<<test functions>>=
+def test_timesheets_net_an_ended_contract(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  kept, missed, extra = _erin_scenario(tmp_path, monkeypatch)
+  args = ["timesheets", "generate", "DD1310", "--user", "erin",
+          "--end", "2025-11-30"]
+
+  hourly = CliRunner().invoke(hrcli.cli, args)
+  amanuenses = CliRunner().invoke(hrcli.cli, args + ["--amanuensis"])
+  assert hourly.exit_code == 0 and amanuenses.exit_code == 0
+  for day in ["2025-09-08", "2025-09-15", "2025-11-03"]:
+    assert day in hourly.stdout
+  assert "erin" not in amanuenses.stdout
+
+  p1_hourly = CliRunner().invoke(hrcli.cli, ERIN_TIMESHEET[:-1]
+                                            + ["--diff", "--store"])
+  assert p1_hourly.exit_code == 0, p1_hourly.output
+  assert not list((tmp_path / "timesheets").glob("erin.*.json"))
+@
+
+The other way around, nothing moves.
+[[hedda]] worked by the hour in period~1 and has a contract from
+period~2, in which she has also worked an extra session.
+The hourly session goes on the hourly time sheet and the extra one on
+the mertid time sheet, and storing the one leaves the other to report.
+<<test functions>>=
+def test_timesheets_split_hourly_before_a_contract(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  hourly_p1 = ("2025-09-22 13:00", "2025-09-22 15:00")
+  contracted = ("2025-11-04 13:00", "2025-11-04 15:00")
+  extra = ("2025-11-11 13:00", "2025-11-11 15:00")
+  _write_contract(tmp_path / "contracts", "hedda", "2025-10-01T10:00:00",
+                  *P2, events=[_row(*contracted, user="hedda")])
+  _add_sessions(monkeypatch, [_sheet_row(*times, tas=("hedda",))
+                              for times in [hourly_p1, contracted, extra]])
+  args = ["timesheets", "generate", "DD1310", "--user", "hedda",
+          "--end", "2025-11-30"]
+  def sheets():
+    hourly = CliRunner().invoke(hrcli.cli, args)
+    amanuenses = CliRunner().invoke(hrcli.cli, args + ["--amanuensis"])
+    assert hourly.exit_code == 0 and amanuenses.exit_code == 0
+    return hourly.stdout, amanuenses.stdout
+
+  hourly, amanuenses = sheets()
+  assert "2025-09-22" in hourly and "2025-11-11" not in hourly
+  assert "2025-11-11" in amanuenses and "2025-09-22" not in amanuenses
+
+  stored = CliRunner().invoke(hrcli.cli, args + ["--store"])
+  assert stored.exit_code == 0, stored.output
+  hourly, amanuenses = sheets()
+  assert "hedda" not in hourly and "2025-11-11" in amanuenses
+@
+
+A contract can pay for a session outside its own employment: a
+difference carried from an earlier period (\cref{sec:carry-difference}).
+[[gus]] had no contract in period~1, but his period~2 contract carries
+a session of 15~September.
+When he loses that session, its deduction goes on his mertid time
+sheet, which is where the contract paid it, not on the hourly one.
+<<test functions>>=
+def test_timesheets_deduct_a_carried_session_as_mertid(tmp_path,
+                                                       monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  carried = ("2025-09-15 13:00", "2025-09-15 15:00")
+  regular = ("2025-11-04 13:00", "2025-11-04 15:00")
+  _write_contract(tmp_path / "contracts", "gus", "2025-10-01T10:00:00", *P2,
+                  events=[_row(*carried, user="gus"),
+                          _row(*regular, user="gus")])
+  _add_sessions(monkeypatch, [_sheet_row(*regular, tas=("gus",))])
+  args = ["timesheets", "generate", "DD1310", "--user", "gus",
+          "--end", "2025-11-30"]
+  hourly = CliRunner().invoke(hrcli.cli, args)
+  amanuenses = CliRunner().invoke(hrcli.cli, args + ["--amanuensis"])
+  assert hourly.exit_code == 0 and amanuenses.exit_code == 0
+  assert "gus" not in hourly.stdout
+  assert "2025-09-15" in amanuenses.stdout
+@
+
+A removed session counts as reported too.
+In the first days of September, [[erin]]'s only difference is the
+session she missed on the 8th, which her contract paid for, so its
+deduction goes on her mertid time sheet.
+<<test functions>>=
+def test_timesheets_tell_by_removed_sessions_too(tmp_path, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import hr as hrcli
+  _erin_scenario(tmp_path, monkeypatch)
+  args = ["timesheets", "generate", "DD1310", "--user", "erin",
+          "--start", "2025-09-01", "--end", "2025-09-09"]
+  hourly = CliRunner().invoke(hrcli.cli, args)
+  amanuenses = CliRunner().invoke(hrcli.cli, args + ["--amanuensis"])
+  assert hourly.exit_code == 0 and amanuenses.exit_code == 0
+  assert "2025-09-08" in amanuenses.stdout and "erin" not in hourly.stdout
 @
 
 \subsection{Output to stdout}
@@ -5167,8 +5556,14 @@ We don't need to include any date, since we store each generated time sheet.
 [[<<generate timesheet for [[user]] based on [[booked]]>>]]
 later.)
 Thus we don't need to store the generated time sheet that we send.
+A TA can have both an hourly and a mertid time sheet in the same month
+(\cref{sec:timesheets-amanuensis}), so the mertid one gets a name of its
+own instead of overwriting the other.
 <<let [[output_filename]] be the filename for the time sheet>>=
-output_filename = f"timesheet-{user}.xlsx"
+if amanuensis:
+  output_filename = f"timesheet-{user}-mertid.xlsx"
+else:
+  output_filename = f"timesheet-{user}.xlsx"
 @
 
 \subsection{Default values for the time sheet}
@@ -5964,9 +6359,9 @@ time sheet and in a contract.
 def accounted_events(user, contracts, timesheets_dir, start=None, end=None):
   """
   Returns `user`'s events that are already accounted for by `contracts`
-  and by the time sheets reported in `timesheets_dir`, in the format of
-  `summarize_user`. Only events between `start` and `end` (inclusive,
-  None means open) are considered.
+  and by the time sheets reported in `timesheets_dir` (None for none),
+  in the format of `summarize_user`. Only events between `start` and
+  `end` (inclusive, None means open) are considered.
   """
   <<signup machinery imports>>
   accounted = []
@@ -6153,7 +6548,8 @@ This chunk is part of [[accounted_events]]
 (\cref{sec:accounted-events}), whose parameters supply [[timesheets_dir]],
 [[start]] and [[end]].
 <<apply [[user]]'s reported time sheets to [[accounted]]>>=
-for timesheet_file in timesheets_dir.glob(f"{user}.*.json"):
+for timesheet_file in (timesheets_dir.glob(f"{user}.*.json")
+                       if timesheets_dir else []):
   try:
     with open(timesheet_file) as infile:
       timesheet_data = json.load(infile)
@@ -7127,6 +7523,601 @@ def test_cli_employed_missing_pipes_bare_usernames(temp_employment_dir,
 
   assert result.exit_code == 0
   assert result.stdout == "alice\nbob\n"
+@
+
+
+\section{Checking reported hours in Medvind}%
+\label{sec:hr-medvind}
+
+Everything above starts from the bookings: who signed up, and
+therefore what each TA should be paid for.
+The other half of the picture is what the TAs themselves report in
+Medvind, KTH's time-reporting system, and comparing the two is HR
+work.
+So the commands that read those reports belong here.
+
+Two of them, [[nytid hr medvind plans]] and [[nytid hr medvind hours]],
+only read Medvind and share no code with this module.
+They live in a module and chapter of their own (\cref{cli.medvind}),
+and we only mount their group.
+That module names its Typer [[medvindcli]], not [[cli]], so the CLI's
+start-up (\cref{climodule}) leaves it to us instead of also mounting it
+at the top level.
+<<imports>>=
+from nytid.cli import medvind as medvindcmds
+<<subcommands>>=
+cli.add_typer(medvindcmds.medvindcli)
+@
+
+The third command, [[nytid hr medvind deviations]], compares the two
+sides and lists the TAs whose reports do not match their bookings.
+It is defined here rather than with the other two because it needs
+both sides: the bookings, the contracts and the TAs' personal data
+from this module, and the times from Medvind.
+It is still a command of the [[medvind]] group, so we add it to
+[[medvindcmds.medvindcli]].
+The command is meant for a monthly cron job that mails the list
+(\cref{CheckingReportedHours}), so its output says nothing at all when
+everything matches.
+\begin{minted}{bash}
+nytid hr medvind deviations "(datintro|prg[im]|tilkry)"
+\end{minted}
+
+
+\subsection{What to compare}
+
+What we compare follows from what we tell the TAs.
+The time-sheet draft that the TAs get each month
+(\cref{CLIoverview}) lists their bookings with the prep time included,
+the salary hours ([[omr_tid]] from [[summarize_user]]), and asks them
+to report those hours in Medvind.
+So for each TA we compare what their hourly time sheet asks them to
+report with the hours they reported in Medvind.
+
+The hourly time sheet is not simply the bookings.
+The sessions on days a contract employs the TA are mertid, and what is
+left of an ended contract is settled against the hourly hours that
+follow it (\cref{sec:timesheets-amanuensis}).
+We split the same way, but as if no time sheet had been stored, so that
+the result does not depend on when we stored them.
+
+That only works over a long enough time.
+A TA reports a settled deficit as fewer hours in some later month, and
+reports late or early across a month's end.
+So we compare the totals from a fixed day up to the end of the period:
+the balance of what was asked and what was reported.
+The day is [[medvind.since]], when we started to use Medvind, since
+the hours before it were never reported there.
+A deviation then stays in the mail until it is settled, instead of
+showing once and being forgotten.
+
+The totals follow the drafts, with two exceptions, both from what moves
+between the time sheets (\cref{sec:timesheets-amanuensis}).
+What is left of an ended contract and stored on a mertid time sheet
+before the TA's hourly work is never asked for by the hour, but the
+comparison, which knows nothing of what we stored, counts it as hourly.
+And what is left of a contract that ended before [[medvind.since]] is
+asked for by the hour when it moves, but not counted.
+Either way, that TA shows the same deviation every month.
+Once we have checked them by hand, we move [[medvind.since]] past it.
+With [[--from]] we start from that day instead, and without either from
+the start of the period.
+
+Mertid is reported in Medvind too, but those times do not show among
+the ones reported to us.
+So all of a TA's times count as hourly.
+Were the mertid times ever to show up there, they would show as
+over-reported hours.
+
+On the Medvind side, the times that matter are those reported to us.
+A plan holds the times of everyone in the organisation unit, and a TA
+who also works for a colleague reports those hours too, with the
+colleague as work leader.
+So we select the times by work leader, [[--leader]], which is a regular
+expression for our name as the TAs pick it in Medvind.
+It has no sensible default, so it must be configured or given.
+
+Finally, small differences are not worth an email.
+Medvind counts in minutes, while our salary hours are the clock hours
+times the prep factor, rounded up to a quarter of an hour
+(\cref{HRroundtime}).
+A TA who reports the unrounded time, $1.8 \cdot 2 = 3.6$ hours for a
+two-hour lab instead of our $3.75$, is a few minutes off without
+anything being wrong.
+A difference counts only when it is at least [[--tolerance]] hours,
+by default a quarter of an hour.
+<<argument and option definitions>>=
+MEDVIND_LEADER_CONFIG = "medvind.leader"
+DEFAULT_MEDVIND_LEADER = default(MEDVIND_LEADER_CONFIG, None)
+medvind_leader_opt = typer.Option(
+  "--leader",
+  help="Compare only times reported to a work leader matching this "
+       "regex, normally your own name. "
+       + config_hint(MEDVIND_LEADER_CONFIG))
+
+MEDVIND_SINCE_CONFIG = "medvind.since"
+DEFAULT_MEDVIND_SINCE = default(MEDVIND_SINCE_CONFIG, None)
+medvind_since_opt = typer.Option(
+  "--from",
+  help="The first date (YYYY-MM-DD) of the totals compared, normally "
+       "when you started to use Medvind; without it, the start of the "
+       "period. " + config_hint(MEDVIND_SINCE_CONFIG),
+  formats=["%Y-%m-%d"])
+
+MEDVIND_TOLERANCE_CONFIG = "medvind.tolerance"
+DEFAULT_MEDVIND_TOLERANCE = default(MEDVIND_TOLERANCE_CONFIG, 0.25,
+                                    cast=float)
+medvind_tolerance_opt = typer.Option(
+  "--tolerance",
+  help="The smallest difference, in hours, that counts as a deviation. "
+       + config_hint(MEDVIND_TOLERANCE_CONFIG))
+@
+
+
+\subsection{The command}
+
+The command first settles the period: it ends as that of
+[[nytid hr medvind hours]] (the previous month up to the cutoff day,
+\cref{cli.medvind}), and starts on [[medvind.since]].
+Then it collects the booked hours, then the reported times, and prints
+the TAs that deviate.
+We collect the bookings before logging in to Medvind, so that a
+mistyped course regex fails at once instead of after a login.
+<<subcommands>>=
+@medvindcmds.medvindcli.command(name="deviations")
+def cli_medvind_deviations(
+    <<argument for matching courses>>,
+    <<option for matching registers, default to mine>>,
+    start: Annotated[Optional[datetime.datetime],
+                     medvind_since_opt] = None,
+    end: Annotated[Optional[datetime.datetime],
+                   medvindcmds.to_opt] = None,
+    plan: Annotated[Optional[str], medvindcmds.plan_opt] = None,
+    leader: Annotated[Optional[str],
+                      medvind_leader_opt] = DEFAULT_MEDVIND_LEADER,
+    tolerance: Annotated[float,
+                         medvind_tolerance_opt] = DEFAULT_MEDVIND_TOLERANCE):
+  """
+  Lists the TAs whose hours reported in Medvind differ from what their
+  hourly time sheets ask them to report (prep time included): user,
+  name, booked, reported and the difference, summed from `--from`, or
+  the configured `medvind.since`, to the end of the period. Reporters
+  without bookings have user `-`.
+
+  Prints nothing when every TA's report matches.
+  """
+  import nytid.medvind as medvind
+
+  <<let [[start]], [[end]] be the Medvind period>>
+  <<exit unless we know the work [[leader]]>>
+  <<set list [[courses]] to ((course, register), config)-pairs>>
+  tas = booked_hourly_hours(courses, course_regex, start, end)
+  connection = medvindcmds.connect()
+  try:
+    times = medvind.select(connection.timelist(start, end, plan),
+                           leader=leader)
+  except (ValueError, medvind.MedvindError) as err:
+    logging.error(err)
+    raise typer.Exit(1)
+  except re.error as err:
+    logging.error(f"Invalid regular expression {err.pattern!r}: {err}")
+    raise typer.Exit(1)
+  print_rows(["User", "Name", "Booked", "Reported", "Difference"],
+             hours_deviations(tas, times, tolerance))
+@
+
+The period comes from [[nytid.cli.medvind]] through the module, not
+as copied names, so that the module's one reading of the clock,
+[[medvindcmds.today]], is the one a test fixes.
+<<let [[start]], [[end]] be the Medvind period>>=
+period_start, period_end = medvindcmds.default_period(
+  medvindcmds.today(), medvindcmds.DEFAULT_CUTOFF_DAY)
+if start:
+  start = start.date()
+elif DEFAULT_MEDVIND_SINCE:
+  <<let [[start]] be the configured [[medvind.since]]>>
+else:
+  start = period_start
+end = end.date() if end else period_end
+@
+
+A mistyped [[medvind.since]] must not quietly shrink the comparison to
+a month, so we stop with an error naming the key.
+<<let [[start]] be the configured [[medvind.since]]>>=
+try:
+  start = datetime.date.fromisoformat(str(DEFAULT_MEDVIND_SINCE))
+except ValueError:
+  logging.error(f"{MEDVIND_SINCE_CONFIG} must be a date, YYYY-MM-DD, "
+                f"not {DEFAULT_MEDVIND_SINCE!r}.")
+  raise typer.Exit(1)
+<<exit unless we know the work [[leader]]>>=
+if not leader:
+  logging.error("Give the work leader with --leader, or set it with "
+                f"`nytid config {MEDVIND_LEADER_CONFIG} -s REGEX`.")
+  raise typer.Exit(1)
+<<imports>>=
+from typing import Optional
+@
+
+
+\subsection{The booked hours}
+
+For each TA booked in the period, [[booked_hourly_hours]] gives the
+username, the personnummer and the name, which Medvind identifies the
+TA by, and the booked salary hours.
+The personnummer and the name come from LADOK, as for the time sheets
+(\cref{WorkingWithTimesheets}).
+Without LADOK there is no personnummer, and we fall back on the name
+Canvas has, which is what Medvind shows unless the TA goes by another
+name in one of them.
+Without Canvas either, all we have is the username, which matches no
+name in Medvind.
+A TA we cannot find comes out twice, once with all the booked hours
+missing and once as an unbooked reporter, so the mail shows the two
+halves side by side rather than hiding them.
+
+The hours are those of the hourly time sheet, as if no time sheet had
+been stored: we account for the TA's contracts only, take the difference
+with the bookings and split it with [[split_by_employment]].
+An amanuensis is not left out: their hours are what is hourly of their
+sessions, often nothing.
+We still need their personnummer: their times in Medvind are theirs
+and must not turn up as times reported by someone we have no bookings
+for.
+
+Sharing the split with the time sheets is what keeps the comparison
+right around a period boundary.
+Take October, when P1 ends and P2 begins.
+Deciding for the whole TA, a TA employed in P1 who then works by the
+hour would be compared with all of October's sessions, the contract's
+too, and show a deficit the size of the contract; one employed from P2
+who worked by the hour in P1 would not be compared at all.
+Split, both are compared on what their hourly drafts list.
+<<helper functions>>=
+def booked_hourly_hours(courses, course_regex, start, end):
+  """
+  Returns `(user, personnummer, name, hours)` for each TA booked in
+  `courses` from `start` to `end` (dates, inclusive). `hours` is the
+  salary hours, prep time included, of the TA's hourly time sheet over
+  the period as if none had been stored. `personnummer` is None when
+  LADOK can't give it.
+  """
+  <<signup machinery imports>>
+  <<let [[booked]] be all bookings from [[courses]]>>
+  start = datetime.datetime.combine(start, datetime.time.min)
+  end = datetime.datetime.combine(end, datetime.time.max)
+  booked = sheets.filter_events_by_date(booked, start, end)
+
+  tas = []
+  for user in sorted(hr.hours_per_TA(booked)):
+    <<set [[user_obj]] to most detailed version possible of [[user]]>>
+    try:
+      personnummer = user_obj.personnummer
+      name = f"{user_obj.first_name} {user_obj.last_name}"
+    except AttributeError as err:
+      logging.warning(f"can't access {user}'s LADOK data: {err}")
+      personnummer = None
+      name = getattr(user_obj, "name", user)
+
+    ta_events = summarize_user(user, booked)
+    contracted = accounted_events(user, get_user_contracts(user), None,
+                                  start, end)
+    (added, removed), _ = split_by_employment(
+      user, remove_events(ta_events, contracted),
+      remove_events(contracted, ta_events))
+    hours = (sum(event["omr_tid"] for event in added)
+             - sum(event["omr_tid"] for event in removed))
+    tas.append((user, personnummer, name, hours))
+  return tas
+@
+
+The whole of [[booked_hourly_hours]] runs on real sign-up rows and the
+real contracts of [[temp_contracts_dir]].
+What we replace is what the test cannot reach: the download of the
+sheet, and Canvas and LADOK, which only Alice is in.
+Erin has two two-hour labs, one in September and one in October; with
+the hourly prep factor of 1.8 for labs (\cref{HRaddprep}), rounded up
+to a quarter (\cref{HRroundtime}), the September one counts 3.75 hours.
+Alice's lab of 1~September is the one of her contract, and her lab in
+October is within her employment, after the last session of her
+contract: mertid, not hourly.
+Bob's first lab in October is before his employment starts on the
+27th, his second after, so only the first counts.
+Charlie's two contracts cover both his labs in October.
+Erin has no contract and all her hours count in both months.
+
+From September to November, Alice has also worked by the hour in
+November, after her employment, and has lost her contracted lab of
+1~September.
+Both what was left of her contract, the extra lab in October and the
+lost one, are then settled against her hourly hours:
+$3.75 + 3.75 - 2 = 5.5$, the contract's lab counting the 2~hours it
+was contracted for.
+<<test functions>>=
+def test_booked_hourly_hours(temp_contracts_dir, monkeypatch):
+  import typerconf
+  from nytid.cli import hr as hrcli
+
+  alices_contracted = _sheet_row("2025-09-01 10:00", "2025-09-01 12:00",
+                                 tas=("alice",), event="Lab")
+  rows = [alices_contracted,
+          _sheet_row("2025-10-20 10:00", "2025-10-20 12:00", tas=("alice",)),
+          _sheet_row("2025-10-20 13:00", "2025-10-20 15:00", tas=("bob",)),
+          _sheet_row("2025-10-28 13:00", "2025-10-28 15:00", tas=("bob",)),
+          _sheet_row("2025-10-21 13:00", "2025-10-21 15:00",
+                     tas=("charlie",)),
+          _sheet_row("2025-10-29 13:00", "2025-10-29 15:00",
+                     tas=("charlie",)),
+          _sheet_row("2025-09-08 10:00", "2025-09-08 12:00"),
+          _sheet_row("2025-10-06 10:00", "2025-10-06 12:00")]
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: list(rows))
+
+  class _CanvasUser:
+    email = "user@kth.se"
+    def __init__(self, name):
+      self.name = name
+  class _LadokStudent:
+    personnummer = "121212-1212"
+    first_name, last_name = "Alice", "Anteater"
+  def ladok_user(canvas_user):
+    if canvas_user.name != "Alice Anteater":
+      raise Exception("not in LADOK")
+    return _LadokStudent()
+  monkeypatch.setattr(hrcli, "get_canvas_user", lambda user, regex:
+    _CanvasUser({"alice": "Alice Anteater", "bob": "Bob Bäver",
+                 "charlie": "Charlie Chinchilla",
+                 "erin": "Erin Exempel"}[user]))
+  monkeypatch.setattr(hrcli, "get_ladok_user", ladok_user)
+
+  config = typerconf.Config({"signupsheet":
+                               {"url": "https://example.com/s.csv"}})
+  tas = booked_hourly_hours({("DD1310", "reg"): config}, "DD1310",
+                            datetime.date(2025, 9, 1),
+                            datetime.date(2025, 9, 30))
+  assert tas == [("alice", "121212-1212", "Alice Anteater", 0),
+                 ("erin", None, "Erin Exempel", pytest.approx(3.75))]
+  tas = booked_hourly_hours({("DD1310", "reg"): config}, "DD1310",
+                            datetime.date(2025, 10, 1),
+                            datetime.date(2025, 10, 31))
+  assert tas == [("alice", "121212-1212", "Alice Anteater", 0),
+                 ("bob", None, "Bob Bäver", pytest.approx(3.75)),
+                 ("charlie", None, "Charlie Chinchilla", 0),
+                 ("erin", None, "Erin Exempel", pytest.approx(3.75))]
+
+  rows.remove(alices_contracted)
+  rows.append(_sheet_row("2025-11-10 10:00", "2025-11-10 12:00",
+                         tas=("alice",)))
+  tas = booked_hourly_hours({("DD1310", "reg"): config}, "DD1310",
+                            datetime.date(2025, 9, 1),
+                            datetime.date(2025, 11, 30))
+  assert tas[0] == ("alice", "121212-1212", "Alice Anteater",
+                    pytest.approx(5.5))
+@
+
+
+\subsection{Comparing}
+
+The comparison itself needs no network, so it is a plain function of
+the TAs and the times, which the tests below feed directly.
+A TA's times are found by personnummer when we have it, through
+[[medvind.matches_ta]] (\cref{medvind.select}), and otherwise by the
+full name, ignoring case.
+Whatever times are left over were reported to us by someone we have no
+bookings for in these courses, which is just as much a deviation: a
+row with [[-]] as user and nothing booked.
+<<helper functions>>=
+def hours_deviations(tas, records, tolerance):
+  """
+  Returns rows `(user, name, booked, reported, difference)` of strings
+  for the TAs in `tas` (as from `booked_hourly_hours`) whose reported
+  hours in `records` differ from the booked by at least `tolerance`
+  hours, then for reporters not in `tas`.
+  """
+  import nytid.medvind as medvind
+
+  deviations = []
+  left = list(records)
+  for user, personnummer, name, booked_hours in tas:
+    pattern = personnummer or f"^{re.escape(name)}$"
+    own = [record for record in left
+           if medvind.matches_ta(record, pattern)]
+    left = [record for record in left if record not in own]
+    deviations.append((user, name, booked_hours,
+                       sum(medvind.hours(record) for record in own)))
+
+  <<add the reporters we have no bookings for to [[deviations]]>>
+
+  return [(user, name, hours_str(booked_hours), hours_str(reported),
+           hours_str(reported - booked_hours))
+          for user, name, booked_hours, reported in deviations
+          if deviates(reported - booked_hours, tolerance)]
+@
+
+The left-over times are grouped by personnummer, which every time in
+Medvind has, and labelled with the name.
+<<add the reporters we have no bookings for to [[deviations]]>>=
+unbooked = {}
+for record in left:
+  key = record.get("realpnr") or medvind.full_name(record)
+  name, reported = unbooked.get(key, (medvind.full_name(record), 0))
+  unbooked[key] = (name, reported + medvind.hours(record))
+for name, reported in sorted(unbooked.values()):
+  deviations.append(("-", name, 0, reported))
+@
+
+Hours are summed as floats, so a difference that should be zero may
+come out as [[1e-15]], and one that should be exactly the tolerance a
+little below it.
+We therefore decide on the difference rounded to hundredths, the
+precision we print with, and a zero difference never deviates, even
+with a tolerance of zero.
+<<helper functions>>=
+def deviates(difference, tolerance):
+  """Returns True if `difference` hours is a deviation."""
+  difference = abs(round(difference, 2))
+  return difference > 0 and difference >= tolerance
+
+def hours_str(hours):
+  """Returns `hours` as a string with at most two decimals."""
+  return f"{round(hours, 2):g}"
+@
+
+Two sums that differ only in their last bit are no deviation, and a
+difference that is the tolerance up to float error is one:
+<<test functions>>=
+def test_deviates_ignores_float_error():
+  assert not deviates(0.1 + 0.2 - 0.3, 0)
+  assert deviates(0.35 - 0.1, 0.25)
+  assert not deviates(0.2, 0.25)
+@
+
+\subsection{Testing the comparison}
+
+We build the times with the helper of the Medvind library's tests, so
+they have the shape of the recorded answers, and use the fictive
+Tolvan identities from there.
+Tolvan's two times reported to Ada Lärare add up to $2.75 + 3.75 = 6.5$
+hours.
+<<test imports>>=
+from test_medvind import time as medvind_time
+from test_medvind import local_server, medvind_routes
+<<test functions>>=
+TOLVAN = ("tolvan", "121212-1212", "Tolvan Tolvansson")
+TOLVANS_TIMES = [
+  medvind_time("Tolvan", "Tolvansson", "121212-1212", "2026-06-04",
+               "09:00", "11:45", arbledare_orsak="Ada Lärare"),
+  medvind_time("Tolvan", "Tolvansson", "121212-1212", "2026-08-25",
+               "13:15", "17:00", arbledare_orsak="Ada Lärare")]
+
+def test_deviations_within_tolerance_are_quiet():
+  assert hours_deviations([(*TOLVAN, 6.5,)], TOLVANS_TIMES, 0.25) == []
+  assert hours_deviations([(*TOLVAN, 6.3,)], TOLVANS_TIMES, 0.25) == []
+  assert hours_deviations([(*TOLVAN, 6.5,)], TOLVANS_TIMES, 0) == []
+
+def test_deviations_over_and_under_reported():
+  assert hours_deviations([(*TOLVAN, 6.25,)], TOLVANS_TIMES, 0.25) == [
+    ("tolvan", "Tolvan Tolvansson", "6.25", "6.5", "0.25")]
+  assert hours_deviations([(*TOLVAN, 8,)], [], 0.25) == [
+    ("tolvan", "Tolvan Tolvansson", "8", "0", "-8")]
+@
+
+Times are found by personnummer when there is one, whatever the name;
+without one, by the name, whatever its case:
+<<test functions>>=
+def test_deviations_match_personnummer_then_name():
+  renamed = ("tolvan", "121212-1212", "T. Tolvansson", 0)
+  assert hours_deviations([renamed], TOLVANS_TIMES, 0.25) == [
+    ("tolvan", "T. Tolvansson", "0", "6.5", "6.5")]
+  no_pnr = ("tolvan", None, "Tolvan Tolvansson", 6.5)
+  assert hours_deviations([no_pnr], TOLVANS_TIMES, 0.25) == []
+  recased = ("tolvan", None, "TolVan tolvansson", 6.5)
+  assert hours_deviations([recased], TOLVANS_TIMES, 0.25) == []
+@
+
+Whatever the TA's employments, all their times count, and times nobody
+claims come out as unbooked:
+<<test functions>>=
+def test_deviations_unbooked_reporters():
+  assert hours_deviations([], TOLVANS_TIMES, 0.25) == [
+    ("-", "Tolvan Tolvansson", "0", "6.5", "6.5")]
+@
+
+\subsection{Testing the command}
+
+The command test runs the real command through [[nytid]]'s top-level
+app, against the local Medvind server of the library's tests with its
+recorded answers, as the tests of the other Medvind commands do
+(\cref{cli.medvind.tests}).
+The bookings are the part we replace: they come from Google Sheets,
+Canvas and LADOK, which the test cannot reach, and
+[[booked_hourly_hours]] only combines helpers that are tested
+elsewhere in this chapter.
+So we monkeypatch it to two booked hourly TAs, Tolvan and Tolva.
+Tolva's times have no work leader, so under Ada Lärare she has reported
+nothing.
+<<test setup>>=
+@pytest.fixture
+def medvind_server(monkeypatch):
+  import requests
+  import nytid.medvind
+  with local_server(medvind_routes()) as (url, received):
+    monkeypatch.setattr(nytid.medvind, "BASE_URL", url)
+    monkeypatch.setattr(nytid.medvind, "shared_session", requests.Session)
+    yield received
+<<test functions>>=
+def test_cli_medvind_deviations(medvind_server, monkeypatch):
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+  from nytid.cli import hr as hrcli
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *args, **kwargs: {("DD1301", "mine"): None})
+  monkeypatch.setattr(hrcli, "booked_hourly_hours",
+                      lambda *args: [(*TOLVAN, 6.5,),
+                                     ("tolva", "121212-2223",
+                                      "Tolva Tolvansson", 2)])
+
+  def deviations(*options):
+    result = CliRunner().invoke(nytid_cli, [
+      "hr", "medvind", "deviations", "DD1301",
+      "--from", "2026-06-01", "--to", "2026-09-30", *options])
+    assert result.exit_code == 0, result.output
+    return result.stdout.splitlines()
+
+  assert deviations("--leader", "Ada") == [
+    "tolva\tTolva Tolvansson\t2\t0\t-2"]
+  assert deviations("--leader", "Nobody") == [
+    "tolvan\tTolvan Tolvansson\t6.5\t0\t-6.5",
+    "tolva\tTolva Tolvansson\t2\t0\t-2"]
+@
+
+The comparison starts on [[medvind.since]], unless [[--from]] says
+otherwise, and a [[medvind.since]] that is no date stops it instead of
+shrinking it to a month.
+We see the start in what the command asks [[booked_hourly_hours]] for.
+<<test functions>>=
+def test_cli_medvind_deviations_since(medvind_server, monkeypatch, caplog):
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+  from nytid.cli import hr as hrcli
+
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *args, **kwargs: {("DD1301", "mine"): None})
+  asked = []
+  monkeypatch.setattr(hrcli, "booked_hourly_hours",
+                      lambda courses, regex, start, end:
+                        asked.append((start, end)) or [])
+  def deviations(*options):
+    return CliRunner().invoke(nytid_cli, [
+      "hr", "medvind", "deviations", "DD1301", "--leader", "Ada",
+      "--to", "2026-09-30", *options])
+
+  monkeypatch.setattr(hrcli, "DEFAULT_MEDVIND_SINCE", "2026-06-01")
+  assert deviations().exit_code == 0
+  assert deviations("--from", "2026-08-01").exit_code == 0
+  assert asked == [(datetime.date(2026, 6, 1), datetime.date(2026, 9, 30)),
+                   (datetime.date(2026, 8, 1), datetime.date(2026, 9, 30))]
+
+  monkeypatch.setattr(hrcli, "DEFAULT_MEDVIND_SINCE", "June")
+  assert deviations().exit_code == 1
+  assert "medvind.since" in caplog.text
+@
+
+Without a work leader the command cannot know which times are ours, so
+it refuses, naming the configuration key.
+The test suite runs with an empty configuration
+(\cref{sec:isolating-the-config}), so leaving out [[--leader]] is
+enough:
+<<test functions>>=
+def test_cli_medvind_deviations_needs_a_leader(caplog):
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+
+  result = CliRunner().invoke(nytid_cli,
+                              ["hr", "medvind", "deviations", "DD1301"])
+  assert result.exit_code == 1
+  assert "medvind.leader" in caplog.text
 @
 
 
