@@ -595,8 +595,8 @@ make clean && make all
 poetry build
 
 # Run specific CLI commands
-poetry run nytid courses ls              # List courses
-poetry run nytid schedule show           # Show schedules  
+poetry run nytid courses list              # List courses
+poetry run nytid schedule view           # Show schedules  
 poetry run nytid utils rooms             # Find free rooms
 poetry run nytid config --help           # Configuration management
 

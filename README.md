@@ -15,7 +15,7 @@ courses, and configure per-course settings such as Canvas URLs and TimeEdit ICS
 links.
 
 ```bash
-nytid courses ls
+nytid courses list
 nytid courses new DD1310
 nytid courses config DD1310
 ```
@@ -27,7 +27,7 @@ and pending tasks. Export the result as an ICS file for import into any calendar
 application.
 
 ```bash
-nytid schedule show
+nytid schedule view
 nytid schedule next      # every detail of the next event, links included
 nytid schedule ics > schedule.ics
 nytid schedule external add https://cloud.timeedit.net/…
@@ -104,7 +104,7 @@ when they have to start.
 
 ```bash
 nytid todo add "Grade assignment 3" --prio 2
-nytid todo ls
+nytid todo list
 nytid todo ready
 nytid todo start 5
 nytid todo done
@@ -137,7 +137,7 @@ nytid utils rooms set-url https://… "Sal A" "Sal B"
 pip install nytid
 nytid courses registry add kth ~/courses
 nytid courses new DD1310
-nytid schedule show
+nytid schedule view
 ```
 
 ## Where the data lives
@@ -148,7 +148,7 @@ of it at once, for example to try a new version or run a script on throw-away
 data:
 
 ```bash
-NYTID_HOME=/tmp/nytid-sandbox nytid todo ls
+NYTID_HOME=/tmp/nytid-sandbox nytid todo list
 ```
 
 The configuration then lives in `$NYTID_HOME/config.json` and the data
