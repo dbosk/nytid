@@ -69,13 +69,16 @@ for. Logging in reuses the KTH credentials and session of `ladok login`, and
 may ask for an Authenticator approval. Piped output is tab-separated rows for
 scripts. `deviations` lists the TAs whose reports since `hr.medvind.since`
 differ from what their hourly time sheets asked them to report (prep time
-included), which the monthly cron script mails out.
+included), which the monthly cron script mails out. With `--user`/`-u` it
+checks only the booked TAs whose usernames match the regex, from the start of
+the username, so `tolva$` is needed to leave out `tolvan`.
 
 ```bash
 nytid hr medvind plans
 nytid hr medvind hours --leader 'Ada Lärare' --no-attested
 nytid hr medvind hours --ta 'Tolvan' --comment DD1301 --from 2026-09-01 --to 2026-09-30
 nytid hr medvind deviations "(datintro|prg[im])" --leader 'Ada Lärare'
+nytid hr medvind deviations "(datintro|prg[im])" --user 'tolva$'
 ```
 
 ### `track` — track time on activities
