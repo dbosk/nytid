@@ -1614,16 +1614,20 @@ xlsx_format_opt = typer.Option(help="How to name the --xlsx files: "
 @
 
 \subsection{Default arguments for user regex}
+\label{sec:hr-user-regex}
 
 We just set up an option defaulting to match anything.
 The completion source should match [[schedule]] so users can tab-complete
 known TA usernames instead of guessing or retyping them.
+The short form [[-u]] is there for the same reason: this is an option we type
+by hand when we are looking at one TA.
 <<option for TAs to filter for>>=
 user_regex: Annotated[str, user_regex_opt] = ".*"
 <<argument and option definitions>>=
-user_regex_opt = typer.Option("--user",
+user_regex_opt = typer.Option("--user", "-u",
                               help="Regex to match TAs' usernames that "
-                                   "should be included.",
+                                   "should be included, from the start of "
+                                   "the username.",
                               autocompletion=complete_signup_users)
 @
 
@@ -7796,11 +7800,15 @@ Then it collects the booked hours, then the reported times, and prints
 the TAs that deviate.
 We collect the bookings before logging in to Medvind, so that a
 mistyped course regex fails at once instead of after a login.
+Narrowing the comparison with [[--user]] touches both the bookings and the
+comparison, so we return to it once we have seen them
+(\cref{sec:hr-medvind-one-ta}).
 <<subcommands>>=
 @medvindcmds.medvindcli.command(name="deviations")
 def cli_medvind_deviations(
     <<argument for matching courses>>,
     <<option for matching registers, default to mine>>,
+    user_regex: Annotated[Optional[str], user_regex_opt] = None,
     start: Annotated[Optional[datetime.datetime],
                      medvind_since_opt] = None,
     end: Annotated[Optional[datetime.datetime],
@@ -7817,14 +7825,23 @@ def cli_medvind_deviations(
   the configured `hr.medvind.since`, to the end of the period. Reporters
   without bookings have user `-`.
 
+  With `--user`, only booked TAs whose usernames match are compared, so
+  reporters without bookings are left out. It is an error if no booked TA
+  matches, and a warning if LADOK can't give a matched TA's personnummer,
+  since times reported under another name then aren't counted.
+
   Prints nothing when every TA's report matches.
   """
   import nytid.medvind as medvind
 
   <<let [[start]], [[end]] be the Medvind period>>
   <<exit unless we know the work [[leader]]>>
+  <<exit unless [[user_regex]] is a valid regex>>
   <<set list [[courses]] to ((course, register), config)-pairs>>
-  tas = booked_hourly_hours(courses, course_regex, start, end)
+  tas = booked_hourly_hours(courses, course_regex, start, end,
+                            user_regex or ".*")
+  <<exit if no booked TA matches [[user_regex]]>>
+  <<warn about matched TAs that only their name can identify>>
   connection = medvindcmds.connect()
   try:
     times = medvind.select(connection.timelist(start, end, plan),
@@ -7836,7 +7853,8 @@ def cli_medvind_deviations(
     logging.error(f"Invalid regular expression {err.pattern!r}: {err}")
     raise typer.Exit(1)
   print_rows(["User", "Name", "Booked", "Reported", "Difference"],
-             hours_deviations(tas, times, tolerance))
+             hours_deviations(tas, times, tolerance,
+                              unbooked=user_regex is None))
 @
 
 The period comes from [[nytid.cli.medvind]] through the module, not
@@ -7873,7 +7891,8 @@ from typing import Optional
 @
 
 
-\subsection{The booked hours}
+\subsection{The booked hours}%
+\label{sec:hr-medvind-booked}
 
 For each TA booked in the period, [[booked_hourly_hours]] gives the
 username, the personnummer and the name, which Medvind identifies the
@@ -7888,6 +7907,8 @@ name in Medvind.
 A TA we cannot find comes out twice, once with all the booked hours
 missing and once as an unbooked reporter, so the mail shows the two
 halves side by side rather than hiding them.
+With [[--user]] the second half is left out, so there we warn instead
+(\cref{sec:hr-medvind-one-ta}).
 
 The hours are those of the hourly time sheet, as if no time sheet had
 been stored: we account for the TA's contracts only, take the difference
@@ -7907,13 +7928,13 @@ too, and show a deficit the size of the contract; one employed from P2
 who worked by the hour in P1 would not be compared at all.
 Split, both are compared on what their hourly drafts list.
 <<helper functions>>=
-def booked_hourly_hours(courses, course_regex, start, end):
+def booked_hourly_hours(courses, course_regex, start, end, user_regex=".*"):
   """
   Returns `(user, personnummer, name, hours)` for each TA booked in
-  `courses` from `start` to `end` (dates, inclusive). `hours` is the
-  salary hours, prep time included, of the TA's hourly time sheet over
-  the period as if none had been stored. `personnummer` is None when
-  LADOK can't give it.
+  `courses` from `start` to `end` (dates, inclusive) whose username
+  matches `user_regex`. `hours` is the salary hours, prep time included,
+  of the TA's hourly time sheet over the period as if none had been
+  stored. `personnummer` is None when LADOK can't give it.
   """
   <<signup machinery imports>>
   <<let [[booked]] be all bookings from [[courses]]>>
@@ -7922,7 +7943,9 @@ def booked_hourly_hours(courses, course_regex, start, end):
   booked = sheets.filter_events_by_date(booked, start, end)
 
   tas = []
+  user_pattern = re.compile(user_regex)
   for user in sorted(hr.hours_per_TA(booked)):
+    <<skip if [[user_regex]] doesn't match [[user]]>>
     <<set [[user_obj]] to most detailed version possible of [[user]]>>
     try:
       personnummer = user_obj.personnummer
@@ -8028,6 +8051,38 @@ def test_booked_hourly_hours(temp_contracts_dir, monkeypatch):
                     pytest.approx(5.5))
 @
 
+A pattern for the users leaves out the others before any of the costly
+work.
+The lookups are the one thing we can see that in, and Canvas is out of
+reach for the test anyway, so we replace it and note who it was asked
+about.
+Without Canvas the name is the username, as above.
+<<test functions>>=
+def test_booked_hourly_hours_looks_up_only_matching_users(
+    temp_contracts_dir, monkeypatch):
+  import typerconf
+  from nytid.cli import hr as hrcli
+
+  rows = [_sheet_row("2025-09-08 10:00", "2025-09-08 12:00"),
+          _sheet_row("2025-09-09 10:00", "2025-09-09 12:00",
+                     tas=("frank",))]
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: list(rows))
+  looked_up = []
+  def no_canvas_user(user, regex):
+    looked_up.append(user)
+    raise Exception("not in Canvas")
+  monkeypatch.setattr(hrcli, "get_canvas_user", no_canvas_user)
+
+  config = typerconf.Config({"signupsheet":
+                               {"url": "https://example.com/s.csv"}})
+  tas = booked_hourly_hours({("DD1310", "reg"): config}, "DD1310",
+                            datetime.date(2025, 9, 1),
+                            datetime.date(2025, 9, 30), "erin")
+  assert tas == [("erin", None, "erin", pytest.approx(3.75))]
+  assert looked_up == ["erin"]
+@
+
 
 \subsection{Comparing}
 
@@ -8039,13 +8094,15 @@ full name, ignoring case.
 Whatever times are left over were reported to us by someone we have no
 bookings for in these courses, which is just as much a deviation: a
 row with [[-]] as user and nothing booked.
+That reasoning needs [[tas]] to be all the booked TAs, so a caller that
+has narrowed the list turns those rows off with [[unbooked]].
 <<helper functions>>=
-def hours_deviations(tas, records, tolerance):
+def hours_deviations(tas, records, tolerance, unbooked=True):
   """
   Returns rows `(user, name, booked, reported, difference)` of strings
   for the TAs in `tas` (as from `booked_hourly_hours`) whose reported
   hours in `records` differ from the booked by at least `tolerance`
-  hours, then for reporters not in `tas`.
+  hours, then, if `unbooked`, for reporters not in `tas`.
   """
   import nytid.medvind as medvind
 
@@ -8059,7 +8116,8 @@ def hours_deviations(tas, records, tolerance):
     deviations.append((user, name, booked_hours,
                        sum(medvind.hours(record) for record in own)))
 
-  <<add the reporters we have no bookings for to [[deviations]]>>
+  if unbooked:
+    <<add the reporters we have no bookings for to [[deviations]]>>
 
   return [(user, name, hours_str(booked_hours), hours_str(reported),
            hours_str(reported - booked_hours))
@@ -8070,12 +8128,12 @@ def hours_deviations(tas, records, tolerance):
 The left-over times are grouped by personnummer, which every time in
 Medvind has, and labelled with the name.
 <<add the reporters we have no bookings for to [[deviations]]>>=
-unbooked = {}
+reporters = {}
 for record in left:
   key = record.get("realpnr") or medvind.full_name(record)
-  name, reported = unbooked.get(key, (medvind.full_name(record), 0))
-  unbooked[key] = (name, reported + medvind.hours(record))
-for name, reported in sorted(unbooked.values()):
+  name, reported = reporters.get(key, (medvind.full_name(record), 0))
+  reporters[key] = (name, reported + medvind.hours(record))
+for name, reported in sorted(reporters.values()):
   deviations.append(("-", name, 0, reported))
 @
 
@@ -8156,6 +8214,106 @@ def test_deviations_unbooked_reporters():
     ("-", "Tolvan Tolvansson", "0", "6.5", "6.5")]
 @
 
+Without the unbooked reporters, times nobody claims are simply not
+compared, while the TAs we were given still are:
+<<test functions>>=
+def test_deviations_can_leave_out_unbooked_reporters():
+  assert hours_deviations([], TOLVANS_TIMES, 0.25, unbooked=False) == []
+  assert hours_deviations([(*TOLVAN, 6.25,)], TOLVANS_TIMES, 0.25,
+                          unbooked=False) == [
+    ("tolvan", "Tolvan Tolvansson", "6.25", "6.5", "0.25")]
+  tolva = ("tolva", "121212-2223", "Tolva Tolvansson", 2)
+  assert hours_deviations([tolva], TOLVANS_TIMES, 0.25, unbooked=False) == [
+    ("tolva", "Tolva Tolvansson", "2", "0", "-2")]
+@
+
+\subsection{Checking one TA}%
+\label{sec:hr-medvind-one-ta}
+
+When a TA asks whether their report is right, the whole list is more than
+we want, so [[--user]] narrows the comparison:
+\begin{minted}{bash}
+nytid hr medvind deviations "(datintro|prg[im]|tilkry)" --user 'tolva$'
+\end{minted}
+The pattern works as for the other commands of this chapter
+(\cref{sec:hr-user-regex}).
+It is matched from the start of the username, so [[tolva]] also matches
+[[tolvan]], and the [[$]] above is what limits it to one TA.
+
+The obvious place to filter is the rows we print, which would be right but
+wasteful.
+Each TA costs a lookup in Canvas and one in LADOK and a read of their
+contracts, and each failed lookup logs a warning.
+So [[booked_hourly_hours]] skips the others in its loop, as the sibling
+commands do, and checking one TA is quick and shows only that TA's
+warnings.
+
+Filtering that early has a consequence for the comparison, though.
+It treats any time that no TA in its list claims as reported by someone
+without bookings.
+With only Tolva in the list, all of Tolvan's times would come out as an
+unbooked reporter, which would be false.
+So with [[--user]] we leave out the unbooked reporters altogether.
+Medvind's times have a personnummer and a name but no username, so those rows
+could never be matched against the pattern anyway.
+
+That is why the default here is [[None]] and not the [[.*]] of
+[[<<option for TAs to filter for>>]], which is otherwise the same option.
+We need to tell a run with no filter, which reports the unbooked, from a run
+with one.
+It follows that [[--user '.*']] means all the booked TAs, without the
+unbooked reporters.
+
+The command prints nothing when every report matches, so a mistyped pattern
+must not print nothing as well: it would read as a clean result.
+If no booked TA matches, we say so and exit with an error.
+We can do it before the login, which saves an Authenticator approval, since
+without TAs and without the unbooked reporters there is nothing left to
+compare.
+Someone who reported without being booked ends up here too, so the message
+points at the run that shows them.
+<<exit if no booked TA matches [[user_regex]]>>=
+if user_regex is not None and not tas:
+  logging.error(f"No TA booked from {start} to {end} matches --user "
+                f"{user_regex!r}. Someone who reported without being booked "
+                "shows only without --user.")
+  raise typer.Exit(1)
+@
+
+Leaving out those rows does cost something for a TA that only their name
+can identify, because LADOK could not give the personnummer.
+Times they reported under another name are then claimed by nobody.
+The full run shows them as an unbooked reporter beside the TA's missing hours
+(\cref{sec:hr-medvind-booked}), but here that row is gone and only the missing
+hours remain, which would read as a TA who has not reported.
+We cannot tell that reporter from the other TAs we left out, so we cannot bring
+the row back.
+Instead we warn that the row may be wrong, and point at the run that shows both
+halves.
+It depends only on the bookings, so it comes with the other checks, before the
+login.
+<<warn about matched TAs that only their name can identify>>=
+if user_regex is not None:
+  for user, personnummer, name, _ in tas:
+    if personnummer is None:
+      logging.warning(f"{user} could only be matched by name, {name!r}: times "
+                      "reported under another name aren't counted. Run "
+                      "without --user to see them.")
+@
+
+A pattern that is no regular expression gets the same treatment as the other
+two errors of the command's arguments: it stops the command at once, before
+the sign-up sheets are downloaded.
+<<exit unless [[user_regex]] is a valid regex>>=
+if user_regex is not None:
+  try:
+    re.compile(user_regex)
+  except re.error as err:
+    logging.error(f"Invalid regular expression {err.pattern!r}: {err}")
+    raise typer.Exit(1)
+@
+
+
 \subsection{Testing the command}
 
 The command test runs the real command through [[nytid]]'s top-level
@@ -8219,7 +8377,7 @@ def test_cli_medvind_deviations_since(medvind_server, monkeypatch, caplog):
                       lambda *args, **kwargs: {("DD1301", "mine"): None})
   asked = []
   monkeypatch.setattr(hrcli, "booked_hourly_hours",
-                      lambda courses, regex, start, end:
+                      lambda courses, regex, start, end, user_regex:
                         asked.append((start, end)) or [])
   def deviations(*options):
     return CliRunner().invoke(nytid_cli, [
@@ -8251,6 +8409,157 @@ def test_cli_medvind_deviations_needs_a_leader(caplog):
                               ["hr", "medvind", "deviations", "DD1301"])
   assert result.exit_code == 1
   assert "hr.medvind.leader" in caplog.text
+@
+
+To check [[--user]] we must not replace [[booked_hourly_hours]], since it
+does half of the filtering.
+So here we replace only what the test cannot reach: the sheet download,
+Canvas and LADOK, and the lookup of the course's configuration in the user's
+storage.
+The sign-up rows, the contracts, the comparison and the local Medvind server
+are all real.
+Tolvan and Tolva both have a two-hour lab, 3.75 salary hours, and since
+Tolva's username is a prefix of Tolvan's, they show what the pattern matches.
+<<test setup>>=
+@pytest.fixture
+def booked_tolvans(temp_contracts_dir, monkeypatch):
+  """Returns the sign-up rows that the command will read."""
+  import typerconf
+  from nytid.cli import hr as hrcli
+
+  rows = [_sheet_row("2026-06-08 10:00", "2026-06-08 12:00",
+                     tas=("tolvan",)),
+          _sheet_row("2026-06-09 10:00", "2026-06-09 12:00",
+                     tas=("tolva",))]
+  config = typerconf.Config({"signupsheet":
+                               {"url": "https://example.com/s.csv"}})
+  monkeypatch.setattr(hrcli.coursescli, "get_courses_configs",
+                      lambda *args, **kwargs: {("DD1310", "mine"): config})
+  monkeypatch.setattr(nytid.signup.sheets, "read_signup_sheet_from_url",
+                      lambda url: list(rows))
+
+  class _Person:
+    email = "user@kth.se"
+    def __init__(self, first_name, personnummer):
+      self.first_name, self.personnummer = first_name, personnummer
+      self.last_name = "Tolvansson"
+      self.name = f"{first_name} Tolvansson"
+  people = {"tolvan": _Person("Tolvan", "121212-1212"),
+            "tolva": _Person("Tolva", "121212-2223")}
+  monkeypatch.setattr(hrcli, "get_canvas_user",
+                      lambda user, regex: people[user])
+  monkeypatch.setattr(hrcli, "get_ladok_user", lambda person: person)
+  return rows
+
+def run_deviations(*options):
+  """Runs the command with the recorded times' period and work leader."""
+  from typer.testing import CliRunner
+  from nytid.cli import cli as nytid_cli
+  return CliRunner().invoke(nytid_cli, [
+    "hr", "medvind", "deviations", "DD1310", "--leader", "Ada",
+    "--from", "2026-06-01", "--to", "2026-09-30", *options])
+@
+
+The main risk is the rest of the times: the other TA's must not come out
+as an unbooked reporter.
+The pattern is a prefix match, as for the other commands, so [[tolva]]
+catches Tolvan too, and a filtered run gives the same rows as the full one.
+<<test functions>>=
+TOLVA_ROW = "tolva\tTolva Tolvansson\t3.75\t0\t-3.75"
+TOLVAN_ROW = "tolvan\tTolvan Tolvansson\t3.75\t6.5\t2.75"
+
+def test_cli_medvind_deviations_user(medvind_server, booked_tolvans):
+  def rows(*options):
+    result = run_deviations(*options)
+    assert result.exit_code == 0, result.output
+    return result.stdout.splitlines()
+
+  assert rows() == [TOLVA_ROW, TOLVAN_ROW]
+  assert rows("--user", "tolva$") == [TOLVA_ROW]
+  assert rows("-u", "tolvan") == [TOLVAN_ROW]
+  assert rows("--user", "tolva") == [TOLVA_ROW, TOLVAN_ROW]
+@
+
+A TA who matches their bookings gives no output and exit status zero,
+which is what makes the error below necessary:
+<<test functions>>=
+def test_cli_medvind_deviations_user_within_tolerance_is_quiet(
+    medvind_server, booked_tolvans):
+  result = run_deviations("-u", "tolvan", "--tolerance", "3")
+  assert result.exit_code == 0, result.output
+  assert result.stdout == ""
+@
+
+Someone who reported without bookings is in the full run, but not in a
+filtered one, since nothing ties those times to a username.
+<<test functions>>=
+def test_cli_medvind_deviations_user_leaves_out_unbooked(
+    medvind_server, booked_tolvans):
+  booked_tolvans.pop(0)
+  unbooked_row = "-\tTolvan Tolvansson\t0\t6.5\t6.5"
+  assert run_deviations().stdout.splitlines() == [TOLVA_ROW, unbooked_row]
+  assert run_deviations("-u", "tolva").stdout.splitlines() == [TOLVA_ROW]
+@
+
+A TA we can match only by name is the one case where those rows matter.
+Here LADOK fails, and Canvas knows Tolvan by another name than Medvind does.
+The full run shows both halves and needs no warning.
+The filtered run shows only the missing hours, so it must warn that they may
+not be missing at all, and a TA with a personnummer must not get that warning.
+<<test functions>>=
+def test_cli_medvind_deviations_user_warns_if_only_name_matches(
+    medvind_server, booked_tolvans, monkeypatch, caplog):
+  from nytid.cli import hr as hrcli
+  warning = "tolvan could only be matched by name"
+
+  assert run_deviations("-u", "tolvan").exit_code == 0
+  assert warning not in caplog.text
+
+  class _CanvasUser:
+    email = "user@kth.se"
+    name = "T. Tolvansson"
+  def not_in_ladok(canvas_user):
+    raise Exception("not in LADOK")
+  monkeypatch.setattr(hrcli, "get_canvas_user",
+                      lambda user, regex: _CanvasUser())
+  monkeypatch.setattr(hrcli, "get_ladok_user", not_in_ladok)
+
+  caplog.clear()
+  unfiltered = run_deviations().stdout.splitlines()
+  assert "tolvan\tT. Tolvansson\t3.75\t0\t-3.75" in unfiltered
+  assert "-\tTolvan Tolvansson\t0\t6.5\t6.5" in unfiltered
+  assert warning not in caplog.text
+
+  caplog.clear()
+  result = run_deviations("-u", "tolvan")
+  assert result.exit_code == 0, result.output
+  assert result.stdout.splitlines() == [
+    "tolvan\tT. Tolvansson\t3.75\t0\t-3.75"]
+  assert warning in caplog.text
+@
+
+That leaves the two failures that silence would hide.
+A pattern no booked TA matches, and one that is no regular expression,
+both stop the command before it logs in, which we see in that the local
+server has received nothing.
+Since the pattern is matched from the start of the username, [[olva]] is no
+match, though it occurs in both usernames.
+<<test functions>>=
+def test_cli_medvind_deviations_user_no_match(
+    medvind_server, booked_tolvans, caplog):
+  result = run_deviations("--user", "nobody")
+  assert result.exit_code == 1
+  assert "'nobody'" in caplog.text
+  assert result.stdout == ""
+  assert run_deviations("--user", "olva").exit_code == 1
+  assert medvind_server == []
+
+def test_cli_medvind_deviations_user_invalid_regex(
+    medvind_server, booked_tolvans, caplog):
+  result = run_deviations("--user", "(")
+  assert result.exit_code == 1
+  assert "Invalid regular expression" in caplog.text
+  assert medvind_server == []
 @
 
 
