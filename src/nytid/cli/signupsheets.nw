@@ -99,7 +99,7 @@ def complete_signup_users(ctx, args, incomplete):
   """Complete usernames from matching courses' sign-up sheets."""
   from nytid.signup import sheets
   try:
-    course = ctx.params.get("course") or ".*"
+    course = course_in_effect(ctx) or ".*"
     register = ctx.params.get("register") or coursescli.MINE
     users = set()
     for (_, _), config in coursescli.get_courses_configs(
@@ -115,6 +115,43 @@ def complete_signup_users(ctx, args, incomplete):
     return sorted(u for u in users if u.startswith(incomplete))
   except Exception:
     return []
+@
+
+The course takes some finding, because the parsed values in [[ctx.params]] are
+not enough.
+When we complete [[--user]], the command line ends in an option that is still
+waiting for its value.
+To the parser that is a usage error, and it stops before it has handed out the
+positional arguments.
+During completion the error is swallowed, so we get a context where the course
+is still at its default and the word we typed lies among the leftovers in
+[[ctx.args]].
+Those leftovers are in the order they were typed, so pairing them with the
+command's arguments in the order they are declared tells us which is which.
+That pairing is why we can't simply take the first leftover: in
+[[hr amanuensis view]], the only positional argument is the [[user_regex]].
+
+When the parser does reach the end, as when we complete a positional
+[[user_regex]], the course is in [[ctx.params]] and normally nothing is left
+over.
+The exception is a surplus word, which we would then take for the course.
+The command would reject that line anyway, so the worst that can happen is a
+wrong suggestion, and we don't add code to tell the two cases apart.
+A leftover must win over [[ctx.params]], since a default like [[.*]] looks just
+like a course that was given.
+We also look for both names, since [[hr]] calls the argument [[course_regex]]
+and the other modules call it [[course]].
+<<helper functions>>=
+def course_in_effect(ctx):
+  """Returns the given or default course regex, None if there is neither."""
+  arguments = [param.name for param in ctx.command.params
+               if param.param_type_name == "argument"]
+  leftovers = dict(zip(arguments, ctx.args))
+  for name in ("course", "course_regex"):
+    course = leftovers.get(name) or ctx.params.get(name)
+    if course:
+      return course
+  return None
 @
 
 We can verify the gathering and prefix filtering without touching the
@@ -153,6 +190,128 @@ def test_complete_signup_users(monkeypatch):
   ]
   assert complete_signup_users(ctx, None, "a") == ["alice"]
   assert complete_signup_users(ctx, None, "z") == []
+@
+
+That test hands the completer a context we built ourselves, so it can only
+confirm what we believe a context looks like.
+What the completer really gets depends on how the argument is named and how far
+the parser came, so the next tests ask the way a shell does: they set the
+variables of the completion protocol and run the whole [[nytid]] command tree.
+The register, the courses and their configuration are real as well.
+Only the sheet's download is replaced, since it goes over the network, and its
+rows keep the real layout so that [[get_TAs_from_csv]] still reads them.
+<<test functions>>=
+REGISTER = "completionregister"
+
+@pytest.fixture
+def courses_with_sheets(tmp_path, monkeypatch):
+  """Two courses in a real register, each with one TA on its sheet."""
+  runner = CliRunner()
+  TAs = {"prgi": "tolvan", "prgm": "olvan"}
+  columns = len(nytid.signup.sheets.SIGNUP_SHEET_HEADER)
+  runner.invoke(nytid_cli, ["courses", "registry", "add",
+                            REGISTER, str(tmp_path)])
+  for course in TAs:
+    runner.invoke(nytid_cli, ["courses", "new", course, "--register", REGISTER])
+    runner.invoke(nytid_cli, ["signupsheets", "set-url", course,
+                              f"http://example/{course}",
+                              "--register", REGISTER])
+  monkeypatch.setattr(
+    nytid.signup.sheets, "read_signup_sheet_from_url",
+    lambda url: [[""] * columns + [TAs[url.rpartition("/")[2]]]],
+  )
+  yield
+  runner.invoke(nytid_cli, ["courses", "registry", "rm", REGISTER])
+
+def complete(*words, incomplete=""):
+  """What the shell would offer after typing `words` and pressing TAB."""
+  line = ["nytid", *words, incomplete]
+  result = CliRunner().invoke(nytid_cli, [], prog_name="nytid", env={
+    "_NYTID_COMPLETE": "complete_bash",
+    "COMP_WORDS": " ".join(line),
+    "COMP_CWORD": str(len(line) - 1),
+  })
+  assert result.exit_code == 0
+  return result.stdout.split()
+@
+
+Every command that offers these names must keep to the course we gave.
+The list covers both spellings of the argument, and both ways the parser can
+end: stopped by an option waiting for its value, and reaching the end when we
+complete a positional [[user_regex]].
+<<test functions>>=
+@pytest.mark.parametrize("command", [
+  ["hr", "timesheets", "generate", "prgi", "--register", REGISTER, "--user"],
+  ["hr", "timesheets", "generate", "--register", REGISTER, "prgi", "--user"],
+  ["hr", "amanuensis", "create", "prgi", "--register", REGISTER, "--user"],
+  ["hr", "employed", "missing", "prgi", "--register", REGISTER],
+  ["schedule", "view", "prgi", "--register", REGISTER, "--user"],
+])
+def test_completing_users_keeps_to_the_course(courses_with_sheets, command):
+  assert complete(*command) == ["tolvan"]
+@
+
+The course is a regex, so it can select several, and leaving it out selects all
+of them.
+What we have typed of the username still narrows the suggestions in every case.
+<<test functions>>=
+def test_completing_users_with_course_regex(courses_with_sheets):
+  assert complete("hr", "timesheets", "generate", "prg(i|m)",
+                  "--register", REGISTER, "--user") == ["olvan", "tolvan"]
+
+def test_completing_users_without_course(courses_with_sheets):
+  assert complete("hr", "timesheets", "generate",
+                  "--register", REGISTER, "--user") == ["olvan", "tolvan"]
+  assert complete("schedule", "view",
+                  "--register", REGISTER, "--user") == ["olvan", "tolvan"]
+
+def test_completing_users_never_takes_a_username_for_a_course(
+    courses_with_sheets, monkeypatch):
+  """Some commands' only positional argument is a username.
+
+  These commands have no --register, so their sheets are found in the default
+  register, which we point at ours. The unknown option makes the parser give up
+  with the word in the leftovers, as an option waiting for its value does.
+  """
+  monkeypatch.setattr(signupsheets_module.coursescli, "MINE", REGISTER)
+  assert complete("hr", "amanuensis", "view", "prgi",
+                  "--no-such-option") == ["olvan", "tolvan"]
+
+def test_completing_users_filters_on_what_is_typed(courses_with_sheets):
+  assert complete("hr", "timesheets", "generate", "prg(i|m)",
+                  "--register", REGISTER, "--user",
+                  incomplete="t") == ["tolvan"]
+  assert complete("hr", "timesheets", "generate", "prgi",
+                  "--register", REGISTER, "--user",
+                  incomplete="o") == []
+@
+
+The shells also differ in a way that matters here.
+Bash splits [[--user=]] into separate words, so the option is left waiting as
+above.
+Zsh keeps it in one piece and sends it as the word being completed, so the
+parser never sees the option and reaches the end.
+That is the only way a [[--user]] completion gets its course from
+[[ctx.params]], so we ask in zsh's protocol as well.
+Its answer is a line of shell code rather than one name per line, so all we
+take from it are the quoted names.
+<<test functions>>=
+def complete_in_zsh(*words):
+  """What zsh would offer after typing `words`, the last being unfinished."""
+  result = CliRunner().invoke(nytid_cli, [], prog_name="nytid", env={
+    "_NYTID_COMPLETE": "complete_zsh",
+    "_TYPER_COMPLETE_ARGS": " ".join(["nytid", *words]),
+  })
+  assert result.exit_code == 0
+  return re.findall(r'"(\w+)"', result.stdout)
+
+@pytest.mark.parametrize("command", [
+  ["hr", "timesheets", "generate"],
+  ["schedule", "view"],
+])
+def test_completing_users_after_equals_in_zsh(courses_with_sheets, command):
+  assert complete_in_zsh(*command, "prgi",
+                         "--register", REGISTER, "--user=") == ["tolvan"]
 @
 
 \section{Generate sign-up sheet}
@@ -485,15 +644,21 @@ url_arg = typer.Argument(help="The URL for the sign-up sheet. "
 
 We only need a light-weight setup here: import the generated module,
 bring its public names into scope, and provide the mocking helpers used
-by the completer test.
+by the completer test, along with the whole command tree that the completion
+tests run.
 We import [[nytid.signup.sheets]] explicitly because the tests patch
 attributes on that source module---the [[signupsheets]] module no
 longer holds it as an attribute, since it defers the import to call
 time.
 
 <<test [[clisignupsheets.py]]>>=
+import re
 from unittest.mock import MagicMock
 
+import pytest
+from typer.testing import CliRunner
+
+from nytid.cli import cli as nytid_cli
 import nytid.cli.signupsheets as signupsheets_module
 import nytid.signup.sheets
 from nytid.cli.signupsheets import *
