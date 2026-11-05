@@ -17,7 +17,7 @@ This module has two commands:
   organisation units---that the user last worked with, since a plan's
   identifier is what [[--plan]] wants.
 \item[ [[nytid hr medvind hours]] ] prints the reported times, one row per
-  time, selected by TA, work leader, comment and attestation.
+  time, selected by TA, work leader, comment, attestation and approval.
 \end{description}
 A third, [[nytid hr medvind deviations]], compares the reported times
 with the bookings; it needs [[hr]]'s bookings and contracts, so it is
@@ -28,6 +28,7 @@ The second form is the point of the command: a script that compares
 the reports with the bookings reads it with [[cut]], [[awk]] or
 Python's [[csv]] module.
 \begin{minted}{bash}
+nytid hr medvind hours --leader 'Ada Lärare' --no-approved
 nytid hr medvind hours --leader 'Ada Lärare' --no-attested
 nytid hr medvind hours --ta 'Tolvan' --comment DD1301 \
   | awk -F'\t' '{s+=$5} END {print s}'
@@ -170,7 +171,12 @@ as the other errors: a message naming the problem, not a traceback.
 <<select the times the options ask for>>=
 try:
     times = medvind.select(
-        times, ta=ta, leader=leader, comment=comment, attested=attested
+        times,
+        ta=ta,
+        leader=leader,
+        comment=comment,
+        attested=attested,
+        approved=approved,
     )
 except re.error as err:
     logging.error(f"Invalid regular expression {err.pattern!r}: {err}")
@@ -194,7 +200,7 @@ comment, the one column of free text, wraps rather than being cut off.
 
 \subsection{The period}
 
-TAs report their hours for a month, and the reports are attested in the
+TAs report their hours for a month, and the reports are approved in the
 first days of the next.
 So early in a month, the month we want to check is the one that just
 ended; later, it is the current one.
@@ -285,24 +291,36 @@ plan_opt = typer.Option(
 
 \subsection{Selecting times}
 
-The four selections are those of [[medvind.select]]
+The five selections are those of [[medvind.select]]
 (\cref{medvind.select}).
 The TA can be given by name or by personnummer; Medvind knows no
 usernames, so a username would match nothing.
 [[--attested]] and [[--no-attested]] are the two halves of one flag,
 and leaving both out shows all times, so the flag has three states.
+[[--approved]] and [[--no-approved]] work the same way.
+Approval comes first and attestation later, so what a work leader wants to see
+is [[--no-approved]], while [[--approved --no-attested]] is what is waiting for
+attestation.
+
+Combined with [[--leader]], [[--approved]] means reported to that leader and
+approved by someone, not approved by them.
+[[--leader]] searches the name the TA typed; the approver is only part of the
+value in another field, which the selection doesn't read.
+We print no column for the approval, since that value holds the approver's
+identity and the flag already answers the question.
+So the status column doesn't show approval: an approved time that isn't
+attested has an empty status or [[G]], and so can a time that isn't approved
+(\cref{medvind.select}).
 <<options for selecting times>>=
 ta: Annotated[Optional[str], ta_opt] = None,
-leader: Annotated[Optional[str], leader_opt] = None,
+leader: Annotated[Optional[str], leader_opt] = DEFAULT_LEADER,
 comment: Annotated[Optional[str], comment_opt] = None,
 attested: Annotated[Optional[bool], attested_opt] = None,
+approved: Annotated[Optional[bool], approved_opt] = None,
 <<constants>>=
 ta_opt = typer.Option(
     help="Only times of this TA: a regex for the name, or a "
     "personnummer (YYMMDD-NNNN or YYYYMMDDNNNN).",
-)
-leader_opt = typer.Option(
-    help="Only times reported to a work leader matching this regex.",
 )
 comment_opt = typer.Option(
     help="Only times whose comment matches this regex, e.g. a course code.",
@@ -310,6 +328,37 @@ comment_opt = typer.Option(
 attested_opt = typer.Option(
     "--attested/--no-attested",
     help="Only attested or only unattested times. Default: both.",
+)
+approved_opt = typer.Option(
+    "--approved/--no-approved",
+    help="Only times with or only times without a work leader's approval, "
+    "whoever gave it; --leader is whom a time was reported to. Default: both.",
+)
+@
+
+The work leader is the one selection with a configured default.
+A teacher mostly asks for the times reported to them, so [[hr.medvind.leader]]
+saves typing their name each time.
+To see everyone's times despite the key there is [[--leader '']]: the empty
+pattern occurs in every text, even the empty one of a time with no work leader,
+so it selects every time.
+
+[[nytid hr medvind deviations]] takes the same option under the same key
+(\cref{sec:hr-medvind}).
+Two copies had already drifted apart, with only that command reading the key, so
+there is one definition, which both commands use.
+It has to be here because [[hr]] imports this module, not the reverse.
+The help text says only what holds for both commands.
+What leaving the leader out means for the comparison belongs to [[deviations]]
+and stays in its docstring.
+<<constants>>=
+LEADER_CONFIG = "hr.medvind.leader"
+DEFAULT_LEADER = default(LEADER_CONFIG, None)
+leader_opt = typer.Option(
+    "--leader",
+    help="Only times reported to a work leader matching this regex, "
+    "normally your own name; an empty pattern means any work leader. "
+    + config_hint(LEADER_CONFIG),
 )
 @
 
@@ -331,6 +380,10 @@ Those are the module's two connections to the outside; everything
 between them and the printed rows is the code under test.
 <<test [[climedvind.py]]>>=
 import datetime
+import json
+import os
+import subprocess
+import sys
 
 import pytest
 import requests
@@ -339,6 +392,7 @@ from typer.testing import CliRunner
 import nytid.medvind
 from nytid.cli.medvind import *
 from test_medvind import local_server, medvind_routes, TIMELIST_ANSWER
+from test_medvind import time as medvind_time
 
 <<test fixtures>>
 <<test functions>>
@@ -376,15 +430,140 @@ def test_hours_prints_tab_separated_rows(medvind_server):
 The options must reach the selection---a personnummer for the TA, and
 the three states of [[--attested]]:
 <<test functions>>=
+def dates(*args):
+  """Return the dates of the times `hours` prints with the options `args`."""
+  result = runner.invoke(medvindcli, ["hours", *args])
+  assert result.exit_code == 0, result.output
+  return [line.split("\t")[1] for line in result.stdout.splitlines()]
+
 def test_hours_selects_times(medvind_server):
-  def dates(*args):
-    result = runner.invoke(medvindcli, ["hours", *args])
-    assert result.exit_code == 0, result.output
-    return [line.split("\t")[1] for line in result.stdout.splitlines()]
   assert dates("--ta", "121212-1212") == ["2026-06-04", "2026-08-25"]
   assert dates("--no-attested") == ["2026-09-01"]
   assert dates("--attested", "--comment", "dd1301") == ["2026-06-04"]
   assert len(dates()) == 4
+@
+
+The work leader selects too, and an empty pattern must take every time,
+also the two recorded without a work leader, or it could not override a
+configured leader:
+<<test functions>>=
+def test_hours_selects_by_leader(medvind_server):
+  assert dates("--leader", "Ada") == ["2026-06-04", "2026-08-25"]
+  assert dates("--leader", "Grace") == []
+  assert len(dates("--leader", "")) == 4
+@
+
+The recorded times cannot tell approval from attestation
+(\cref{medvind.select}), so here the local server answers with the four
+combinations of the two.
+It still goes through the real request and the real selection, which is what
+shows that each flag reaches the right criterion, in the right direction.
+The approval of the second time also names a colleague, as the recorded values
+name the approver: [[--leader]] looks at whom a time was reported to, not at who
+approved it.
+<<test functions>>=
+def test_hours_approved_is_not_attested(medvind_server, monkeypatch):
+  def reported(datum, **fields):
+    return medvind_time("Tolvan", "Tolvansson", "121212-1212", datum,
+                        "08:00", "10:00", **fields)
+  approval = {"arbledare_godk": "2026-10-07 12:35:45.000 Grace Kollega"}
+  monkeypatch.setitem(TIMELIST_ANSWER, "timeapprove", [
+    reported("2026-09-01"),
+    reported("2026-09-02", arbledare_orsak="Ada Lärare", **approval),
+    reported("2026-09-03", atteststatus="A"),
+    reported("2026-09-04", **approval, atteststatus="A")])
+
+  assert dates("--approved") == ["2026-09-02", "2026-09-04"]
+  assert dates("--no-approved") == ["2026-09-01", "2026-09-03"]
+  assert dates("--attested") == ["2026-09-03", "2026-09-04"]
+  assert dates("--no-attested") == ["2026-09-01", "2026-09-02"]
+  assert dates("--approved", "--no-attested") == ["2026-09-02"]
+  assert dates("--no-approved", "--attested") == ["2026-09-03"]
+  assert len(dates()) == 4
+  assert dates("--leader", "Ada", "--approved") == ["2026-09-02"]
+  assert dates("--leader", "Grace", "--approved") == []
+@
+
+The configured leader is a default bound when the module is imported, so a
+test in this process, which has imported it already, cannot show that it is
+read.
+We therefore start a new process with a real configuration file in a home of
+its own, as for the renamed keys (\cref{cli.utils.defaults.renamed}), and read
+what each command's help gives as the default.
+[[deviations]] is here too, although [[hr]] defines it, since sharing the key
+is the point.
+The terminal is made wide because [[rich]] would otherwise wrap the default in
+the middle.
+<<test functions>>=
+@pytest.mark.parametrize("command", ["hours", "deviations"])
+def test_help_shows_the_configured_leader_as_default(tmp_path, command):
+  (tmp_path / "config.json").write_text(json.dumps(
+    {"hr": {"medvind": {"leader": "Zyxwv Kollega"}}}))
+  env = {**os.environ, "NYTID_HOME": str(tmp_path),
+         "COLUMNS": "400", "TERMINAL_WIDTH": "400"}
+  env.pop("TMUX", None)
+  env.pop("TMUX_PANE", None)
+  result = subprocess.run(
+    [sys.executable, "-c", "from nytid.cli import cli; cli()",
+     "hr", "medvind", command, "--help"],
+    env=env, capture_output=True, text=True,
+  )
+  assert result.returncode == 0, result.stderr
+  assert "[default: Zyxwv Kollega]" in result.stdout
+  assert "[config: hr.medvind.leader]" in result.stdout
+@
+
+The help shows only that the key is read.
+That the key really narrows the selection, and that [[--leader '']] really
+overrides it, takes a run of each command with the key set.
+So a new process logs in to a local server run by this one.
+It replaces the same two connections as our other tests, and for [[deviations]]
+also what the bookings say, as the tests in [[hr]] do
+(\cref{sec:hr-medvind}), since those would need real sign-up sheets.
+Under Ada Lärare, Tolvan's times match the bookings and Tolva's count for
+nothing; for any work leader, Tolva has reported all her $5.75$ hours.
+<<test functions>>=
+RUN_WITH_LOCAL_MEDVIND = """
+import sys
+import requests
+import nytid.medvind
+from nytid.cli import cli, hr
+nytid.medvind.BASE_URL = sys.argv[1]
+nytid.medvind.shared_session = requests.Session
+hr.coursescli.get_courses_configs = lambda *a, **k: {("DD1301", "mine"): None}
+hr.booked_hourly_hours = lambda *a: [
+  ("tolvan", "121212-1212", "Tolvan Tolvansson", 6.5),
+  ("tolva", "121212-2223", "Tolva Tolvansson", 2)]
+sys.argv = ["nytid", "hr", "medvind", *sys.argv[2:]]
+cli()
+"""
+
+def test_configured_leader_selects_and_empty_pattern_overrides(tmp_path):
+  (tmp_path / "config.json").write_text(json.dumps(
+    {"hr": {"medvind": {"leader": "Ada"}}}))
+  env = {**os.environ, "NYTID_HOME": str(tmp_path)}
+  env.pop("TMUX", None)
+  env.pop("TMUX_PANE", None)
+  period = ["--from", "2026-06-01", "--to", "2026-09-30"]
+
+  with local_server(medvind_routes()) as (url, _):
+    def rows(*args):
+      result = subprocess.run(
+        [sys.executable, "-c", RUN_WITH_LOCAL_MEDVIND, url, *args, *period],
+        env=env, capture_output=True, text=True,
+      )
+      assert result.returncode == 0, result.stderr
+      return [line.split("\t") for line in result.stdout.splitlines()]
+
+    assert [row[1] for row in rows("hours")] == ["2026-06-04", "2026-08-25"]
+    assert len(rows("hours", "--leader", "")) == 4
+    assert [row[1] for row in rows("hours", "--leader", "Nobody")] == []
+
+    def reported(*args):
+      return {row[0]: row[3] for row in rows("deviations", "DD1301", *args)}
+
+    assert reported() == {"tolva": "0"}
+    assert reported("--leader", "") == {"tolva": "5.75"}
 @
 
 Without [[--from]] and [[--to]] the default period is used---for a
