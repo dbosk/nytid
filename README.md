@@ -70,8 +70,9 @@ may ask for an Authenticator approval. Piped output is tab-separated rows for
 scripts. `deviations` lists the TAs whose reports since `hr.medvind.since`
 differ from what their hourly time sheets asked them to report (prep time
 included), which the monthly cron script mails out. Without `--leader` or
-`hr.medvind.leader` it counts the times of any work leader, so normally you set
-your own name there. With `--user`/`-u` it checks only the booked TAs whose
+`hr.medvind.leader` it lists only the TAs booked on the courses and counts their
+times for any work leader, so hours they reported to a colleague show as
+over-reported. With `--user`/`-u` it checks only the booked TAs whose
 usernames match the regex, from the start of the username, so `tolva$` is needed
 to leave out `tolvan`.
 
