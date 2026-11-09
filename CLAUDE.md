@@ -44,7 +44,7 @@ poetry run nytid --help
 - `cd tests && poetry run pytest test_courses.py -v` — Run a single test file
 - `cd tests && poetry run pytest test_courses.py::test_function_name -v` — Run a single test function
 - `cd tests && poetry run pytest -k "keyword" -v` — Run tests matching a keyword
-- `make clean all` — Clean rebuild of everything (source **and** docs). `make -C <dir> clean all` scopes a clean rebuild to one subdirectory, e.g. `make -C doc clean all` rebuilds only the documentation PDF.
+- `make clean && make all` at the root — Clean rebuild of everything (source **and** docs). Keep the two invocations: **`make clean all` in one command builds each subdirectory and *then* cleans it**, because `makefiles/subdir.mk` sorts the goals it passes on (dbosk/makefiles#102). It exits 0 and leaves no `.py` files in `src/`, and the docs build is deleted when it finishes. The same goes for `make -C src/nytid clean all`. `make -C doc clean all` is safe, since `doc/` has no subdirectories, and rebuilds only the documentation PDF.
 
 `make test` runs `${PYTEST}`, which defaults to `poetry run pytest`. Override it where the Poetry venv isn't the interpreter under test (a git worktree, CI): `make -C tests test PYTEST="PYTHONPATH=$PWD/src /path/to/python -m pytest"`.
 
@@ -54,7 +54,8 @@ situation below, `all` only (re)builds the `.py` MODULES and any *missing*
 prose/LaTeX in a `.nw` file (documentation chunks, chunk names, `\cref`s) will
 therefore not appear in the built docs after a plain `make all` — the stale
 `.tex` is reused. Use a **clean** rebuild to force re-weaving:
-`make -C doc clean all` (docs only) or `make clean all` (everything). This is
+`make -C doc clean all` (docs only) or `make clean && make all` (everything;
+not `make clean all`, see above). This is
 the LaTeX/`.tex` analogue of the test-file gotcha described below.
 
 ## Architecture
