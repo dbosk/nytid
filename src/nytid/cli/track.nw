@@ -7207,10 +7207,10 @@ Tmux-launched commands need a different waiting strategy from direct
 [[subprocess.run]].  The [[tmux split-window]] and [[new-window]]
 commands return as soon as the pane exists, not when the program inside
 the pane finishes.  To preserve [[track start]]'s launch semantics we therefore
-make tmux notify us when the pane's command exits.
+have the pane tell us when its command exits.
 
 The main race is at startup: a very short-lived command could finish
-before we manage to install any hook on its pane.  We avoid that by
+before we have published its pane's state or installed its hooks.  We avoid that by
 launching a tiny shell wrapper that first blocks on a tmux
 [[wait-for]] channel.  Once the parent has learned the new [[pane_id]]
 and installed pane-scoped exit hooks, it signals that channel so the
@@ -7222,18 +7222,19 @@ between tmux and the real command---so reading login startup files would
 only add risk.  A login shell can emit errors, alter the environment, or
 delay startup before the hook handshake is in place.
 
-Normal completion now flows through the wrapper itself: after the child
-command exits, the wrapper records its exit status and signals the
-waiting parent directly.  That keeps the common [[exit]]/Ctrl+D path
-independent of tmux hook delivery.  We still install pane-scoped exit
-hooks as a fallback for abnormal cases such as an explicit
-[[kill-pane]]---the wrapper cannot run cleanup after it has been killed,
-but tmux can still report that the pane died.
+Completion flows through the wrapper itself, however the pane ends:
+when the child command exits, the wrapper records its exit status and
+signals the waiting parent directly, and when the pane is killed, a
+watcher process the wrapper started does the same
+([[build_tmux_wait_wrapper]] below).  Tmux hooks cannot do it: on
+tmux 3.6 a hook set on a pane does not run when that pane ends.  We
+still install pane-scoped exit hooks, but only as a mark that nytid
+launched the pane.
 
-Both paths share one atomic completion guard.  The first path to claim
-that guard writes the status file, runs any follow-up shell command, and
-wakes the parent.  Later signals become harmless no-ops instead of
-double-running cleanup.
+Every completion path claims one atomic completion guard.  The first
+path to claim it writes the status file, runs any follow-up shell
+command, and wakes the parent.  Later attempts become harmless no-ops
+instead of double-running cleanup.
 
 \subsubsection{Shared Launch Options}
 
@@ -8364,7 +8365,8 @@ def build_tmux_wait_wrapper(
     """Return a wrapper that waits and finalizes however the pane ends.
 
     ``cleanup_shell`` runs after ``on_exit_shell`` and may refer to
-    ``$nytid_window``, the wrapper's window id, and ``$TMUX_PANE``.
+    ``$nytid_window`` and ``$nytid_pane``, the wrapper's window and
+    pane ids.
     """
     ready_wait = f"tmux wait-for {shlex.quote(ready_channel)}"
     finalize = join_shell_commands(on_exit_shell, cleanup_shell)
@@ -8378,55 +8380,75 @@ def build_tmux_wait_wrapper(
 
 A launched pane can end in two ways, and the wrapper is the one piece
 of nytid present at both, which is why it, and not a tmux hook,
-finalizes the launch.  Either the command returns and the wrapper
-carries on: a normal exit.  Or tmux destroys the pane underneath
-it---[[kill-pane]], [[kill-window]], a killed session---and closes the
-pane's terminal: a hangup.  Tmux's own [[pane-exited]] and
-[[pane-died]] hooks cannot stand in for the second case.  A hook set
-on a pane, as ours have to be, never fired in our tests with tmux 3.6
-when that pane went away, whether it exited or was killed, with or
-without a client attached; [[pane-died]] fired only with
-[[remain-on-exit]] on.  An earlier design relied on those hooks for
-the hangup, so a killed tracked pane went on tracking.
+finalizes the launch.  Either the command returns: a normal exit.  Or
+tmux destroys the pane underneath it---[[kill-pane]], [[kill-window]],
+a killed session or server---and closes the pane's terminal: a hangup.
+Tmux's own [[pane-exited]] and [[pane-died]] hooks cannot stand in for
+the second case.  A hook set on a pane, as ours have to be, never fired
+in our tests with tmux 3.6 when that pane went away, whether it exited
+or was killed, with or without a client attached; [[pane-died]] fired
+only with [[remain-on-exit]] on.  An earlier design relied on those
+hooks for the hangup, so a killed tracked pane went on tracking.
 
 A hangup is hard to catch from the shell that runs the command, for
 the way the signal arrives (we observed this with tmux 3.6 on Linux,
 and the tests below exercise it against a real server).  When tmux
-closes the terminal, [[SIGHUP]] goes to the terminal's session
-leader---the wrapper---alone.  The command gets its [[SIGHUP]] only
-once the wrapper has died.  A wrapper that trapped the signal would
-therefore not die, and as a shell it runs a trap only after the
-command it waits for has finished: a command that never touches its
-terminal, a script or a [[sleep]], would outlive the pane, where
-without nytid it dies with it.
+closes the terminal, [[SIGHUP]] goes to the terminal's session leader
+alone: the wrapper, or the shell tmux started the wrapper from.  The
+command gets its [[SIGHUP]] only once that leader has died.  A wrapper
+that trapped the signal would keep the leader alive, and as a shell it
+runs a trap only after the command it waits for has finished: a
+command that never touches its terminal, a script or a [[sleep]],
+would outlive the pane, where without nytid it dies with it.
 
-So the wrapper keeps its default reaction, and the hangup completion
-runs in a separate shell, a \emph{watcher} at the other end of a pipe.
-The command side writes [[done]] into the pipe once it has completed
-normally.  If the pipe closes without that word, the command side has
-died, and the watcher, which ignores the signals that kill the rest,
-finalizes instead.  The pipe gives us that signal for free: its write
-end closes when the last process holding it dies, however it dies.
-The command itself does not hold the write end, or a daemon it leaves
-behind would keep the watcher waiting; nor does it hold the saved
-terminal descriptor [[4]], through which the command side gets its
-standard output back from the pipe.
+So the wrapper keeps its default reaction, and the finalizing happens
+in a separate shell, a \emph{watcher} at the other end of a pipe.  The
+command side writes the command's exit status into the pipe when the
+command returns.  If the pipe closes without a status, the command side
+has died, and the watcher finalizes the hangup instead.  The pipe gives
+us that signal for free: its write end closes when the last process
+holding it dies, however it dies.  The command itself does not hold the
+write end, or a daemon it leaves behind would keep the watcher waiting;
+nor does it hold the saved terminal descriptor [[4]], through which the
+command side gets its standard output back from the pipe.  The watcher
+ignores the signals that end a pane, so a pane killed while a slow
+finalize runs---two Python start-ups, and a GitHub comment for a todo
+run---does not cut the finalize short; and it exits with the command's
+status, which becomes the pane's.
+
+Ctrl-C needs care too.  Without job control it sends [[SIGINT]] to the
+whole foreground process group, the command side included, and a
+command side that died of it would make the watcher record a hangup for
+a command that may well have caught the signal and finished normally.
+The command side and the wrapper therefore catch [[SIGINT]] and
+[[SIGQUIT]] with a trap that does nothing.  Unlike an ignored signal, a
+caught one is reset when a program is executed, so the command still
+receives Ctrl-C as usual.
 
 When there is nothing to finalize, the wrapper only waits for the
-ready signal and runs the command, as before.
+ready signal and runs the command, as before.  If the ready signal
+never comes, the command side tells the watcher to [[skip]], since
+nothing has run that needs finalizing.
 
 <<run the command with a watcher on the other end>>=
 script = (
+    "trap : INT QUIT; "
     "exec 4>&1; "
     "{ "
-    f"{ready_wait} || {{ echo done >&3; exit 1; }}; "
+    "trap : INT QUIT; "
+    f"{ready_wait} || {{ echo skip >&3; exit 1; }}; "
     '"$@" 3>&- 4>&-; '
-    "status=$?; "
-    f"{normal_shell}; "
-    "echo done >&3; "
+    'echo "$?" >&3; '
     "} 3>&1 1>&4 4>&- | { "
     "trap '' HUP INT QUIT TERM; "
-    f"read -r _ || {hangup_shell}; "
+    "unset TMUX_PANE; "
+    "if read -r status; then "
+    '[ "$status" = skip ] && exit 1; '
+    f"{normal_shell}; "
+    'exit "$status"; '
+    "fi; "
+    f"{hangup_shell}; "
+    f"exit {128 + int(signal.SIGHUP)}; "
     "} 4>&-"
 )
 @
@@ -8440,15 +8462,18 @@ interactive shell exits on its own when its terminal closes, so even
 the normal end can come after the pane---and a write to a closed
 terminal fails and could abort a finalize command halfway.  Nobody
 would see the output anyway, since the pane closes as the command
-ends.  Both ends also claim the same [[completion_guard]], so whichever
-comes first finalizes and the other does nothing.
+ends.  Both ends also claim the same [[completion_guard]], so a
+finalize runs at most once even should a hook ever fire as well.
 
-The completion exports the window id the wrapper captured as
-[[NYTID_TMUX_WINDOW_ID]].  That is for the finalize command: it finds
-the window to update through [[$TMUX_PANE]], which no longer leads
-anywhere once the pane is gone, and then falls back to this variable
-(\cref{track:ended-pane-window}).  The export happens after the
-command has ended, so the user's command never sees it.
+The watcher unsets [[TMUX_PANE]] before it finalizes.  The launch
+published its labels into the new pane's or window's context, and the
+cleanup undoes exactly that, with the labels named explicitly
+(\cref{track:detached-finalize}).  A finalize that also unregistered
+labels through [[TMUX_PANE]] would decrement only the labels it
+happened to stop, missing those suspended or still needed elsewhere;
+in a pane launch it would even decrement the enclosing window, which
+the launch never incremented; and once the pane is gone it would find
+no window at all.
 
 <<build the completion for each way the pane ends>>=
 def quiet_completion(status_arg, signal_arg):
@@ -8462,24 +8487,23 @@ def quiet_completion(status_arg, signal_arg):
     )
     if completion == ":":
         return completion
-    return (
-        '{ export NYTID_TMUX_WINDOW_ID="$nytid_window"; '
-        f"{completion}; }} </dev/null >/dev/null 2>&1"
-    )
+    return f"{{ {completion}; }} </dev/null >/dev/null 2>&1"
 
 normal_shell = quiet_completion('"$status"', "''")
 hangup_shell = quiet_completion("''", str(int(signal.SIGHUP)))
 @
 
-The window id has to be captured while the pane certainly exists, so
-the wrapper asks first thing.  Tmux does not expand formats in a
-[[new-window]] or [[split-window]] command, so the [[#{window_id}]]
-reaches [[display-message]] intact.
+The cleanup needs the pane's own ids, and the window id has to be
+captured while the pane certainly exists, so the wrapper asks first
+thing.  Tmux does not expand formats in a [[new-window]] or
+[[split-window]] command, so the [[#{window_id}]] reaches
+[[display-message]] intact.
 
 <<run the command with a watcher on the other end>>=
 script = (
     "nytid_window=$(tmux display-message -p"
     ' -t "$TMUX_PANE" \'#{window_id}\' 2>/dev/null); '
+    'nytid_pane="$TMUX_PANE"; '
     + script
 )
 @
@@ -8632,6 +8656,7 @@ def run_tmux_command(
     cleanup_shell = None
     if focus_labels and focus_who and tmux_server_key:
         cleanup_shell = build_tmux_launch_cleanup_shell(
+            focus_labels,
             focus_who,
             tmux_server_key,
             window=focus_window,
@@ -9036,7 +9061,7 @@ def write_suspend_state(
 Reading the state file returns [[None]] when the file is missing or
 corrupt.  This lets the resume path treat absence as a no-op rather
 than raising, which is the normal case when a pane exits while
-unfocused (the cleanup hook already removed the file).
+unfocused (the launch cleanup already removed the file).
 
 <<helper functions>>=
 def read_suspend_state(
@@ -9050,7 +9075,7 @@ def read_suspend_state(
 @
 
 Deletion is idempotent: the file may already have been removed by
-the cleanup hook or by a concurrent resume in another pane.
+the launch cleanup or by a concurrent resume in another pane.
 
 <<helper functions>>=
 def delete_suspend_state(
@@ -9770,7 +9795,7 @@ We hook the rename into [[write_window_label_entries]] rather than
 into each of those commands.  They all reach the window file through
 the add, remove, write and backfill helpers above, which all end in
 that one writer, so a single call site covers every path, including
-the pane-exit cleanup hook that runs long after the command that
+the launch cleanup that runs long after the command that
 started the labels.  The writers already run under the tmux-context
 lock, so two concurrent label changes rename the window in the same
 order as they change the file, and the last name matches the last
@@ -10846,26 +10871,12 @@ resolves the live window from [[TMUX_PANE]], checks for existing
 tracked-window state in the current tmux server, and only returns a
 [[window_id]] when the window is already tracked by nytid.
 
-One caller runs when [[TMUX_PANE]] may no longer resolve: the finalize
-command of a launched pane, which the launch wrapper runs as the pane
-ends, possibly after it has gone (\cref{track:detached-finalize}).
-Tmux cannot say which window a gone pane was in, so the wrapper asks
-while the pane still exists and hands the answer to the finalize
-command as [[NYTID_TMUX_WINDOW_ID]].  We use it only when the pane
-does not resolve; a live pane always wins.  The wrapper sets the
-variable only for its finalize commands, so no other command sees it.
-\label{track:ended-pane-window}
-
 <<helper functions>>=
 def get_current_tracked_window_id(
     who: str,
     tmux_server_key: str,
 ) -> str | None:
-    """Return the live tmux window id if it is already tracked.
-
-    Falls back to ``$NYTID_TMUX_WINDOW_ID`` when ``$TMUX_PANE``
-    does not resolve, as for a launched pane that has just ended.
-    """
+    """Return the live tmux window id if it is already tracked."""
     pane_id = os.environ.get("TMUX_PANE")
     if not pane_id:
         return None
@@ -10873,10 +10884,7 @@ def get_current_tracked_window_id(
         who, tmux_server_key,
     ):
         return None
-    window_id = (
-        get_tmux_window_id_for_pane(pane_id)
-        or os.environ.get("NYTID_TMUX_WINDOW_ID")
-    )
+    window_id = get_tmux_window_id_for_pane(pane_id)
     if not window_id:
         return None
     if read_window_labels(
@@ -11684,17 +11692,20 @@ labels file and, once the window has no other panes, the file itself.
 The launch wrapper ([[build_tmux_wait_wrapper]]) runs a cleanup for
 all of it after the finalize command, on both ways the pane can end.
 
-The finalize command has already taken this pane's labels out of the
-pane or window labels file by the time the cleanup runs, on either
-end: it finds the window through [[$TMUX_PANE]] while the pane lives
-and through [[NYTID_TMUX_WINDOW_ID]] once it has gone.  The cleanup
-only deletes what has become obsolete.  Its shell refers to
-[[$TMUX_PANE]] and to the [[$nytid_window]] the wrapper captured,
-which is why those stay unquoted here, for the wrapper's shell to
-expand.
+The finalize command leaves the tmux context alone (it runs without
+[[TMUX_PANE]], see [[build_tmux_wait_wrapper]]), so the cleanup undoes
+exactly what the launch published: it takes the launch's labels out of
+the window labels file, or deletes the pane's files.  Naming the labels
+explicitly matters, because at the end the labels may not be active:
+auto-suspend stops them while their window is not selected, and a todo
+run's labels may stay active for another task on the stack.  They are
+still the window's to give back.  The shell refers to the
+[[$nytid_window]] and [[$nytid_pane]] the wrapper captured, which is
+why those stay unquoted here, for the wrapper's shell to expand.
 
 <<helper functions>>=
 def build_tmux_launch_cleanup_shell(
+    labels: list[str],
     who: str,
     tmux_server_key: str,
     *,
@@ -11702,18 +11713,19 @@ def build_tmux_launch_cleanup_shell(
 ) -> str:
     """Return the shell command the wrapper runs to clean up."""
     prefix = build_detached_nytid_prefix()
-    options = f" --server-key {shlex.quote(tmux_server_key)}"
+    options = (
+        ' --pane-id "$nytid_pane"'
+        f" --server-key {shlex.quote(tmux_server_key)}"
+    )
     if who != default_username:
         options += f" --who {shlex.quote(who)}"
     if not window:
-        return (
-            f"{prefix} _cleanup-pane-detached"
-            f' --pane-id "$TMUX_PANE"{options}'
-        )
+        return f"{prefix} _cleanup-pane-detached{options}"
+    label_args = " ".join(shlex.quote(lbl) for lbl in labels)
     return (
         f"{prefix} _cleanup-window-detached"
-        ' --window-id "$nytid_window"'
-        f' --pane-id "$TMUX_PANE"{options}'
+        f' --window-id "$nytid_window"{options}'
+        f" -- {label_args}"
     )
 @
 
@@ -11794,9 +11806,8 @@ def stop_detached(
 @
 
 The window cleanup command receives the window explicitly, since the
-pane it served may be gone.  It decrements only the label names it is
-given.  The launch wrapper gives none, since the finalize command has
-already taken them out; adopt's hook, below, gives the labels the
+pane it served may be gone, and decrements only the label names it is
+given: the launch's labels, or for adopt's hook below the labels the
 adopting pane contributed.
 
 It is also the one place that deletes a window file, and the question
@@ -11816,11 +11827,9 @@ the delete are atomic with respect to other context mutations.
 <<detached finalize command>>=
 @cli.command(name="_cleanup-window-detached", hidden=True)
 def cleanup_window_detached(
+    labels: Annotated[list[str], detached_labels_arg],
     window_id: Annotated[str, window_id_opt],
     tmux_server_key: Annotated[str, tmux_server_key_opt],
-    labels: Annotated[
-        list[str] | None, detached_optional_labels_arg
-    ] = None,
     pane_id: Annotated[str | None, pane_id_opt] = None,
     who: Annotated[str, who_opt] = default_username,
 ):
@@ -11829,10 +11838,9 @@ def cleanup_window_detached(
         return
 
     def cleanup():
-        if labels:
-            remove_window_labels(
-                window_id, who, tmux_server_key, list(labels),
-            )
+        remove_window_labels(
+            window_id, who, tmux_server_key, list(labels),
+        )
         panes = list_window_panes(window_id)
         if panes is not None and not panes - {pane_id}:
             delete_window_labels(
@@ -11840,13 +11848,6 @@ def cleanup_window_detached(
             )
 
     with_tmux_context_lock(cleanup)
-@
-
-The launch wrapper passes no labels, so the argument must be optional,
-unlike the required labels of [[_stop-detached]].
-
-<<argument and option definitions>>=
-detached_optional_labels_arg = typer.Argument()
 @
 
 We list the panes of all windows and filter, rather than asking for
@@ -14277,39 +14278,6 @@ def test_get_current_tracked_window_id_uses_live_window_lookup(
                 "me", TEST_SERVER_KEY,
             ) == "@42"
 
-def test_get_current_tracked_window_id_falls_back_for_ended_pane(
-    temp_tracking_dir,
-):
-    """A pane tmux no longer knows uses the wrapper's window id."""
-    write_window_labels("@42", "me", TEST_SERVER_KEY, ["seminar"])
-    with patch.dict(
-        os.environ,
-        {"TMUX_PANE": "%7", "NYTID_TMUX_WINDOW_ID": "@42"},
-    ), patch(
-        "nytid.cli.track.get_tmux_window_id_for_pane",
-        return_value=None,
-    ):
-        assert get_current_tracked_window_id(
-            "me", TEST_SERVER_KEY,
-        ) == "@42"
-
-def test_get_current_tracked_window_id_prefers_live_pane(
-    temp_tracking_dir,
-):
-    """While the pane resolves, the wrapper's window id is ignored."""
-    write_window_labels("@42", "me", TEST_SERVER_KEY, ["seminar"])
-    write_window_labels("@43", "me", TEST_SERVER_KEY, ["other"])
-    with patch.dict(
-        os.environ,
-        {"TMUX_PANE": "%7", "NYTID_TMUX_WINDOW_ID": "@43"},
-    ), patch(
-        "nytid.cli.track.get_tmux_window_id_for_pane",
-        return_value="@42",
-    ):
-        assert get_current_tracked_window_id(
-            "me", TEST_SERVER_KEY,
-        ) == "@42"
-
 def test_get_current_tracked_context_labels_prefers_window_labels(
     temp_tracking_dir,
 ):
@@ -15091,6 +15059,7 @@ session, completed_entries = stop_tracking_labels(
     labels=launched_labels,
     end_time=end_time,
     quiet_if_missing=True,
+    update_tmux_context=not (pane or window),
 )
 @
 
@@ -15102,11 +15071,49 @@ would miss auto-suspended cases, while using the full effective launch
 label set would wrongly unregister an unrelated implicit command label
 that launch mode was not allowed to borrow.
 
+A tmux launch is the exception.  It registered its labels in the new
+pane's or window's context, not in ours---the start above left our
+context alone for [[--pane]] and [[--window]]---and the launch wrapper's
+cleanup gives them back there (\cref{track:detached-finalize}).
+Unregistering them here as well would take them from whatever context
+this command runs in, which never had them from this launch.
+
 <<unregister launched labels from tracked tmux context>>=
-if launched_labels:
+if launched_labels and not (pane or window):
     unregister_tmux_context_labels(
         launched_labels, who,
     )
+@
+
+The test runs a blocking pane launch from a pane in a tracked window
+whose labels include the launch's: they must still be there after the
+launch has ended, with the same count.
+
+<<test functions>>=
+def test_blocking_pane_launch_leaves_parent_window_alone(
+  temp_tracking_dir,
+):
+  """A blocking tmux launch takes no labels from where it was run."""
+  write_window_labels("@9", default_username, TEST_SERVER_KEY, ["work"])
+  with patch.dict(
+    os.environ, {"TMUX": "session", "TMUX_PANE": "%1"},
+  ), patch(
+    "nytid.cli.track.run_tmux_command", return_value=0,
+  ), patch(
+    "nytid.cli.track.get_current_tmux_server_key",
+    return_value=TEST_SERVER_KEY,
+  ), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value="@9",
+  ):
+    result = runner.invoke(
+      cli, ["start", "work", "--pane", "--block", "--", "true"],
+    )
+
+  assert result.exit_code == 0, result.output
+  assert read_window_label_entries(
+    "@9", default_username, TEST_SERVER_KEY,
+  )["work"]["count"] == 1
 @
 
 <<report launch result>>=
@@ -16405,8 +16412,8 @@ identity rewrite.
 
 Relabeling must also reach the tmux context.  A pane started with
 [[start -P wronglabel]] records that label in its pane-context file so
-the pane-exit hook can stop it.  If [[edit]] renamed the label only in
-the session, the hook would later stop [[wronglabel]]---a no-op---and
+the pane's exit handling can stop it.  If [[edit]] renamed the label only in
+the session, the exit handling would later stop [[wronglabel]]---a no-op---and
 the corrected label would keep running unnoticed.  So
 [[edit_active_batch]] syncs the current pane/window context in the
 same critical section, exactly as [[start_tracking_labels]] and
@@ -16892,7 +16899,7 @@ def test_edit_no_hash_rejects_label_mix(temp_tracking_dir):
   assert "cannot be combined" in result.output
 @
 
-The tmux context must follow the rename, or the pane-exit hook would
+The tmux context must follow the rename, or the pane's exit handling would
 stop the corrected-away label (a no-op) and leave the corrected one
 running.  A pure rename is the sharpest case: processed in the wrong
 order it would empty---and thereby delete---the pane file instead of
@@ -20606,23 +20613,6 @@ def test_cleanup_window_detached_preserves_other_labels(
     assert read_window_labels(
         window_id, default_username, TEST_SERVER_KEY,
     ) == ["shared", "Y"]
-
-def test_cleanup_window_detached_without_labels_keeps_counts(
-  temp_tracking_dir,
-):
-  """A cleanup given no labels decrements nothing.
-
-  The launch wrapper's finalize has already decremented the window,
-  so a second decrement would take a sibling pane's share.
-  """
-  add_window_labels("@42", default_username, TEST_SERVER_KEY, ["X"])
-  add_window_labels("@42", default_username, TEST_SERVER_KEY, ["X"])
-
-  result = run_window_cleanup(["--pane-id", "%1"], {"%1", "%2"})
-  assert result.exit_code == 0
-  assert read_window_label_entries(
-    "@42", default_username, TEST_SERVER_KEY,
-  )["X"]["count"] == 2
 @
 
 The cleanup command is also the sole owner of window-file deletion, and
@@ -20653,7 +20643,7 @@ def test_cleanup_window_detached_deletes_with_only_ending_pane(
   """A window whose only pane is the ending one loses its file."""
   add_window_labels("@42", default_username, TEST_SERVER_KEY, ["X"])
 
-  result = run_window_cleanup(["--pane-id", "%1"], {"%1"})
+  result = run_window_cleanup(["--pane-id", "%1", "--", "X"], {"%1"})
   assert result.exit_code == 0
   assert not window_labels_path(
     "@42", default_username, TEST_SERVER_KEY,
@@ -20677,7 +20667,7 @@ def test_cleanup_window_detached_keeps_file_when_tmux_silent(
   """When tmux cannot be asked, the file stays."""
   add_window_labels("@42", default_username, TEST_SERVER_KEY, ["X"])
 
-  result = run_window_cleanup(["--pane-id", "%1"], None)
+  result = run_window_cleanup(["--pane-id", "%1", "--", "X"], None)
   assert result.exit_code == 0
   assert window_labels_path(
     "@42", default_username, TEST_SERVER_KEY,
@@ -20749,23 +20739,26 @@ def test_cleanup_pane_detached_deletes_pane_files(temp_tracking_dir):
 @
 
 The launch cleanup names the pane and window through the wrapper's
-variables, so that it describes whichever pane is ending.
+variables, so that it describes whichever pane is ending, and gives
+back the launch's labels after a [[--]], so that no label can be read
+as an option.
 
 <<test functions>>=
 def test_launch_cleanup_shell_names_the_ending_pane():
   """The cleanup reads the pane and window from the wrapper."""
   window = build_tmux_launch_cleanup_shell(
-    default_username, TEST_SERVER_KEY, window=True,
+    ["work", "-x y"], default_username, TEST_SERVER_KEY, window=True,
   )
   assert "_cleanup-window-detached" in window
   assert '--window-id "$nytid_window"' in window
-  assert '--pane-id "$TMUX_PANE"' in window
+  assert '--pane-id "$nytid_pane"' in window
+  assert shlex.split(window)[-3:] == ["--", "work", "-x y"]
 
   pane = build_tmux_launch_cleanup_shell(
-    default_username, TEST_SERVER_KEY, window=False,
+    ["work"], default_username, TEST_SERVER_KEY, window=False,
   )
   assert "_cleanup-pane-detached" in pane
-  assert '--pane-id "$TMUX_PANE"' in pane
+  assert '--pane-id "$nytid_pane"' in pane
 @
 
 The empty marker file is what lets a window survive a full stop.  Its
@@ -20960,7 +20953,7 @@ def test_build_tmux_wait_wrapper_signals_done_once():
 
     assert wrapper[:3] == ["/bin/sh", "-c", wrapper[2]]
     assert "tmux wait-for ready-chan" in wrapper[2]
-    assert "status=$?" in wrapper[2]
+    assert 'echo "$?" >&3' in wrapper[2]
     assert "mkdir /tmp/nytid.status.guard" in wrapper[2]
     assert "printf 'status=%s\\nsignal=%s\\n' \"$status\" ''" in (
         wrapper[2]
@@ -20971,7 +20964,7 @@ def test_build_tmux_wait_wrapper_signals_done_once():
 
 
 def test_build_tmux_hook_command_uses_guarded_run_shell():
-    """Pane exit hooks become a guarded fallback path."""
+    """Pane exit hooks carry the guarded completion."""
     hook = build_tmux_hook_command(
         status_file="/tmp/nytid.status",
         wait_channel="done-chan",
@@ -20990,13 +20983,12 @@ def test_build_tmux_hook_command_uses_guarded_run_shell():
 The tests above only read the wrapper's text.  Whether it finalizes a
 pane that ends depends on how tmux, the kernel and the shell behave, so
 we also run it in a window of the [[private_tmux]] server and end that
-window both ways.  Before a kill the command writes a line to say it
-has started, so that we kill a wrapper that is running, not one still
-reading its script.  The cleanup prints what [[$nytid_window]],
-[[$NYTID_TMUX_WINDOW_ID]] and [[$TMUX_PANE]] expand to, which checks
-that the wrapper captured its own window and passes it on.  The last
-test checks the reason for the watcher: a command that ignores its
-terminal still dies with the pane.
+window in the ways that matter.  Before a kill or a Ctrl-C the
+command writes a line to say it has started, so that we signal a
+wrapper that is running, not one still reading its script.  The
+finalize prints whether it sees [[TMUX_PANE]] (it must not), and the
+cleanup prints what [[$nytid_window]] and [[$nytid_pane]] expand to,
+which checks that the wrapper captured its own pane and window.
 
 <<test functions>>=
 def launch_wrapper(sock, wrapper):
@@ -21035,11 +21027,10 @@ def logging_wrapper(command, tmp_path):
     command,
     "ready-chan",
     status_file=status,
-    on_exit_shell=f"echo finalize >> {log}",
+    on_exit_shell=f'echo "finalize ${{TMUX_PANE:-unset}}" >> {log}',
     completion_guard=make_tmux_completion_guard(status),
     cleanup_shell=(
-      'echo "cleanup $nytid_window $NYTID_TMUX_WINDOW_ID'
-      f' $TMUX_PANE" >> {log}'
+      f'echo "cleanup $nytid_window $nytid_pane" >> {log}'
     ),
   )
 
@@ -21049,7 +21040,7 @@ def test_wrapper_finalizes_normal_exit(private_tmux, tmp_path):
   pane, window = launch_wrapper(private_tmux, wrapper)
 
   assert wait_for_lines(tmp_path / "log", 2) == [
-    "finalize", f"cleanup {window} {window} {pane}",
+    "finalize unset", f"cleanup {window} {pane}",
   ]
   assert read_tmux_exit_status(str(tmp_path / "status")) == 3
 
@@ -21067,7 +21058,7 @@ def test_wrapper_finalizes_killed_pane(private_tmux, tmp_path):
     check=True,
   )
   assert wait_for_lines(tmp_path / "log", 3) == [
-    "started", "finalize", f"cleanup {window} {window} {pane}",
+    "started", "finalize unset", f"cleanup {window} {pane}",
   ]
   assert read_tmux_exit_status(str(tmp_path / "status")) == 129
 
@@ -21089,7 +21080,7 @@ def test_wrapper_lets_killed_pane_take_its_command(
     ["tmux", "-S", private_tmux, "kill-pane", "-t", pane],
     check=True,
   )
-  assert wait_for_lines(tmp_path / "log", 2)[0] == "finalize"
+  assert wait_for_lines(tmp_path / "log", 2)[0] == "finalize unset"
   deadline = time.monotonic() + 10
   while time.monotonic() < deadline:
     try:
@@ -21100,6 +21091,98 @@ def test_wrapper_lets_killed_pane_take_its_command(
   else:
     os.kill(pid, 9)
     pytest.fail("the command outlived its pane")
+
+def test_wrapper_records_status_after_ctrl_c(private_tmux, tmp_path):
+  """Ctrl-C reaches the command, not the finalize's bookkeeping.
+
+  One command catches the interrupt and exits 5, another dies of it;
+  both are normal ends, recorded with the command's own status.
+  """
+  log = shlex.quote(str(tmp_path / "log"))
+  catching = logging_wrapper(
+    ["sh", "-c", f"trap 'exit 5' INT; echo started >> {log};"
+     " while :; do sleep 0.1; done"],
+    tmp_path,
+  )
+  pane, _ = launch_wrapper(private_tmux, catching)
+  assert wait_for_lines(tmp_path / "log", 1) == ["started"]
+  subprocess.run(
+    ["tmux", "-S", private_tmux, "send-keys", "-t", pane, "C-c"],
+    check=True,
+  )
+  assert wait_for_lines(tmp_path / "log", 3)[1] == "finalize unset"
+  assert read_tmux_exit_status(str(tmp_path / "status")) == 5
+
+  (tmp_path / "log").unlink()
+  (tmp_path / "status").unlink()
+  os.rmdir(tmp_path / "status.guard")
+  dying = logging_wrapper(
+    ["sh", "-c", f"echo started >> {log}; exec sleep 60"], tmp_path,
+  )
+  pane, _ = launch_wrapper(private_tmux, dying)
+  assert wait_for_lines(tmp_path / "log", 1) == ["started"]
+  subprocess.run(
+    ["tmux", "-S", private_tmux, "send-keys", "-t", pane, "C-c"],
+    check=True,
+  )
+  assert wait_for_lines(tmp_path / "log", 3)[1] == "finalize unset"
+  assert read_tmux_exit_status(str(tmp_path / "status")) == 130
+
+def test_wrapper_finishes_finalize_when_killed_meanwhile(
+  private_tmux, tmp_path,
+):
+  """Killing the pane during a slow finalize does not cut it short."""
+  log = shlex.quote(str(tmp_path / "log"))
+  status = str(tmp_path / "status")
+  wrapper = build_tmux_wait_wrapper(
+    ["true"],
+    "ready-chan",
+    status_file=status,
+    on_exit_shell=(
+      f"echo finalizing >> {log}; sleep 1; echo finalized >> {log}"
+    ),
+    completion_guard=make_tmux_completion_guard(status),
+    cleanup_shell=f"echo cleanup >> {log}",
+  )
+  pane, _ = launch_wrapper(private_tmux, wrapper)
+  assert wait_for_lines(tmp_path / "log", 1) == ["finalizing"]
+
+  subprocess.run(
+    ["tmux", "-S", private_tmux, "kill-pane", "-t", pane],
+    check=True,
+  )
+  assert wait_for_lines(tmp_path / "log", 3) == [
+    "finalizing", "finalized", "cleanup",
+  ]
+  assert read_tmux_exit_status(status) == 0
+
+def test_wrapper_finalizes_despite_leftover_daemon(
+  private_tmux, tmp_path,
+):
+  """A process the command leaves behind does not hold up a hangup."""
+  log = shlex.quote(str(tmp_path / "log"))
+  daemon_file = tmp_path / "daemon"
+  wrapper = logging_wrapper(
+    ["sh", "-c",
+     "(trap '' HUP; exec sleep 30) & "
+     f"echo $! > {shlex.quote(str(daemon_file))}; "
+     f"echo started >> {log}; exec sleep 60"],
+    tmp_path,
+  )
+  pane, _ = launch_wrapper(private_tmux, wrapper)
+  assert wait_for_lines(tmp_path / "log", 1) == ["started"]
+  daemon = int(daemon_file.read_text())
+  try:
+    subprocess.run(
+      ["tmux", "-S", private_tmux, "kill-pane", "-t", pane],
+      check=True,
+    )
+    assert wait_for_lines(tmp_path / "log", 2)[1] == "finalize unset"
+  finally:
+    try:
+      os.kill(daemon, 9)
+    except ProcessLookupError:
+      pass
 
 def test_start_publishes_context_without_auto_suspend(
   temp_tracking_dir,
@@ -21395,7 +21478,7 @@ and the [[last_selected_window]] write.  After releasing the lock it
 executes the source stop, target start, and one debug emission inline,
 then briefly retakes the lock to backfill the published file's batch
 ids (they are only final after the transition) before installing the
-session sync hook and cleanup hook.
+session sync hook.
 
 <<test functions>>=
 def test_run_tmux_command_locks_window_launch_setup(
