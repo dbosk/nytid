@@ -167,7 +167,7 @@ from nytid.cli.utils.output import Column, print_rows
 from nytid.cli.utils.workweek import (
     DAY_NAMES, count_work_days, get_work_days, is_work_day,
 )
-from typing import Annotated, NamedTuple
+from typing import Annotated, Callable, NamedTuple
 import time
 
 from nytid import home
@@ -4860,7 +4860,10 @@ Track and todo should also present launch context the same way.  We therefore
 compute one context string up front and reuse it for tmux window names and
 as a best-effort [[PS1]] seed.  In tmux the user's [[~/.bashrc]] will
 likely overwrite [[PS1]] during normal startup, so the tmux window name is
-the primary context indicator for pane and window launches.
+the primary context indicator for pane and window launches.  For a window
+the name is only where the indicator starts: when the window's labels
+change later, the name follows them (\cref{track:window-retitle}), which
+the [[PS1]] seed, fixed in the shell's environment, cannot do.
 
 <<prepare launch mode>>=
 launch_requested = (
@@ -9504,6 +9507,12 @@ and so cannot know batch ids yet; the ids are backfilled once the
 session has allocated them (see [[update_window_label_batches]]
 below).
 
+Every change to a window's label set passes through this one writer,
+which is why it is also where the window's tmux name is kept in step
+with its labels (\cref{track:window-retitle}): it remembers the labels
+it is about to replace so that it can tell whether the visible set
+changed.
+
 <<helper functions>>=
 def write_window_label_entries(
     window_id: str,
@@ -9511,14 +9520,22 @@ def write_window_label_entries(
     tmux_server_key: str,
     entries: dict[str, dict],
 ) -> None:
-    """Atomically write a tracked window's label entries."""
+    """Atomically write a tracked window's label entries.
+
+    A window still carrying the name nytid gave it is renamed to
+    match the new labels, see `retitle_tracked_window`.
+    """
     path = window_labels_path(
+        window_id, who, tmux_server_key,
+    )
+    previous = read_window_label_entries(
         window_id, who, tmux_server_key,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries))
     tmp.rename(path)
+    <<retitle the window if its labels changed>>
 
 
 def write_window_labels(
@@ -9658,6 +9675,344 @@ def delete_window_labels(
         ).unlink()
     except OSError:
         pass
+@
+
+\subsubsection{Keeping the Window Name in Step}
+\label{track:window-retitle}
+
+A window launched with [[--window]] is named after its labels,
+[[track:work echo]], so that the tmux status line shows what the
+window is tracking.  The labels do not stay fixed: a [[track start]]
+or [[track stop]] typed inside the window, a [[track edit]], an
+[[adopt]] that merges into the window, a resume, or a pane exiting and
+taking its labels with it all change the set.  A name that kept the
+launch-time labels would then claim work the window no longer tracks,
+or hide work it does.
+
+We hook the rename into [[write_window_label_entries]] rather than
+into each of those commands.  They all reach the window file through
+the add, remove, write and backfill helpers above, which all end in
+that one writer, so a single call site covers every path, including
+the pane-exit cleanup hook that runs long after the command that
+started the labels.  The writers already run under the tmux-context
+lock, so two concurrent label changes rename the window in the same
+order as they change the file, and the last name matches the last
+file.
+
+Not every write is a label change.  A batch-id backfill or a second
+pane contributing a label the window already lists changes only the
+entries' contents, not the visible set, and a write with no previous
+file is a fresh launch, which [[new-window -n]] has already named, or
+an [[adopt]], which renames only when asked.  Those writes leave the
+name alone.  The ownership check below would turn most first writes
+away anyway, since the empty label set's name [[track]] is not what a
+launched window is called, but not all: an untracked window that its
+user happens to have called [[track]] would be renamed on adoption.
+Skipping first writes also saves a tmux query at every launch.
+
+<<retitle the window if its labels changed>>=
+if previous is not None and list(previous) != list(entries):
+    retitle_tracked_window(
+        window_id,
+        tmux_server_key,
+        list(previous),
+        list(entries),
+    )
+@
+
+The rename itself must not overwrite a name that nytid did not give.
+An adopted window usually keeps a name its user chose, which is why
+[[adopt]] renames only on request, and a window launched by [[todo]]
+is called [[todo:<id>]] after its work item, not after its labels.
+Rather than store which windows we named, we compare the window's
+current name with the name we \emph{would} have given it for the old
+labels: if it is [[track:]] followed by exactly those labels, the name
+is ours and may follow them; anything else belongs to someone else.
+A window left with no labels is called plain [[track]], which is again
+the name of its (empty) label set, so a later [[start]] there renames
+it back.
+
+There is one more guard.  A bare [[tmux]] client talks to the server
+named by [[$TMUX]], while [[tmux_server_key]] names the server whose
+state file changed.  The two differ when a resume runs outside tmux, or
+in another server, and puts labels back into a window: window ids are
+only unique within one server, so renaming [[@7]] there would rename
+some unrelated window.  We rename only when the ambient server is the
+one the key names, and otherwise leave the name as it is.
+
+Since [[rename-window]], like [[new-window -n]], turns off tmux's
+[[automatic-rename]] for that window, tmux does not overwrite the name
+we set.  Errors are ignored: the window may have closed in between, and
+a stale name must never make a label change fail.
+
+<<helper functions>>=
+def retitle_tracked_window(
+    window_id: str,
+    tmux_server_key: str,
+    old_labels: list[str],
+    new_labels: list[str],
+) -> None:
+    """Rename a tracked window to follow its changed labels.
+
+    Only a window still named `track:<old labels>` is renamed, so
+    names chosen by the user or by other commands are kept.
+    """
+    if get_current_tmux_server_key() != tmux_server_key:
+        return
+    old_name = build_context_name("track", old_labels)
+    if get_tmux_window_name(window_id) != old_name:
+        return
+    subprocess.run(
+        [
+            "tmux", "rename-window",
+            "-t", window_id,
+            build_context_name("track", new_labels),
+        ],
+        check=False,
+        capture_output=True,
+    )
+@
+
+Reading the current name is a separate helper.  [[display-message]]
+with a target window expands a format for that window, but it does not
+fail for a window that has gone, which is exactly the situation of the
+pane-exit cleanup hook.  tmux 3.6 then exits successfully anyway: run
+directly it prints an empty line, and run from a hook's [[run-shell]]
+it falls back to the client's current window and prints \emph{that}
+window's name.  Asking for the name alone would therefore let another
+window's name stand in for ours.  We ask for the window id as well and
+accept the answer only when it is the window we asked about; any other
+answer, like an error, becomes [[None]], so the comparison above fails
+and nothing is renamed.  Having the lookup separate also gives the
+tests one seam to replace, so that no test ever asks the developer's
+tmux server about its windows.
+
+<<helper functions>>=
+def get_tmux_window_name(window_id: str) -> str | None:
+    """Return the tmux name of ``window_id``, or ``None``."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                window_id,
+                "#{window_id} #{window_name}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    answered_id, _, name = result.stdout.rstrip("\n").partition(" ")
+    if answered_id != window_id:
+        return None
+    return name
+@
+
+We check the lookup against a real tmux server of its own, started on
+a socket in the test's temporary directory, since the property under
+test is how tmux answers, which a fake would only restate.  Pointing
+[[$TMUX]] at that socket makes the bare [[tmux]] client talk to it and
+never to the developer's server.  The server's fallback to the current
+window only shows inside a [[run-shell]] job, which a test cannot
+easily sit in, so that case replays the answer we observed there.
+
+<<test functions>>=
+@pytest.fixture
+def private_tmux(tmp_path, monkeypatch):
+  """Start a tmux server on a private socket; yield its socket."""
+  if shutil.which("tmux") is None:
+    pytest.skip("tmux is not installed")
+  sock = str(tmp_path / "tmux.sock")
+  monkeypatch.delenv("TMUX_PANE", raising=False)
+  subprocess.run(
+    ["tmux", "-S", sock, "new-session", "-d",
+     "-n", "track:work echo", "sleep 60"],
+    check=True,
+  )
+  monkeypatch.setenv("TMUX", f"{sock},0,0")
+  try:
+    yield sock
+  finally:
+    subprocess.run(
+      ["tmux", "-S", sock, "kill-server"], check=False,
+    )
+
+def test_get_tmux_window_name_reads_real_name(private_tmux):
+  """The lookup returns a live window's name, spaces included."""
+  window_id = subprocess.run(
+    ["tmux", "-S", private_tmux, "display-message", "-p",
+     "#{window_id}"],
+    capture_output=True, text=True, check=True,
+  ).stdout.strip()
+  assert get_tmux_window_name(window_id) == "track:work echo"
+
+def test_get_tmux_window_name_missing_window(private_tmux):
+  """A window id the server does not know yields `None`."""
+  assert get_tmux_window_name("@999") is None
+
+def test_get_tmux_window_name_rejects_other_window():
+  """tmux answering for another window counts as no answer."""
+  with patch(
+    "nytid.cli.track.subprocess.run",
+    return_value=subprocess.CompletedProcess(
+      [], 0, stdout="@0 other\n", stderr="",
+    ),
+  ):
+    assert get_tmux_window_name("@1") is None
+@
+
+Let's verify the rename rules on the helpers that change the window
+file.  Running tmux for real would rename the windows of whoever runs
+the tests, so the tests stand in a small fake window for tmux: it
+starts with the name the test gives it, [[get_tmux_window_name]] reads
+that name, and a [[rename-window]] passed to the recorded
+[[subprocess.run]] changes it.  The fake must remember renames because
+the ownership check reads the name each time; a fixed answer would
+hide a second rename that depends on the first.  The tests also pin
+[[get_current_tmux_server_key]] to the scaffold's key, as if they ran
+inside that server.
+
+<<test functions>>=
+def window_renames(run_mock):
+  """Return the `tmux rename-window` argvs recorded by `run_mock`."""
+  return [
+    call.args[0] for call in run_mock.call_args_list
+    if call.args and call.args[0][:2] == [
+      "tmux", "rename-window",
+    ]
+  ]
+
+@contextlib.contextmanager
+def window_named(name, server_key=TEST_SERVER_KEY):
+  """Pretend the ambient tmux window is called `name`."""
+  window = {"name": name}
+
+  def fake_run(argv, *args, **kwargs):
+    if argv[:2] == ["tmux", "rename-window"]:
+      window["name"] = argv[-1]
+    return DEFAULT
+
+  with patch(
+    "nytid.cli.track.get_current_tmux_server_key",
+    return_value=server_key,
+  ), patch(
+    "nytid.cli.track.get_tmux_window_name",
+    side_effect=lambda window_id: window["name"],
+  ), patch(
+    "nytid.cli.track.subprocess.run",
+    side_effect=fake_run,
+  ) as run_mock:
+    yield run_mock
+
+def test_retitle_follows_added_label(temp_tracking_dir):
+  """A window named after its labels gains the new label."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  with window_named("track:work") as run_mock:
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["echo"])
+  assert window_renames(run_mock) == [[
+    "tmux", "rename-window", "-t", "@7", "track:work echo",
+  ]]
+
+def test_retitle_without_labels_is_track(temp_tracking_dir):
+  """Removing the last label leaves the bare name `track`."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  with window_named("track:work") as run_mock:
+    remove_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  assert window_renames(run_mock) == [[
+    "tmux", "rename-window", "-t", "@7", "track",
+  ]]
+
+def test_retitle_keeps_foreign_name(temp_tracking_dir):
+  """A window the user renamed keeps its name."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  with window_named("mywin") as run_mock:
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["echo"])
+  assert window_renames(run_mock) == []
+
+def test_retitle_ignores_unchanged_label_set(temp_tracking_dir):
+  """A second contribution of a listed label renames nothing."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  with window_named("track:work") as run_mock:
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+    update_window_label_batches(
+      "@7", "me", TEST_SERVER_KEY, {"work": 3},
+    )
+  assert window_renames(run_mock) == []
+
+def test_retitle_skips_other_tmux_server(temp_tracking_dir):
+  """A label change in another server's window renames nothing."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  with window_named(
+    "track:work", server_key="other-server",
+  ) as run_mock:
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["echo"])
+  assert window_renames(run_mock) == []
+
+def test_retitle_skips_first_write(temp_tracking_dir):
+  """Adopting an untracked window called `track` keeps the name."""
+  with window_named("track") as run_mock:
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  assert window_renames(run_mock) == []
+@
+
+The helpers are only half the story: the commands must actually route
+their label changes into the window file.  We run [[track start]] and
+[[track edit]] inside a tracked window, the way a user would, with only
+the tmux lookups replaced, and check the name the window ends up with.
+The window is seeded the way a [[--window]] launch leaves it: the
+labels file published once, and the labels started without registering
+them in the tmux context a second time, which would count each label
+twice and keep it listed after a removal.
+[[edit]] registers its added labels before it removes the old ones, so
+a replacement renames twice, through [[track:work new]]; what matters
+is that the last name is the new label set.
+
+<<test functions>>=
+RETITLE_TMUX_ENV = {
+  "TMUX": "/tmp/tmux.sock,123,0",
+  "TMUX_PANE": "%3",
+}
+
+def run_in_tracked_window(args):
+  """Run `track` in tracked window @7 named `track:work`."""
+  write_window_labels("@7", "me", TEST_SERVER_KEY, ["work"])
+  start_tracking_labels(
+    ["work"],
+    start_time=datetime.datetime.now(),
+    who="me",
+    update_tmux_context=False,
+  )
+  with patch.dict(
+    os.environ, RETITLE_TMUX_ENV,
+  ), patch(
+    "nytid.cli.track.get_tmux_window_id_for_pane",
+    return_value="@7",
+  ):
+    with window_named("track:work") as run_mock:
+      result = runner.invoke(cli, args + ["--who", "me"])
+  return result, window_renames(run_mock)
+
+def test_start_in_tracked_window_retitles(temp_tracking_dir):
+  """`track start` inside a tracked window renames it."""
+  result, renames = run_in_tracked_window(["start", "extra"])
+  assert result.exit_code == 0, result.output
+  assert renames == [[
+    "tmux", "rename-window", "-t", "@7", "track:work extra",
+  ]]
+
+def test_edit_in_tracked_window_retitles(temp_tracking_dir):
+  """`track edit -l` inside a tracked window ends at the new set."""
+  result, renames = run_in_tracked_window(
+    ["edit", "-l", "new"],
+  )
+  assert result.exit_code == 0, result.output
+  assert renames[-1] == [
+    "tmux", "rename-window", "-t", "@7", "track:new",
+  ]
 @
 
 \subsubsection{Window-Scoped Batch Targeting}
@@ -12348,13 +12703,14 @@ def adopt_current_window(
     labels: list[str],
     who: str,
     auto_suspend: bool | None,
-    rename_to: str | None = None,
+    rename_to: str | Callable[[list[str]], str] | None = None,
 ):
     """Adopt the current tmux window as a tracked window.
 
     Publishes `labels` on the window, starts them, and arms the
     sync and cleanup hooks; `rename_to` optionally renames the
-    window.  Returns None outside a usable tmux context.
+    window, either to a fixed name or to the name a function
+    gives the window's labels after the merge.  Returns None outside a usable tmux context.
     Otherwise returns a dict with the resolved `pane_id`,
     `window_id`, `session_id` and `tmux_server_key`, plus the
     `started` and `already_tracking` label lists.
@@ -12393,7 +12749,7 @@ def adopt(
     adopted = adopt_current_window(
         labels, who, auto_suspend,
         rename_to=(
-            build_context_name("track", labels)
+            (lambda merged: build_context_name("track", merged))
             if rename else None
         ),
     )
@@ -12454,8 +12810,12 @@ resolved_auto_suspend = should_auto_suspend(
 )
 
 def publish():
+    nonlocal window_labels
     add_window_labels(
         window_id, who, tmux_server_key, labels,
+    )
+    window_labels = read_window_labels(
+        window_id, who, tmux_server_key,
     )
     prev_window_id = None
     prev_labels = None
@@ -12475,6 +12835,7 @@ def publish():
     )
     return prev_window_id, prev_labels
 
+window_labels = None
 source_window_id, source_labels = (
     with_tmux_context_lock(publish)
 )
@@ -12539,9 +12900,19 @@ installer above, arms it while clearing any stale-key hooks, which
 makes adopt a complete one-command recovery.  Renaming is opt-in
 (the CLI's [[--rename]] flag): an adopted window usually has a
 name its user chose, and overwriting it unasked would trade one
-inconsistency for another.  The name is a caller-supplied string
+inconsistency for another.  The name is supplied by the caller
 because track and todo adoption follow different naming
-conventions ([[track:<labels>]] versus [[todo:<id>]]).
+conventions ([[track:<labels>]] versus [[todo:<id>]]).  Todo's name
+is fixed, so it passes a string.  Track's depends on the labels, and
+not only on the adopted ones: adopting into a window that is already
+tracked merges the two sets, and a name built from the adopted labels
+alone would no longer be [[track:]] followed by the window's labels,
+so the window would drop out of the retitling that keeps such names
+current (\cref{track:window-retitle}).  Track therefore passes a
+function, which we apply to the merged labels as [[publish]] left
+them.  From then on later label changes keep the name current on
+their own; a window adopted without [[--rename]] keeps its own name
+through them too.
 
 <<install adopt hooks and optionally rename>>=
 if resolved_auto_suspend:
@@ -12556,7 +12927,11 @@ if rename_to is not None:
         [
             "tmux", "rename-window",
             "-t", window_id,
-            rename_to,
+            (
+                rename_to(window_labels)
+                if callable(rename_to)
+                else rename_to
+            ),
         ],
         check=False,
     )
@@ -12714,6 +13089,24 @@ def test_adopt_rename(temp_tracking_dir):
     "tmux", "rename-window", "-t", "@7",
     "track:devel nytid",
   ]]
+
+def test_adopt_rename_merged_window(temp_tracking_dir):
+  """--rename on a tracked window names all its labels."""
+  write_window_labels(
+    "@7", "me", TEST_SERVER_KEY, ["work"],
+  )
+  with window_named("track:work") as run_mock:
+    result, _, _ = invoke_adopt(
+      ["echo", "--who", "me",
+       "--no-auto-suspend", "--rename"],
+    )
+    add_window_labels("@7", "me", TEST_SERVER_KEY, ["more"])
+
+  assert result.exit_code == 0
+  assert window_renames(run_mock)[-1] == [
+    "tmux", "rename-window", "-t", "@7",
+    "track:work echo more",
+  ]
 @
 
 \subsubsection{Focus-Events Validation}
@@ -19168,6 +19561,7 @@ interact with the tracking layer---such as [[todo]]
 Here we assemble the final test file:
 
 <<test [[clitrack.py]]>>=
+import contextlib
 import datetime
 import io
 import json
@@ -19182,7 +19576,7 @@ import subprocess
 import tempfile
 import pytest
 from typer.testing import CliRunner
-from unittest.mock import patch, MagicMock
+from unittest.mock import DEFAULT, patch, MagicMock
 
 import sys
 sys.path.insert(0, '../src')
@@ -19261,6 +19655,7 @@ from nytid.cli.track import (
     remove_window_labels,
     delete_window_labels,
     current_window_batch_scope,
+    start_tracking_labels,
     suspend_tracking_labels,
     restart_window_batches,
     resume_stopped_batches,
@@ -19272,6 +19667,7 @@ from nytid.cli.track import (
     get_tmux_window_id_for_pane,
     get_tmux_selected_window_id,
     tmux_window_exists,
+    get_tmux_window_name,
     last_selected_window_path,
     read_last_selected_window,
     write_last_selected_window,
